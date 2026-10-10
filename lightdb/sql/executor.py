@@ -117,7 +117,11 @@ class Executor:
         parsed = parser.parse(sql)
         if parsed is None:
             return self._err(1064, f"无法解析 SQL: {sql[:80]}")
-        return self.execute(parsed, session or {})
+        # 注意：不能用 `session or {}` —— 空 dict 是 falsy，会新建一个字典，
+        # 调用方传进来的会话就丢了（BEGIN 写的 s['txn'] 传不回去，
+        # 导致 BEGIN/ROLLBACK 各自变成 autocommit，回滚静默失效）。
+        return self.execute(
+            parsed, session if session is not None else {})
 
     def _dispatch(self, p: Dict, s: Dict) -> Dict:
         cmd = p['command']

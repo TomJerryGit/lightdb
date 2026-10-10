@@ -9,12 +9,23 @@
   [19:21] next_row_ptr
   [21:24] reserved
   [24:]   槽位数组(向下增长) + 行数据(向上增长)
+
+修复历史:
+- 事务原子性批次: 磁盘魔数写入字节序修正。
+  旧实现用 struct.pack_into('<I', ...) 写入 0x4C444250，落盘字节是
+  b'PBDL'，而 BufferPool.get_page 是按字节比较 b'LDBP' 的，
+  导致**任何页都无法从磁盘读回**（进程内只靠内存帧工作）。
+  崩溃后重开数据库时所有页读回 None：数据文件其实早已写好，
+  但索引/堆都"看不见"了，只能靠 WAL 重放整表，删除与更新更是直接丢失。
+  现在改为按大端写入魔数，落盘字节恰好是 b'LDBP'，与 BufferPool 校验一致。
+  注意: 修正前写出的历史数据文件（首 4 字节为 b'PBDL'）本来就读不回来，
+  修正后依旧不兼容（BufferPool 拒绝），需要重建表。
 """
 import struct
 
 PAGE_SIZE = 4096
 PAGE_HEADER_SIZE = 24
-PAGE_MAGIC = 0x4C444250  # "LDBP"
+PAGE_MAGIC = 0x4C444250  # "LDBP"（按大端写入磁盘，字节序 4C 44 42 50）
 
 PAGE_TYPE_META = 0
 PAGE_TYPE_HEAP = 1
@@ -28,7 +39,8 @@ class Page:
     def __init__(self, page_id: int = 0, data: bytes = None, page_type: int = PAGE_TYPE_HEAP):
         if data is None:
             self.data = bytearray(PAGE_SIZE)
-            struct.pack_into('<I', self.data, 0, PAGE_MAGIC)
+            # 大端写入 → 落盘字节为 b'LDBP'，与 BufferPool 的校验一致
+            struct.pack_into('>I', self.data, 0, PAGE_MAGIC)
             struct.pack_into('<I', self.data, 4, page_id)
             struct.pack_into('<Q', self.data, 8, 0)
             self.data[16] = page_type
@@ -101,7 +113,38 @@ class Page:
         struct.pack_into('<HH', self.data, self._slot_off(slot_id), off, len(row_bytes))
         self.dirty = True
         return True
-    
+
+    def restore_row(self, slot_id: int, row_bytes: bytes) -> bool:
+        """
+        把 row_bytes 恢复到**指定槽位**（事务回滚 / 崩溃恢复 undo 用）。
+
+        与 insert_row 的区别：槽位号可控。删除过的槽位（off/ln 为 0）
+        会重新挂上数据；槽位已有数据且空间够则原地覆盖。
+        返回 False 表示该页容纳不下（调用方需换页或走 insert_row）。
+        """
+        if slot_id >= self.n_slots:
+            return False
+        off, ln = struct.unpack_from('<HH', self.data, self._slot_off(slot_id))
+
+        if off != 0 and ln >= len(row_bytes):
+            # 原地覆盖
+            self.data[off:off + len(row_bytes)] = row_bytes
+            struct.pack_into('<HH', self.data, self._slot_off(slot_id),
+                             off, len(row_bytes))
+            self.dirty = True
+            return True
+
+        # 需要一段新空间（槽位为空，或旧位置太小）
+        new_off = self.next_row_ptr - len(row_bytes)
+        if new_off < PAGE_HEADER_SIZE + self.n_slots * 4:
+            return False
+        self.data[new_off:new_off + len(row_bytes)] = row_bytes
+        struct.pack_into('<HH', self.data, self._slot_off(slot_id),
+                         new_off, len(row_bytes))
+        self._set_next_row_ptr(new_off)
+        self.dirty = True
+        return True
+
     def free_space(self) -> int:
         return self.next_row_ptr - PAGE_HEADER_SIZE - self.n_slots * 4
     

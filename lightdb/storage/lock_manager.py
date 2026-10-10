@@ -77,6 +77,20 @@ class LockManager:
         # key -> Condition（按 key 通知）
         self.key_conds = {}
 
+        # key -> 正在 cond.wait() 上等待的线程数。
+        # ★ 性能关键 1：release() 旧实现遍历**所有见过的 key**（含从未
+        #   有人等待的）逐个 notify_all()，autocommit 场景下每个主键
+        #   都会留下一个 key_conds 表项，于是每次放锁都变成
+        #   O(历史主键数)。
+        self._waiters = defaultdict(int)
+
+        # 表名 -> {正在等待该表下某个行 key 的 key}
+        # ★ 性能关键 2：表级意向锁释放时，旧实现（以及按 key_conds
+        #   过滤的中间版本）都要扫"该表下出现过的全部行 key"，同样是
+        #   O(历史行数)。这里只登记**真的有人在等**的 key，没有竞争时
+        #   集合为空，放锁就是 O(1)。
+        self._waiting_by_table = defaultdict(set)
+
         # key -> list of LockEntry
         self.locks = defaultdict(list)
         # 事务持有的锁
@@ -109,10 +123,12 @@ class LockManager:
             while True:
                 if self._can_acquire(key, lock_type, txn_id):
                     self._grant(key, lock_type, txn_id)
+                    # 成功拿到锁 → 不再等待：只清自己的出边。
+                    # 绝不能顺手把"别人等我"的边也删掉（那会破坏死锁检测）。
                     self._clear_wait_graph(txn_id)
                     return True
 
-                # 清理旧等待关系，重新记录
+                # 清理自己的旧等待关系，重新记录当前 holder
                 self._clear_wait_graph(txn_id)
 
                 holders = {e.txn_id for e in self.locks.get(key, [])
@@ -122,50 +138,88 @@ class LockManager:
 
                 # 死锁检测
                 if holders and self._detect_cycle(txn_id):
-                    self._clear_wait_graph(txn_id)
+                    self._drop_waiter(txn_id)
                     raise DeadlockError(
                         f"死锁检测: 事务 {txn_id} 被选为受害者")
 
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    self._clear_wait_graph(txn_id)
+                    # 放弃等待 → 双向清理，避免留下陈旧边造成误判
+                    self._drop_waiter(txn_id)
                     return False
 
-                cond.wait(timeout=min(remaining, 0.5))
+                self._waiters[key] += 1
+                if key[0] != 'TABLE':
+                    self._waiting_by_table[key[0]].add(key)
+                try:
+                    cond.wait(timeout=min(remaining, 0.5))
+                finally:
+                    self._waiters[key] -= 1
+                    if not self._waiters[key]:
+                        del self._waiters[key]
+                        if key[0] != 'TABLE':
+                            tbl_set = self._waiting_by_table.get(key[0])
+                            if tbl_set is not None:
+                                tbl_set.discard(key)
+                                if not tbl_set:
+                                    self._waiting_by_table.pop(
+                                        key[0], None)
 
     def release(self, txn_id: int):
         """
         释放事务持有的所有锁，并只通知等待相关 key 的事务。
+
+        ★ 性能：旧实现无条件遍历 key_conds 全表逐个 notify_all()，
+        而 key_conds 会为每个出现过的行 key 留一个表项、永不回收，
+        于是每次放锁都是 O(历史行数)。autocommit 场景下每个 INSERT
+        都放一次锁，插入 3000 行时 notify_all 被调用百万次。
+        现在只遍历**本事务真正持有的 key**，并且只有该 key 上确实
+        有线程在 wait（_waiters > 0）才通知。
         """
         with self.lock:
-            released_keys = set()
-            for key in list(self.txn_locks.get(txn_id, [])):
-                self.locks[key] = [
-                    e for e in self.locks[key] if e.txn_id != txn_id]
-                if not self.locks[key]:
-                    del self.locks[key]
-                released_keys.add(key)
+            held = list(self.txn_locks.get(txn_id, ()))
+            if not held:
+                self.txn_locks.pop(txn_id, None)
+                self._drop_waiter(txn_id)
+                return
+
+            released_keys = []
+            touched_tables = []
+            for key in held:
+                entries = self.locks.get(key)
+                if entries:
+                    kept = [e for e in entries if e.txn_id != txn_id]
+                    if kept:
+                        self.locks[key] = kept
+                    else:
+                        del self.locks[key]
+                released_keys.append(key)
+                if key[0] == 'TABLE':
+                    touched_tables.append(key[1])
 
             self.txn_locks.pop(txn_id, None)
-            self._clear_wait_graph(txn_id)
+            self._drop_waiter(txn_id)
 
-            # 按 key 通知
+            # 按 key 通知：只通知**真的有人在等**的 key
             notified = set()
             for key in released_keys:
-                cond = self.key_conds.get(key)
-                if cond is not None:
-                    cond.notify_all()
-                    notified.add(key)
+                if self._waiters.get(key) and key not in notified:
+                    cond = self.key_conds.get(key)
+                    if cond is not None:
+                        cond.notify_all()
+                        notified.add(key)
 
-            # 表级锁释放 → 通知所有等待该表的 key
-            for key in released_keys:
-                if key[0] == 'TABLE':
-                    table = key[1]
-                    for k, cond in list(self.key_conds.items()):
-                        if isinstance(k, tuple) and k[0] == table \
-                                and k not in notified:
-                            cond.notify_all()
-                            notified.add(k)
+            # 表级意向锁释放 → 通知等待该表下任何行的事务。
+            # _waiting_by_table 只包含"当前真的有人在等"的 key，
+            # 没有竞争时是空集合。
+            for table in touched_tables:
+                for k in list(self._waiting_by_table.get(table, ())):
+                    if k in notified:
+                        continue
+                    cond = self.key_conds.get(k)
+                    if cond is not None:
+                        cond.notify_all()
+                        notified.add(k)
 
     # ==================== 内部: 授予/检查 ====================
 
@@ -263,6 +317,19 @@ class LockManager:
         return dfs(start)
 
     def _clear_wait_graph(self, txn_id):
+        """
+        只清除 txn_id 的**出边**（它不再等待别人）。
+        修复: 旧实现同时把 txn_id 从所有其他事务的等待集合里删掉，
+        等于单方面抹掉"别人正在等我"这条边，双向等待因此常常检测不到环，
+        两个事务最后一起超时（死锁只能靠 5 秒超时兜底）。
+        """
+        self.wait_graph.pop(txn_id, None)
+
+    def _drop_waiter(self, txn_id):
+        """
+        事务彻底退出等待（拿到锁/超时/被选为死锁受害者/事务结束）时，
+        双向清理它的等待关系，避免陈旧边导致误报。
+        """
         self.wait_graph.pop(txn_id, None)
         for s in self.wait_graph.values():
             s.discard(txn_id)

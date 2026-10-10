@@ -35,6 +35,15 @@
 
 **SQL 实测**（同实例、真实执行器）：窗口 4 项、CTE 4 项、UNION 4 项、GROUP BY/DISTINCT 4 项、普通路径回归 4 项 —— **17/17 通过**。
 
+- **事务原子性与崩溃恢复可用**：
+  - **持久化根因**：磁盘页魔数用 `'<I'` 写入 `0x4C444250`（小端落盘为 `b'PBDL'`），而读回时比较的是 `b'LDBP'`，于是**任何页都读不回来**——重启后只能靠 WAL 重放，UPDATE/DELETE 直接丢；修正字节序后磁盘页可正常读回。
+  - **WAL 隐式提交**：autocommit 语句使用合成高位事务号且 WAL 无 COMMIT 记录，恢复时被当成 loser 撤销（连基行一起丢）；现在 `txn_id == 0` 或 `>= 合成号下限` 一律按隐式提交重放，且写入时 flush 到 OS（log-before-data）。
+  - **loser 前像重建**：撤销 loser 事务时不再把「带删除标记的旧版本」原样写回（那会让行头永久 `xmax != 0`、恢复后整表不可见），而是按原值重建 `xmax = 0` 的前像。
+  - **真回滚**：`BEGIN; INSERT/UPDATE/DELETE; ROLLBACK` 三种场景回滚后表内容与事务前完全一致，且主键可再次插入（INSERT 路径原先根本不传事务号，已在 SQL 层修掉）。
+  - **锁泄漏**：autocommit 语句改用合成事务号并在语句结束释放，`BEGIN; UPDATE` 同一主键不再 5 秒超时。
+
+**事务实测**（Lead 亲自复核，非子代理自述）：初始 3 行 → 三种 ROLLBACK 后仍是 `[(1,'v1'),(2,'v2'),(3,'v3')]` → 连续重开 2 次行数不变（无重复行累积）→ 子进程 autocommit 写入后 `os._exit(1)` 硬杀，重开后该行仍在（日志 `崩溃恢复 t: redo 1 条, undo 0 条`）。
+
 **多进程模式实测**（`python -m lightdb.main --mode multi --workers 2` + 真实 pymysql）：
 
 | 验证项 | 结果 |
