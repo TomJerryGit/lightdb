@@ -400,6 +400,43 @@ GROUP BY 与 DISTINCT 属于**静默错答**：不报错、结果错。仓库自
 
 ---
 
+## 17. 事务原子性与崩溃恢复（后续会话，2026-10）
+
+审计结论是「事务不能支撑 ACID：无页级回滚、`xmax` 恒 0、恢复只重放 INSERT、启动即 truncate」。后续会话修好了三处根因，并实测通过。
+
+### 17.1 三处根因
+
+| # | 根因 | 后果 | 修法 |
+|---|---|---|---|
+| 1 | **磁盘页读不回来**：页魔数用 `'<I'` 写入 `0x4C444250`，小端落盘是 `b'PBDL'`，而 `BufferPool.get_page` 比较的是 `b'LDBP'` | **任何页都无法从磁盘读回**，重启后只能靠 WAL 重放整表；UPDATE/DELETE 直接丢数据 | 改用大端写魔数，磁盘页可正常读回 |
+| 2 | **autocommit 写入被误判为 loser**：autocommit 语句使用合成高位事务号，而 WAL 没有对应的 COMMIT 记录 | 恢复时把**已提交**的 autocommit 行当未提交事务撤销，重启后整表消失 | `txn_id == 0` 或 `>= 合成号下限` 一律按隐式提交重放；`WAL.log()` 默认 flush 到 OS（log-before-data） |
+| 3 | **loser 撤销把旧版本写成永久删除**：撤销时把「带删除标记的旧版本」原样写回页 | 行头 `xmax` 永久非 0 → 恢复后整表不可见（`[]`） | 撤销前按原值重建 `xmax = 0` 的前像 |
+
+配套修复：`lock_manager` 等待图 `_drop_waiter`（死锁检测由必失败变为 10/10 通过）；`mvcc` 增加 `UndoAction` 物理 undo 栈；`table`/`database` 接线真 abort（物理回滚）、COMMIT 顺序、崩溃 redo/undo、`xmax` 写真实事务号、autocommit 语句用合成事务号并在语句结束释放锁（不再泄漏）。SQL 层配合两处：`_cmd_insert` 传入 `txn['txn_id']` 与 `read_view`（原先无条件 `txn_id=0`，事务内 INSERT 根本无法回滚）；`execute_sql` 修掉 `session or {}`（空字典是 falsy，会新建字典丢掉调用方会话，导致 `BEGIN` 写的 `s['txn']` 传不回去、三步各自 autocommit、ROLLBACK 静默失效）。
+
+### 17.2 Lead 亲自复核的实测（不是子代理自述）
+
+```
+初始              : [(1,'v1'), (2,'v2'), (3,'v3')]
+回滚 INSERT 后    : [(1,'v1'), (2,'v2'), (3,'v3')]
+回滚 UPDATE 后    : [(1,'v1'), (2,'v2'), (3,'v3')]
+回滚 DELETE 后    : [(1,'v1'), (2,'v2'), (3,'v3')]
+连续重开 2 次     : 行数不变（无重复行累积，排除 WAL 重放导致的行膨胀）
+硬杀子进程后重开  : [(1,'v1'), (2,'v2'), (3,'v3'), (77,'x')]   # 已提交的 autocommit 写入保住
+                  日志：崩溃恢复 t: redo 1 条, undo 0 条
+```
+
+新增 [`tests/test_txn_atomicity.py`](../tests/test_txn_atomicity.py)（15 项）通过。
+
+### 17.3 仍未做到
+
+- **旧版本只存在于 WAL 与内存 MVCC 链**：页上的 UPDATE 是原地覆写、DELETE 是物理删行，旧版本的 `xmax` 没有真正落盘；因此**重启后老快照查不回被覆盖的旧版本**（快照隔离只在同一次运行内成立）。
+- `recover_from_wal()` 末尾仍然 truncate（现在是先 flush 再 truncate，接近「恢复完成后截断」，但没有「恢复成功才截断」的判定）。
+- 进程内回滚 INSERT 只摘索引项、不回收堆槽位（空间浪费，不影响可见性）。
+- Windows 上文件句柄未及时释放：若干「删除数据目录」的测试报 `PermissionError [WinError 32]`（文件被占用），属平台相关，Linux 下删除已打开的文件不受限。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。
