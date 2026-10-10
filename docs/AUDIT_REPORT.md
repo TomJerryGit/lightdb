@@ -350,6 +350,7 @@ tests/test_v4_batch6.py
 - **查询执行仍是 Master 单线程**：多进程的收益是连接与协议层多核化 + 崩溃隔离，**不是**查询执行的 CPU 加速。文档中「8 核 92,000 QPS」与本次改动无关，仍属未验证的设计目标。
 - **仍是 `mysql_native_password` 且无 TLS**，权限模型依旧未接入调用链。
 - 会话状态（`SHOW PROCESSLIST`/`KILL`、事务）是**每 Worker 进程各自一份**，没有汇聚到 Master。
+- 元数据（`SHOW TABLES`/`SHOW COLUMNS`）每个 Worker 各持一份快照，**最多 5 秒延迟**（后台线程每 5 秒向 Master 刷新一次）；已为该行为补了回归测试。
 - Linux/macOS 走 `SO_REUSEPORT` 由 Worker 自绑定，本机（Windows）无法验证该路径。
 
 ---
