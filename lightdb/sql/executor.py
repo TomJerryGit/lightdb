@@ -76,6 +76,9 @@ class Executor:
             self.optimizer = None
             self.stats_manager = None
 
+        # 兼容别名：测试与部分调用方用的是 stats_mgr
+        self.stats_mgr = self.stats_manager
+
         # ★ 事件调度器（可选）
         self._event_scheduler = None
 
@@ -168,6 +171,27 @@ class Executor:
         self.db.drop_table(p['table'])
         return self._ok(
             message=f"Table '{p['table']}' dropped")
+
+    def _cmd_analyze(self, p, s):
+        """ANALYZE [TABLE] t —— 收集统计信息
+
+        解析器一直能解析 ANALYZE，但执行器没有对应 handler（返回 1064），
+        导致 stats 永远为空、优化器只能一直选全表扫描。
+        """
+        if self.stats_manager is None:
+            return self._err(1105, "统计管理器不可用")
+        tbl = self.db.get_table(p['table'])
+        st = self.stats_manager.analyze_table(tbl)
+        try:
+            self.stats_manager.save()
+        except Exception as e:
+            logger.warn(f"统计信息落盘失败: {e}")
+        n = getattr(st, 'row_count', None)
+        if n is None:
+            n = tbl.row_count
+        return self._ok(
+            message=f"Table '{p['table']}' analyzed "
+                    f"({n} rows)")
 
     # ==================== DML ====================
 
