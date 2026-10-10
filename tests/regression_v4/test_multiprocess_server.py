@@ -92,6 +92,26 @@ def test_multiprocess_server_end_to_end():
         finally:
             conn.close()
 
+        # 元数据必须能跨 Worker 刷新：快照每 5 秒同步一次，
+        # 因此新连接上的 SHOW TABLES 最多等 12 秒应看到刚建的表
+        deadline = time.time() + 12
+        seen = False
+        while time.time() < deadline:
+            c = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                password='', autocommit=True,
+                                charset='utf8mb4', connect_timeout=15)
+            try:
+                cu = c.cursor()
+                cu.execute("SHOW TABLES")
+                names = [row[0] for row in cu.fetchall()]
+            finally:
+                c.close()
+            if 't' in names:
+                seen = True
+                break
+            time.sleep(1)
+        assert seen, 'SHOW TABLES 未看到刚创建的表（元数据快照未刷新）'
+
         # 2/3. 并发客户端：写完再查，三方必须互相可见
         results = {}
         errors = []

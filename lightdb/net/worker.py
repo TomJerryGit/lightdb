@@ -225,6 +225,10 @@ def worker_main(worker_id: int, config: dict,
                 f"[Worker-{worker_id}] 元数据快照获取失败，"
                 f"登录校验可能失败")
 
+        # 元数据快照只在启动时拉一次的话，别的 Worker 上执行的 DDL
+        # 在本进程的 SHOW TABLES / SHOW COLUMNS 里看不到，因此定期刷新
+        _start_snapshot_refresher(worker_id, remote_db)
+
         stats_hub = _open_stats_hub(shared_state)
 
         ctx = {
@@ -272,6 +276,25 @@ def worker_main(worker_id: int, config: dict,
             except Exception:
                 pass
         logger.info(f"[Worker-{worker_id}] 退出")
+
+
+def _start_snapshot_refresher(worker_id: int, remote_db: 'RemoteDB',
+                              interval: float = 5.0):
+    """后台定期刷新元数据快照（用户表 / 表结构）
+
+    只捕获异常、不写日志：避免守护线程在解释器关闭阶段去写 stdout。
+    """
+    def loop():
+        while True:
+            time.sleep(interval)
+            try:
+                remote_db.refresh(timeout=10)
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=loop, daemon=True,
+        name=f'worker-{worker_id}-meta').start()
 
 
 def _open_stats_hub(shared_state: dict):
