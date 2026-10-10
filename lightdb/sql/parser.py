@@ -18,12 +18,24 @@ class Parser:
         if not sql:
             return None
 
+        upper = sql.upper()
+
+        # WITH [RECURSIVE] name AS (subquery), ... <主体语句>
+        # 必须在 UNION 拆分之前处理：CTE 前缀属于整条语句（包括 UNION）
+        if upper == 'WITH' or upper.startswith('WITH '):
+            ctes, rest = self._extract_ctes(sql)
+            if ctes:
+                body = self.parse(rest)
+                if body is None:
+                    raise SyntaxError("WITH 之后缺少可解析的语句")
+                body = dict(body)
+                body['ctes'] = ctes
+                return body
+
         # UNION
         union_parts = self._split_union(sql)
         if union_parts:
             return self._parse_union(union_parts)
-
-        upper = sql.upper()
 
         if upper.startswith('EXPLAIN'):
             inner = self.parse(sql[len('EXPLAIN'):].strip())
@@ -109,12 +121,131 @@ class Parser:
 
     def _parse_union(self, parts) -> Dict:
         segments = []
+        all_flags = []
         for sql, all_flag in parts:
             p = self.parse(sql)
             if p is None:
                 raise SyntaxError(f"UNION 子查询解析失败: {sql[:40]}")
             segments.append(p)
-        return {'command': 'UNION', 'segments': segments}
+            all_flags.append(bool(all_flag))
+        # unions_all[i] 表示 segments[i] 与 segments[i+1] 之间是 UNION ALL
+        # （原实现把 all_flag 丢掉了，导致 UNION ALL 被当成 UNION 去重）
+        return {
+            'command': 'UNION',
+            'segments': segments,
+            'unions_all': all_flags[:max(0, len(segments) - 1)],
+        }
+
+    # ==================== CTE ====================
+
+    _CTE_HEAD = re.compile(
+        r'[`"]?(\w+)[`"]?\s*(?:\([^)]*\)\s*)?AS\s*\(',
+        re.IGNORECASE)
+
+    def _extract_ctes(self, sql: str):
+        """解析 `WITH [RECURSIVE] a AS (...), b AS (...) <rest>`
+
+        返回 ([{'name','query'}...], 剩余语句)。递归 CTE 只做到「能解析」，
+        执行期不保证正确（见 executor 的说明）。
+        """
+        m = re.match(r'WITH\s+(RECURSIVE\s+)?', sql, re.IGNORECASE)
+        if not m:
+            return [], sql
+        recursive = bool(m.group(1))
+        rest = sql[m.end():].lstrip()
+
+        ctes = []
+        while True:
+            hm = self._CTE_HEAD.match(rest)
+            if not hm:
+                break
+            name = hm.group(1)
+            # 找到与该 '(' 配对的 ')'
+            start = hm.end() - 1
+            depth = 0
+            end = -1
+            for j in range(start, len(rest)):
+                if rest[j] == '(':
+                    depth += 1
+                elif rest[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+            if end < 0:
+                raise SyntaxError(f"CTE {name} 括号不匹配")
+            inner = rest[start + 1:end].strip()
+            rest = rest[end + 1:].lstrip()
+            ctes.append({
+                'name': name,
+                'query': self.parse(inner),
+                'recursive': recursive,
+            })
+            if rest.startswith(','):
+                rest = rest[1:].lstrip()
+                continue
+            break
+        return ctes, rest
+
+    # ==================== 窗口函数 ====================
+
+    _WINDOW_RE = re.compile(
+        r'^(?P<func>[A-Za-z_]\w*)\s*\(\s*(?P<args>[^)]*)\)\s*'
+        r'OVER\s*\(\s*(?P<spec>[^)]*)\)\s*'
+        r'(?:AS\s+(?P<alias>[`"]?\w+[`"]?))?$',
+        re.IGNORECASE | re.DOTALL)
+
+    def _split_windows(self, raw_columns):
+        """把 `FUNC(...) OVER (...)` 从列表达式里抽出来
+
+        返回 (基本列, 窗口列表, 投影顺序)：
+        - 基本列：交给现有查询引擎（table.select）处理的表达式
+        - 窗口列表：每个元素含 func/args/partition_by/order_by/alias
+        - 投影顺序：('col', 表达式) 或 ('win', 窗口字典)，用于拼最终行
+        """
+        if raw_columns == ['*']:
+            return ['*'], [], [('col', '*')]
+
+        base, windows, projection = [], [], []
+        for raw in raw_columns:
+            text = raw.strip()
+            m = self._WINDOW_RE.match(text)
+            if not m:
+                base.append(raw)
+                projection.append(('col', text))
+                continue
+
+            spec = (m.group('spec') or '').strip()
+            partition, order = [], []
+            pm = re.search(
+                r'PARTITION\s+BY\s+(.+?)(?=\s+ORDER\s+BY\b|$)',
+                spec, re.IGNORECASE | re.DOTALL)
+            if pm:
+                partition = [c.strip()
+                             for c in self._split_top_level(pm.group(1))]
+            om = re.search(r'ORDER\s+BY\s+(.+)$', spec,
+                           re.IGNORECASE | re.DOTALL)
+            if om:
+                for item in self._split_top_level(om.group(1)):
+                    im = re.match(r'[`"]?([\w.]+)[`"]?(?:\s+(ASC|DESC))?',
+                                  item.strip(), re.IGNORECASE)
+                    if im:
+                        order.append((im.group(1),
+                                      (im.group(2) or '').upper() == 'DESC'))
+
+            func = m.group('func').upper()
+            alias = (m.group('alias') or '').strip('`"')
+            win = {
+                'func': func,
+                'args': [a.strip() for a in (m.group('args') or '').split(',')
+                         if a.strip()],
+                'partition_by': partition,
+                'order_by': order,
+                'alias': alias or f'{func}()',
+            }
+            windows.append(win)
+            projection.append(('win', win))
+        return base, windows, projection
 
     # ==================== SELECT ====================
 
@@ -190,11 +321,10 @@ class Parser:
                 'type': jtype, 'table': jtable, 'on': on_cond,
             })
 
-        # 列
-        if cols_str == '*':
-            columns = ['*']
-        else:
-            columns = self._split_top_level(cols_str)
+        # 列（窗口函数从列表达式里抽出来，交给执行器单独计算）
+        raw_columns = (['*'] if cols_str == '*'
+                       else self._split_top_level(cols_str))
+        columns, windows, projection = self._split_windows(raw_columns)
 
         # WHERE / GROUP / HAVING / ORDER / LIMIT
         where = None
@@ -244,6 +374,8 @@ class Parser:
             'subquery': subquery,
             'joins': joins,
             'columns': columns,
+            'windows': windows,
+            'projection': projection,
             'distinct': distinct,
             'where': where,
             'group_by': group_by,

@@ -42,7 +42,10 @@ class VectorizedScan:
         self.projection = projection or column_store.col_names
         self.batch_size = batch_size
         # 预读取全部列
-        self.data = store.scan(self.projection)
+        # 原实现写成 store.scan(...)，而 store 是未定义名字（参数名是
+        # column_store，self.store 才是实例属性），构造 VectorizedScan 直接
+        # 抛 NameError —— 整个向量化引擎与 hybrid_table.olap_aggregate 都不可用。
+        self.data = self.store.scan(self.projection)
         self.total = len(next(iter(self.data.values()))) if self.data else 0
         self.pos = 0
 
