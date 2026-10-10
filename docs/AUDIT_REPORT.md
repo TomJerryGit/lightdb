@@ -355,6 +355,51 @@ tests/test_v4_batch6.py
 
 ---
 
+## 16. SQL 能力补齐（后续会话，2026-10）
+
+审计时结论：解析器是正则驱动，CTE 不存在、窗口函数被当成不透明列名、UNION 解析出来却没有执行分支、GROUP BY 与 DISTINCT 被静默忽略。后续会话补齐了前四项。
+
+### 16.1 做了什么
+
+| 能力 | 原先 | 现在 |
+|---|---|---|
+| 窗口函数 | 不存在（`ROW_NUMBER() OVER (...)` 被当作列名） | 解析器抽出 `func/args/partition_by/order_by/alias`；执行器取到基础行后计算 ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / SUM / AVG / COUNT / MIN / MAX（有 ORDER BY 为累计值，无则整分区值） |
+| CTE | `WITH` 直接解析失败 | `WITH [RECURSIVE] a AS (...), b AS (...)` 解析为内存关系（**不建真实表文件**，避免主键唯一性把有重复值的 CTE 结果吃掉），后面的 CTE 可引用前面的；主体复用现有查询引擎 |
+| UNION / UNION ALL | 解析出 `{'command':'UNION',...}` 但**丢弃了 ALL 标记**，执行器又没有 UNION 分支（测试报 `KeyError: 'rows'`） | 按左结合语义合并：UNION 对已累积结果去重（含同一分支内部重复），UNION ALL 直接追加；列数不一致返回 1222 |
+| GROUP BY | **被完全忽略**：`SELECT dept, COUNT(*) ... GROUP BY dept` 返回全表一行的聚合 | 真正分组，复用存储层 `Table._aggregate` 计算聚合列 |
+| DISTINCT | 解析器记录了 `distinct`，**执行路径从未使用** | 在分组/窗口之后去重，再 ORDER BY / LIMIT |
+
+GROUP BY 与 DISTINCT 属于**静默错答**：不报错、结果错。仓库自带的 `tests/test_batch7.py::test_group_by` 只断言 `sum(COUNT(*)) == 20`，所以「退化成一行的全表聚合」也能通过 —— 这类测试对缺陷无鉴别力。
+
+### 16.2 实测
+
+同实例、真实执行器，17 项断言全部通过（并已固化为 [`tests/test_v4_sql_features.py`](../tests/test_v4_sql_features.py)，5 组用例）：
+
+| 组 | 内容 | 结果 |
+|---|---|---|
+| 窗口 | ROW_NUMBER 分区、RANK/DENSE_RANK、LAG/LEAD、SUM OVER 累计（120→220） | ✅ |
+| CTE | 单 CTE + 外层 WHERE、多 CTE + UNION ALL、CTE + 窗口（列名带出 `rn`）、CTE + 聚合 | ✅ |
+| UNION | UNION 去重（含同分支内部重复）、UNION ALL 不去重、三重 UNION | ✅ |
+| 分组/去重 | GROUP BY + COUNT、GROUP BY + ORDER BY 别名、DISTINCT、`u.dept` 限定名 | ✅ |
+| 回归 | `COUNT(*)`、`SELECT *`、`ORDER BY ... LIMIT`、`WHERE` 单表路径 | ✅ |
+
+顺带修掉 [`vectorized_engine.py:45`](../lightdb/olap/vectorized_engine.py#L45) 的 `store.scan` → `self.store.scan`（未定义名字，构造 `VectorizedScan` 直接 `NameError`，是 OLAP 向量化不可用的直接原因；解掉该报错后向量化路径仍受 COUNT 计 NULL、AVG 未实现等问题限制）。
+
+### 16.3 仍未支持（诚实清单）
+
+- `WHERE ... IN (SELECT ...)`、`NOT IN (SELECT ...)`、`EXISTS`（后者目前是「子查询非空即全真」的简化实现）
+- `HAVING`（解析器无法处理 `HAVING COUNT(*) > 1` 这类聚合谓词）
+- **带表别名的 JOIN**：`FROM users u JOIN orders o ON ...` 里的 JOIN 会被解析器丢弃（只认 `FROM users JOIN orders`），于是查询退化成单表聚合——这属于静默错答，已确认；顺带导致 `tests/test_batch7.py::test_tpch_simplified` 失败（该用例此前"通过"是因为表为空、`_aggregate` 短路成 None，属于假通过）
+- JOIN 上的聚合（`plan_executor` 无法解析 `SUM(o.amount)` 这类投影）
+- `LIMIT n OFFSET m` 的 OFFSET、递归 CTE（能解析，结果不保证）
+- 窗口帧（`ROWS BETWEEN ...`）、`FIRST_VALUE/LAST_VALUE/NTILE`
+
+### 16.4 顺带修掉的测试环境问题
+
+新增 [`tests/conftest.py`](../tests/conftest.py)：把标准流改成「无法编码的字符就替换」。中文 Windows 控制台是 GBK，而测试里有 1800 多处 `print` 带 emoji；这类 `UnicodeEncodeError` 会**在 `db.shutdown()` 之前**中断测试，插入的数据还留在 BufferPool 内存里没落盘，导致后续共用同一数据目录的测试读到空表（这正是 `test_batch7.py::test_union` 长期失败的真正原因）。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。

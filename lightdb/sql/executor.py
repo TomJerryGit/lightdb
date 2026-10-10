@@ -188,8 +188,13 @@ class Executor:
             values_list = expanded
 
         n = 0
+        # 必须把事务号传下去：原实现无条件走 txn_id=0（autocommit），
+        # 导致 BEGIN; INSERT; ROLLBACK 无法回滚，且插入的锁与事务无关。
+        txn = s.get('txn')
+        tid = txn['txn_id'] if txn else 0
+        rv = txn['read_view'] if txn else None
         for row in values_list:
-            tbl.insert(row)
+            tbl.insert(row, txn_id=tid, read_view=rv)
             n += 1
 
         self.stats['rows'] += n
