@@ -30,12 +30,26 @@
 - **启动不再因 emoji 崩溃**：[`lightdb/main.py`](lightdb/main.py)、[`lightdb/main_v4.py`](lightdb/main_v4.py) 增加控制台编码保护并把裸 emoji 换成 ASCII 标记，`--check` 现已正常退出。
 - **桌面端可启动**：[`lightdb_studio/core/reports.py`](lightdb_studio/core/reports.py) 的 f-string 改写为 Python 3.8+ 兼容；另修 [`agent_chat.py`](lightdb_studio/ui/agent_chat.py) 缺失的 `QLineEdit` 导入、[`sql_editor.py`](lightdb_studio/ui/sql_editor.py) 的 `QPlainTextEdit.ExtraSelection`、[`main_window.py`](lightdb_studio/ui/main_window.py) 的状态栏构建顺序。offscreen 实测 `MainWindow` 可构造（6 个菜单）。
 - **打包与容器**：[`pyproject.toml`](pyproject.toml) 现在会打包 `lightdb` 并补上 `lightdb-server` 入口，Dockerfile 不再 COPY 不存在的 `main.py`。
+- **多进程模式已接线可用**：[`master.py`](lightdb/net/master.py) 现在会建立每 Worker 的连接队列与响应队列、运行执行服务线程、绑定端口并把 accept 到的连接交给 Worker；[`worker.py`](lightdb/net/worker.py) 通过 RPC 把 SQL 交回 Master 执行，连接句柄用 `socket.share/fromshare` 跨进程交接（Windows）。
+
+**多进程模式实测**（`python -m lightdb.main --mode multi --workers 2` + 真实 pymysql）：
+
+| 验证项 | 结果 |
+|---|---|
+| 端口监听 | ✅ `127.0.0.1:8892` 被 Master 绑定 |
+| 建表 / 插入 / 查询 | ✅ `CREATE TABLE` → 2 条 `INSERT` → `SELECT` 返回 `((1,100),(2,200))` |
+| 连接分散到多个 Worker | ✅ 3 个并发客户端分布到 3 个 Worker 进程（各 1-2 个连接） |
+| 跨进程数据一致 | ✅ 3 个客户端各自 `COUNT(*)` 均为 3，彼此可见 |
+| Master 被强杀 | ✅ Worker 3 秒内自行退出，无孤儿进程，端口释放 |
+| 优雅停机 | ✅ 端口释放，共享内存文件零残留 |
+
+**这一版多进程的边界（务必了解）**：存储引擎**只由 Master 进程持有并串行执行 SQL**，Worker 负责连接与协议处理。这样做的原因是：多进程各自打开同一份文件型存储会各自持有 BufferPool 页缓存与 BTree root，交叉写回必然损坏数据（原设计正是如此，且从未跑起来过）。因此**多进程带来的是连接/协议层的多核利用与崩溃隔离，不是查询执行的 CPU 加速** —— 文档中「8 核 92,000 QPS」的说法与此无关。
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
 **测试套件**：**163 通过 / 105 失败**（修复前 150 / 118）。剩余失败中约 32 个来自沙箱限制（禁止写工作区外文件、禁止多进程原语），其余是真实待修项：SQL 解析器不支持 CTE/窗口函数/UNION（`KeyError: 'rows'`）、OLAP 向量化引擎 [`vectorized_engine.py:45`](lightdb/olap/vectorized_engine.py#L45) 的 `NameError`、并行执行无加速等。
 
-**仍未修复**：Windows 下多进程模式不可用 —— [`master.py:95-102`](lightdb/net/master.py#L95-L102) 从不建立 `conn_queue`，[`worker.py:124-129`](lightdb/net/worker.py#L124-L129) 因此立即退出，且始终无人监听端口；Linux/macOS 走 `SO_REUSEPORT` 自绑定路径，本机无法验证。
+**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；SQL 解析器不支持 CTE / 窗口函数 / UNION；OLAP 向量化引擎的 `NameError`；事务原子性与崩溃恢复；Cython 从未编译。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 
 ---
 

@@ -30,7 +30,8 @@ class SharedBufferPool:
 
     def __init__(self, name: str = 'buffer_pool',
                  slot_count: int = None,
-                 create: bool = False):
+                 create: bool = False,
+                 shm_dir: str = None):
         self.name = name
         self.slot_count = slot_count or self.SLOT_COUNT
         self.create = create
@@ -41,7 +42,8 @@ class SharedBufferPool:
         self.total_size = self.meta_size + self.data_size
 
         # 打开共享内存
-        self.mgr = SharedMemoryManager(namespace='lightdb')
+        self.mgr = SharedMemoryManager(namespace='lightdb',
+                                       shm_dir=shm_dir)
         if create:
             self.shm = self.mgr.create(name, self.total_size)
         else:
@@ -132,6 +134,14 @@ class SharedBufferPool:
 
     def close(self):
         self.mgr.close_all()
+
+    def destroy(self):
+        """仅 Master 调用：关闭并删除共享内存文件
+
+        原实现没有 destroy()，停机后 lightdb_buffer_pool.shm 会一直留在
+        共享内存目录里。
+        """
+        self.mgr.destroy_all()
 
     # ==================== 统计 ====================
 

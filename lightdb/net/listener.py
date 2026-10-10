@@ -135,7 +135,7 @@ class MasterListener:
 
             if self.worker_pool:
                 try:
-                    self.worker_pool.dispatch(conn)
+                    self.worker_pool.dispatch(conn, addr)
                 except Exception as e:
                     logger.warn(f"dispatch 失败: {e}")
                     try:

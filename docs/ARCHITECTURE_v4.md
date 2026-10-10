@@ -4,6 +4,8 @@
 
 > ⚠️ **数据可信度声明（2026-10 审计）**：本文档中的 QPS、加速比、压缩比、rows/s 等数字**并非由本仓库内的工具产出** —— `lightdb/benchmark/` 下没有任何基准运行产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录也不存在（`~/.lightdb_studio/` 下只有空的 `reports/`、`soak/`）。其中 12000 QPS / 80000 QPS 目标只出现在 `tests/regression_v4/test_performance_v4.py:13-18` 的 `PERF_TARGETS` 字典里，**从未被任何测试断言**。因此本文数字应视为**设计目标或估计值**，而非实测结果。正文表格保持原貌以便对照，完整审计结论见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。
 
+> 🔧 **多进程实现现状（2026-10 接线后）**：多进程模式已可用，但实际架构与本文描述的「多进程 + 共享内存突破 GIL」不同 —— **存储引擎只由 Master 进程持有并串行执行 SQL**，Worker 仅负责连接与协议处理（原因与实测见 [AUDIT_REPORT.md §15](AUDIT_REPORT.md)）。因此它带来的是连接层多核化与崩溃隔离，并非查询执行的 CPU 加速；本文的 8 核 QPS 数字与此无关。
+
 **版本**：4.0.0
 **更新日期**：2025-08-01
 **读者对象**：架构师、核心开发者、技术决策者

@@ -251,15 +251,21 @@ class SharedBuffer:
 # ==================== SharedMemoryManager ====================
 
 class SharedMemoryManager:
-    def __init__(self, namespace: str = 'lightdb'):
+    def __init__(self, namespace: str = 'lightdb',
+                 shm_dir: str = None):
         self.namespace = namespace
+        # 显式目录优先；未指定时才回落到 ~/.lightdb_studio/shm。
+        # Master / Worker 会统一传入 <data_dir>/shm，避免把运行期状态写到
+        # 用户主目录，也避免多实例互相覆盖。
+        self.shm_dir = shm_dir
         self.buffers = {}
         self._lock = threading.RLock()
 
     def create(self, name: str, size: int) -> SharedBuffer:
         with self._lock:
             full_name = f'{self.namespace}_{name}'
-            buf = SharedBuffer(full_name, size, create=True)
+            buf = SharedBuffer(full_name, size, create=True,
+                               dir=self.shm_dir)
             self.buffers[name] = buf
             return buf
 
@@ -268,7 +274,8 @@ class SharedMemoryManager:
             if name in self.buffers:
                 return self.buffers[name]
             full_name = f'{self.namespace}_{name}'
-            buf = SharedBuffer(full_name, size, create=False)
+            buf = SharedBuffer(full_name, size, create=False,
+                               dir=self.shm_dir)
             self.buffers[name] = buf
             return buf
 

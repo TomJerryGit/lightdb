@@ -34,6 +34,8 @@
 
 ## 3. 四个入口的实测状态
 
+> **后续进展**：本节的 multi 与 `--check` 两项、桌面端启动问题均已在后续会话修复，多进程模式的接线与实测见 **§15**。
+
 | 入口 | 实测结果 |
 |---|---|
 | `python -m lightdb.main`（默认 `auto` → 8 核下走 multi） | ❌ 日志输出「Worker 池启动失败」后退出，**8888 端口从未被 bind**，进程不会接受任何连接 |
@@ -308,7 +310,47 @@ tests/test_v4_batch6.py
 
 **剩余 105 个失败的归因**：约 32 个来自沙箱限制（禁止写工作区外文件、禁止多进程原语，`PermissionError`）；其余为真实待修项 —— `vectorized_engine.py:45` 的 `NameError: store`（8 个）、CTE/窗口/UNION 未实现导致的 `KeyError: 'rows'`/`'columns'`（8 个）、`Database.binlog` 等属性缺失（5 个）、并行无加速与 Cython 未编译的性能类断言（约 8 个），以及 SQL 解析器语法缺口等。
 
-**本次未做**：多进程 `conn_queue`/`MasterListener` 接线（Windows 下 multi 模式仍不可用）、事务原子性与崩溃恢复、SQL 解析器重写、权限/审计接线。
+**本次未做**：事务原子性与崩溃恢复、SQL 解析器重写、权限/审计接线。
+
+---
+
+## 15. 多进程模式接线（后续会话，2026-10）
+
+审计时的结论是「多进程模式默认启用却恒定不可用」。后续会话完成了接线，实测可用。
+
+### 15.1 原设计为什么不可能工作
+
+1. **无人监听**：`MasterServer.start()` 从不调用 `create_listener`/`MasterListener`，worker 在无 `SO_REUSEPORT` 的平台（Windows）只走队列路径，于是没有任何进程 bind 端口。
+2. **Worker 立即退出**：`shared_state` 里没有 `conn_queue`，而 `WorkerPool._pending_conns` 是另一个队列且 `dispatch()` 无人调用。
+3. **`shared_state` 不可序列化**：里面塞了 `Database`/`Executor`/共享内存对象（含文件句柄与 `RLock`），Windows spawn 下无法 pickle；即便在 Linux fork 下能启动，每个 Worker 也各自持有一份**独立的存储副本**。
+4. **共享内存路径硬编码**：`SharedBuffer` 默认写 `~/.lightdb_studio/shm`；`SharedTxnCoordinator(...)` 漏了 `create=True`，打开不存在的文件必然失败；`SharedBufferPool` 没有 `destroy()`，停机后 `.shm` 文件永久残留。
+
+第 3 点是架构性的：多进程各自打开同一份文件型存储，会各自维护 BufferPool 页缓存与 BTree root，交叉写回**必然损坏数据**。所以正确的接线不是「把 Database 复制给每个 Worker」，而是**让 Master 独占存储**。
+
+### 15.2 接线后的架构
+
+- **Master（存储与调度）**：独占 `Database`/`Executor`；创建共享内存组件与队列；运行执行服务线程；在无 `SO_REUSEPORT` 的平台绑定端口，把 accept 到的连接按轮询交给 Worker；停机时停监听 → 发哨兵 → 停 Worker → 销毁共享内存（含 unlink）。
+- **Worker（连接与协议）**：从自己的连接队列取连接（Windows 用 `socket.share(pid)` / `socket.fromshare()` 交接句柄）；通过 `exec_queue` 把 SQL 发回 Master，从**本 Worker 专属的响应队列**取结果（按 `req_id` 路由，避免并发串包）；元数据（用户表/表结构）通过 `snapshot` 请求同步。
+- **共享内存目录**：统一为 `<data_dir>/shm`（可用 `shm_dir` 配置覆盖），不再写用户主目录。
+
+### 15.3 实测结果
+
+| 验证项 | 结果 |
+|---|---|
+| `python -m lightdb.main --mode multi --workers 2` | ✅ 端口被绑定，Worker 就绪 |
+| 建表 / 插入 / 查询（真实 pymysql） | ✅ `CREATE TABLE` → 2×`INSERT` → `SELECT` 返回 `((1,100),(2,200))` |
+| 3 个并发客户端 | ✅ 分散到 3 个 Worker 进程 |
+| 跨进程可见性 | ✅ 3 个客户端各自 `COUNT(*)` 都是 3 |
+| Master 被强杀 | ✅ Worker 3 秒内自行退出（探活），无孤儿进程，端口释放 |
+| 优雅停机 | ✅ 端口释放，共享内存文件零残留 |
+| 多进程相关测试 | ✅ `tests/test_v4_batch2.py` + `tests/regression_v4/test_multiprocess.py` 共 15 项全通过 |
+
+### 15.4 边界（不要误解为性能已达标）
+
+- **查询执行仍是 Master 单线程**：多进程的收益是连接与协议层多核化 + 崩溃隔离，**不是**查询执行的 CPU 加速。文档中「8 核 92,000 QPS」与本次改动无关，仍属未验证的设计目标。
+- **仍是 `mysql_native_password` 且无 TLS**，权限模型依旧未接入调用链。
+- 会话状态（`SHOW PROCESSLIST`/`KILL`、事务）是**每 Worker 进程各自一份**，没有汇聚到 Master。
+- Linux/macOS 走 `SO_REUSEPORT` 由 Worker 自绑定，本机（Windows）无法验证该路径。
 
 ---
 

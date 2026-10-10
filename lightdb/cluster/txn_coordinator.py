@@ -162,13 +162,15 @@ class SharedTxnCoordinator:
 
     def __init__(self, name: str = 'txn_coord',
                  size_mb: int = 1,
-                 create: bool = False):
+                 create: bool = False,
+                 shm_dir: str = None):
         from ..concurrency.shared_memory import (
             SharedMemoryManager, SharedCounter)
 
         self.name = name
         self.create = create
-        self.mgr = SharedMemoryManager(namespace='lightdb')
+        self.mgr = SharedMemoryManager(namespace='lightdb',
+                                       shm_dir=shm_dir)
         size = max(self.NEED_SIZE, size_mb * 1024 * 1024)
 
         if create:

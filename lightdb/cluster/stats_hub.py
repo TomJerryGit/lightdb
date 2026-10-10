@@ -28,7 +28,8 @@ class StatsHub:
 
     def __init__(self, name: str = 'stats',
                  worker_count: int = 8,
-                 create: bool = False):
+                 create: bool = False,
+                 shm_dir: str = None):
         from ..concurrency.shared_memory import (
             SharedMemoryManager, SharedCounter)
 
@@ -37,7 +38,8 @@ class StatsHub:
         self.create = create
         self.lock = threading.RLock()
 
-        self.mgr = SharedMemoryManager(namespace='lightdb')
+        self.mgr = SharedMemoryManager(namespace='lightdb',
+                                       shm_dir=shm_dir)
         size = SLOT_SIZE * worker_count
 
         if create:

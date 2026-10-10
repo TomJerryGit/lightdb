@@ -11,6 +11,36 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
+def _cpu_work(n):
+    """CPU 密集负载（必须模块级，spawn 下 mp.Pool.map 需要 pickle 它）"""
+    x = 0
+    for i in range(n):
+        x += i * i
+    return x
+
+
+def _fake_worker_for_pool(worker_id, config, shared_state):
+    """WorkerPool 的测试用 Worker
+
+    必须是模块级函数：Windows 用 spawn 启动子进程，嵌套函数无法 pickle。
+    """
+    stats = shared_state.get('stats_hub')
+    if stats:
+        stats.report(worker_id, 'connections', 1)
+    time.sleep(0.5)
+
+
+def _shared_counter_child(counter_offset):
+    """跨进程计数器测试的子进程入口（必须模块级，spawn 无法 pickle 嵌套函数）"""
+    from lightdb.concurrency.shared_memory import (
+        SharedMemoryManager, SharedCounter)
+    mgr2 = SharedMemoryManager(namespace='test')
+    shm2 = mgr2.open('test_shm', 1024)
+    c = SharedCounter(shm2, offset=counter_offset)
+    for _ in range(100):
+        c.increment()
+
+
 def test_has_reuseport():
     """测试1: SO_REUSEPORT 检测"""
     print("\n【测试1】SO_REUSEPORT 支持检测")
@@ -93,16 +123,7 @@ def test_shared_memory():
     # 跨进程测试
     import multiprocessing as mp
 
-    def child(counter_offset):
-        from lightdb.concurrency.shared_memory import (
-            SharedMemoryManager, SharedCounter)
-        mgr2 = SharedMemoryManager(namespace='test')
-        shm2 = mgr2.open('test_shm', 1024)
-        c = SharedCounter(shm2, offset=counter_offset)
-        for _ in range(100):
-            c.increment()
-
-    procs = [mp.Process(target=child, args=(100,))
+    procs = [mp.Process(target=_shared_counter_child, args=(100,))
               for _ in range(4)]
     for p in procs:
         p.start()
@@ -122,16 +143,10 @@ def test_worker_pool():
     print("\n【测试4】Worker 池")
     from lightdb.concurrency.multiprocess import WorkerPool
 
-    # 简单的 Worker 函数
-    def fake_worker(worker_id, config, shared_state):
-        # 上报就绪
-        stats = shared_state.get('stats_hub')
-        if stats:
-            stats.report(worker_id, 'connections', 1)
-        time.sleep(0.5)
-
+    # 注意：Windows 用 spawn 启动子进程，target 必须是模块级函数，
+    # 局部的嵌套函数无法被 pickle（见文件顶部 _fake_worker_for_pool）
     pool = WorkerPool(
-        worker_func=fake_worker,
+        worker_func=_fake_worker_for_pool,
         size=2,
         config={},
         shared_state={},
@@ -262,23 +277,17 @@ def test_multi_process_parallelism():
     import multiprocessing as mp
     import time
 
-    def cpu_work(n):
-        x = 0
-        for i in range(n):
-            x += i * i
-        return x
-
     # 单进程跑 4 次
     t0 = time.perf_counter()
     for _ in range(4):
-        cpu_work(500000)
+        _cpu_work(500000)
     single_time = time.perf_counter() - t0
     print(f"  → 单进程 4 次: {single_time*1000:.1f}ms")
 
     # 4 进程并行
     t0 = time.perf_counter()
     with mp.Pool(4) as pool:
-        pool.map(cpu_work, [500000] * 4)
+        pool.map(_cpu_work, [500000] * 4)
     multi_time = time.perf_counter() - t0
     print(f"  → 4 进程并行: {multi_time*1000:.1f}ms")
 

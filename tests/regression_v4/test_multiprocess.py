@@ -11,16 +11,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 
 
+def _fake_worker_sleep(worker_id, config, shared_state):
+    """测试用 Worker（必须模块级，spawn 无法 pickle 嵌套函数）"""
+    time.sleep(10)
+
+
+def _cpu_work(n):
+    """CPU 密集负载（必须模块级，spawn 下 mp.Pool.map 需要 pickle 它）"""
+    x = 0
+    for i in range(n):
+        x += i * i
+    return x
+
+
+def _counter_worker():
+    """并发计数器子进程入口（必须模块级，spawn 无法 pickle 嵌套函数）"""
+    from lightdb.concurrency.shared_memory import (
+        SharedMemoryManager, SharedCounter)
+    mgr2 = SharedMemoryManager(namespace='regtest')
+    shm2 = mgr2.open('counter', 1024)
+    c = SharedCounter(shm2, 0)
+    for _ in range(1000):
+        c.increment()
+
+
 def test_worker_pool_restart():
     """测试：Worker 崩溃自动重启"""
     print("\n【Worker 池重启】")
     from lightdb.concurrency.multiprocess import WorkerPool
 
-    def fake_worker(worker_id, config, shared_state):
-        time.sleep(10)
-
     pool = WorkerPool(
-        worker_func=fake_worker,
+        worker_func=_fake_worker_sleep,
         size=2,
         config={},
         shared_state={})
@@ -58,25 +79,15 @@ def test_shared_counter():
     counter = SharedCounter(shm, 0)
 
     N_WORKERS = 4
-    N_ITER = 1000
 
-    def worker():
-        from lightdb.concurrency.shared_memory import (
-            SharedMemoryManager, SharedCounter)
-        mgr2 = SharedMemoryManager(namespace='regtest')
-        shm2 = mgr2.open('counter', 1024)
-        c = SharedCounter(shm2, 0)
-        for _ in range(N_ITER):
-            c.increment()
-
-    procs = [mp.Process(target=worker) for _ in range(N_WORKERS)]
+    procs = [mp.Process(target=_counter_worker) for _ in range(N_WORKERS)]
     for p in procs:
         p.start()
     for p in procs:
         p.join()
 
     final = counter.get()
-    expected = N_WORKERS * N_ITER
+    expected = N_WORKERS * 1000
     print(f"  → 期望 {expected}, 实际 {final}")
     assert final == expected
     print(f"  ✅ 并发安全")
@@ -138,21 +149,15 @@ def test_multiprocess_parallelism():
     """测试：多进程并行效率"""
     print("\n【多进程并行】")
 
-    def cpu_work(n):
-        x = 0
-        for i in range(n):
-            x += i * i
-        return x
-
     # 4 进程 vs 串行
     t0 = time.perf_counter()
     for _ in range(4):
-        cpu_work(200000)
+        _cpu_work(200000)
     serial = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     with mp.Pool(4) as p:
-        p.map(cpu_work, [200000] * 4)
+        p.map(_cpu_work, [200000] * 4)
     parallel = time.perf_counter() - t0
 
     speedup = serial / parallel if parallel > 0 else 0

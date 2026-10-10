@@ -83,7 +83,9 @@ def run_multi(cfg) -> int:
     log.info(f"  日志目录:     {cfg.log_dir or '(stdout)'}")
     log.info(f"  Worker 数:    {workers}")
     log.info(f"  CPU 核数:     {os.cpu_count()}")
-    log.info(f"  共享内存目录: {cfg.effective_shm_dir or '(无)'}")
+    log.info(
+        f"  共享内存目录: "
+        f"{cfg.shm_dir or os.path.join(os.path.abspath(cfg.data_dir), 'shm')}")
     log.info("=" * 60)
 
     # ---------- 准备临时配置 ----------
