@@ -1,0 +1,752 @@
+Microsoft Windows [版本 10.0.19045.6466]
+(c) Microsoft Corporation。保留所有权利。
+C:\Users\PL>D:
+D:\>cd D:\lightdb_project
+D:\lightdb_project>python create_project.py
+
+lightdb_project/
+├── lightdb/                                       
+│   │
+│   ├── storage/                                    
+│   │   ├── page.py                                 
+│   │   ├── buffer_pool.py                          
+│   │   ├── btree.py                                
+│   │   ├── btree_optimized.py                      
+│   │   ├── wal.py                                  
+│   │   ├── mvcc.py                                 
+│   │   ├── lock_manager.py                         
+│   │   ├── txn.py                                  
+│   │   ├── row_format.py                       
+│   │   ├── row_format_v4.py                        
+│   │   └── page_prefetch.py                        
+│   │
+│   ├── sql/                                        
+│   │   ├── lexer.py                                
+│   │   ├── parser.py                               
+│   │   ├── parser_v3b4.py                          
+│   │   ├── plan.py                                 
+│   │   ├── optimizer.py                            
+│   │   ├── plan_cache.py                           
+│   │   ├── plan_executor.py                        
+│   │   ├── executor.py                             
+│   │   ├── batch_executor.py                       
+│   │   ├── vectorized.py                           
+│   │   ├── predicate_pushdown.py                   
+│   │   ├── predicate_v4.py                         
+│   │   ├── icp.py                                  
+│   │   ├── parallel_planner.py                     
+│   │   ├── variables.py                            
+│   │   ├── cursor.py                               
+│   │   ├── stats.py                                
+│   │   ├── pl.py                                   
+│   │   ├── stored.py                               
+│   │   ├── trigger.py                              
+│   │   ├── event.py                                
+│   │   ├── window.py                               
+│   │   ├── cte.py                                  
+│   │   ├── json_func.py                            
+│   │   ├── fulltext.py                             
+│   │   ├── partition.py                            
+│   │   ├── generated.py                            
+│   │   └── functions/                              
+│   │       ├── string_funcs.py                     
+│   │       ├── datetime_funcs.py                   
+│   │       ├── math_funcs.py                       
+│   │       ├── control_funcs.py                    
+│   │       └── registry.py                         
+│   │
+│   ├── db/                                         
+│   │   ├── database.py
+│   │   ├── table.py
+│   │   ├── table_v3.py                             
+│   │   ├── hybrid_table.py                         
+│   │   └── information_schema.py
+│   │
+│   ├── net/                                        
+│   │   ├── mysql_protocol.py                       
+│   │   ├── server.py                               
+│   │   ├── listener.py                             
+│   │   ├── master.py                               
+│   │   └── worker.py                               
+│   │
+│   ├── replication/                                
+│   │   ├── binlog.py
+│   │   ├── master.py
+│   │   ├── slave.py
+│   │   └── semi_sync.py                            
+│   │
+│   ├── security/                                   
+│   │   ├── privileges.py
+│   │   ├── ssl_support.py
+│   │   ├── audit.py
+│   │   ├── password_policy.py
+│   │   ├── connection_limit.py
+│   │   └── ip_whitelist.py
+│   │
+│   ├── performance/                                
+│   │   ├── connection_pool.py
+│   │   ├── query_cache.py
+│   │   ├── batch_inserter.py
+│   │   ├── index_only_scan.py
+│   │   ├── parallel.py
+│   │   └── benchmark.py
+│   │
+│   ├── concurrency/                                
+│   │   ├── rw_lock.py                              
+│   │   ├── lockfree_mvcc.py                        
+│   │   ├── multiprocess.py                         
+│   │   ├── shared_memory.py                        
+│   │   ├── atomic.py                               
+│   │   └── ipc.py                                  
+│   │
+│   ├── cluster/                                    
+│   │   ├── shared_buffer.py                        
+│   │   ├── txn_coordinator.py                      
+│   │   ├── lock_coordinator.py                     
+│   │   └── stats_hub.py                            
+│   │
+│   ├── columnar/                                   
+│   │   ├── chunk.py                                
+│   │   ├── encoders.py                             
+│   │   ├── column_store.py                         
+│   │   ├── segment.py                              
+│   │   └── stats.py                                
+│   │
+│   ├── olap/                                       
+│   │   ├── vectorized_engine.py                    
+│   │   ├── aggregator.py                           
+│   │   ├── scanner.py                              
+│   │   ├── olap_optimizer.py                       
+│   │   └── parallel_olap.py                        
+│   │
+│   ├── parallel/                                   
+│   │   ├── fragment.py                             
+│   │   ├── executor.py                             
+│   │   ├── work_stealing.py                        
+│   │   ├── adaptive.py                             
+│   │   ├── scheduler.py                            
+│   │   ├── resource_group.py                       
+│   │   └── merge.py                                
+│   │
+│   ├── cython/                                     
+│   │   ├── __init__.py                             
+│   │   ├── setup.py                                
+│   │   ├── btree_pyx.pyx                           
+│   │   ├── row_codec.pyx                           
+│   │   ├── page_pyx.pyx                            
+│   │   ├── predicate_pyx.pyx                       
+│   │   ├── buffer_pool_pyx.pyx                     
+│   │   └── hash_table_pyx.pyx                      
+│   │
+│   ├── monitor/                                    
+│   │   ├── slow_log_analyzer.py
+│   │   ├── metrics_v3.py                           
+│   │   ├── slow_query_analyzer.py                  
+│   │   ├── lock_analyzer.py                        
+│   │   ├── index_advisor.py                        
+│   │   ├── health_checker.py                       
+│   │   └── parallel_stats.py                       
+│   │
+│   ├── stability/                                  
+│   │   ├── soak_test.py                            
+│   │   ├── fault_injector.py                       
+│   │   ├── consistency_checker.py                  
+│   │   ├── memory_leak_detector.py                 
+│   │   ├── watchdog.py                             
+│   │   └── crash_recovery_v3.py                    
+│   │
+│   ├── benchmark/                                  
+│   │   ├── runner.py
+│   │   ├── workloads.py                            
+│   │   ├── profiler.py                             
+│   │   ├── memory_analyzer.py
+│   │   ├── baseline.py
+│   │   ├── report.py
+│   │   └── cli.py
+│   │
+│   ├── profiling/                                  
+│   │   ├── cprofile_analyzer.py
+│   │   ├── flamegraph.py
+│   │   ├── hotspot_ranker.py
+│   │   ├── gil_analyzer.py
+│   │   └── reporter.py
+│   │
+│   ├── experiments/                                
+│   │   ├── multiprocess_test.py
+│   │   ├── cython_test.py
+│   │   ├── subinterp_test.py
+│   │   └── comparison.py
+│   │
+│   ├── tools/                                      
+│   │   ├── cli.py                                  
+│   │   ├── dump.py                                 
+│   │   ├── admin.py                                
+│   │   ├── benchmark.py                            
+│   │   ├── check.py                                
+│   │   ├── tune.py                                 
+│   │   ├── index_advisor.py                        
+│   │   ├── dashboard.py                            
+│   │   ├── diagnose.py                             
+│   │   └── migrate.py                              
+│   │
+│   ├── backup/backup.py
+│   ├── logger.py
+│   ├── config.py
+│   ├── __init__.py
+│   ├── main.py                                     
+│   ├── main_v4.py                                  
+│   └── build.sh                                    
+│
+├── lightdb_studio/                                 
+│   ├── lightdb_studio/
+│   │   ├── core/                                   
+│   │   │   ├── snippets.py                         
+│   │   │   ├── masking.py                          
+│   │   │   ├── sql_formatter.py                    
+│   │   │   ├── sql_profiler.py                     
+│   │   │   ├── sql_auto_optimizer.py               
+│   │   │   ├── environments.py                     
+│   │   │   ├── review_workflow.py                  
+│   │   │   ├── data_contract.py                    
+│   │   │   ├── federated_gov.py                    
+│   │   │   ├── slo.py                              
+│   │   │   ├── lineage.py                          
+│   │   │   ├── lineage_enhanced.py                 
+│   │   │   ├── lineage_v2.py                       
+│   │   │   ├── lineage_visual.py                   
+│   │   │   ├── lineage_closure.py                  
+│   │   │   ├── catalog.py                          
+│   │   │   ├── data_map.py                         
+│   │   │   ├── assets.py                           
+│   │   │   ├── data_quality.py                     
+│   │   │   ├── quality_v2.py                       
+│   │   │   ├── health_score.py                     
+│   │   │   ├── recommender.py                      
+│   │   │   ├── data_market.py                      
+│   │   │   ├── product_ops.py                      
+│   │   │   ├── ai_integration.py                   
+│   │   │   ├── ai_sql_gen.py                       
+│   │   │   ├── ai_agent.py                         
+│   │   │   ├── agent_react.py                      
+│   │   │   ├── ai_finetune.py                      
+│   │   │   ├── nlb.py                              
+│   │   │   ├── virtualization.py                   
+│   │   │   ├── federation.py                       
+│   │   │   ├── data_lake.py                        
+│   │   │   ├── etl.py                              
+│   │   │   ├── data_api.py                         
+│   │   │   ├── observability.py                    
+│   │   │   ├── fullstack_obs.py                    
+│   │   │   ├── performance_monitor.py              
+│   │   │   ├── alerts.py                           
+│   │   │   ├── metrics.py                          
+│   │   │   ├── collaboration.py                    
+│   │   │   ├── team.py                             
+│   │   │   ├── notifications.py                    
+│   │   │   ├── scheduler.py                        
+│   │   │   ├── workflow.py                         
+│   │   │   ├── workflow_visual.py                  
+│   │   │   ├── data_mesh.py                        
+│   │   │   ├── data_fabric.py                      
+│   │   │   ├── shadow_table.py                     
+│   │   │   ├── digital_twin.py                     
+│   │   │   ├── cloud.py                            
+│   │   │   ├── distributed.py                      
+│   │   │   ├── autonomy.py                         
+│   │   │   ├── snapshot.py                         
+│   │   │   ├── migration.py                        
+│   │   │   └── reports.py                          
+│   │   │
+│   │   ├── ui/                                     
+│   │   │   ├── main_window.py                      
+│   │   │   ├── connection_dialog.py                
+│   │   │   ├── object_tree.py                      
+│   │   │   ├── sql_editor.py                       
+│   │   │   ├── result_table.py                     
+│   │   │   ├── data_editor.py                      
+│   │   │   ├── table_designer.py                   
+│   │   │   ├── query_history.py                    
+│   │   │   ├── import_export.py                    
+│   │   │   ├── cell_viewer.py                      
+│   │   │   ├── data_grid_enhanced.py               
+│   │   │   ├── db_compare.py                       
+│   │   │   ├── er_diagram.py                       
+│   │   │   ├── query_builder.py                    
+│   │   │   ├── perf_panel.py                       
+│   │   │   ├── multi_result.py                     
+│   │   │   ├── chart_view.py                       
+│   │   │   ├── chart_view_enhanced.py              
+│   │   │   ├── import_wizard.py                    
+│   │   │   ├── settings_dialog.py                  
+│   │   │   ├── theme.py                            
+│   │   │   ├── snippet_panel.py                    
+│   │   │   ├── masking_dialog.py                   
+│   │   │   ├── ai_panel.py                         
+│   │   │   ├── plugin_panel.py                     
+│   │   │   ├── cloud_sync_dialog.py                
+│   │   │   ├── team_config_dialog.py               
+│   │   │   ├── report_builder.py                   
+│   │   │   ├── scheduler_panel.py                  
+│   │   │   ├── audit_viewer.py                     
+│   │   │   ├── dashboard.py                        
+│   │   │   ├── environment_bar.py                  
+│   │   │   ├── lineage_view.py                     
+│   │   │   ├── lineage_interactive.py              
+│   │   │   ├── review_panel.py                     
+│   │   │   ├── snapshot_dialog.py                  
+│   │   │   ├── catalog_panel.py                    
+│   │   │   ├── agent_chat.py                       
+│   │   │   ├── react_agent_panel.py                
+│   │   │   ├── impact_dialog.py                    
+│   │   │   ├── quality_v2_dialog.py                
+│   │   │   ├── alerts_panel.py                     
+│   │   │   ├── data_map_view.py                    
+│   │   │   ├── assets_dashboard.py                 
+│   │   │   ├── data_science_view.py                
+│   │   │   ├── cdc_panel.py                        
+│   │   │   ├── virtual_table_panel.py              
+│   │   │   ├── federation_view.py                  
+│   │   │   ├── etl_designer.py                     
+│   │   │   ├── data_api_panel.py                   
+│   │   │   ├── recommender_panel.py                
+│   │   │   ├── market_view.py                      
+│   │   │   ├── contract_panel.py                   
+│   │   │   ├── closure_view.py                     
+│   │   │   ├── slo_dashboard.py                    
+│   │   │   ├── mesh_view.py                        
+│   │   │   ├── governance_panel.py                 
+│   │   │   ├── shadow_panel.py                     
+│   │   │   ├── observability_view.py               
+│   │   │   ├── cloud_map_view.py                   
+│   │   │   ├── distributed_panel.py                
+│   │   │   ├── autonomy_panel.py                   
+│   │   │   ├── fabric_panel.py                     
+│   │   │   ├── twin_view.py                        
+│   │   │   ├── nlb_view.py                         
+│   │   │   ├── product_ops_view.py                 
+│   │   │   └── fullstack_view.py                   
+│   │   │
+│   │   ├── db/
+│   │   │   ├── connection.py
+│   │   │   ├── metadata.py
+│   │   │   ├── schema_diff.py
+│   │   │   └── table_ops.py
+│   │   │
+│   │   ├── net/collab_server.py                    
+│   │   │
+│   │   ├── utils/
+│   │   │   ├── sql_highlighter.py
+│   │   │   ├── sql_completer.py
+│   │   │   ├── history.py
+│   │   │   └── i18n.py
+│   │   │
+│   │   ├── config.py
+│   │   └── app.py
+│   │
+│   └── plugins/example_plugin.py
+│
+├── web/                                            
+│   ├── server.py
+│   ├── api.py
+│   ├── auth.py
+│   ├── metrics.py
+│   ├── start.py
+│   └── static/
+│       ├── index.html
+│       ├── app.js
+│       └── style.css
+│
+├── docker/                                         
+│   ├── Dockerfile
+│   ├── Dockerfile.v3                               
+│   ├── Dockerfile.v4                               
+│   ├── docker-compose.yml
+│   ├── docker-compose.v3.yml
+│   ├── docker-compose.v4.yml                       
+│   ├── docker-compose.multi.yml                    
+│   ├── prometheus.yml
+│   ├── k8s.yaml
+│   ├── entrypoint.sh
+│   └── entrypoint-v4.sh
+│
+├── dashboards/                                     
+│   ├── lightdb_overview.json
+│   ├── lightdb_performance.json
+│   ├── lightdb_replication.json
+│   └── lightdb_innodb.json
+│
+├── docs/                                           
+│   ├── USER_GUIDE.md
+│   ├── API_REFERENCE.md
+│   ├── DEPLOYMENT.md
+│   ├── V3_ROADMAP.md
+│   ├── V3_RELEASE_NOTES.md
+│   ├── USER_GUIDE_v3.md
+│   ├── ADMIN_GUIDE_v3.md
+│   ├── MIGRATION_GUIDE_v3.md
+│   ├── PERFORMANCE_WHITEPAPER_v3.md
+│   ├── V4_DECISION.md                              
+│   ├── V4_RELEASE_NOTES.md                         
+│   ├── USER_GUIDE_v4.md
+│   ├── ADMIN_GUIDE_v4.md
+│   ├── ARCHITECTURE_v4.md                          
+│   ├── MIGRATION_v3_to_v4.md
+│   ├── PERFORMANCE_WHITEPAPER_v4.md                
+│   └── CYTHON_DEV_GUIDE.md                         
+│
+├── scripts/                                        
+│   ├── install.sh
+│   ├── install.ps1
+│   ├── install_v4.sh
+│   ├── upgrade.sh
+│   ├── build_cython.sh                             
+│   └── benchmark_v4.sh
+│
+├── tests/                                          
+│   ├── test_batch1.py ~ test_batch15.py
+│   ├── test_v2_batch1.py ~ test_v2_batch8.py
+│   ├── test_v3_batch1.py ~ test_v3_batch6.py
+│   ├── test_v4_batch1.py ~ test_v4_batch6.py       
+│   ├── benchmark_v4_batch3.py
+│   ├── benchmark_v4_batch4.py
+│   ├── benchmark_v4_batch5.py
+│   ├── regression/
+│   │   ├── run_all.py
+│   │   ├── test_sql_compat.py
+│   │   ├── test_transaction.py
+│   │   ├── test_replication.py
+│   │   └── test_performance.py
+│   └── regression_v4/                              
+│       ├── run_all.py
+│       ├── test_cython_compat.py
+│       ├── test_multiprocess.py
+│       ├── test_columnar.py
+│       ├── test_parallel.py
+│       └── test_performance_v4.py
+│
+├── pyproject.toml                                  
+├── requirements.txt
+├── requirements_web.txt
+├── README.md
+├── CHANGELOG_v3.md
+├── CHANGELOG_v4.md
+├── RELEASE_v3.0.md
+├── RELEASE_v4.0.md
+└── LICENSE
+==========================2.0 
+cd lightdb_studio/
+python tests/test_v2_batch1.py
+python main.py
+
+
+cd lightdb_studio/
+python tests/test_v2_batch2.py
+python main.py
+
+cd lightdb_studio/
+pip install websockets  # 可选
+python tests/test_v2_batch3.py
+
+cd lightdb_studio/
+python tests/test_v2_batch4.py
+
+cd lightdb_studio/
+python tests/test_v2_batch5.py
+
+cd lightdb_studio/
+python tests/test_v2_batch6.py
+
+cd lightdb_studio/
+python tests/test_v2_batch7.py
+
+-----------------==----------------
+## ?? 快速开始
+### 安装
+```bash
+pip install lightdb
+
+启动服务
+bash
+python main.py
+# 或
+lightdb-server
+输出：
+
+text
+============================================================
+  LightDB v5.10 - 生产就绪版
+============================================================
+  监听: 0.0.0.0:8888
+
+
+
+
+
+使用客户端
+# 交互式 CLI
+lightdb -h 127.0.0.1 -P 8888 -u root
+# 一次性执行
+lightdb -h 127.0.0.1 -P 8888 -u root -e "SELECT VERSION()"
+# 备份
+lightdbdump -h 127.0.0.1 -P 8888 -u root -o backup.sql
+# 管理
+lightdbadmin -h 127.0.0.1 -P 8888 -u root status
+
+
+
+Python 连接
+import pymysql
+
+conn = pymysql.connect(
+    host='127.0.0.1', port=8888,
+    user='root', password='',
+    charset='utf8mb4', autocommit=True,
+)
+cur = conn.cursor()
+
+cur.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50))")
+cur.execute("INSERT INTO users VALUES (1, 'Alice')")
+cur.execute("SELECT * FROM users")
+print(cur.fetchall())
+
+
+SQL 支持
+-- DDL
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50), age INT)
+DROP TABLE users
+CREATE INDEX idx_name ON users (name)
+
+-- DML
+INSERT INTO users VALUES (1, 'Alice', 30)
+UPDATE users SET age = 31 WHERE id = 1
+DELETE FROM users WHERE id = 1
+
+-- 查询
+SELECT * FROM users
+SELECT * FROM users WHERE age > 20 ORDER BY age DESC LIMIT 10
+SELECT city, COUNT(*) FROM users GROUP BY city HAVING COUNT(*) > 5
+SELECT DISTINCT city FROM users
+
+-- JOIN
+SELECT u.name, o.amount FROM users u
+  JOIN orders o ON u.id = o.user_id
+
+-- 子查询
+SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)
+SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders)
+
+-- UNION
+SELECT name FROM users UNION SELECT name FROM admins
+
+-- 事务
+BEGIN;
+INSERT INTO users VALUES (2, 'Bob', 25);
+COMMIT;
+ROLLBACK;
+
+-- 权限
+CREATE USER 'alice' IDENTIFIED BY 'pass123'
+GRANT SELECT, INSERT ON *.* TO 'alice'
+REVOKE INSERT ON *.* FROM 'alice'
+DROP USER 'alice'
+
+-- 优化
+ANALYZE TABLE users
+EXPLAIN SELECT * FROM users WHERE id = 100
+SHOW STATS
+
+
+
+=========================3.0
+cd lightdb/
+python tests/test_v3_batch1.py
+# 完整诊断流程（约 30 分钟）
+cd lightdb/
+
+# 启动服务
+python main.py &
+
+# 跑基准测试（8 个负载 × 30s = 4 分钟）
+python -m lightdb.benchmark.cli run \
+    --workload all --label v3.0.baseline
+
+# 内存分析 5 分钟
+python -m lightdb.benchmark.cli memory --duration 300
+
+# CPU Profiling 10 秒
+python -m lightdb.benchmark.cli profile --duration 10
+
+# 查看报告
+ls ~/.lightdb_studio/reports/
+cat ~/.lightdb_studio/reports/benchmark_v3.0.baseline_*.md
+
+cd lightdb/
+python tests/test_v3_batch2.py
+cd lightdb/
+python tests/test_v3_batch3.py
+
+场景 1：跑 30 天长稳测试
+# 终端 1：启动 DB 服务
+python lightdb/main.py
+# 终端 2：启动看门狗（可选）
+python -m lightdb.stability.watchdog --interval 30
+# 终端 3：启动长稳测试（24h）
+python -c "
+from lightdb.stability.soak_test import SoakTest, SoakConfig
+cfg = SoakConfig(duration_hours=24, sample_interval_s=300)
+SoakTest(config=cfg).run()
+"
+场景 2：故障注入测试
+bash
+python -m lightdb.stability.fault_injector \
+    --host 127.0.0.1 --port 8888
+场景 3：一致性检查
+bash
+python -c "
+from lightdb.stability.consistency_checker import ConsistencyChecker
+checker = ConsistencyChecker()
+checker.full_check(tables=['users', 'orders', 'products'])
+"
+运行验证
+bash
+cd lightdb/
+python tests/test_v3_batch4.py
+
+cd lightdb/
+python tests/test_v3_batch5.py
+
+# 1. 健康检查
+python -m lightdb.tools.check -h 127.0.0.1 -P 8888
+# 2. 参数调优
+python -m lightdb.tools.tune -h 127.0.0.1 -P 8888
+# 3. 索引推荐
+python -m lightdb.tools.index_advisor -h 127.0.0.1 -P 8888
+# 4. 生成 Grafana 面板
+python -m lightdb.tools.dashboard --action generate
+# → dashboards/*.json
+## ?? 安装
+```bash
+# pip
+pip install lightdb-server==3.0.0
+# Docker
+docker pull lightdb/server:3.0.0
+# 源码
+git clone https://github.com/lightdb/lightdb.git
+cd lightdb && pip install -e .
+
+
+
+
+
+
+
+
+
+
+
+
+
+=========================4.0
+===================运行验证
+C:\Users\PL>D:
+D:\>cd D:\lightdb_project
+cd lightdb/
+python tests/test_v4_batch1.py
+==================启动 v4.0 服务
+# 自动模式（推荐）
+python -m lightdb.main_v4
+# 明确多进程
+python -m lightdb.main_v4 --mode multi --workers 8
+# 单进程兼容模式
+python -m lightdb.main_v4 --mode single
+
+=================运行验证
+步骤 1：构建
+bash
+cd lightdb/
+pip install cython
+chmod +x build.sh
+./build.sh
+步骤 2：功能测试
+bash
+python tests/test_v4_batch3.py
+步骤 3：性能对比
+bash
+python tests/benchmark_v4_batch3.py
++++++++++++++++++++++++++++++++运行验证
+cd lightdb/
+python tests/test_v4_batch4.py
+cd lightdb/
+python tests/test_v4_batch5.py
+安装
+bash
+# pip
+pip install lightdb-server==4.0.0
+
+# Docker
+docker pull lightdb/server:4.0.0
+
+# 源码
+git clone https://github.com/lightdb/lightdb.git
+cd lightdb && ./scripts/install_v4.sh
+
+=======================studio =================
+## ?? 运行验证
+```bash
+# 1. 安装依赖
+pip install PySide6 pymysql
+
+# 2. 启动 LightDB 服务器（先决条件）
+cd lightdb/ && python main.py
+
+# 3. 新开一个终端，启动 GUI
+cd lightdb_studio/
+python main.py
+
+
+┌──────────────────────────────────────────────────────┐
+│ 文件  编辑  查询  工具  帮助                          │
+├──────────────────────────────────────────────────────┤
+│ [?? 新建连接] [?? 新建查询] [? 执行] [?? EXPLAIN] [?? 刷新] │
+├────────────┬─────────────────────────────────────────┤
+│ 对象浏览器  │ 查询                                     │
+│            │ ┌──────────────────────────────────────┐│
+│ (空)       │ │ -- 在这里输入 SQL                     ││
+│            │ │                                       ││
+│            │ │                                       ││
+│            │ ├──────────────────────────────────────┤│
+│            │ │                                      ││
+│            │ │ 就绪                                 ││
+│            │ └──────────────────────────────────────┘│
+├────────────┴─────────────────────────────────────────┤
+│ 就绪                                    未连接         │
+└──────────────────────────────────────────────────────┘
+使用流程：
+
+点击 ?? 新建连接
+
+填写：
+
+连接名称：本地库
+
+主机：127.0.0.1
+
+端口：8888
+
+用户名：root
+
+密码：（空）
+
+点击 测试连接 → 成功
+
+点击 确定
+
+左侧出现数据库树
+展开 default → 看到表
+
+双击表 → 自动执行 SELECT * FROM xxx LIMIT 1000
+
+下方表格显示结果
+
+
+

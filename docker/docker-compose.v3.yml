@@ -1,0 +1,144 @@
+version: '3.8'
+
+# ============================================================
+# LightDB v3.0 - 单进程版 Docker Compose
+# 适用场景: 开发环境、单机测试、小流量生产
+# ============================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  # ========== LightDB v3.0 Server ==========
+  lightdb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.v3
+    image: lightdb/server:3.0.0
+    container_name: lightdb-server-v3
+    hostname: lightdb
+    command: >
+      python -m lightdb.main
+      --mode single
+      --host 0.0.0.0
+      --port 8888
+    ports:
+      - "8888:8888"
+    volumes:
+      - lightdb-v3-data:/app/data
+      - lightdb-v3-logs:/app/logs
+      - ./config/config.v3.json:/app/config.json:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - LIGHTDB_VERSION=3.0.0
+      - LIGHTDB_LOG_LEVEL=INFO
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.socket(); s.connect(('127.0.0.1',8888)); s.close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-v3-net
+
+  # ========== Studio Web ==========
+  studio-web:
+    image: lightdb/server:3.0.0
+    container_name: lightdb-studio-web-v3
+    hostname: studio-web
+    command: >
+      python -m web.start
+      --host 0.0.0.0
+      --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - studio-v3-config:/home/lightdb/.lightdb_studio
+    environment:
+      - TZ=Asia/Shanghai
+      - LIGHTDB_HOST=lightdb
+      - LIGHTDB_PORT=8888
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      lightdb:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-v3-net
+
+  # ========== Prometheus ==========
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: lightdb-prometheus-v3
+    hostname: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-v3-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-v3-net
+
+  # ========== Grafana ==========
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: lightdb-grafana-v3
+    hostname: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-v3-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-v3-net
+
+volumes:
+  lightdb-v3-data:
+    driver: local
+  lightdb-v3-logs:
+    driver: local
+  studio-v3-config:
+    driver: local
+  prometheus-v3-data:
+    driver: local
+  grafana-v3-data:
+    driver: local
+
+networks:
+  lightdb-v3-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16

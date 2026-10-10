@@ -1,0 +1,90 @@
+# ============================================================
+# Prometheus 抓取配置 - LightDB 生产版
+# ============================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+  external_labels:
+    cluster: lightdb-prod
+    env: production
+    region: cn-hangzhou
+
+# ---------- 告警规则文件 ----------
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# ---------- 抓取目标 ----------
+scrape_configs:
+
+  # ========== LightDB 主服务器 ==========
+  - job_name: 'lightdb-server'
+    static_configs:
+      - targets:
+          - 'lightdb:8888'
+        labels:
+          service: 'lightdb-server'
+          role: 'master'
+          tier: 'database'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    honor_labels: true
+
+  # ========== Studio Web ==========
+  - job_name: 'lightdb-studio-web'
+    static_configs:
+      - targets:
+          - 'studio-web:8080'
+        labels:
+          service: 'studio-web'
+          tier: 'app'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 5s
+
+  # ========== Prometheus 自监控 ==========
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - 'localhost:9090'
+        labels:
+          service: 'prometheus'
+          tier: 'monitoring'
+    scrape_interval: 30s
+
+  # ========== Node Exporter（宿主机指标）==========
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets:
+          - 'node-exporter:9100'
+        labels:
+          service: 'node'
+          tier: 'host'
+    scrape_interval: 15s
+    scrape_timeout: 5s
+
+  # ========== Grafana 自监控 ==========
+  - job_name: 'grafana'
+    static_configs:
+      - targets:
+          - 'grafana:3000'
+        labels:
+          service: 'grafana'
+          tier: 'monitoring'
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # ========== 压测客户端（profile=bench 时启用）==========
+  - job_name: 'lightdb-bench'
+    static_configs:
+      - targets:
+          - 'bench:9101'
+        labels:
+          service: 'lightdb-bench'
+          tier: 'benchmark'
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 3s

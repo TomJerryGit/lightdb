@@ -1,0 +1,139 @@
+# ============================================================
+# LightDB v4.0 - 多进程 + Cython 性能版镜像
+# 基础: python:3.11-slim
+# 特点: 多进程 Worker、Cython 加速、列存、并行查询
+# ============================================================
+FROM python:3.11-slim AS builder
+
+LABEL stage="builder"
+
+WORKDIR /build
+
+# ---------- 系统依赖（Cython 编译需要）----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        libc6-dev \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- Python 依赖 ----------
+COPY requirements.txt requirements_web.txt ./
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        pymysql>=1.0.0 \
+        psutil>=5.9.0 \
+        numpy>=1.24.0 && \
+    pip install --no-cache-dir cython>=3.0.0
+
+# ---------- 复制源码 ----------
+COPY lightdb/ ./lightdb/
+COPY web/ ./web/
+COPY pyproject.toml ./
+
+# ---------- 编译 Cython ----------
+WORKDIR /build/lightdb/cython
+RUN python setup.py build_ext --inplace 2>&1 | tee /tmp/cython_build.log || \
+    (echo "⚠️ Cython 编译失败，将回退 Python 版本" && \
+     cat /tmp/cython_build.log | tail -30)
+
+WORKDIR /build
+
+# ---------- 验证 Cython 模块 ----------
+RUN python -c "
+import sys
+sys.path.insert(0, '/build')
+try:
+    from lightdb.cython import status
+    st = status()
+    print('Cython 模块状态:')
+    for name, ok in st['available'].items():
+        print(f'  {\"✅\" if ok else \"❌\"} {name}')
+except Exception as e:
+    print(f'⚠️ Cython 状态检查失败: {e}')
+" || true
+
+# ============================================================
+# 运行阶段
+# ============================================================
+FROM python:3.11-slim
+
+LABEL maintainer="LightDB Team"
+LABEL description="LightDB v4.0 多进程 + Cython 数据库"
+LABEL version="4.0.0"
+
+# ---------- 运行时依赖 ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        procps \
+        curl \
+        netcat-openbsd \
+        tini \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- 创建用户 ----------
+RUN useradd -m -u 1000 -s /bin/bash lightdb && \
+    mkdir -p /app/data /app/logs /app/backups && \
+    chown -R lightdb:lightdb /app
+
+WORKDIR /app
+
+# ---------- 复制依赖 ----------
+COPY --from=builder /usr/local/lib/python3.11/site-packages \
+                    /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# ---------- 复制源码 ----------
+COPY --chown=lightdb:lightdb lightdb/ ./lightdb/
+COPY --chown=lightdb:lightdb web/ ./web/
+COPY --chown=lightdb:lightdb pyproject.toml ./
+
+# ---------- 复制 Cython 编译产物 ----------
+COPY --from=builder --chown=lightdb:lightdb \
+     /build/lightdb/cython/ ./lightdb/cython/
+
+# ---------- 默认配置（v4 优化）----------
+RUN cat > /app/config.json <<'EOF'
+{
+  "host": "0.0.0.0",
+  "port": 8888,
+  "max_connections": 500,
+  "buffer_pool_size": 8192,
+  "page_size": 4096,
+  "data_dir": "/app/data",
+  "backup_dir": "/app/backups",
+  "workers": 8,
+  "parallel_workers": 8,
+  "slow_query_threshold": 0.5,
+  "max_allowed_packet": 16777216,
+  "log_level": "INFO",
+  "ssl_enabled": false,
+  "audit_level": "DDL",
+  "semi_sync_enabled": false,
+  "max_conn_per_ip": 100,
+  "password_min_length": 6,
+  "password_deny_weak": true
+}
+EOF
+
+# ---------- 入口脚本 ----------
+COPY --chown=lightdb:lightdb docker/entrypoint-v4.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# ---------- 提升文件描述符限制 ----------
+RUN echo "lightdb soft nofile 65536" >> /etc/security/limits.conf && \
+    echo "lightdb hard nofile 65536" >> /etc/security/limits.conf && \
+    echo "lightdb soft nproc 65536"  >> /etc/security/limits.conf && \
+    echo "lightdb hard nproc 65536"  >> /etc/security/limits.conf
+
+USER lightdb
+
+EXPOSE 8888 8080
+
+# 启动时间稍长（多进程 + Cython 加载）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=5 \
+    CMD python -c "import socket; s=socket.socket(); s.connect(('127.0.0.1',8888)); s.close()" || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+CMD ["server"]

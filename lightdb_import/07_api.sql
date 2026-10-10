@@ -1,0 +1,20 @@
+INSERT INTO `lightdb_api`
+(module_code, method, path, auth, description) VALUES
+('web', 'GET',  '/api/v1/health',                      'none',  '健康检查'),
+('web', 'POST', '/api/v1/login',                       'none',  '登录'),
+('web', 'GET',  '/api/v1/me',                          'jwt',   '当前用户'),
+('web', 'GET',  '/api/v1/connections',                 'jwt',   '连接列表'),
+('web', 'POST', '/api/v1/connections/test',            'jwt',   '测试连接'),
+('web', 'GET',  '/api/v1/databases',                   'jwt',   '数据库列表'),
+('web', 'GET',  '/api/v1/databases/{db}/tables',       'jwt',   '表列表'),
+('web', 'GET',  '/api/v1/databases/{db}/tables/{t}/columns', 'jwt', '列信息'),
+('web', 'GET',  '/api/v1/databases/{db}/tables/{t}/data', 'jwt', '表数据'),
+('web', 'POST', '/api/v1/databases/{db}/tables/{t}/insert', 'jwt', '插入'),
+('web', 'PUT',  '/api/v1/databases/{db}/tables/{t}/update', 'jwt', '更新'),
+('web', 'DELETE', '/api/v1/databases/{db}/tables/{t}/delete', 'jwt', '删除'),
+('web', 'POST', '/api/v1/query',                       'jwt',   '执行查询'),
+('web', 'GET',  '/api/v1/history',                     'jwt',   '查询历史'),
+('web', 'GET',  '/api/v1/reports',                     'jwt',   '报表列表'),
+('web', 'POST', '/api/v1/reports/{name}/run',          'jwt',   '运行报表'),
+('web', 'GET',  '/metrics',                            'none',  'Prometheus 指标'),
+('web', 'GET',  '/api/v1/metrics/json',                'none',  'JSON 指标');

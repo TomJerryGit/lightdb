@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightdb-studio"
+version = "1.0.0"
+description = "LightDB Studio - 图形化数据库管理工具 (Navicat 替代)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "LightDB Team" }]
+keywords = ["database", "gui", "navicat", "mysql", "sql", "pyside6"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+]
+
+dependencies = [
+    "pymysql>=1.0.0",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PySide6>=6.5.0",
+    "openpyxl>=3.1.0",
+]
+web = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.6",
+]
+all = [
+    "PySide6>=6.5.0",
+    "openpyxl>=3.1.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.6",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+lightdb-studio = "lightdb_studio.app:run"
+lightdb-studio-web = "web.start:main"
+lightdb-studio-cli = "lightdb_studio.tools.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lightdb/studio"
+Documentation = "https://github.com/lightdb/studio/docs"
+Repository = "https://github.com/lightdb/studio"
+
+[tool.setuptools.packages.find]
+include = ["lightdb_studio*", "web*"]
+
+[tool.setuptools.package-data]
+lightdb_studio = ["**/*.json", "**/*.qss"]
+web = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

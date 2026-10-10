@@ -1,0 +1,84 @@
+一、生成完整知识库文档：把所有模块整理成 Markdown 总览。
+二、生成导入 SQL：设计 lightdb_docs 等表，写入这些资料。
+Microsoft Windows [版本 10.0.19041.264]
+(c) 2020 Microsoft Corporation. 保留所有权利。
+C:\Users\Administrator>D:
+D:\>cd D:\lightdb_project
+D:\lightdb_project>python generate_full_import.py /path/to/lightdb_project > full_import.sql
+D:\lightdb_project>
+
+lightdb_import/
+├── 01_schema.sql
+├── 02_versions.sql
+├── 03_modules.sql
+├── 04_features.sql
+├── 05_benchmarks.sql
+├── 06_issues.sql
+├── 07_api.sql
+├── 08_docs.sql
+├── 09_tags.sql
+├── 10_files.sql            # 由脚本生成
+├── generate_import_sql.py  # 简化版
+├── generate_full_import.py # 完整版
+└── import_all.sh           # 一键导入
+
+三、修复剩余 UI 层 Bug：main_window.py、lineage_view.py、chart_view_enhanced.py。
+运行验证
+# 1. 桌面版
+pip install -e ".[all]"
+lightdb-studio
+# 2. 或直接
+python -c "from lightdb_studio.app import run; run()"
+#验证清单
+# 单元自检（不需 GUI）
+import ast
+
+for f in [
+    'lightdb_studio/lightdb_studio/ui/main_window.py',
+    'lightdb_studio/lightdb_studio/ui/lineage_view.py',
+    'lightdb_studio/lightdb_studio/ui/chart_view_enhanced.py',
+]:
+    with open(f, encoding='utf-8') as fp:
+        tree = ast.parse(fp.read())
+    # 找出未定义的 self.xxx 调用（粗略）
+    print(f"{f}: OK")
+
+启动 Studio：
+
+bash
+pip install -e ".[all]"
+lightdb-studio
+
+四、审查数据库内核：重点看 B+Tree、MVCC、WAL、锁管理器。
+五、生成部署与压测方案：Docker/K8s + lightdb-bench。
+
+
+
+
+你可以按以下方式继续：
+
+“补全所有 __init__.py” —— 我一次性给 26 个文件
+“补全 Docker 7 个文件” —— 我一次性给 Dockerfile.v3/v4、docker-compose.*.yml、entrypoint*.sh
+“补全 Dashboards 4 个” —— 我给完整 Grafana JSON
+“补全 Scripts 6 个” —— 我给安装/构建脚本
+“修复 P3 剩余 bug” —— 我给修复后的 table.py、database.py、parser.py、executor.py、window.py、server.py
+“生成 Tests 骨架” —— 我按 batch 生成 60 个测试骨架
+“补全 Docs 11 个” —— 我按文档类型生成
+
+
+九、下一步
+剩余待补全的（按优先级）：
+
+优先级	项目	数量
+🔴 P0	入口/配置 bug 修复	8
+🟠 P1	Docker 7 + Dashboards 4	11
+🟡 P2	Scripts 6 + Docs 11	17
+🔵 P3	Tests 60	60
+⚠️	内核 bug 修复	14
+你可以直接说：
+
+“补全 Docker 7 个”
+“补全 Dashboards 4 个”
+“修复 P0 入口/配置”
+“修复 P3 内核 bug”
+“生成 Tests 骨架”

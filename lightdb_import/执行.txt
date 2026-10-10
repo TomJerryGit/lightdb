@@ -1,0 +1,93 @@
+# 按顺序执行
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 01_schema.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 02_versions.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 03_modules.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 04_features.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 05_benchmarks.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 06_issues.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 07_api.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 08_docs.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 09_tags.sql
+mysql -h 127.0.0.1 -P 8888 -u root --default-character-set=utf8mb4 < 10_files.sql
+================为什么用  mysql 命令
+为什么用 mysql 命令？
+一、直接原因
+因为 LightDB 是 MySQL 兼容数据库，实现了 MySQL Wire Protocol v10，所以官方的 mysql 客户端可以直接连接 LightDB 并执行 SQL。
+
+text
+mysql 客户端  ──MySQL 协议──>  LightDB 服务器 :8888
+LightDB 在 lightdb/net/server.py 中监听 8888 端口，握手协议、认证、查询响应都遵循 MySQL 协议，所以任何 MySQL 客户端（mysql、mysqladmin、mysqldump、PyMySQL、SQLAlchemy、Navicat、DBeaver）都能直接连。
+
+二、但这不是唯一选择
+LightDB 自带了多个客户端工具，都可以替代 mysql：
+
+工具	位置	对标
+lightdb CLI	lightdb/tools/cli.py	mysql 客户端
+lightdbdump	lightdb/tools/dump.py	mysqldump
+lightdbadmin	lightdb/tools/admin.py	mysqladmin
+PyMySQL	第三方库	—
+Web 版	web/	—
+Studio 桌面版	lightdb_studio/	Navicat
+三、更推荐的 LightDB 原生方式
+方式 1：LightDB CLI
+bash
+python -m lightdb.tools.cli -h 127.0.0.1 -P 8888 -u root
+进入交互式客户端后：
+
+sql
+lightdb> SOURCE 01_schema.sql;
+lightdb> SOURCE 02_versions.sql;
+lightdb> SOURCE 03_modules.sql;
+-- ...
+lightdb> \q
+或者一条命令执行：
+
+bash
+python -m lightdb.tools.cli -h 127.0.0.1 -P 8888 -u root \
+    -e "SOURCE 01_schema.sql"
+
+=====================验证顺序
+#验证顺序
+-- 1. 总览
+SELECT 
+    m.category,
+    COUNT(f.id) AS files,
+    SUM(CASE WHEN f.status='provided' THEN 1 ELSE 0 END) AS provided,
+    SUM(CASE WHEN f.status='fixed' THEN 1 ELSE 0 END) AS fixed,
+    SUM(CASE WHEN f.status='missing' THEN 1 ELSE 0 END) AS missing,
+    SUM(f.has_issue) AS issues
+FROM lightdb_modules m
+LEFT JOIN lightdb_files f ON f.module_id = m.id
+GROUP BY m.category
+ORDER BY files DESC;
+
+-- 2. 按模块统计
+SELECT 
+    m.code, m.name, COUNT(f.id) AS files, SUM(f.lines) AS lines
+FROM lightdb_modules m
+LEFT JOIN lightdb_files f ON f.module_id = m.id
+GROUP BY m.code, m.name
+ORDER BY files DESC
+LIMIT 30;
+
+-- 3. 严重问题
+SELECT severity, COUNT(*) AS cnt
+FROM lightdb_issues
+WHERE fixed = 0
+GROUP BY severity
+ORDER BY FIELD(severity, 'critical','high','medium','low');
+
+-- 4. 按标签统计文件
+SELECT t.name, COUNT(ft.file_id) AS files
+FROM lightdb_tags t
+LEFT JOIN lightdb_file_tags ft ON ft.tag_id = t.id
+GROUP BY t.name
+ORDER BY files DESC;
+
+-- 5. 完整文件清单（含模块和标签）
+SELECT 
+    m.code AS module, f.file_path, f.file_type, f.lines,
+    f.status, f.has_issue
+FROM lightdb_files f
+JOIN lightdb_modules m ON m.id = f.module_id
+ORDER BY m.code, f.file_path;

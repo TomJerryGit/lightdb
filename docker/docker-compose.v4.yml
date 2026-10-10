@@ -1,0 +1,201 @@
+version: '3.8'
+
+# ============================================================
+# LightDB v4.0 - 多进程 + Cython 性能版 Docker Compose
+# 适用场景: 生产环境、性能敏感场景、高并发
+# ============================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "5"
+
+x-ulimits: &default-ulimits
+  nofile:
+    soft: 65536
+    hard: 65536
+  nproc: 65536
+
+services:
+  # ========== LightDB v4.0 Server (多进程) ==========
+  lightdb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.v4
+    image: lightdb/server:4.0.0
+    container_name: lightdb-server
+    hostname: lightdb
+    command: >
+      python -m lightdb.main
+      --mode multi
+      --workers ${LIGHTDB_WORKERS:-8}
+      --host 0.0.0.0
+      --port 8888
+    ports:
+      - "8888:8888"
+    volumes:
+      - lightdb-data:/app/data
+      - lightdb-logs:/app/logs
+      - lightdb-backups:/app/backups
+      - ./config/config.v4.json:/app/config.json:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - LIGHTDB_VERSION=4.0.0
+      - LIGHTDB_LOG_LEVEL=${LIGHTDB_LOG_LEVEL:-INFO}
+      - LIGHTDB_WORKERS=${LIGHTDB_WORKERS:-8}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+    ulimits: *default-ulimits
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
+        reservations:
+          cpus: '4'
+          memory: 8G
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.socket(); s.connect(('127.0.0.1',8888)); s.close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-net
+
+  # ========== Studio Web ==========
+  studio-web:
+    image: lightdb/server:4.0.0
+    container_name: lightdb-studio-web
+    hostname: studio-web
+    command: >
+      python -m web.start
+      --host 0.0.0.0
+      --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - studio-config:/home/lightdb/.lightdb_studio
+    environment:
+      - TZ=Asia/Shanghai
+      - LIGHTDB_HOST=lightdb
+      - LIGHTDB_PORT=8888
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      lightdb:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-net
+
+  # ========== Prometheus ==========
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: lightdb-prometheus
+    hostname: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-net
+
+  # ========== Grafana ==========
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: lightdb-grafana
+    hostname: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-net
+
+  # ========== Node Exporter ==========
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: lightdb-node-exporter
+    hostname: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-net
+
+  # ========== 压测客户端（可选，profile=bench）==========
+  bench:
+    image: lightdb/server:4.0.0
+    container_name: lightdb-bench
+    hostname: bench
+    profiles: ["bench"]
+    command: >
+      sleep infinity
+    environment:
+      - TZ=Asia/Shanghai
+      - LIGHTDB_HOST=lightdb
+      - LIGHTDB_PORT=8888
+    depends_on:
+      lightdb:
+        condition: service_healthy
+    networks:
+      - lightdb-net
+
+volumes:
+  lightdb-data:
+    driver: local
+  lightdb-logs:
+    driver: local
+  lightdb-backups:
+    driver: local
+  studio-config:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  lightdb-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

@@ -1,0 +1,95 @@
+# ============================================================
+# LightDB v3.0 - 单进程版镜像
+# 基础: python:3.11-slim
+# 特点: 无 Cython、无多进程、启动快、镜像小
+# ============================================================
+FROM python:3.11-slim AS builder
+
+LABEL stage="builder"
+
+WORKDIR /build
+
+# ---------- 系统依赖 ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- Python 依赖 ----------
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        pymysql>=1.0.0 \
+        psutil>=5.9.0
+
+# ---------- 复制源码 ----------
+COPY lightdb/ ./lightdb/
+COPY web/ ./web/
+COPY pyproject.toml ./
+
+# ============================================================
+# 运行阶段
+# ============================================================
+FROM python:3.11-slim
+
+LABEL maintainer="LightDB Team"
+LABEL description="LightDB v3.0 单进程数据库"
+LABEL version="3.0.0"
+
+# ---------- 运行时依赖 ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        procps \
+        curl \
+        netcat-openbsd \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- 创建用户 ----------
+RUN useradd -m -u 1000 -s /bin/bash lightdb && \
+    mkdir -p /app/data /app/logs /app/backups && \
+    chown -R lightdb:lightdb /app
+
+WORKDIR /app
+
+# ---------- 复制依赖 ----------
+COPY --from=builder /usr/local/lib/python3.11/site-packages \
+                    /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# ---------- 复制源码 ----------
+COPY --chown=lightdb:lightdb lightdb/ ./lightdb/
+COPY --chown=lightdb:lightdb web/ ./web/
+COPY --chown=lightdb:lightdb pyproject.toml ./
+
+# ---------- 默认配置 ----------
+RUN cat > /app/config.json <<'EOF'
+{
+  "host": "0.0.0.0",
+  "port": 8888,
+  "max_connections": 100,
+  "buffer_pool_size": 1000,
+  "page_size": 4096,
+  "data_dir": "/app/data",
+  "backup_dir": "/app/backups",
+  "workers": 1,
+  "parallel_workers": 2,
+  "slow_query_threshold": 0.5,
+  "max_allowed_packet": 16777216,
+  "log_level": "INFO"
+}
+EOF
+
+# ---------- 入口脚本 ----------
+COPY --chown=lightdb:lightdb docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+USER lightdb
+
+EXPOSE 8888 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import socket; s=socket.socket(); s.connect(('127.0.0.1',8888)); s.close()" || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+CMD ["server"]

@@ -1,0 +1,185 @@
+version: '3.8'
+
+# ============================================================
+# LightDB v4.0 - Master + Worker 横向扩展版
+# 适用场景: 多进程架构验证、压测、集群测试
+#
+# 说明:
+# - Master 通过 SO_REUSEPORT 让所有 Worker 独立监听同一端口
+# - 通过共享内存 (IPC) 协调事务和锁
+# - 压测时建议 workers=CPU核数
+# ============================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "3"
+
+x-common: &common
+  image: lightdb/server:4.0.0
+  environment:
+    - TZ=Asia/Shanghai
+    - PYTHONUNBUFFERED=1
+    - LIGHTDB_LOG_LEVEL=INFO
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - lightdb-multi-net
+
+services:
+  # ========== Master 服务 ==========
+  master:
+    <<: *common
+    container_name: lightdb-master
+    hostname: lightdb-master
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.v4
+    command: >
+      python -m lightdb.main
+      --mode multi
+      --workers ${WORKER_COUNT:-4}
+      --host 0.0.0.0
+      --port 8888
+    ports:
+      - "8888:8888"
+    volumes:
+      - lightdb-multi-data:/app/data
+      - lightdb-multi-shm:/dev/shm
+      - ./config/config.multi.json:/app/config.json:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - LIGHTDB_LOG_LEVEL=INFO
+      - LIGHTDB_WORKERS=${WORKER_COUNT:-4}
+      - LIGHTDB_MODE=master
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.socket(); s.connect(('127.0.0.1',8888)); s.close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 5
+
+  # ========== Worker 池（横向扩展示例）==========
+  # 说明: Master 已内部拉起 Worker，此处演示外部 Worker
+  # 如需外部 Worker，请设置 LIGHTDB_EXTERNAL_WORKERS=1
+  worker:
+    <<: *common
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.v4
+    image: lightdb/server:4.0.0
+    deploy:
+      replicas: ${WORKER_REPLICAS:-0}
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    command: >
+      python -c "
+import os, sys, time
+print('Worker 等待 Master 就绪...')
+time.sleep(10)
+print('Worker 退出（示例容器，可由编排层扩展）')
+"
+    depends_on:
+      master:
+        condition: service_healthy
+    volumes:
+      - lightdb-multi-data:/app/data
+      - lightdb-multi-shm:/dev/shm
+    environment:
+      - TZ=Asia/Shanghai
+      - LIGHTDB_HOST=lightdb-master
+      - LIGHTDB_PORT=8888
+      - LIGHTDB_MODE=worker
+
+  # ========== 监控栈 ==========
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: lightdb-multi-prometheus
+    hostname: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-multi-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-multi-net
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: lightdb-multi-grafana
+    hostname: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-multi-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - lightdb-multi-net
+
+  # ========== 压测客户端 ==========
+  bench:
+    image: lightdb/server:4.0.0
+    container_name: lightdb-multi-bench
+    hostname: bench
+    profiles: ["bench"]
+    command: sleep infinity
+    environment:
+      - TZ=Asia/Shanghai
+      - LIGHTDB_HOST=lightdb-master
+      - LIGHTDB_PORT=8888
+    depends_on:
+      master:
+        condition: service_healthy
+    networks:
+      - lightdb-multi-net
+
+volumes:
+  lightdb-multi-data:
+    driver: local
+  lightdb-multi-shm:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=2g,mode=1777"
+  prometheus-multi-data:
+    driver: local
+  grafana-multi-data:
+    driver: local
+
+networks:
+  lightdb-multi-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

@@ -1,0 +1,16 @@
+{
+  "host": "0.0.0.0",
+  "port": 8888,
+  "max_connections": 100,
+  "buffer_pool_size": 1000,
+  "page_size": 4096,
+  "data_dir": "/app/data",
+  "backup_dir": "/app/backups",
+  "workers": 1,
+  "parallel_workers": 2,
+  "slow_query_threshold": 0.5,
+  "max_allowed_packet": 16777216,
+  "log_level": "INFO",
+  "wal_enabled": true,
+  "autocommit": true
+}

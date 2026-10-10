@@ -1,0 +1,429 @@
+﻿lightdb_project/
+├── lightdb/                                       
+│   │
+│   ├── storage/                                    
+│   │   ├── page.py                                 
+│   │   ├── buffer_pool.py                          
+│   │   ├── btree.py                                
+│   │   ├── btree_optimized.py                      
+│   │   ├── wal.py                                  
+│   │   ├── mvcc.py                                 
+│   │   ├── lock_manager.py                         
+│   │   ├── txn.py                                  
+│   │   ├── row_format.py                           n）
+│   │   ├── row_format_v4.py                        
+│   │   └── page_prefetch.py                        
+│   │
+│   ├── sql/                                        
+│   │   ├── lexer.py                                
+│   │   ├── parser.py                               
+│   │   ├── parser_v3b4.py                          
+│   │   ├── plan.py                                 
+│   │   ├── optimizer.py                            
+│   │   ├── plan_cache.py                           
+│   │   ├── plan_executor.py                        
+│   │   ├── executor.py                             
+│   │   ├── batch_executor.py                       
+│   │   ├── vectorized.py                           
+│   │   ├── predicate_pushdown.py                   
+│   │   ├── predicate_v4.py                         
+│   │   ├── icp.py                                  
+│   │   ├── parallel_planner.py                     
+│   │   ├── variables.py                            
+│   │   ├── cursor.py                               
+│   │   ├── stats.py                                
+│   │   ├── pl.py                                   
+│   │   ├── stored.py                               
+│   │   ├── trigger.py                              
+│   │   ├── event.py                                
+│   │   ├── window.py                               
+│   │   ├── cte.py                                  
+│   │   ├── json_func.py                            
+│   │   ├── fulltext.py                             
+│   │   ├── partition.py                            
+│   │   ├── generated.py                            
+│   │   └── functions/                              
+│   │       ├── string_funcs.py                     
+│   │       ├── datetime_funcs.py                   
+│   │       ├── math_funcs.py                       
+│   │       ├── control_funcs.py                    
+│   │       └── registry.py                         
+│   │
+│   ├── db/                                         
+│   │   ├── database.py
+│   │   ├── table.py
+│   │   ├── table_v3.py                             
+│   │   ├── hybrid_table.py                         
+│   │   └── information_schema.py
+│   │
+│   ├── net/                                        
+│   │   ├── mysql_protocol.py                       
+│   │   ├── server.py                               
+│   │   ├── listener.py                             
+│   │   ├── master.py                               
+│   │   └── worker.py                               
+│   │
+│   ├── replication/                                
+│   │   ├── binlog.py
+│   │   ├── master.py
+│   │   ├── slave.py
+│   │   └── semi_sync.py                            
+│   │
+│   ├── security/                                   
+│   │   ├── privileges.py
+│   │   ├── ssl_support.py
+│   │   ├── audit.py
+│   │   ├── password_policy.py
+│   │   ├── connection_limit.py
+│   │   └── ip_whitelist.py
+│   │
+│   ├── performance/                                
+│   │   ├── connection_pool.py
+│   │   ├── query_cache.py
+│   │   ├── batch_inserter.py
+│   │   ├── index_only_scan.py
+│   │   ├── parallel.py
+│   │   └── benchmark.py
+│   │
+│   ├── concurrency/                                
+│   │   ├── rw_lock.py                              
+│   │   ├── lockfree_mvcc.py                        
+│   │   ├── multiprocess.py                         
+│   │   ├── shared_memory.py                        
+│   │   ├── atomic.py                               
+│   │   └── ipc.py                                  
+│   │
+│   ├── cluster/                                    
+│   │   ├── shared_buffer.py                        
+│   │   ├── txn_coordinator.py                      
+│   │   ├── lock_coordinator.py                     
+│   │   └── stats_hub.py                            
+│   │
+│   ├── columnar/                                   
+│   │   ├── chunk.py                                
+│   │   ├── encoders.py                             
+│   │   ├── column_store.py                         
+│   │   ├── segment.py                              
+│   │   └── stats.py                                
+│   │
+│   ├── olap/                                       
+│   │   ├── vectorized_engine.py                    
+│   │   ├── aggregator.py                           
+│   │   ├── scanner.py                              
+│   │   ├── olap_optimizer.py                       
+│   │   └── parallel_olap.py                        
+│   │
+│   ├── parallel/                                   
+│   │   ├── fragment.py                             
+│   │   ├── executor.py                             
+│   │   ├── work_stealing.py                        
+│   │   ├── adaptive.py                             
+│   │   ├── scheduler.py                            
+│   │   ├── resource_group.py                       
+│   │   └── merge.py                                
+│   │
+│   ├── cython/                                     
+│   │   ├── __init__.py                             
+│   │   ├── setup.py                                
+│   │   ├── btree_pyx.pyx                           
+│   │   ├── row_codec.pyx                           
+│   │   ├── page_pyx.pyx                            
+│   │   ├── predicate_pyx.pyx                       
+│   │   ├── buffer_pool_pyx.pyx                     
+│   │   └── hash_table_pyx.pyx                      
+│   │
+│   ├── monitor/                                    
+│   │   ├── slow_log_analyzer.py
+│   │   ├── metrics_v3.py                           
+│   │   ├── slow_query_analyzer.py                  
+│   │   ├── lock_analyzer.py                        
+│   │   ├── index_advisor.py                        
+│   │   ├── health_checker.py                       
+│   │   └── parallel_stats.py                       
+│   │
+│   ├── stability/                                  
+│   │   ├── soak_test.py                            
+│   │   ├── fault_injector.py                       
+│   │   ├── consistency_checker.py                  
+│   │   ├── memory_leak_detector.py                 
+│   │   ├── watchdog.py                             
+│   │   └── crash_recovery_v3.py                    
+│   │
+│   ├── benchmark/                                  
+│   │   ├── runner.py
+│   │   ├── workloads.py                            
+│   │   ├── profiler.py                             
+│   │   ├── memory_analyzer.py
+│   │   ├── baseline.py
+│   │   ├── report.py
+│   │   └── cli.py
+│   │
+│   ├── profiling/                                  
+│   │   ├── cprofile_analyzer.py
+│   │   ├── flamegraph.py
+│   │   ├── hotspot_ranker.py
+│   │   ├── gil_analyzer.py
+│   │   └── reporter.py
+│   │
+│   ├── experiments/                                
+│   │   ├── multiprocess_test.py
+│   │   ├── cython_test.py
+│   │   ├── subinterp_test.py
+│   │   └── comparison.py
+│   │
+│   ├── tools/                                      
+│   │   ├── cli.py                                  
+│   │   ├── dump.py                                 
+│   │   ├── admin.py                                
+│   │   ├── benchmark.py                            
+│   │   ├── check.py                                
+│   │   ├── tune.py                                 
+│   │   ├── index_advisor.py                        
+│   │   ├── dashboard.py                            
+│   │   ├── diagnose.py                             
+│   │   └── migrate.py                              
+│   │
+│   ├── backup/backup.py
+│   ├── logger.py
+│   ├── config.py
+│   ├── __init__.py
+│   ├── main.py                                     
+│   ├── main_v4.py                                  
+│   └── build.sh                                    
+│
+├── lightdb_studio/                                 
+│   ├── lightdb_studio/
+│   │   ├── core/                                   
+│   │   │   ├── snippets.py                         
+│   │   │   ├── masking.py                          
+│   │   │   ├── sql_formatter.py                    
+│   │   │   ├── sql_profiler.py                     
+│   │   │   ├── sql_auto_optimizer.py               
+│   │   │   ├── environments.py                     
+│   │   │   ├── review_workflow.py                  
+│   │   │   ├── data_contract.py                    
+│   │   │   ├── federated_gov.py                    
+│   │   │   ├── slo.py                              
+│   │   │   ├── lineage.py                          
+│   │   │   ├── lineage_enhanced.py                 
+│   │   │   ├── lineage_v2.py                       
+│   │   │   ├── lineage_visual.py                   
+│   │   │   ├── lineage_closure.py                  
+│   │   │   ├── catalog.py                          
+│   │   │   ├── data_map.py                         
+│   │   │   ├── assets.py                           
+│   │   │   ├── data_quality.py                     
+│   │   │   ├── quality_v2.py                       
+│   │   │   ├── health_score.py                     
+│   │   │   ├── recommender.py                      
+│   │   │   ├── data_market.py                      
+│   │   │   ├── product_ops.py                      
+│   │   │   ├── ai_integration.py                   
+│   │   │   ├── ai_sql_gen.py                       
+│   │   │   ├── ai_agent.py                         
+│   │   │   ├── agent_react.py                      
+│   │   │   ├── ai_finetune.py                      
+│   │   │   ├── nlb.py                              
+│   │   │   ├── virtualization.py                   
+│   │   │   ├── federation.py                       
+│   │   │   ├── data_lake.py                        
+│   │   │   ├── etl.py                              
+│   │   │   ├── data_api.py                         
+│   │   │   ├── observability.py                    
+│   │   │   ├── fullstack_obs.py                    
+│   │   │   ├── performance_monitor.py              
+│   │   │   ├── alerts.py                           
+│   │   │   ├── metrics.py                          
+│   │   │   ├── collaboration.py                    
+│   │   │   ├── team.py                             
+│   │   │   ├── notifications.py                    
+│   │   │   ├── scheduler.py                        
+│   │   │   ├── workflow.py                         
+│   │   │   ├── workflow_visual.py                  
+│   │   │   ├── data_mesh.py                        
+│   │   │   ├── data_fabric.py                      
+│   │   │   ├── shadow_table.py                     
+│   │   │   ├── digital_twin.py                     
+│   │   │   ├── cloud.py                            
+│   │   │   ├── distributed.py                      
+│   │   │   ├── autonomy.py                         
+│   │   │   ├── snapshot.py                         
+│   │   │   ├── migration.py                        
+│   │   │   └── reports.py                          
+│   │   │
+│   │   ├── ui/                                     
+│   │   │   ├── main_window.py                      
+│   │   │   ├── connection_dialog.py                
+│   │   │   ├── object_tree.py                      
+│   │   │   ├── sql_editor.py                       
+│   │   │   ├── result_table.py                     
+│   │   │   ├── data_editor.py                      
+│   │   │   ├── table_designer.py                   
+│   │   │   ├── query_history.py                    
+│   │   │   ├── import_export.py                    
+│   │   │   ├── cell_viewer.py                      
+│   │   │   ├── data_grid_enhanced.py               
+│   │   │   ├── db_compare.py                       
+│   │   │   ├── er_diagram.py                       
+│   │   │   ├── query_builder.py                    
+│   │   │   ├── perf_panel.py                       
+│   │   │   ├── multi_result.py                     
+│   │   │   ├── chart_view.py                       
+│   │   │   ├── chart_view_enhanced.py              
+│   │   │   ├── import_wizard.py                    
+│   │   │   ├── settings_dialog.py                  
+│   │   │   ├── theme.py                            
+│   │   │   ├── snippet_panel.py                    
+│   │   │   ├── masking_dialog.py                   
+│   │   │   ├── ai_panel.py                         
+│   │   │   ├── plugin_panel.py                     
+│   │   │   ├── cloud_sync_dialog.py                
+│   │   │   ├── team_config_dialog.py               
+│   │   │   ├── report_builder.py                   
+│   │   │   ├── scheduler_panel.py                  
+│   │   │   ├── audit_viewer.py                     
+│   │   │   ├── dashboard.py                        
+│   │   │   ├── environment_bar.py                  
+│   │   │   ├── lineage_view.py                     
+│   │   │   ├── lineage_interactive.py              
+│   │   │   ├── review_panel.py                     
+│   │   │   ├── snapshot_dialog.py                  
+│   │   │   ├── catalog_panel.py                    
+│   │   │   ├── agent_chat.py                       
+│   │   │   ├── react_agent_panel.py                
+│   │   │   ├── impact_dialog.py                    
+│   │   │   ├── quality_v2_dialog.py                
+│   │   │   ├── alerts_panel.py                     
+│   │   │   ├── data_map_view.py                    
+│   │   │   ├── assets_dashboard.py                 
+│   │   │   ├── data_science_view.py                
+│   │   │   ├── cdc_panel.py                        
+│   │   │   ├── virtual_table_panel.py              
+│   │   │   ├── federation_view.py                  
+│   │   │   ├── etl_designer.py                     
+│   │   │   ├── data_api_panel.py                   
+│   │   │   ├── recommender_panel.py                
+│   │   │   ├── market_view.py                      
+│   │   │   ├── contract_panel.py                   
+│   │   │   ├── closure_view.py                     
+│   │   │   ├── slo_dashboard.py                    
+│   │   │   ├── mesh_view.py                        
+│   │   │   ├── governance_panel.py                 
+│   │   │   ├── shadow_panel.py                     
+│   │   │   ├── observability_view.py               
+│   │   │   ├── cloud_map_view.py                   
+│   │   │   ├── distributed_panel.py                
+│   │   │   ├── autonomy_panel.py                   
+│   │   │   ├── fabric_panel.py                     
+│   │   │   ├── twin_view.py                        
+│   │   │   ├── nlb_view.py                         
+│   │   │   ├── product_ops_view.py                 
+│   │   │   └── fullstack_view.py                   
+│   │   │
+│   │   ├── db/
+│   │   │   ├── connection.py
+│   │   │   ├── metadata.py
+│   │   │   ├── schema_diff.py
+│   │   │   └── table_ops.py
+│   │   │
+│   │   ├── net/collab_server.py                    
+│   │   │
+│   │   ├── utils/
+│   │   │   ├── sql_highlighter.py
+│   │   │   ├── sql_completer.py
+│   │   │   ├── history.py
+│   │   │   └── i18n.py
+│   │   │
+│   │   ├── config.py
+│   │   └── app.py
+│   │
+│   └── plugins/example_plugin.py
+│
+├── web/                                            
+│   ├── server.py
+│   ├── api.py
+│   ├── auth.py
+│   ├── metrics.py
+│   ├── start.py
+│   └── static/
+│       ├── index.html
+│       ├── app.js
+│       └── style.css
+│
+├── docker/                                         
+│   ├── Dockerfile
+│   ├── Dockerfile.v3                               
+│   ├── Dockerfile.v4                               
+│   ├── docker-compose.yml
+│   ├── docker-compose.v3.yml
+│   ├── docker-compose.v4.yml                       
+│   ├── docker-compose.multi.yml                    
+│   ├── prometheus.yml
+│   ├── k8s.yaml
+│   ├── entrypoint.sh
+│   └── entrypoint-v4.sh
+│
+├── dashboards/                                     
+│   ├── lightdb_overview.json
+│   ├── lightdb_performance.json
+│   ├── lightdb_replication.json
+│   └── lightdb_innodb.json
+│
+├── docs/                                           
+│   ├── USER_GUIDE.md
+│   ├── API_REFERENCE.md
+│   ├── DEPLOYMENT.md
+│   ├── V3_ROADMAP.md
+│   ├── V3_RELEASE_NOTES.md
+│   ├── USER_GUIDE_v3.md
+│   ├── ADMIN_GUIDE_v3.md
+│   ├── MIGRATION_GUIDE_v3.md
+│   ├── PERFORMANCE_WHITEPAPER_v3.md
+│   ├── V4_DECISION.md                              
+│   ├── V4_RELEASE_NOTES.md                         
+│   ├── USER_GUIDE_v4.md
+│   ├── ADMIN_GUIDE_v4.md
+│   ├── ARCHITECTURE_v4.md                          
+│   ├── MIGRATION_v3_to_v4.md
+│   ├── PERFORMANCE_WHITEPAPER_v4.md                
+│   └── CYTHON_DEV_GUIDE.md                         
+│
+├── scripts/                                        
+│   ├── install.sh
+│   ├── install.ps1
+│   ├── install_v4.sh
+│   ├── upgrade.sh
+│   ├── build_cython.sh                             
+│   └── benchmark_v4.sh
+│
+├── tests/                                          
+│   ├── test_batch1.py ~ test_batch15.py
+│   ├── test_v2_batch1.py ~ test_v2_batch8.py
+│   ├── test_v3_batch1.py ~ test_v3_batch6.py
+│   ├── test_v4_batch1.py ~ test_v4_batch6.py       
+│   ├── benchmark_v4_batch3.py
+│   ├── benchmark_v4_batch4.py
+│   ├── benchmark_v4_batch5.py
+│   ├── regression/
+│   │   ├── run_all.py
+│   │   ├── test_sql_compat.py
+│   │   ├── test_transaction.py
+│   │   ├── test_replication.py
+│   │   └── test_performance.py
+│   └── regression_v4/                              
+│       ├── run_all.py
+│       ├── test_cython_compat.py
+│       ├── test_multiprocess.py
+│       ├── test_columnar.py
+│       ├── test_parallel.py
+│       └── test_performance_v4.py
+│
+├── pyproject.toml                                  
+├── requirements.txt
+├── requirements_web.txt
+├── README.md
+├── CHANGELOG_v3.md
+├── CHANGELOG_v4.md
+├── RELEASE_v3.0.md
+├── RELEASE_v4.0.md
+└── LICENSE

@@ -1,0 +1,492 @@
+# ============================================================
+# LightDB Prometheus 告警规则
+# 分类:
+#   1. 可用性
+#   2. 连接
+#   3. 查询与性能
+#   4. 事务与锁
+#   5. 缓冲池与存储
+#   6. 复制
+#   7. 磁盘与资源
+#   8. 服务器进程
+# ============================================================
+
+groups:
+
+  # ============================================================
+  # 1. 可用性
+  # ============================================================
+  - name: lightdb.availability
+    interval: 30s
+    rules:
+
+      - alert: LightDBDown
+        expr: up{job="lightdb-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "LightDB 实例不可用"
+          description: "{{ $labels.instance }} ({{ $labels.role }}) 已宕机超过 1 分钟"
+          runbook: "https://docs.lightdb.io/runbook#LightDBDown"
+
+      - alert: LightDBRestartFrequent
+        expr: changes(lightdb_uptime_seconds[15m]) > 2
+        for: 5m
+        labels:
+          severity: warning
+          category: availability
+        annotations:
+          summary: "LightDB 频繁重启"
+          description: "15 分钟内重启超过 2 次"
+
+      - alert: StudioWebDown
+        expr: up{job="lightdb-studio-web"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          category: availability
+        annotations:
+          summary: "Studio Web 不可用"
+
+  # ============================================================
+  # 2. 连接
+  # ============================================================
+  - name: lightdb.connections
+    interval: 30s
+    rules:
+
+      - alert: HighConnectionUsage
+        expr: lightdb_threads_connected > 160
+        for: 5m
+        labels:
+          severity: warning
+          category: connection
+        annotations:
+          summary: "连接数过高 (当前 {{ $value }})"
+          description: "连接数超过 160，最大 200，请检查连接池配置"
+
+      - alert: ConnectionSaturation
+        expr: lightdb_threads_connected > 190
+        for: 2m
+        labels:
+          severity: critical
+          category: connection
+        annotations:
+          summary: "连接数接近饱和 ({{ $value }}/200)"
+          description: "即将达到 max_connections 上限，可能拒绝新连接"
+
+      - alert: ConnectionAbortedHigh
+        expr: rate(lightdb_connections_aborted[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          category: connection
+        annotations:
+          summary: "异常断开连接速率高 ({{ $value }}/s)"
+
+      - alert: ThreadsRunningHigh
+        expr: lightdb_threads_running > 20
+        for: 5m
+        labels:
+          severity: warning
+          category: connection
+        annotations:
+          summary: "运行中线程过高 ({{ $value }})"
+          description: "可能存在锁等待或慢查询堆积"
+
+  # ============================================================
+  # 3. 查询与性能
+  # ============================================================
+  - name: lightdb.queries
+    interval: 30s
+    rules:
+
+      - alert: QPSDrop
+        expr: |
+          (lightdb_queries_per_second
+           - lightdb_queries_per_second offset 5m)
+          / lightdb_queries_per_second offset 5m < -0.5
+          and lightdb_queries_per_second offset 5m > 100
+        for: 5m
+        labels:
+          severity: warning
+          category: query
+        annotations:
+          summary: "QPS 骤降超过 50%"
+          description: "当前 QPS: {{ $value }}, 请检查服务状态"
+
+      - alert: QPSSurge
+        expr: |
+          (lightdb_queries_per_second
+           - lightdb_queries_per_second offset 5m)
+          / lightdb_queries_per_second offset 5m > 1.0
+        for: 5m
+        labels:
+          severity: warning
+          category: query
+        annotations:
+          summary: "QPS 突增超过 100%"
+          description: "可能存在异常流量或攻击"
+
+      - alert: HighSlowQueryRate
+        expr: rate(lightdb_slow_queries_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          category: query
+        annotations:
+          summary: "慢查询速率 {{ $value }}/s"
+          description: "慢查询超过 10/s，请检查慢查询日志"
+
+      - alert: VeryHighSlowQueryRate
+        expr: rate(lightdb_slow_queries_total[5m]) > 50
+        for: 2m
+        labels:
+          severity: critical
+          category: query
+        annotations:
+          summary: "慢查询速率极高 {{ $value }}/s"
+
+      - alert: QueryP99High
+        expr: |
+          histogram_quantile(0.99,
+            rate(lightdb_query_duration_seconds_bucket[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+          category: query
+        annotations:
+          summary: "P99 查询延迟 > 1s"
+          description: "P99 延迟: {{ $value }}s"
+
+      - alert: QueryP99Critical
+        expr: |
+          histogram_quantile(0.99,
+            rate(lightdb_query_duration_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: critical
+          category: query
+        annotations:
+          summary: "P99 查询延迟 > 5s"
+
+  # ============================================================
+  # 4. 事务与锁
+  # ============================================================
+  - name: lightdb.transactions
+    interval: 30s
+    rules:
+
+      - alert: HighTransactionRollbackRate
+        expr: |
+          rate(lightdb_transactions_rollback[5m])
+          / (rate(lightdb_transactions_total[5m]) + 0.001) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: transaction
+        annotations:
+          summary: "事务回滚率 > 10%"
+          description: "回滚率: {{ $value | humanizePercentage }}"
+
+      - alert: LongRunningTransactions
+        expr: lightdb_transactions_active > 50
+        for: 5m
+        labels:
+          severity: warning
+          category: transaction
+        annotations:
+          summary: "活跃事务过多 ({{ $value }})"
+          description: "可能存在长事务未提交"
+
+  - name: lightdb.locks
+    interval: 30s
+    rules:
+
+      - alert: HighLockWaits
+        expr: rate(lightdb_lock_waits_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          category: lock
+        annotations:
+          summary: "锁等待速率 {{ $value }}/s"
+
+      - alert: DeadlocksDetected
+        expr: increase(lightdb_deadlocks_total[1h]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          category: lock
+        annotations:
+          summary: "1 小时内检测到 {{ $value }} 次死锁"
+          description: "请检查应用事务隔离级别和加锁顺序"
+
+      - alert: DeadlocksCritical
+        expr: increase(lightdb_deadlocks_total[10m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+          category: lock
+        annotations:
+          summary: "10 分钟内死锁超过 10 次，严重影响可用性"
+
+      - alert: ManyRowLocks
+        expr: lightdb_row_locks_current > 1000
+        for: 5m
+        labels:
+          severity: warning
+          category: lock
+        annotations:
+          summary: "当前行锁数量过多 ({{ $value }})"
+
+  # ============================================================
+  # 5. 缓冲池与存储
+  # ============================================================
+  - name: lightdb.buffer_pool
+    interval: 30s
+    rules:
+
+      - alert: LowBufferPoolHitRate
+        expr: lightdb_buffer_pool_hit_rate < 0.95
+        for: 10m
+        labels:
+          severity: warning
+          category: buffer_pool
+        annotations:
+          summary: "缓冲池命中率 {{ $value | humanizePercentage }}"
+          description: "低于 95%，建议增大 buffer_pool_size"
+
+      - alert: VeryLowBufferPoolHitRate
+        expr: lightdb_buffer_pool_hit_rate < 0.85
+        for: 5m
+        labels:
+          severity: critical
+          category: buffer_pool
+        annotations:
+          summary: "缓冲池命中率严重偏低 {{ $value | humanizePercentage }}"
+
+      - alert: HighDirtyPages
+        expr: lightdb_buffer_pool_pages_dirty > 1000
+        for: 5m
+        labels:
+          severity: warning
+          category: buffer_pool
+        annotations:
+          summary: "脏页过多 ({{ $value }})"
+          description: "可能刷盘不及时，考虑调整刷盘策略"
+
+      - alert: BufferPoolNearlyFull
+        expr: |
+          (lightdb_buffer_pool_pages_total - lightdb_buffer_pool_pages_free)
+          / lightdb_buffer_pool_pages_total > 0.95
+        for: 10m
+        labels:
+          severity: warning
+          category: buffer_pool
+        annotations:
+          summary: "缓冲池接近满载"
+
+  # ============================================================
+  # 6. 复制
+  # ============================================================
+  - name: lightdb.replication
+    interval: 30s
+    rules:
+
+      - alert: ReplicationLag
+        expr: lightdb_slave_lag_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+          category: replication
+        annotations:
+          summary: "主从延迟 {{ $value }}s"
+          description: "从库落后主库超过 30 秒"
+
+      - alert: ReplicationLagCritical
+        expr: lightdb_slave_lag_seconds > 300
+        for: 2m
+        labels:
+          severity: critical
+          category: replication
+        annotations:
+          summary: "主从延迟 {{ $value }}s，已超过 5 分钟"
+
+      - alert: SlaveIOStopped
+        expr: lightdb_slave_io_running == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: replication
+        annotations:
+          summary: "从库 IO 线程停止"
+
+      - alert: SlaveSQLStopped
+        expr: lightdb_slave_sql_running == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: replication
+        annotations:
+          summary: "从库 SQL 线程停止"
+
+      - alert: SemiSyncWaitHigh
+        expr: lightdb_semi_sync_avg_wait_ms > 100
+        for: 5m
+        labels:
+          severity: warning
+          category: replication
+        annotations:
+          summary: "半同步平均等待 {{ $value }}ms"
+
+      - alert: BinlogGrowthFast
+        expr: rate(lightdb_binlog_bytes_total[5m]) > 10485760
+        for: 10m
+        labels:
+          severity: info
+          category: replication
+        annotations:
+          summary: "Binlog 增长速度 > 10MB/s"
+
+  # ============================================================
+  # 7. 磁盘与资源
+  # ============================================================
+  - name: lightdb.disk
+    interval: 30s
+    rules:
+
+      - alert: DiskSpaceLow
+        expr: |
+          (1 - (node_filesystem_avail_bytes{mountpoint="/"}
+                / node_filesystem_size_bytes{mountpoint="/"})) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+          category: disk
+        annotations:
+          summary: "磁盘使用率 {{ $value }}%"
+          description: "根分区使用率超过 85%"
+
+      - alert: DiskSpaceCritical
+        expr: |
+          (1 - (node_filesystem_avail_bytes{mountpoint="/"}
+                / node_filesystem_size_bytes{mountpoint="/"})) * 100 > 95
+        for: 5m
+        labels:
+          severity: critical
+          category: disk
+        annotations:
+          summary: "磁盘使用率 {{ $value }}%，即将耗尽"
+
+      - alert: HighDiskReadIOPS
+        expr: rate(lightdb_disk_read_iops[5m]) > 5000
+        for: 10m
+        labels:
+          severity: warning
+          category: disk
+        annotations:
+          summary: "磁盘读 IOPS 高 ({{ $value }})"
+
+      - alert: HighDiskWriteIOPS
+        expr: rate(lightdb_disk_write_iops[5m]) > 5000
+        for: 10m
+        labels:
+          severity: warning
+          category: disk
+        annotations:
+          summary: "磁盘写 IOPS 高 ({{ $value }})"
+
+  - name: lightdb.resources
+    interval: 30s
+    rules:
+
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by(instance)
+            (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 10m
+        labels:
+          severity: warning
+          category: cpu
+        annotations:
+          summary: "CPU 使用率 {{ $value }}%"
+          description: "{{ $labels.instance }} CPU 使用率超过 85%"
+
+      - alert: CPUUsageCritical
+        expr: |
+          100 - (avg by(instance)
+            (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 95
+        for: 5m
+        labels:
+          severity: critical
+          category: cpu
+        annotations:
+          summary: "CPU 使用率 {{ $value }}%，接近饱和"
+
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes
+                / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+          category: memory
+        annotations:
+          summary: "内存使用率 {{ $value }}%"
+
+      - alert: MemoryUsageCritical
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes
+                / node_memory_MemTotal_bytes)) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+          category: memory
+        annotations:
+          summary: "内存使用率 {{ $value }}%，可能触发 OOM"
+
+      - alert: HighLoadAverage
+        expr: node_load5 > 8
+        for: 10m
+        labels:
+          severity: warning
+          category: cpu
+        annotations:
+          summary: "5 分钟负载 {{ $value }}"
+
+  # ============================================================
+  # 8. 服务器进程
+  # ============================================================
+  - name: lightdb.process
+    interval: 30s
+    rules:
+
+      - alert: ServerOpenFilesHigh
+        expr: lightdb_server_open_files > 10000
+        for: 5m
+        labels:
+          severity: warning
+          category: process
+        annotations:
+          summary: "打开文件数过高 ({{ $value }})"
+
+      - alert: ServerMemoryHigh
+        expr: lightdb_server_memory_bytes > 16 * 1024 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+          category: process
+        annotations:
+          summary: "LightDB 进程内存 > 16GB"
+
+      - alert: ServerCPUHigh
+        expr: lightdb_server_cpu_usage > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          category: process
+        annotations:
+          summary: "LightDB 进程 CPU > 90%"
