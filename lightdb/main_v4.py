@@ -26,6 +26,14 @@ from pathlib import Path
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# 控制台编码保护：中文 Windows 控制台为 GBK，emoji 会让 print 抛
+# UnicodeEncodeError 并中断启动（多进程模式下这正是 Worker 池启动失败的原因之一）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors='replace')
+    except Exception:
+        pass
+
 
 # ==================== 信号处理 ====================
 
@@ -210,13 +218,13 @@ def main(argv=None) -> int:
     # ---------- 校验 ----------
     errors = cfg.validate()
     if errors:
-        print("❌ 配置错误:", file=sys.stderr)
+        print("[错误] 配置错误:", file=sys.stderr)
         for e in errors:
             print(f"   - {e}", file=sys.stderr)
         return 1
 
     if args.check:
-        print("✅ 配置校验通过")
+        print("[OK] 配置校验通过")
         print(cfg.describe())
         return 0
 

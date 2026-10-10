@@ -1,7 +1,7 @@
 """SQL 编辑器（带语法高亮 + 执行快捷键）"""
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPlainTextEdit, QToolBar, QPushButton,
-    QLabel, QHBoxLayout, QMessageBox
+    QLabel, QHBoxLayout, QMessageBox, QTextEdit
 )
 from PySide6.QtCore import Qt, Signal, QRect, QSize
 from PySide6.QtGui import (
@@ -102,7 +102,9 @@ class SQLEditor(QPlainTextEdit):
     def _highlight_current_line(self):
         extra = []
         if not self.isReadOnly():
-            sel = QPlainTextEdit.ExtraSelection()
+            # ExtraSelection 定义在 QTextEdit 上，QPlainTextEdit 没有这个属性
+            # （PySide6 6.6 实测 QPlainTextEdit.ExtraSelection 不存在）
+            sel = QTextEdit.ExtraSelection()
             line_color = QColor("#2a2d2e")
             sel.format.setBackground(line_color)
             sel.format.setProperty(QTextFormat.FullWidthSelection, True)

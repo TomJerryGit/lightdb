@@ -1,0 +1,74 @@
+# ============================================================
+# LightDB 项目 .gitignore
+# ============================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+.Python
+
+# ---------- 测试 / 代码质量 ----------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- Cython 生成物 ----------
+*.c
+*.html
+
+# 例外：lightdb/cython/ 下随仓库分发的 .c 预编译源码需要保留
+!lightdb/cython/*.c
+
+# ---------- 数据库数据 / 日志 ----------
+*.dat
+*.wal
+*.btroot
+*.log
+data/
+data_*/
+_tmpdata/
+backups/
+backups_b*/
+lightdb-data/
+*.sql.gz
+
+# 运行时配置（保留随仓库分发的 config.json / *.example.json）
+docker/config/config.json
+
+# ---------- Studio 桌面版运行时 ----------
+.lightdb_studio/
+*.lightdb
+*.qss.bak
+
+# ---------- Web / 前端 ----------
+web/static/dist/
+node_modules/
+.vite/
+
+# ---------- 编辑器 / 操作系统 ----------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- 日志与诊断产物 ----------
+_*.log
+_*_test.log

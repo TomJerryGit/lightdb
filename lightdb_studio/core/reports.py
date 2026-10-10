@@ -16,6 +16,17 @@ REPORT_DIR = Path.home() / '.lightdb_studio' / 'reports'
 OUTPUT_DIR = REPORT_DIR / 'outputs'
 
 
+def _html_cell(value) -> str:
+    """把单个单元格转成 <td>，NULL 用灰色斜体表示。
+
+    原先这里写成单行 f-string 内嵌反斜杠转义，Python 3.11 及以下会直接
+    抛 SyntaxError（PEP 701 之后才允许），导致整个 lightdb_studio 无法导入。
+    """
+    if value is None:
+        return '<td><i style="color:#888">NULL</i></td>'
+    return f'<td>{html.escape(str(value))}</td>'
+
+
 @dataclass
 class ReportTemplate:
     name: str = ""
@@ -168,9 +179,7 @@ class ReportEngine:
                         for c in columns)
         tbody_rows = []
         for r in rows:
-            cells = ''.join(
-                f'<td>{"<i style=\'color:#888\'>NULL</i>" if v is None else html.escape(str(v))}</td>'
-                for v in r)
+            cells = ''.join(_html_cell(v) for v in r)
             tbody_rows.append(f'<tr>{cells}</tr>')
         tbody = '\n'.join(tbody_rows)
 

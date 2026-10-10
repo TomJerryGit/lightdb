@@ -1,5 +1,7 @@
 # LightDB v4.0.0 发布说明
 
+> ⚠️ **数据可信度声明（2026-10 审计）**：本文档中的 QPS、加速比、压缩比等数字**并非由本仓库内的工具产出** —— `lightdb/benchmark/` 下没有任何基准运行产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录也不存在（`~/.lightdb_studio/` 下只有空的 `reports/`、`soak/`）。其中 12000 QPS / 80000 QPS 目标只出现在 `tests/regression_v4/test_performance_v4.py:13-18` 的 `PERF_TARGETS` 字典里，**从未被任何测试断言**。因此本文数字应视为**设计目标或估计值**，而非实测结果。正文表格保持原貌以便对照，完整审计结论见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。
+
 **发布日期**：2025-08-01
 **版本代号**：Performance Breakthrough
 **对标目标**：MySQL 5.7（综合达成 125%）

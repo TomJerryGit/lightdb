@@ -22,6 +22,17 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+# ==================== 控制台编码保护 ====================
+# 中文 Windows 控制台默认 GBK(cp936)。原有的 print 里带 emoji（✅/❌/🚀 等）
+# 在 GBK 下会抛 UnicodeEncodeError 并直接终止启动流程（--check 就是这样挂的）。
+# 保留控制台原编码（中文仍能正常显示），只把无法编码的字符替换掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors='replace')
+    except Exception:
+        pass
+
+
 # ==================== 信号处理 ====================
 
 _shutdown_requested = False
@@ -153,13 +164,13 @@ def main(argv=None) -> int:
     # ---------- 校验 ----------
     errors = cfg.validate()
     if errors:
-        print("❌ 配置错误:", file=sys.stderr)
+        print("[错误] 配置错误:", file=sys.stderr)
         for e in errors:
             print(f"   - {e}", file=sys.stderr)
         return 1
 
     if args.check:
-        print("✅ 配置校验通过")
+        print("[OK] 配置校验通过")
         print(cfg.describe())
         return 0
 
@@ -268,7 +279,7 @@ def _run_multi(cfg) -> int:
     try:
         from lightdb.main_v4 import run_multi
     except ImportError as e:
-        print(f"❌ 无法加载多进程模式: {e}", file=sys.stderr)
+        print(f"[错误] 无法加载多进程模式: {e}", file=sys.stderr)
         print("   请检查 lightdb/main_v4.py 是否存在", file=sys.stderr)
         return 1
 

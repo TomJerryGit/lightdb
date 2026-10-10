@@ -290,18 +290,25 @@ def mysql_native_password(auth_response: bytes, auth_seed: bytes,
     stored_hash 是 SHA1(SHA1(password)) (20 bytes)
     auth_response = SHA1(password) XOR SHA1(auth_seed + SHA1(SHA1(password)))
     """
-    if len(stored_hash) != 20:
-        return False
+    import hashlib
+
+    # 空密码必须放在长度校验之前：空密码用户的 stored_hash 就是 b''，
+    # 原实现先判 len(stored_hash) != 20 直接 return False，导致空密码永远登录失败。
     if len(auth_response) == 0:
         # 空密码
-        return stored_hash == b'\x00' * 20 or stored_hash == b''
-    
-    import hashlib
+        return stored_hash in (b'', b'\x00' * 20)
+
+    if len(stored_hash) != 20:
+        return False
+
     # SHA1(auth_seed + stored_hash)
     temp = hashlib.sha1(auth_seed + stored_hash).digest()
-    # auth_response XOR temp
+    if len(auth_response) != len(temp):
+        return False
+    # auth_response XOR temp 得到 SHA1(password)，再取一次 SHA1 才能和 stored_hash 比较
+    # （原实现漏掉了最后一次 SHA1，导致任何非空密码都被判为错误）
     candidate = bytes(a ^ b for a, b in zip(auth_response, temp))
-    return candidate == stored_hash
+    return hashlib.sha1(candidate).digest() == stored_hash
 
 
 def hash_password(password: str) -> bytes:

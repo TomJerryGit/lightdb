@@ -1,20 +1,41 @@
 version: '3.8'
 
+# ============================================================
+# LightDB 4.0 通用版 Docker Compose（数据库服务端 + Studio Web）
+#
+# 镜像: docker/Dockerfile（多模式：server / web / cli / check / bench / bash）
+# 构建上下文: ..（仓库根目录）
+# 启动: docker compose -f docker/docker-compose.yml up -d
+# ============================================================
+
 services:
-  # LightDB 服务器
+  # LightDB 服务器（镜像默认 CMD = server）
   lightdb:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: lightdb/server:4.0.0
     container_name: lightdb-server
-    command: python main.py
+    # 入口脚本 docker/entrypoint.sh 解析 "server" -> python -m lightdb.main --mode single
+    # 原 `command: python main.py` 已移除：仓库根目录没有 main.py。
+    command: ["server"]
     ports:
       - "8888:8888"
     volumes:
       - lightdb-data:/app/data
-      - ./config.json:/app/config.json:ro
+      - lightdb-logs:/app/logs
+      - ./config/config.json:/app/config.json:ro
     environment:
       - TZ=Asia/Shanghai
+      - LIGHTDB_LOG_LEVEL=INFO
+    # 数据库端口存活探测（镜像内健康检查亦探测 8888）
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.create_connection(('127.0.0.1',8888),3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     restart: unless-stopped
     networks:
       - lightdb-net
@@ -24,8 +45,10 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: lightdb/server:4.0.0
     container_name: lightdb-studio-web
-    command: python -m web.start --host 0.0.0.0 --port 8080
+    # 走 entrypoint 的 web 模式：会先等待 lightdb 就绪再启动 web.start
+    command: ["web"]
     ports:
       - "8080:8080"
     volumes:
@@ -33,8 +56,17 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - LIGHTDB_HOST=lightdb
+      - LIGHTDB_PORT=8888
+      - WEB_PORT=8080
     depends_on:
-      - lightdb
+      lightdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     restart: unless-stopped
     networks:
       - lightdb-net
@@ -46,7 +78,8 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # docker/config/prometheus.yml 真实存在（含 lightdb:8888 与 studio-web:8080 抓取目标）
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     restart: unless-stopped
     networks:
@@ -71,6 +104,7 @@ services:
 
 volumes:
   lightdb-data:
+  lightdb-logs:
   studio-config:
   prometheus-data:
   grafana-data:

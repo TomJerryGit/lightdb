@@ -1,13 +1,17 @@
 #!/bin/bash
 # ============================================================
-# LightDB 容器入口脚本 (v3 通用版)
+# LightDB 容器入口脚本 (通用版)
 #
 # 用法:
-#   docker run lightdb/server:3.0.0 server
-#   docker run lightdb/server:3.0.0 web
-#   docker run lightdb/server:3.0.0 cli
-#   docker run lightdb/server:3.0.0 migrate
-#   docker run lightdb/server:3.0.0 check
+#   docker run lightdb/server:4.0.0 server
+#   docker run lightdb/server:4.0.0 web
+#   docker run lightdb/server:4.0.0 cli
+#   docker run lightdb/server:4.0.0 check
+#   docker run lightdb/server:4.0.0 bench
+#   docker run lightdb/server:4.0.0 bash
+#
+# 说明: 镜像内代码即仓库 lightdb/、web/ 源码，版本以 lightdb/__init__.py 的
+#       __version__ = "4.0.0" 为准。
 # ============================================================
 
 set -euo pipefail
@@ -67,7 +71,7 @@ wait_for_host() {
 print_banner() {
     echo ""
     echo -e "${BLUE}============================================================${NC}"
-    echo -e "${BLUE}  LightDB v3.0.0 - 单进程数据库${NC}"
+    echo -e "${BLUE}  LightDB v4.0.0 - 数据库服务端${NC}"
     echo -e "${BLUE}============================================================${NC}"
     echo "  模式:         $1"
     echo "  数据目录:     $LIGHTDB_DATA_DIR"
@@ -119,13 +123,12 @@ cmd_cli() {
         "$@"
 }
 
-# ---------- 命令: migrate ----------
-cmd_migrate() {
-    log "启动数据库迁移工具..."
-    wait_for_host "${LIGHTDB_HOST:-lightdb}" "$LIGHTDB_PORT" "LightDB" 60 || true
-
-    exec python -m lightdb.tools.migrate "$@"
-}
+# 注意: 原 migrate 子命令已移除。
+# 原因: lightdb/tools/migrate.py 在仓库中不存在（lightdb/tools/ 下实际只有
+#       admin/benchmark/check/cli/dashboard/diagnose/dump/index_advisor/tune），
+#       执行 `python -m lightdb.tools.migrate` 必然 ModuleNotFoundError。
+# 待人工确认: 若迁移工具确实需要，请补回 lightdb/tools/migrate.py，
+#       并在此恢复 cmd_migrate() 分发（详见 docs/MIGRATION_v3_to_v4.md）。
 
 # ---------- 命令: check ----------
 cmd_check() {
@@ -143,7 +146,11 @@ cmd_bench() {
     log "启动压测客户端..."
     wait_for_host "${LIGHTDB_HOST:-lightdb}" "$LIGHTDB_PORT" "LightDB" 60 || true
 
-    exec python -m lightdb.benchmark.cli "$@"
+    # 注意: lightdb.benchmark.cli 强制要求子命令(run/compare/profile/memory)
+    exec python -m lightdb.benchmark.cli run \
+        --host "${LIGHTDB_HOST:-lightdb}" \
+        --port "$LIGHTDB_PORT" \
+        "$@"
 }
 
 # ---------- 命令: bash ----------
@@ -163,7 +170,6 @@ main() {
         server)   cmd_server   "$@" ;;
         web)      cmd_web      "$@" ;;
         cli)      cmd_cli      "$@" ;;
-        migrate)  cmd_migrate  "$@" ;;
         check)    cmd_check    "$@" ;;
         bench)    cmd_bench    "$@" ;;
         bash|sh)  cmd_bash     "$@" ;;

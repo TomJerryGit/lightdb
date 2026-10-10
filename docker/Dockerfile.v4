@@ -1,7 +1,10 @@
 # ============================================================
-# LightDB v4.0 - 多进程 + Cython 性能版镜像
+# LightDB v4.0 - 多进程 + Cython 性能版镜像 (数据库服务端 + Studio Web)
 # 基础: python:3.11-slim
 # 特点: 多进程 Worker、Cython 加速、列存、并行查询
+#
+# 构建上下文 = 仓库根目录:
+#   docker build -f docker/Dockerfile.v4 -t lightdb/server:4.0.0 .
 # ============================================================
 FROM python:3.11-slim AS builder
 
@@ -19,20 +22,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- Python 依赖 ----------
-COPY requirements.txt requirements_web.txt ./
+COPY requirements.txt ./
+# 核心依赖统一从 requirements.txt 安装，避免版本漂移；
+# 不含 PySide6(容器无头运行，桌面 GUI 不适用)。
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-        pymysql>=1.0.0 \
-        psutil>=5.9.0 \
-        numpy>=1.24.0 && \
+    pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir cython>=3.0.0
 
-# ---------- 复制源码 ----------
+# ---------- 复制源码（路径均真实存在于仓库根目录）----------
 COPY lightdb/ ./lightdb/
+COPY lightdb_studio/ ./lightdb_studio/
 COPY web/ ./web/
 COPY pyproject.toml ./
 
 # ---------- 编译 Cython ----------
+# lightdb/cython/{setup.py,*.pyx} 真实存在；未装 Cython 时 setup.py 会回退 .c 文件。
+# 编译失败不阻断构建，运行期自动回退纯 Python 实现。
 WORKDIR /build/lightdb/cython
 RUN python setup.py build_ext --inplace 2>&1 | tee /tmp/cython_build.log || \
     (echo "⚠️ Cython 编译失败，将回退 Python 版本" && \
@@ -60,10 +65,11 @@ except Exception as e:
 FROM python:3.11-slim
 
 LABEL maintainer="LightDB Team"
-LABEL description="LightDB v4.0 多进程 + Cython 数据库"
+LABEL description="LightDB v4.0 多进程 + Cython 数据库 + Studio Web"
 LABEL version="4.0.0"
 
 # ---------- 运行时依赖 ----------
+# netcat-openbsd: entrypoint-v4.sh 的 wait_for_host() 需要 nc
 RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         curl \
@@ -86,6 +92,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # ---------- 复制源码 ----------
 COPY --chown=lightdb:lightdb lightdb/ ./lightdb/
+COPY --chown=lightdb:lightdb lightdb_studio/ ./lightdb_studio/
 COPY --chown=lightdb:lightdb web/ ./web/
 COPY --chown=lightdb:lightdb pyproject.toml ./
 
@@ -117,7 +124,7 @@ RUN cat > /app/config.json <<'EOF'
 }
 EOF
 
-# ---------- 入口脚本 ----------
+# ---------- 入口脚本（路径真实存在: docker/entrypoint-v4.sh）----------
 COPY --chown=lightdb:lightdb docker/entrypoint-v4.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
@@ -133,7 +140,7 @@ EXPOSE 8888 8080
 
 # 启动时间稍长（多进程 + Cython 加载）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=5 \
-    CMD python -c "import socket; s=socket.socket(); s.connect(('127.0.0.1',8888)); s.close()" || exit 1
+    CMD python -c "import socket; s=socket.create_connection(('127.0.0.1',8888),3); s.close()" || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["server"]

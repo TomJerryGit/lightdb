@@ -140,10 +140,13 @@ class MainWindow(QMainWindow):
         self.resize(1480, 940)
 
         # 构建 UI
+        # 注意顺序：_build_ui() 里新增查询标签页会触发 _on_tab_changed()，
+        # 而它要访问 self.conn_label；因此状态栏必须先建好（原实现顺序相反，
+        # 导致 MainWindow 构造时直接 AttributeError）。
         self._build_menu()
+        self._build_statusbar()
         self._build_ui()
         self._build_toolbar()
-        self._build_statusbar()
         self._apply_settings()
 
         # 启动后台服务

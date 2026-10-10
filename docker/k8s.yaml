@@ -48,8 +48,12 @@ spec:
     spec:
       containers:
       - name: server
-        image: lightdb:1.0.0
-        command: ["python", "main.py"]
+        # 镜像来自 docker/Dockerfile.v4（含 lightdb/ 与 web/ 源码）
+        image: lightdb/server:4.0.0
+        # 仓库根目录没有 main.py，必须用模块方式启动（与 entrypoint 一致）
+        command: ["python", "-m", "lightdb.main", "--mode", "multi",
+                  "--host", "0.0.0.0", "--port", "8888",
+                  "--config", "/app/config.json"]
         ports:
         - containerPort: 8888
         volumeMounts:
@@ -105,7 +109,7 @@ spec:
     spec:
       containers:
       - name: web
-        image: lightdb:1.0.0
+        image: lightdb/server:4.0.0
         command: ["python", "-m", "web.start", "--host", "0.0.0.0",
                   "--port", "8080"]
         ports:

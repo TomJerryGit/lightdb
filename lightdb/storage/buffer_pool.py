@@ -12,6 +12,11 @@ class BufferPool:
         self.frames = OrderedDict()
         self.lock = threading.RLock()
         
+        # 数据文件首次使用时并不存在，'r+b' 会直接抛 FileNotFoundError，
+        # 导致 CREATE TABLE 永远失败（且异常被上层吞掉）。先确保文件存在。
+        if not os.path.exists(path):
+            with open(path, 'wb'):
+                pass
         self.f = open(path, 'r+b')
         self.f.seek(0, 2)
         if self.f.tell() == 0:

@@ -86,13 +86,7 @@ services:
         limits:
           cpus: '1'
           memory: 2G
-    command: >
-      python -c "
-import os, sys, time
-print('Worker 等待 Master 就绪...')
-time.sleep(10)
-print('Worker 退出（示例容器，可由编排层扩展）')
-"
+    command: ["python", "-c", "import time; print('Worker 等待 Master 就绪...'); time.sleep(10); print('Worker 退出（示例容器，可由编排层扩展）')"]
     depends_on:
       master:
         condition: service_healthy

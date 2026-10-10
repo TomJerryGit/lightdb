@@ -1,0 +1,13 @@
+# LightDB 开发/测试依赖（与 pyproject.toml [project.optional-dependencies].dev 一致）
+# 安装: pip install -r requirements-dev.txt
+-r requirements.txt
+-r requirements_web.txt
+
+pytest>=7.0
+pytest-cov>=4.0
+black>=23.0
+ruff>=0.1
+httpx>=0.25.0
+
+# Cython 加速模块的本地编译（可选，见 scripts/build_cython.sh）
+# cython>=3.0.0

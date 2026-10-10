@@ -20,22 +20,24 @@ services:
     image: lightdb/server:3.0.0
     container_name: lightdb-server-v3
     hostname: lightdb
-    command: >
-      python -m lightdb.main
-      --mode single
-      --host 0.0.0.0
-      --port 8888
+    # 入口脚本 docker/entrypoint.sh 的 server 模式:
+    #   python -m lightdb.main --mode single --host $LIGHTDB_HOST --port $LIGHTDB_PORT
+    # 端口/配置改由 entrypoint 的环境变量驱动，避免命令行与 entrypoint 不一致。
+    command: ["server"]
     ports:
       - "8888:8888"
     volumes:
       - lightdb-v3-data:/app/data
       - lightdb-v3-logs:/app/logs
+      # docker/config/config.v3.json 真实存在（port=8888, workers=1）
       - ./config/config.v3.json:/app/config.json:ro
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
       - LIGHTDB_VERSION=3.0.0
       - LIGHTDB_LOG_LEVEL=INFO
+      - LIGHTDB_HOST=0.0.0.0
+      - LIGHTDB_PORT=8888
     deploy:
       resources:
         limits:
@@ -61,10 +63,8 @@ services:
     image: lightdb/server:3.0.0
     container_name: lightdb-studio-web-v3
     hostname: studio-web
-    command: >
-      python -m web.start
-      --host 0.0.0.0
-      --port 8080
+    # entrypoint web 模式: 先等待 LightDB 就绪再 python -m web.start --host 0.0.0.0 --port $WEB_PORT
+    command: ["web"]
     ports:
       - "8080:8080"
     volumes:
@@ -73,6 +73,7 @@ services:
       - TZ=Asia/Shanghai
       - LIGHTDB_HOST=lightdb
       - LIGHTDB_PORT=8888
+      - WEB_PORT=8080
       - PYTHONUNBUFFERED=1
     depends_on:
       lightdb:

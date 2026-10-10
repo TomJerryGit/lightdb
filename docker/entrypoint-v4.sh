@@ -8,7 +8,9 @@
 #   docker run lightdb/server:4.0.0 web
 #   docker run lightdb/server:4.0.0 cli
 #   docker run lightdb/server:4.0.0 check
-#   docker run lightdb/server:4.0.0 bench
+#   docker run lightdb/server:4.0.0 tune
+#   docker run lightdb/server:4.0.0 diagnose
+#   docker run lightdb/server:4.0.0 bench           # 等价于 bench run
 #   docker run lightdb/server:4.0.0 bash
 # ============================================================
 
@@ -245,7 +247,9 @@ cmd_bench() {
     log "启动压测客户端..."
     wait_for_host "${LIGHTDB_HOST:-lightdb}" "$LIGHTDB_PORT" "LightDB" 60 || true
 
-    exec python -m lightdb.benchmark.cli \
+    # 注意: lightdb.benchmark.cli 强制要求子命令(run/compare/profile/memory)，
+    # 原写法 `python -m lightdb.benchmark.cli --host ...` 会因缺少子命令报错。
+    exec python -m lightdb.benchmark.cli run \
         --host "${LIGHTDB_HOST:-lightdb}" \
         --port "$LIGHTDB_PORT" \
         "$@"

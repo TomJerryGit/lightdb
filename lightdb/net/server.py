@@ -324,6 +324,14 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._show_columns(sql)
             return
 
+        # ---------- 会话设置语句 ----------
+        # 标准 MySQL 客户端在登录成功后固定发送 SET NAMES <charset>（字符集协商）
+        # 以及 SET AUTOCOMMIT/AUTOCOMMIT=1 等语句。本引擎不维护会话变量表，
+        # 这里直接确认；否则 pymysql 等客户端会在连接阶段就报 1064 而无法使用。
+        if upper == "SET" or upper.startswith("SET "):
+            self._send_packet(mp.make_ok_packet())
+            return
+
         # ---------- 通用 SQL ----------
         try:
             from ..sql.parser import parser
@@ -390,6 +398,16 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
     def _send_execution_result(self, result, parsed):
         cmd = parsed['command']
+
+        # 执行器把异常转成错误字典返回而不抛出（见 sql/executor.py:107 _err），
+        # 因此这里必须优先翻译成 ERR 包；否则所有失败都会以 OK 包回给客户端，
+        # 客户端（以及测试）会把失败当成成功。
+        if isinstance(result, dict) and result.get('type') == 'error':
+            self._send_packet(mp.make_err_packet(
+                int(result.get('code') or 1105),
+                'HY000',
+                str(result.get('message', 'execution error'))[:200]))
+            return
 
         if cmd == 'INSERT':
             affected = self._extract_affected(result)
