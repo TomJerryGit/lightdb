@@ -214,7 +214,14 @@ def test_union_all():
     p = parser.parse(sql)
     r = ex.execute(p, {})
     print(f"  → 返回 {len(r['rows'])} 行（不去重）")
-    assert len(r['rows']) == sum(1 for u in range(1, 21) if u % 5 == 2) * 2
+    # 期望值必须由 setup() 的同一份数据推导：cities 列表里 'Beijing'
+    # 出现在下标 1..4 中的 2/3/4 三处，所以 i % 5 ∈ {2,3,4} 都是 Beijing
+    # （12 行），不是只有 i % 5 == 2（4 行）。原断言把 12 行当成 4 行，
+    # 因此恒为 8，属于测试本身的算术错误。
+    cities = ['Beijing', 'Shanghai', 'Beijing', 'Beijing', 'Shenzhen']
+    expected = sum(1 for u in range(1, 21)
+                   if cities[u % len(cities)] == 'Beijing') * 2
+    assert len(r['rows']) == expected, f"期望 {expected}, 实际 {len(r['rows'])}"
     print("  ✅ UNION ALL 不去重")
 
     db.shutdown()

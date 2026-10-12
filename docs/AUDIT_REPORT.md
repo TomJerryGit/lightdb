@@ -486,9 +486,18 @@ GROUP BY 与 DISTINCT 属于**静默错答**：不报错、结果错。仓库自
 
 **未验证**：`.pyx` 能否真正编译（需 Cython ≥3.0 + MSVC/gcc）；回退与 `.pyx` 的逐字节等价性（5 处边界差异已记入 `fallback/__init__.py`）；`build_cython.sh` 的 bash 运行（沙箱禁命名管道）。
 
-### 18.4 一处未定位的测试隔离缺陷（如实记录）
+### 18.4 一次误判的纠正：`test_union_all` 不是缺陷，是期望值算错
 
-`tests/test_batch7.py::test_union_all` 报 `assert 24 == 8`，即 `users` 读到了 3 倍行数。可复现范围：同一 pytest 进程内跑 `test_group_by` + `test_union_all` 即可复现。但两次最小复现（2 行写入不 shutdown 连续打开 3 次；20 行 `Table.insert` + shutdown + 连续打开 3 次）**都未重现**，重放日志显示 `redo 2 条` 且行数稳定。因此**不能断定是「WAL 重放不幂等」**，根因待专项排查。
+排查过程与结论（记录下来，避免下次重犯）：
+
+1. 现象：`tests/test_batch7.py::test_union_all` 报 `assert 24 == 8`，即查到 3 倍行数；只跑 `test_group_by` + `test_union_all` 即可复现。
+2. 两次最小复现（2 行写入不 shutdown 连续打开 3 次；20 行 `Table.insert` + shutdown + 连续打开 3 次）**都未重现**，且重放日志为 `redo 2 条`、行数稳定 ⇒ 一开始怀疑的「WAL 重放不幂等 / 堆里追加重复行」被**证伪**。
+3. 改为解剖真实失败现场（`data_b7`）：索引 `bt.count() = 20`、堆页 20 行、`SELECT *` 20 行；而 `_find_pks(city='Beijing')` 返回 `[2,3,5,7,8,10,12,13,15,17,18,20]` —— **12 个互不重复的 pk**，没有重复。
+4. 对着 `setup()` 的数据生成读：`cities = ['Beijing','Shanghai','Beijing','Beijing','Shenzhen']`，`cities[i % len(cities)]` 让 `i % 5 ∈ {2,3,4}` 都是 Beijing ⇒ 真实行数是 **12**，`UNION ALL` 两条分支即 **24**。而原断言写的是 `sum(1 for u in range(1,21) if u % 5 == 2) * 2 = 8` —— **测试自己的算术错误**。
+
+结论：存储层（索引、堆、`_find_pks`）都正确；`test_batch7.py` 的期望值已改为从同一份 `cities` 列表推导，修正后该文件 **9/9 全绿**（含 `test_group_by_having`、`test_in_subquery`、`test_not_in`、`test_exists`、`test_tpch_simplified`）。
+
+教训：本项目里「测试红灯」有两种来源——被实现掩盖的假通过（如 `test_group_by` 只断言总数、`test_cython_row_codec` 拿 Python 比 Python）与**测试自身的错误期望**（如本例）。两者都不能靠改实现来"修"，必须先解剖真实数据。
 
 ---
 

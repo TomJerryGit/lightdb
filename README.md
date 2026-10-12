@@ -63,7 +63,9 @@
 
 **测试套件**：**234 通过 / 81 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：相关子查询与 `FROM` 子查询、OLAP 向量化路径仍受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
 
-**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；**相关子查询**与 `FROM` 子查询、窗口帧（`ROWS BETWEEN`）、`LIMIT ... OFFSET` 的 OFFSET、递归 CTE 仍不支持；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）。已知一处**未定位**的测试隔离缺陷：`tests/test_batch7.py::test_union_all` 在共享 `data_b7` 目录时会读到 3 倍行数，但两次最小复现（含 20 行写法）都未能重现，根因待查。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
+**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；**相关子查询**与 `FROM` 子查询、窗口帧（`ROWS BETWEEN`）、`LIMIT ... OFFSET` 的 OFFSET、递归 CTE 仍不支持；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
+
+> 更正记录：`tests/test_batch7.py::test_union_all` 曾长期失败（`assert 24 == 8`），一度被误判为「重复行 / 测试隔离」缺陷。实际是**该用例的期望值算错**：`setup()` 的城市列表 `['Beijing','Shanghai','Beijing','Beijing','Shenzhen']` 里有三处 'Beijing'，因此 `i % 5 ∈ {2,3,4}` 都是 Beijing（12 行），正确期望是 `12 × 2 = 24`；原断言只按 `i % 5 == 2` 算成 4 行。实测索引 20 条、堆 20 行、`_find_pks` 返回 12 个**互不重复**的 pk —— 存储层无缺陷。期望值现已改为从同一份 `cities` 列表推导，`test_batch7.py` 9/9 全绿。
 
 ---
 
