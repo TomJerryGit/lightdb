@@ -38,6 +38,25 @@ class _Env:
         for r in EMP:
             self.ex.execute_sql(
                 "INSERT INTO emp VALUES (%d,'%s','%s',%d)" % r, {})
+        # 供 JOIN 用例使用：两表都有 id，用于验证限定名不歧义
+        self.ex.execute_sql(
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), "
+            "city VARCHAR(20))", {})
+        self.ex.execute_sql(
+            "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, "
+            "amount INT)", {})
+        i = 0
+        for name, city in [('a', 'BJ'), ('b', 'BJ'), ('c', 'SH')]:
+            i += 1
+            self.ex.execute_sql(
+                "INSERT INTO users VALUES (%d,'%s','%s')" % (i, name, city),
+                {})
+        oid = 0
+        for uid in (1, 1, 2):
+            oid += 1
+            self.ex.execute_sql(
+                "INSERT INTO orders VALUES (%d,%d,%d)" % (oid, uid, oid * 10),
+                {})
         return self
 
     def __exit__(self, *exc):
@@ -167,4 +186,46 @@ def test_plain_path_not_broken():
         assert len(rows) == 2 and rows[0][0] == 'Alice'
 
         _, rows = e.q("SELECT name FROM emp WHERE dept='HR'")
+        assert len(rows) == 3
+
+
+def test_aliased_join_and_aggregate():
+    """带表别名的 JOIN 与 JOIN 聚合
+
+    原先解析器不认表别名，`FROM users u JOIN orders o ON ...` 的 JOIN
+    会被整个丢弃，查询静默退化成单表聚合（返回看似正常但错误的结果）。
+    """
+    with _Env() as e:
+        # JOIN 聚合：a 有 2 笔订单、b 有 1 笔，都属 BJ；SH 无订单故不出现在 INNER JOIN
+        _, rows = e.q(
+            "SELECT u.city, COUNT(*), SUM(o.amount) FROM users u "
+            "JOIN orders o ON u.id = o.user_id GROUP BY u.city")
+        assert rows == [('BJ', 3, 60)], rows
+
+        # 两表同名列：限定名必须精确解析，不能报歧义
+        _, rows = e.q(
+            "SELECT u.id, o.user_id FROM users u JOIN orders o "
+            "ON u.id = o.user_id")
+        assert len(rows) == 3
+
+        # LEFT JOIN 保留未匹配行
+        _, rows = e.q(
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o "
+            "ON u.id = o.user_id")
+        assert len(rows) == 4 and ('c', None) in rows, rows
+
+        # 单表 + 别名：WHERE / ORDER BY / GROUP BY 里的限定名
+        _, rows = e.q(
+            "SELECT u.name FROM users u WHERE u.city = 'BJ'")
+        assert sorted(r[0] for r in rows) == ['a', 'b']
+
+        _, rows = e.q(
+            "SELECT u.city, COUNT(*) FROM users u GROUP BY u.city "
+            "ORDER BY u.city")
+        assert rows == [('BJ', 2), ('SH', 1)], rows
+
+        # 无别名写法必须保持原行为
+        _, rows = e.q(
+            "SELECT * FROM users JOIN orders "
+            "ON users.id = orders.user_id")
         assert len(rows) == 3

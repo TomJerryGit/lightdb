@@ -232,7 +232,10 @@ class PlanExecutor:
 
     def _exec_SeqScan(self, node):
         tbl = self.db.get_table(node.table)
-        cols = [f"{node.table}.{c['name']}" for c in tbl.cols]
+        # 列前缀优先用表别名：`u.id` / `o.id` 这类同名限定列只有精确
+        # 前缀才能被 _resolve_col 命中，否则会因后缀相同被判歧义
+        prefix = getattr(node, 'alias', None) or node.table
+        cols = [f"{prefix}.{c['name']}" for c in tbl.cols]
 
         rows = []
         for pk, pid, sid in tbl.bt.scan():

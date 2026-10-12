@@ -247,6 +247,25 @@ class Parser:
             projection.append(('win', win))
         return base, windows, projection
 
+    # ==================== 表别名 ====================
+
+    # 这些关键字不能当成表别名（否则 `FROM users JOIN ...` 会把 JOIN 吃掉）
+    _ALIAS_STOP = {
+        'INNER', 'LEFT', 'RIGHT', 'CROSS', 'FULL', 'OUTER', 'JOIN',
+        'STRAIGHT_JOIN', 'ON', 'USING', 'WHERE', 'GROUP', 'ORDER',
+        'LIMIT', 'HAVING', 'UNION', 'SET', 'VALUES', 'AS',
+    }
+
+    def _take_alias(self, rest: str):
+        """吃掉可选表别名（`u` 或 `AS u`），返回 (别名或None, 剩余文本)"""
+        m = re.match(r'\s+AS\s+[`"]?(\w+)[`"]?', rest, re.IGNORECASE)
+        if m:
+            return m.group(1), rest[m.end():]
+        m = re.match(r'\s+[`"]?(\w+)[`"]?', rest)
+        if m and m.group(1).upper() not in self._ALIAS_STOP:
+            return m.group(1), rest[m.end():]
+        return None, rest
+
     # ==================== SELECT ====================
 
     def _select(self, sql: str) -> Dict:
@@ -268,6 +287,7 @@ class Parser:
         # FROM：子查询 or 主表
         subquery = None
         main_table = None
+        main_alias = None
 
         if from_rest.startswith('('):
             depth = 0
@@ -297,6 +317,9 @@ class Parser:
                 raise SyntaxError("表名缺失")
             main_table = tm.group(1)
             rest = from_rest[tm.end():]
+            # 表别名：`FROM users u JOIN ...` —— 不识别别名的话下面
+            # 的 JOIN 正则会在 ' u JOIN' 处匹配失败，整个 JOIN 被静默丢弃
+            main_alias, rest = self._take_alias(rest)
 
         # JOIN
         joins = []
@@ -309,6 +332,7 @@ class Parser:
             jtype = (jm.group(1) or 'INNER').upper()
             jtable = jm.group(2)
             rest = rest[jm.end():]
+            jalias, rest = self._take_alias(rest)
             on_cond = None
             om = re.match(
                 r'\s+ON\s+(.+?)(?=\s+(?:INNER|LEFT|RIGHT|CROSS)?\s*(?:OUTER\s+)?JOIN\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b|\s+LIMIT\b|$)',
@@ -319,6 +343,7 @@ class Parser:
                 rest = rest[om.end():]
             joins.append({
                 'type': jtype, 'table': jtable, 'on': on_cond,
+                'alias': jalias,
             })
 
         # 列（窗口函数从列表达式里抽出来，交给执行器单独计算）
@@ -371,6 +396,7 @@ class Parser:
         return {
             'command': 'SELECT',
             'table': main_table,
+            'table_alias': main_alias,
             'subquery': subquery,
             'joins': joins,
             'columns': columns,

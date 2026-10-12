@@ -25,14 +25,18 @@ class PlanNode:
 
 # ==================== 扫描 ====================
 class SeqScan(PlanNode):
-    def __init__(self, table, filter_=None):
+    def __init__(self, table, filter_=None, alias=None):
         super().__init__('SeqScan')
         self.table = table
+        # 表别名：列名前缀用别名（`u.id` 而不是 `users.id`），
+        # 否则 JOIN 里两表同名列会被 _resolve_col 判成歧义
+        self.alias = alias
         self.filter = filter_
 
     def explain_row(self, indent=0):
         f = self._fmt_filter(self.filter)
-        return f"{'  ' * indent}-> SeqScan on {self.table}" + (f" (filter: {f})" if f else "")
+        label = f"{self.table} {self.alias}" if self.alias else self.table
+        return f"{'  ' * indent}-> SeqScan on {label}" + (f" (filter: {f})" if f else "")
 
     @staticmethod
     def _fmt_filter(f):

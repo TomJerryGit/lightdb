@@ -272,10 +272,16 @@ class Executor:
             tid = self.db.mvcc.next_txn_id()
             rv = self.db.mvcc.create_readview(tid)
 
-        # GROUP BY / DISTINCT / 窗口函数：都要在拿到行之后再加工
+        # GROUP BY / DISTINCT / 窗口函数 / 带限定列名的单表查询：
+        # 都要在拿到行之后再加工
         # （原实现的 DISTINCT 只在解析器里记录，执行路径从未使用，属于静默错答）
+        qualified = (
+            any('.' in str(c) for c in (p.get('columns') or []))
+            or self._where_has_qualified(p.get('where'))
+            or bool(p.get('order_by')
+                    and '.' in str(p['order_by'][0])))
         if (p.get('windows') or p.get('group_by')
-                or p.get('distinct')):
+                or p.get('distinct') or qualified):
             return self._select_advanced(p, tbl, read_view=rv)
 
         cols, rows = tbl.select(
@@ -352,7 +358,7 @@ class Executor:
         取基础行 → （可选）分组聚合 → （可选）计算窗口 → 投影 → DISTINCT/ORDER BY/LIMIT。
         """
         base_cols, rows = self._base_rows_and_cols(
-            src, p.get('where'), read_view)
+            src, self._normalize_where(p.get('where')), read_view)
         if p.get('group_by'):
             base_cols, rows = self._group_rows(p, src, base_cols, rows)
         if p.get('windows'):
@@ -367,6 +373,38 @@ class Executor:
         `SUM(o.amount)`、`GROUP BY u.city` 必须归一化后才能复用它们。
         """
         return re.sub(r'\b\w+\.(\w+)', r'\1', str(text))
+
+    def _normalize_where(self, where):
+        """把 WHERE 条件里的限定列名归一化（`u.city` -> `city`）
+
+        存储层的 Table._match 只认裸列名；只改 column 字段，
+        value 原样保留（字符串常量里也可能含点）。
+        """
+        if not isinstance(where, dict):
+            return where
+        if 'and' in where:
+            return {'and': [self._normalize_where(c)
+                            for c in where['and']]}
+        if 'or' in where:
+            return {'or': [self._normalize_where(c)
+                           for c in where['or']]}
+        out = dict(where)
+        if isinstance(out.get('column'), str):
+            out['column'] = self._strip_qualifier(out['column'])
+        return out
+
+    def _where_has_qualified(self, where) -> bool:
+        """WHERE 里是否出现 `u.city` 这类限定列名"""
+        if not isinstance(where, dict):
+            return False
+        if 'and' in where:
+            return any(self._where_has_qualified(c)
+                       for c in where['and'])
+        if 'or' in where:
+            return any(self._where_has_qualified(c)
+                       for c in where['or'])
+        col = where.get('column')
+        return isinstance(col, str) and '.' in col
 
     def _group_rows(self, p, src, base_cols, rows):
         """按 GROUP BY 分组并计算聚合列，返回 (分组后的列名, 分组后的行)
@@ -422,7 +460,7 @@ class Executor:
             if kind == 'win':
                 continue
             expr, alias = self._split_alias(str(text))
-            out_cols.append(alias or expr)
+            out_cols.append(alias or self._strip_qualifier(expr))
             idx.append(self._col_index_of(base_cols, str(text)))
 
         out_rows = [[r[i] if 0 <= i < len(r) else None for i in idx]
@@ -489,8 +527,13 @@ class Executor:
         order_by = p.get('order_by')
         if order_by:
             col, desc = order_by
+            key = self._strip_qualifier(col)
+            i = None
             if col in out_cols:
                 i = out_cols.index(col)
+            elif key in out_cols:
+                i = out_cols.index(key)
+            if i is not None:
                 out_rows.sort(key=lambda r: (r[i] is None, r[i]),
                               reverse=bool(desc))
 

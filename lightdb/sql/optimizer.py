@@ -108,7 +108,7 @@ class Optimizer:
                 return None
             node = SubqueryScan(inner_plan, subquery.get('alias', 'sub'))
         elif table:
-            node = SeqScan(table, None)
+            node = SeqScan(table, None, parsed.get('table_alias'))
         else:
             return None
 
@@ -119,7 +119,7 @@ class Optimizer:
             on = j.get('on')
             if not jtbl:
                 continue
-            right = SeqScan(jtbl, None)
+            right = SeqScan(jtbl, None, j.get('alias'))
 
             if jtype == 'CROSS':
                 node = CrossJoin(node, right)
