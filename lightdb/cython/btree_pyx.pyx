@@ -1,5 +1,22 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
 # cython: cdivision=True, initializedcheck=False, nonecheck=False
+# =============================================================================
+# ⚠️ 未在本机验证编译：本机未安装 Cython，也没有任何 C 编译器
+#    （import Cython → ModuleNotFoundError；gcc / cl / clang 全部未找到），
+#    因此本文件**从未被编译过**，以下修复只是按 Cython 语义做的静态更正。
+#    验证条件：pip install cython 且具备 C 编译器（Windows 用 MSVC cl.exe，
+#    Linux 用 gcc），然后运行 scripts/build_cython.sh。
+#
+# 修复 3：原先 leaf_search / leaf_lower_bound / internal_find_child /
+#        compare_keys_bulk / leaf_range_scan 都是
+#        ``cpdef ... (const unsigned char* data, ...)``。
+#        cpdef 会同时生成 Python 可见的包装函数，而 Python 层无法把
+#        bytes/bytearray 转成 ``const unsigned char*``，编译期就会报
+#        "Cannot convert Python object to 'const unsigned char *'"。
+#        现已改为 ``const unsigned char[:]`` 内存视图签名：既保留 cpdef 的
+#        Python 可调用性，又能自动接受 bytes/bytearray/memoryview，
+#        并且因为 boundscheck=False，索引仍是裸 C 指针访问（不牺牲性能）。
+# =============================================================================
 """
 B+Tree 核心（Cython 实现）
 - 叶子节点查找
@@ -67,10 +84,12 @@ cdef inline int _leaf_sid_at(const unsigned char* data, int i) nogil:
 
 # ==================== 二分查找 ====================
 
-cpdef tuple leaf_search(const unsigned char* data, int64_t key):
+cdef tuple _leaf_search_c(const unsigned char* data, int64_t key):
     """
-    叶子节点二分查找
-    返回 (found, page_id, slot_id)
+    叶子节点二分查找（C 指针内核）
+
+    注意：这里**不能**加 nogil —— 返回 tuple 需要创建 Python 对象、
+    持有 GIL，``cdef tuple`` 函数一旦标 nogil 就无法编译。
     """
     cdef int n = _leaf_n_keys(data)
     cdef int lo = 0
@@ -91,13 +110,25 @@ cpdef tuple leaf_search(const unsigned char* data, int64_t key):
     return (False, 0, 0)
 
 
-cpdef int leaf_lower_bound(const unsigned char* data, int64_t key):
+cpdef tuple leaf_search(const unsigned char[:] data, int64_t key):
     """
-    找第一个 >= key 的位置
+    叶子节点二分查找
+    返回 (found, page_id, slot_id)
+
+    修复：原签名为 ``cpdef tuple leaf_search(const unsigned char* data, ...)``，
+    cpdef 会生成 Python 包装层，而 Python 无法把 bytes 转成
+    ``const unsigned char*``，编译期报错。现改用内存视图签名，
+    Python 侧可直接传 bytes/bytearray/memoryview。
     """
+    return _leaf_search_c(&data[0], key)
+
+
+cdef int _leaf_lower_bound_c(const unsigned char* data, int64_t key) nogil:
+    """找第一个 >= key 的位置（C 指针内核）"""
     cdef int n = _leaf_n_keys(data)
     cdef int lo = 0
     cdef int hi = n
+    cdef int mid
 
     while lo < hi:
         mid = (lo + hi) >> 1
@@ -106,6 +137,13 @@ cpdef int leaf_lower_bound(const unsigned char* data, int64_t key):
         else:
             hi = mid
     return lo
+
+
+cpdef int leaf_lower_bound(const unsigned char[:] data, int64_t key):
+    """
+    找第一个 >= key 的位置（修复 3：指针参数 → 内存视图签名）
+    """
+    return _leaf_lower_bound_c(&data[0], key)
 
 
 # ==================== 内部节点 ====================
@@ -125,10 +163,8 @@ cdef inline int _internal_first_child(const unsigned char* data) nogil:
     return _read_int32(data, PAGE_HEADER_SIZE + 2)
 
 
-cpdef int internal_find_child(const unsigned char* data, int64_t key):
-    """
-    找内部节点的子节点
-    """
+cdef int _internal_find_child_c(const unsigned char* data, int64_t key) nogil:
+    """找内部节点的子节点（C 指针内核）"""
     cdef int n = _internal_n_keys(data)
     cdef int child = _internal_first_child(data)
     cdef int i
@@ -142,15 +178,18 @@ cpdef int internal_find_child(const unsigned char* data, int64_t key):
     return child
 
 
+cpdef int internal_find_child(const unsigned char[:] data, int64_t key):
+    """
+    找内部节点的子节点（修复 3：指针参数 → 内存视图签名）
+    """
+    return _internal_find_child_c(&data[0], key)
+
+
 # ==================== 批量键比较 ====================
 
-cpdef int compare_keys_bulk(
-        const unsigned char* a, const unsigned char* b,
-        int n):
-    """
-    批量比较两个键数组
-    返回 -1 / 0 / 1
-    """
+cdef int _compare_keys_bulk_c(const unsigned char* a,
+                              const unsigned char* b, int n) nogil:
+    """批量比较两个键数组，返回 -1 / 0 / 1（C 指针内核）"""
     cdef int i
     cdef int64_t ka, kb
     for i in range(n):
@@ -163,15 +202,24 @@ cpdef int compare_keys_bulk(
     return 0
 
 
+cpdef int compare_keys_bulk(
+        const unsigned char[:] a, const unsigned char[:] b,
+        int n):
+    """
+    批量比较两个键数组
+    返回 -1 / 0 / 1
+
+    修复 3：原签名两个参数都是 ``const unsigned char*``，cpdef 无法暴露给
+    Python；现改为内存视图（调用方传 bytes 即可）。
+    """
+    return _compare_keys_bulk_c(&a[0], &b[0], n)
+
+
 # ==================== 范围扫描 ====================
 
-cpdef list leaf_range_scan(
-        const unsigned char* data,
-        int64_t start_key, int64_t end_key):
-    """
-    叶子节点范围扫描
-    返回 [(key, pid, sid), ...]
-    """
+cdef list _leaf_range_scan_c(const unsigned char* data,
+                             int64_t start_key, int64_t end_key):
+    """叶子节点范围扫描（C 指针内核；返回 list，故不能标 nogil）"""
     cdef int n = _leaf_n_keys(data)
     cdef list result = []
     cdef int i
@@ -188,6 +236,18 @@ cpdef list leaf_range_scan(
     return result
 
 
+cpdef list leaf_range_scan(
+        const unsigned char[:] data,
+        int64_t start_key, int64_t end_key):
+    """
+    叶子节点范围扫描
+    返回 [(key, pid, sid), ...]
+
+    修复 3：指针参数 → 内存视图签名。
+    """
+    return _leaf_range_scan_c(&data[0], start_key, end_key)
+
+
 # ==================== C 结构版本（更快）====================
 
 cdef class BTreeLeafView:
@@ -198,6 +258,10 @@ cdef class BTreeLeafView:
     cdef int n
 
     def __cinit__(self, bytes page_data):
+        # ⚠️ 与编译无关的隐患（本轮不改行为，仅标注）：Cython 允许把 bytes
+        #    隐式转成 const unsigned char*，但 C 字段**不持有该 bytes 的引用**，
+        #    page_data 一旦被回收，self.data 就是悬垂指针。若要真正安全，
+        #    应额外加一个 ``cdef bytes _keepalive`` 字段持有 page_data。
         self.data = page_data
         self.n = _leaf_n_keys(self.data)
 

@@ -1,10 +1,25 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
+# =============================================================================
+# ⚠️ 未在本机验证编译：本机未安装 Cython，也没有任何 C 编译器
+#    （import Cython → ModuleNotFoundError；gcc / cl / clang 全部未找到），
+#    因此本文件**从未被编译过**，以下修复只是按 Cython 语义做的静态更正。
+#    验证条件：pip install cython 且具备 C 编译器（Windows 用 MSVC cl.exe，
+#    Linux 用 gcc），然后运行 scripts/build_cython.sh。
+#
+# 额外修复（审计只列了三处，以下这处是同类必然编译失败，一并修掉）:
+#   C. _match_like 是 ``cdef`` 函数，函数体里却写了 ``import re`` ——
+#      cdef（C 函数）内不允许 Python import 语句，编译期报错。
+#      现把 ``import re`` 提到模块级（别名 _re）。
+# =============================================================================
 """
 谓词求值（Cython）
 """
 from libc.stdint cimport int64_t
 from libc.string cimport memcpy, strcmp
 from cpython.bytes cimport PyBytes_AsString
+
+# 修复 C：cdef 函数体里不能出现 import，这里提到模块级
+import re as _re
 
 
 cdef class CompiledPredicate:
@@ -109,10 +124,9 @@ cdef class CompiledPredicate:
     cdef bint _match_like(self, str s):
         """LIKE 匹配"""
         cdef str pat = self.value
-        # 简化：用 Python 正则
-        import re
+        # 简化：用 Python 正则（_re 在模块级导入，cdef 内不允许 import）
         regex = '^' + pat.replace('%', '.*').replace('_', '.') + '$'
-        return bool(re.match(regex, s))
+        return bool(_re.match(regex, s))
 
 
 cdef class PredicateSet:

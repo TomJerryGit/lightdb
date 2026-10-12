@@ -229,3 +229,114 @@ def test_aliased_join_and_aggregate():
             "SELECT * FROM users JOIN orders "
             "ON users.id = orders.user_id")
         assert len(rows) == 3
+
+
+def test_in_not_in_exists_subquery():
+    """WHERE 里的子查询条件：IN / NOT IN / EXISTS
+
+    解析器早就能产出这些条件，缺的是求值接线：执行器现在先把子查询跑一次，
+    再把条件改写成存储层能下推的等值 or / and 链（或常量真/假）。
+
+    本用例数据：users 1..3；orders 的 user_id = 1,1,2
+    → 有订单的用户 = {1,2}，无订单 = {3}
+    """
+    with _Env() as e:
+        # IN (SELECT ...)
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE id IN (SELECT user_id FROM orders)")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+        # NOT IN (SELECT ...)
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE id NOT IN (SELECT user_id FROM orders)")
+        assert [r[0] for r in rows] == [3], rows
+
+        # EXISTS：子查询非空 → 全真，users 3 行都要返回
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE EXISTS (SELECT 1 FROM orders)")
+        assert sorted(r[0] for r in rows) == [1, 2, 3], rows
+
+        # NOT EXISTS：子查询非空 → 全假
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE NOT EXISTS (SELECT 1 FROM orders)")
+        assert rows == [], rows
+
+        # 空结果集的两条边界：IN 恒假、NOT IN（含 NULL 左值语义）恒真
+        _, rows = e.q("SELECT id FROM users WHERE id IN "
+                      "(SELECT user_id FROM orders WHERE user_id > 100)")
+        assert rows == [], rows
+        _, rows = e.q("SELECT id FROM users WHERE id NOT IN "
+                      "(SELECT user_id FROM orders WHERE user_id > 100)")
+        assert len(rows) == 3, rows
+
+        # 子查询里还能有子查询
+        _, rows = e.q(
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders "
+            "WHERE user_id IN (SELECT id FROM users WHERE city = 'BJ'))")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+        # 子查询条件与普通条件 AND / OR 混用（选择性必须仍然生效）
+        _, rows = e.q(
+            "SELECT id FROM users WHERE city = 'SH' "
+            "AND id IN (SELECT user_id FROM orders)")
+        assert rows == [], rows
+        _, rows = e.q(
+            "SELECT id FROM users WHERE city = 'SH' "
+            "OR id IN (SELECT user_id FROM orders)")
+        assert sorted(r[0] for r in rows) == [1, 2, 3], rows
+
+        # 相关子查询必须明确报错，不能静默给错答案
+        r = e.ex.execute(
+            e.parser.parse(
+                "SELECT id FROM users WHERE id IN (SELECT user_id FROM "
+                "orders WHERE orders.user_id = users.id)"), {})
+        assert r.get('type') == 'error', r
+        assert '相关子查询' in r.get('message', ''), r
+
+
+def test_having_aggregate_predicate():
+    """HAVING：左值为聚合函数的谓词 + 引用非聚合列
+
+    原先 `HAVING COUNT(*) > 1` 连解析都过不去（_where 只认普通列名，
+    直接 SyntaxError）。现在解析成 {'agg': 'COUNT(*)', 'op': '>', ...}，
+    由分组阶段用聚合求值后比较。
+
+    本用例 emp：Eng 3 人 / Sales 2 人 / HR 3 人
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+                      "HAVING COUNT(*) > 2")
+        assert sorted(rows) == [('Eng', 3), ('HR', 3)], rows
+
+        _, rows = e.q("SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+                      "HAVING COUNT(*) = 2")
+        assert rows == [('Sales', 2)], rows
+
+        # HAVING 里的聚合可以不在 SELECT 列表里
+        _, rows = e.q("SELECT dept FROM emp GROUP BY dept "
+                      "HAVING SUM(salary) >= 300")
+        assert rows == [('Eng',)], rows
+
+        # HAVING 引用非聚合列
+        _, rows = e.q("SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+                      "HAVING dept = 'HR'")
+        assert rows == [('HR', 3)], rows
+
+        # HAVING 里的 AND / OR 组合
+        _, rows = e.q("SELECT dept FROM emp GROUP BY dept "
+                      "HAVING COUNT(*) > 2 AND SUM(salary) > 300")
+        assert rows == [('Eng',)], rows
+        _, rows = e.q("SELECT dept FROM emp GROUP BY dept "
+                      "HAVING COUNT(*) = 2 OR SUM(salary) < 300")
+        assert sorted(r[0] for r in rows) == ['HR', 'Sales'], rows
+
+        # 没有 GROUP BY 的 HAVING：整表算一行再过滤
+        _, rows = e.q("SELECT COUNT(*) FROM emp HAVING COUNT(*) > 5")
+        assert rows == [(8,)], rows
+        _, rows = e.q("SELECT COUNT(*) FROM emp HAVING COUNT(*) > 50")
+        assert rows == [], rows
+
+        # GROUP BY + HAVING 与 ORDER BY / LIMIT / 限定列名共存
+        _, rows = e.q("SELECT e.dept, COUNT(*) FROM emp e GROUP BY e.dept "
+                      "HAVING COUNT(*) >= 3 ORDER BY e.dept")
+        assert rows == [('Eng', 3), ('HR', 3)], rows

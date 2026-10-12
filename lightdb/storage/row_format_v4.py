@@ -22,8 +22,15 @@ class BinaryRowFormatV4:
         self.types = [(c.get('type') or 'VARCHAR').upper()
                        for c in columns]
 
-        # 是否使用 Cython
-        if _cy is not None:
+        # 是否使用「真正编译过的」Cython 加速实现
+        # 注意：_cy 现在恒不为 None（未编译时会拿到纯 Python 回退），
+        # 所以不能再拿 `_cy is not None` 当加速判据，否则会谎报在用 Cython。
+        try:
+            from ..cython import status as _cstatus
+            _accel = bool(_cstatus().get('any_accelerated'))
+        except Exception:
+            _accel = False
+        if _cy is not None and _accel:
             self.use_cython = True
             self._cy_codec = _cy.RowCodec(self.types)
         else:

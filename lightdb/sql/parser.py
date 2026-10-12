@@ -465,6 +465,26 @@ class Parser:
                 ],
             }
 
+        # 聚合谓词（HAVING 的常见形式）：
+        #   COUNT(*) > 1 / SUM(amount) >= 100 / COUNT(id) < 3
+        # 左值是聚合函数而不是普通列，_where 原先直接抛 SyntaxError，
+        # 导致 `... GROUP BY city HAVING COUNT(*) > 5` 连解析都过不去。
+        # 产出 {'agg': 'COUNT(*)', 'op': '>', 'value': 1}，聚合值由
+        # GroupBy / 统一分组路径用 _eval_agg_expr 求出后再比较。
+        am = re.match(
+            r'\s*(\w+)\s*\(\s*(\*|[^()]*?)\s*\)\s*'
+            r'(=|!=|<>|<=|>=|<|>)\s*(.+?)\s*$',
+            s, re.IGNORECASE)
+        if am:
+            op = am.group(3).upper()
+            if op == '<>':
+                op = '!='
+            return {
+                'agg': f'{am.group(1).upper()}({am.group(2).strip()})',
+                'op': op,
+                'value': am.group(4).strip().strip("'\""),
+            }
+
         # 普通比较
         m = re.match(
             r'\s*[`"]?([\w.]+)[`"]?\s*(=|!=|<>|<=|>=|<|>|LIKE)\s*(.+?)\s*$',

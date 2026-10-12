@@ -1,4 +1,11 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
+# =============================================================================
+# ⚠️ 未在本机验证编译：本机未安装 Cython，也没有任何 C 编译器
+#    （import Cython → ModuleNotFoundError；gcc / cl / clang 全部未找到），
+#    因此本文件**从未被编译过**，以下修复只是按 Cython 语义做的静态更正。
+#    验证条件：pip install cython 且具备 C 编译器（Windows 用 MSVC cl.exe，
+#    Linux 用 gcc），然后运行 scripts/build_cython.sh。
+# =============================================================================
 """
 行编解码（Cython）
 - 二进制行格式
@@ -6,8 +13,10 @@
 """
 
 from libc.stdint cimport int32_t, int64_t, uint16_t, uint8_t
+# 修复 2：encode() / encode_many() 里调用了 memset，但原先没有 cimport，
+#        编译时报 "undeclared name not builtin: memset"。
 from libc.stdlib cimport malloc, free
-from libc.string cimport memcpy, strlen
+from libc.string cimport memcpy, memset, strlen
 from cpython.bytes cimport PyBytes_FromStringAndSize, PyBytes_AsString
 
 

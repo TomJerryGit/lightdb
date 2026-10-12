@@ -16,7 +16,13 @@ class CompiledPredicateSetV4:
                  col_map: Dict[str, int]):
         self.conditions = conditions
         self.col_map = col_map
-        self.use_cython = _cy is not None
+        # _cy 恒不为 None（未编译时拿到的是纯 Python 回退），
+        # 不能拿它当加速判据，否则会谎报在用 Cython。
+        try:
+            from ..cython import status as _cstatus
+            self.use_cython = bool(_cstatus().get('any_accelerated'))
+        except Exception:
+            self.use_cython = False
 
         if self.use_cython:
             # 编译

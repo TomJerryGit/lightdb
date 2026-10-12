@@ -1,8 +1,17 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
+# =============================================================================
+# ⚠️ 未在本机验证编译：本机未安装 Cython，也没有任何 C 编译器
+#    （import Cython → ModuleNotFoundError；gcc / cl / clang 全部未找到），
+#    因此本文件**从未被编译过**，以下修复只是按 Cython 语义做的静态更正。
+#    验证条件：pip install cython 且具备 C 编译器（Windows 用 MSVC cl.exe，
+#    Linux 用 gcc），然后运行 scripts/build_cython.sh。
+# =============================================================================
 """
 哈希表（Cython 实现）
 """
-from libc.stdint cimport int64_t, uint32_t
+# 修复 1：_hash() 里用了 uint64_t，这里必须一并 cimport（原先只 cimport 了
+#        int64_t / uint32_t，编译时会报 "'uint64_t' is not a type identifier"）。
+from libc.stdint cimport int32_t, int64_t, uint32_t, uint64_t
 from libc.stdlib cimport malloc, free, calloc
 from libc.string cimport memset
 

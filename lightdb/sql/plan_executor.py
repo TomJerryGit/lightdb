@@ -21,6 +21,26 @@ from .plan import (
 )
 
 
+# 常量投影的识别（`SELECT 1 FROM orders`）——用于无法用 None 表示的字面量
+_NOT_LITERAL = object()
+
+
+def _literal_of(text):
+    """识别 SQL 字面量；不是字面量时返回 _NOT_LITERAL"""
+    t = str(text or '').strip()
+    if not t:
+        return _NOT_LITERAL
+    if re.match(r'^-?\d+$', t):
+        return int(t)
+    if re.match(r'^-?\d+\.\d+$', t):
+        return float(t)
+    if len(t) >= 2 and t[0] == "'" and t[-1] == "'":
+        return t[1:-1].replace("''", "'")
+    if t.upper() == 'NULL':
+        return None
+    return _NOT_LITERAL
+
+
 class PlanExecutor:
     """计划执行器
 
@@ -74,10 +94,14 @@ class PlanExecutor:
 
     # ==================== 条件求值（唯一定义） ====================
 
-    def _eval_condition(self, row, cols, where):
+    def _eval_condition(self, row, cols, where, agg_values=None):
         """求值 WHERE/HAVING 条件
 
         ★ 只保留这一份实现（原代码中重复定义两次）
+
+        agg_values: HAVING 语境下预先算好的聚合值 {'COUNT(*)': 3, ...}。
+        GROUP BY 之后行里只剩输出列，HAVING 引用的聚合表达式可能不在
+        SELECT 列表里，因此在分组时统一算好再传进来。
         """
         if where is None:
             return True
@@ -85,13 +109,39 @@ class PlanExecutor:
             return True
 
         if 'and' in where:
-            return all(self._eval_condition(row, cols, c)
+            return all(self._eval_condition(row, cols, c, agg_values)
                        for c in where['and'])
         if 'or' in where:
-            return any(self._eval_condition(row, cols, c)
-                       for c in where['or'])
+            parts = where['or']
+            # 空 OR 列表 = 常量假（执行器改写子查询时用这个表示）
+            if not parts:
+                return False
+            return any(self._eval_condition(row, cols, c, agg_values)
+                       for c in parts)
 
         op = where.get('op')
+
+        # ---------- 聚合谓词（HAVING）----------
+        if 'agg' in where:
+            key = str(where.get('agg', '')).strip()
+            if agg_values is not None and key in agg_values:
+                l = agg_values[key]
+            else:
+                l = self._eval_agg_expr(key, cols, [row])
+            r = where.get('value')
+            if l is None:
+                return op == '=' and r is None
+            if r is None:
+                return op == '!='
+            # 数值列 + 字符串字面量（`HAVING COUNT(*) > '1'`）也要能比
+            l, r = self._coerce_pair(l, r, op)
+            if op == '=':  return l == r
+            if op == '!=': return l != r
+            if op == '<':  return l < r
+            if op == '>':  return l > r
+            if op == '<=': return l <= r
+            if op == '>=': return l >= r
+            return False
 
         # ---------- EXISTS ----------
         if op in ('EXISTS', 'NOT EXISTS'):
@@ -279,12 +329,21 @@ class PlanExecutor:
 
         target_idx = []
         raw_cols = []
+        consts = []
         for c in node.columns:
             c = c.strip()
             if c == '*':
                 target_idx.extend(range(len(cols)))
                 raw_cols.extend(cols)
             else:
+                val = _literal_of(c)
+                if val is not _NOT_LITERAL:
+                    # 常量投影（`SELECT 1 FROM orders`）：子查询里很常见，
+                    # 原来会直接报「列 1 不存在」
+                    target_idx.append(-1)
+                    raw_cols.append(c)
+                    consts.append((len(target_idx) - 1, val))
+                    continue
                 i = self._resolve_col(cols, c)
                 target_idx.append(i)
                 raw_cols.append(cols[i])
@@ -300,7 +359,12 @@ class PlanExecutor:
                 short_cols.append(short)
                 seen[short] = True
 
-        out_rows = [[r[i] for i in target_idx] for r in rows]
+        out_rows = []
+        for r in rows:
+            out = [r[i] if i >= 0 else None for i in target_idx]
+            for pos, val in consts:
+                out[pos] = val
+            out_rows.append(out)
         return short_cols, out_rows
 
     def _exec_Sort(self, node):
@@ -372,18 +436,44 @@ class PlanExecutor:
 
         out_cols = [c.upper().strip() for c in agg_cols]
         out_rows = []
+        # HAVING 里的聚合表达式可能不在 SELECT 列表里（例如
+        # `SELECT city FROM users GROUP BY city HAVING COUNT(*) > 5`），
+        # 分组时必须先把它们算出来，否则求值时拿不到
+        having_aggs = self._collect_having_aggs(node.having)
         for gkey, grows in groups.items():
             row = self._build_group_row(agg_cols, cols, gkey, grows)
             out_rows.append(row)
 
         # HAVING
         if node.having:
-            out_rows = [
-                r for r in out_rows
-                if self._eval_condition(r, out_cols, node.having)
-            ]
+            filtered = []
+            for idx, grows in enumerate(groups.values()):
+                agg_values = {
+                    a: self._eval_agg_expr(a, cols, grows)
+                    for a in having_aggs
+                }
+                if self._eval_condition(
+                        out_rows[idx], out_cols, node.having, agg_values):
+                    filtered.append(out_rows[idx])
+            out_rows = filtered
 
         return out_cols, out_rows
+
+    @classmethod
+    def _collect_having_aggs(cls, having) -> list:
+        """收集 HAVING 条件里出现的聚合表达式（保持出现顺序、去重）"""
+        found = []
+        if isinstance(having, dict):
+            if 'agg' in having:
+                a = str(having['agg']).strip()
+                if a and a not in found:
+                    found.append(a)
+            for key in ('and', 'or'):
+                for c in (having.get(key) or []):
+                    for a in cls._collect_having_aggs(c):
+                        if a not in found:
+                            found.append(a)
+        return found
 
     def _build_group_row(self, agg_cols, src_cols, gkey, grows):
         """根据聚合表达式列表构建一行"""

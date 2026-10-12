@@ -21,6 +21,13 @@ PERF_TARGETS = {
 def test_cython_row_codec():
     """测试：Cython 行编解码性能"""
     print("\n【Cython 行编解码】")
+    # 没有编译好的扩展时 BinaryRowFormatV4 走纯 Python 回退，
+    # 拿 Python 和 Python 比出来的 ratio 没有意义（原先 `_cy is None`
+    # 让本用例成了假通过）。只有存在真正加速的编译版时断言才成立。
+    from lightdb.cython import status as _cython_status
+    if not _cython_status().get('any_accelerated'):
+        print("  ⏭ 未编译 Cython 扩展（当前为纯 Python 回退），跳过加速断言")
+        return
     from lightdb.storage.row_format import BinaryRowFormat
     from lightdb.storage.row_format_v4 import BinaryRowFormatV4
 

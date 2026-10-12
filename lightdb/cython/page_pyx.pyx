@@ -1,8 +1,24 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
+# =============================================================================
+# ⚠️ 未在本机验证编译：本机未安装 Cython，也没有任何 C 编译器
+#    （import Cython → ModuleNotFoundError；gcc / cl / clang 全部未找到），
+#    因此本文件**从未被编译过**，以下修复只是按 Cython 语义做的静态更正。
+#    验证条件：pip install cython 且具备 C 编译器（Windows 用 MSVC cl.exe，
+#    Linux 用 gcc），然后运行 scripts/build_cython.sh。
+#
+# 额外修复（审计只列了三处，以下两处是同类的必然编译失败，一并修掉）:
+#   A. RawPage.__dealloc__ 调用了 free()，但原先没有 cimport
+#      libc.stdlib.free —— 与 hash_table/row_codec 是同一类错误。
+#   B. page_n_slots 原为 ``cpdef int page_n_slots(bytes page_data) nogil``：
+#      带 Python 对象参数/返回值的函数不能标 nogil（nogil 函数体内无法
+#      操作需要 GIL 的 Python 对象），编译期报错。现把无 GIL 的内核拆到
+#      cdef 函数 _page_n_slots_c，公开函数保留 cpdef 语义。
+# =============================================================================
 """
 页操作（Cython）
 """
 from libc.stdint cimport uint16_t, uint32_t, uint64_t
+from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy, memset
 from cpython.bytes cimport PyBytes_FromStringAndSize
 
@@ -129,11 +145,24 @@ cdef class RawPage:
 
 # ==================== 无对象页操作（更快）====================
 
-cpdef int page_n_slots(bytes page_data) nogil:
-    cdef const unsigned char* data = page_data
+cdef int _page_n_slots_c(const unsigned char* data) nogil:
+    """读页内槽位数（无 GIL 内核）"""
     cdef uint16_t v
     memcpy(&v, data + 17, 2)
     return <int>v
+
+
+cpdef int page_n_slots(bytes page_data):
+    """
+    读页内槽位数
+
+    修复 B：原签名是 ``cpdef int page_n_slots(bytes page_data) nogil``。
+    带 Python 对象参数（bytes）的 cpdef 函数**不能**标 nogil，因为函数体
+    进入无 GIL 区后无法处理 Python 对象，编译期直接报错。现在内核
+    （_page_n_slots_c）保持 nogil，公开函数回到带 GIL 的 cpdef。
+    """
+    cdef const unsigned char* data = page_data
+    return _page_n_slots_c(data)
 
 
 cpdef bytes page_get_row(bytes page_data, int slot_id):

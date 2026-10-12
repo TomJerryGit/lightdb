@@ -15,6 +15,10 @@ from ..db.information_schema import InformationSchema
 from ..db.table import Table as _StorageTable
 
 
+# 哨兵：区分"调用方没传 where"与"where 被改写成恒真(None)"
+_UNSET = object()
+
+
 class _CTERelation:
     """WITH 子句物化出来的内存关系
 
@@ -263,6 +267,18 @@ class Executor:
             except Exception:
                 self._last_plan = None
 
+        # WHERE 里的子查询条件（IN/NOT IN/EXISTS）先在执行器侧求值，
+        # 改写成存储层认识的条件再下推（db/table.py 的 _match 只认
+        # and/or/column+op+value，不认 subquery）
+        has_sub = self._contains_subquery(p.get('where'))
+        where = p.get('where')
+        if has_sub:
+            try:
+                where, _ = self._rewrite_subqueries(
+                    where, s, table, p.get('table_alias'))
+            except Exception as e:
+                return self._err(1105, f"子查询求值失败: {e}")
+
         tbl = self.db.get_table(table)
 
         txn = s.get('txn')
@@ -280,15 +296,286 @@ class Executor:
             or self._where_has_qualified(p.get('where'))
             or bool(p.get('order_by')
                     and '.' in str(p['order_by'][0])))
-        if (p.get('windows') or p.get('group_by')
-                or p.get('distinct') or qualified):
-            return self._select_advanced(p, tbl, read_view=rv)
+        # 常量投影（`SELECT 1 FROM orders`）存储层认不了，必须走投影路径
+        literal = any(self._literal_value(c)[0]
+                      for c in (p.get('columns') or []) if c != '*')
+        if (p.get('windows') or p.get('group_by') or p.get('having')
+                or p.get('distinct') or qualified or literal or has_sub):
+            return self._select_advanced(p, tbl, read_view=rv, where=where)
 
         cols, rows = tbl.select(
-            p['columns'], p.get('where'),
+            p['columns'], where,
             p.get('order_by'), p.get('limit'),
             read_view=rv)
         return self._rs(cols, rows)
+
+    # ==================== 子查询条件求值（WHERE） ====================
+
+    # 常量条件的内部表示（沿用工程既有约定）：
+    #   恒假 -> {'or': []}（空 or 列表，_match 的 any([]) / _eval_condition
+    #          的 any([]) 都是 False）
+    #   恒真 -> None（条件被就地删除；带 filter 的路径也都把 None 当"无过滤"）
+    _ALWAYS_FALSE = {'or': []}
+
+    @classmethod
+    def _contains_subquery(cls, where) -> bool:
+        """WHERE 条件里是否包含 EXISTS / IN (SELECT ...)"""
+        if not isinstance(where, dict):
+            return False
+        if 'subquery' in where:
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._contains_subquery(c):
+                    return True
+        return False
+
+    @staticmethod
+    def _eq_conditions(column, values):
+        """column IN (v1,v2,...) -> {'or': [{'column':c,'op':'=','value':v}, ...]}
+
+        存储层的 _match 只有单值比较，没有 IN，因此必须展开成等值 or 链。
+        """
+        return {'or': [{'column': column, 'op': '=', 'value': v}
+                       for v in values]}
+
+    @classmethod
+    def _collect_agg_exprs(cls, having) -> list:
+        """收集 HAVING 里的聚合表达式（形如 COUNT(*) / SUM(amount)）"""
+        found = []
+        if isinstance(having, dict):
+            if 'agg' in having:
+                a = str(having['agg']).strip()
+                if a and a not in found:
+                    found.append(a)
+            for key in ('and', 'or'):
+                for c in (having.get(key) or []):
+                    for a in cls._collect_agg_exprs(c):
+                        if a not in found:
+                            found.append(a)
+        return found
+
+    def _rewrite_subqueries(self, where, session, outer_table=None,
+                            outer_alias=None, depth=0):
+        """把带子查询的条件改写成可下推的条件
+
+        返回值 (条件, 是否常量真)：
+
+        * EXISTS / NOT EXISTS：先执行一次子查询，非空即真（沿用
+          plan_executor._eval_subquery_exists 的语义），再改写成常量
+          —— 真 -> (None, True)，假 -> ({'or': []}, False)。
+        * col IN (SELECT ...)：执行子查询取第一列的值集合 v，改写成
+          `col = v1 OR col = v2 OR ...`；空集合时 IN 恒假 → {'or': []}。
+        * col NOT IN (SELECT ...)：同样取集合后改写成
+          `col != v1 AND col != v2 AND ...`；空集合时 NOT IN 恒真 → None。
+
+        相关子查询（引用外层列）不在支持范围内，遇到直接报错，
+        避免"看起来有结果其实是错答案"。
+        """
+        if not isinstance(where, dict):
+            return where, False
+        if depth > 8:
+            raise ValueError("子查询嵌套过深（>8 层）")
+
+        if 'and' in where:
+            out = []
+            for c in where['and']:
+                rc, always_true = self._rewrite_subqueries(
+                    c, session, outer_table, outer_alias, depth)
+                if rc is None or always_true:
+                    continue          # 恒真：AND 里可以直接去掉
+                out.append(rc)
+            if not out:
+                return None, True
+            if len(out) == 1:
+                return out[0], False
+            return {'and': out}, False
+
+        if 'or' in where:
+            out = []
+            for c in where['or']:
+                rc, always_true = self._rewrite_subqueries(
+                    c, session, outer_table, outer_alias, depth)
+                if rc is None or always_true:
+                    return None, True  # 有一项恒真 → 整体恒真
+                out.append(rc)
+            if not out:
+                return self._ALWAYS_FALSE, False
+            if len(out) == 1:
+                return out[0], False
+            return {'or': out}, False
+
+        op = where.get('op')
+        sub = where.get('subquery')
+
+        if 'subquery' in where and sub is not None:
+            self._check_correlated(sub, outer_table, outer_alias)
+            res = self.execute(sub, session)
+            if not isinstance(res, dict) or res.get('type') == 'error':
+                msg = (res or {}).get('message', '未知错误')
+                raise ValueError(f"子查询执行失败: {msg}")
+            rows = res.get('rows') or []
+
+            if op in ('EXISTS', 'NOT EXISTS'):
+                exists = len(rows) > 0
+                if op == 'NOT EXISTS':
+                    exists = not exists
+                if exists:
+                    return None, True
+                return self._ALWAYS_FALSE, False
+
+            if op in ('IN', 'NOT IN'):
+                column = where.get('column')
+                if not isinstance(column, str) or not column:
+                    raise ValueError("IN 子查询缺少左值列")
+                values, seen = [], set()
+                for r in rows:
+                    if not r:
+                        continue
+                    k = (type(r[0]).__name__, r[0])
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    values.append(r[0])
+
+                neg = (op == 'NOT IN')
+                if neg:
+                    # NOT IN 空集合恒真（含 NULL 左值，语义上也是真）
+                    if not values:
+                        return None, True
+                    return {'and': [{'column': column, 'op': '!=',
+                                     'value': v} for v in values]}, False
+                if not values:
+                    return self._ALWAYS_FALSE, False
+                return self._eq_conditions(column, values), False
+
+        # 兜底：结构上不像已知形态，原样返回（保持旧行为）
+        rw = dict(where)
+        rw.pop('subquery', None)
+        return rw, False
+
+    @staticmethod
+    def _referenced_columns(where, out=None):
+        """递归收集条件里引用到的列名（含有子查询）
+
+        比较条件的右侧也可能是列（`orders.user_id = users.id`），
+        带点号又没被引号包起来的一律按限定列名收集，供相关子查询检测用。
+        """
+        if out is None:
+            out = []
+        if not isinstance(where, dict):
+            return out
+        col = where.get('column')
+        if isinstance(col, str) and col:
+            out.append(col)
+        val = where.get('value')
+        if (isinstance(val, str) and '.' in val
+                and not val.startswith(("'", '"'))
+                and re.match(r'^[\w.]+$', val)):
+            out.append(val)
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                Executor._referenced_columns(c, out)
+        if isinstance(where.get('subquery'), dict):
+            Executor._referenced_columns(where['subquery'], out)
+        return out
+
+    def _subquery_ast_columns(self, sub, root=True) -> list:
+        """取子查询 AST 里出现的所有列引用（SELECT/WHERE/HAVING/JOIN ON）"""
+        if not isinstance(sub, dict):
+            return []
+        cmds = sub.get('segments')
+        if cmds:
+            out = []
+            for c in cmds:
+                out.extend(self._subquery_ast_columns(c, root=False))
+            return out
+
+        cols = []
+        for c in (sub.get('columns') or []):
+            for part in str(c).split(','):
+                part = part.strip()
+                if not part or part == '*' or '(' in part:
+                    continue
+                cols.append(part)
+        cols.extend(self._referenced_columns(sub.get('where')))
+        cols.extend(self._referenced_columns(sub.get('having')))
+        for j in (sub.get('joins') or []):
+            for k in (j.get('on') or {}).values():
+                if isinstance(k, str):
+                    cols.append(k)
+        return cols
+
+    @staticmethod
+    def _qualified_owner(text) -> str:
+        """`users.id` -> 'users'；裸列名 -> ''"""
+        t = str(text or '').strip().strip('`"')
+        if '.' in t and re.match(r'^[\w.]+$', t):
+            return t.rsplit('.', 1)[0].lower()
+        return ''
+
+    def _check_correlated(self, sub, outer_table, outer_alias=None):
+        """相关子查询检测：子查询引用了外层表的列就直接报错
+
+        判据：
+        1. 列名限定符等于外层表名、且不是子查询自己的表/别名 —— 外层引用；
+        2. WHERE 里的裸列名在子查询表里不存在，却在外层表里存在 —— 外层引用。
+        （`SELECT 1 FROM orders`、`SELECT user_id FROM orders WHERE id > 0`
+        这类自洽子查询一律放行。）
+        """
+        if not outer_table:
+            return
+        outers = {str(outer_table).lower()}
+        if outer_alias:
+            outers.add(str(outer_alias).lower())
+
+        # 子查询自身可用的限定符（表名 + 别名 + JOIN 进来的表）
+        inner_names = set()
+        for key in ('table', 'table_alias'):
+            if sub.get(key):
+                inner_names.add(str(sub[key]).lower())
+        for j in (sub.get('joins') or []):
+            for key in ('table', 'alias'):
+                if j.get(key):
+                    inner_names.add(str(j[key]).lower())
+
+        for c in self._subquery_ast_columns(sub):
+            owner = self._qualified_owner(c)
+            # 限定符是外层表名/别名，而子查询自己并没有同名表/别名 → 外层引用
+            if owner and owner in outers and owner not in inner_names:
+                raise ValueError(
+                    f"不支持相关子查询（引用了外层列 {c}）")
+
+        inner = sub.get('table')
+        inner_cols = set()
+        if inner:
+            try:
+                inner_tbl = self.db.get_table(inner)
+                inner_cols = {col['name'].lower() for col in inner_tbl.cols}
+            except KeyError:
+                pass
+
+        outer_cols = set()
+        try:
+            outer_tbl = self.db.get_table(outer_table)
+            outer_cols = {col['name'].lower() for col in outer_tbl.cols}
+        except KeyError:
+            pass
+
+        if not inner_cols or not outer_cols:
+            return
+
+        # 裸列名（不带限定符）只在子查询表里找不到、只在外层表里存在时，
+        # 才可以断定是外层引用 —— 避免把 `SELECT id FROM orders` 这种
+        # 同名自洽子查询误判成相关子查询。只看 WHERE：
+        # SELECT 列表里的裸列名属于投影，不是条件。
+        for c in self._referenced_columns(sub.get('where')):
+            c = str(c).strip().strip('`"')
+            if '.' in c:
+                continue
+            if c.lower() not in inner_cols and c.lower() in outer_cols:
+                raise ValueError(
+                    f"不支持相关子查询（列 {c} 只在子查询外的表里存在）")
 
     # ==================== CTE / 窗口函数 ====================
 
@@ -351,15 +638,19 @@ class Executor:
         cols, rows = src.select(['*'], where, None, None, read_view)
         return list(cols), [list(r) for r in rows]
 
-    def _select_advanced(self, p, src, read_view=None):
+    def _select_advanced(self, p, src, read_view=None, where=_UNSET):
         """GROUP BY / 窗口函数 / 普通投影的统一执行路径
 
         分组与窗口都必须先拿到「全部列的行」，因此流程固定为：
         取基础行 → （可选）分组聚合 → （可选）计算窗口 → 投影 → DISTINCT/ORDER BY/LIMIT。
+
+        where: WHERE 子查询求值改写后的条件。默认 _UNSET 表示"调用方没改写"，
+        此时用 p['where']；显式传 None 表示"条件已被改写成恒真、不再需要过滤"。
         """
+        src_where = p.get('where') if where is _UNSET else where
         base_cols, rows = self._base_rows_and_cols(
-            src, self._normalize_where(p.get('where')), read_view)
-        if p.get('group_by'):
+            src, self._normalize_where(src_where), read_view)
+        if p.get('group_by') or p.get('having'):
             base_cols, rows = self._group_rows(p, src, base_cols, rows)
         if p.get('windows'):
             return self._apply_windows(p, base_cols, rows)
@@ -422,6 +713,13 @@ class Executor:
         # 计算用归一化后的表达式，输出列名保留用户原样（含表别名）
         agg_eval = [self._strip_qualifier(c) for c in agg_cols]
 
+        having = p.get('having')
+        having_aggs = self._collect_agg_exprs(having)
+        eval_cols = list(agg_eval)
+        for a in having_aggs:
+            if a not in eval_cols:
+                eval_cols.append(a)
+
         groups, order = {}, []
         for r in rows:
             key = tuple(r[i] for i in kidx)
@@ -433,12 +731,104 @@ class Executor:
         out_rows = []
         for key in order:
             vals = list(key)
-            if agg_eval:
+            agg_vals = {}
+            if eval_cols:
                 # 复用存储层的聚合实现（Table._aggregate）
-                vals += list(_StorageTable._aggregate(
-                    src, groups[key], agg_eval))
+                agg_vals = dict(zip(
+                    eval_cols,
+                    list(_StorageTable._aggregate(
+                        src, groups[key], eval_cols))))
+                vals += list(agg_vals[a] for a in agg_eval)
+            if having:
+                # HAVING 的聚合值单独备好：可能不在 SELECT 列表里
+                # （`SELECT city FROM users GROUP BY city HAVING COUNT(*)>5`），
+                # 此时 SELECT 输出里没有这一列，必须由 agg_vals 提供
+                extra = {a: agg_vals.get(a) for a in having_aggs}
+                if not self._eval_condition(
+                        vals, list(keys) + list(eval_cols), having, extra):
+                    continue
             out_rows.append(vals)
         return keys + agg_cols, out_rows
+
+    # ==================== 条件求值（统一路径） ====================
+
+    def _eval_condition(self, row, cols, where, agg_values=None):
+        """统一路径上的 WHERE/HAVING 条件求值
+
+        只处理分组后还要再过滤的场景（HAVING），因此实现得比
+        plan_executor._eval_condition 窄：and/or/agg/普通比较。
+        """
+        if where is None:
+            return True
+        if not isinstance(where, dict):
+            return True
+
+        if 'and' in where:
+            return all(self._eval_condition(row, cols, c, agg_values)
+                       for c in where['and'])
+        if 'or' in where:
+            parts = where['or']
+            if not parts:
+                return False
+            return any(self._eval_condition(row, cols, c, agg_values)
+                       for c in parts)
+
+        op = where.get('op')
+        if 'agg' in where:
+            key = str(where.get('agg', '')).strip()
+            # 分组时已经算好（normalize 过、位于 cols 里的聚合列也能按名取到）
+            l = None
+            if agg_values is not None and key in agg_values:
+                l = agg_values[key]
+            else:
+                i = self._col_index_of(cols, key)
+                if 0 <= i < len(row):
+                    l = row[i]
+            r = where.get('value')
+            if l is None:
+                return op == '=' and r is None
+            if r is None:
+                return op == '!='
+            try:
+                if isinstance(l, (int, float)) and isinstance(r, str):
+                    r = float(r) if '.' in r else int(r)
+            except (TypeError, ValueError):
+                pass
+            if op == '=':  return l == r
+            if op == '!=': return l != r
+            if op == '<':  return l < r
+            if op == '>':  return l > r
+            if op == '<=': return l <= r
+            if op == '>=': return l >= r
+            return False
+
+        col = where.get('column')
+        if not isinstance(col, str):
+            return True
+        i = self._col_index_of(cols, col)
+        if i < 0:
+            return False
+        l = row[i] if i < len(row) else None
+        r = where.get('value')
+        if l is None:
+            return op == '=' and r is None
+        if r is None:
+            return op == '!='
+        try:
+            if isinstance(l, (int, float)) and isinstance(r, str):
+                r = float(r) if '.' in r else int(r)
+        except (TypeError, ValueError):
+            pass
+        if op == '=':  return l == r
+        if op == '!=': return l != r
+        if op == '<':  return l < r
+        if op == '>':  return l > r
+        if op == '<=': return l <= r
+        if op == '>=': return l >= r
+        if op == 'LIKE':
+            pat = str(r).replace('%', '.*').replace('_', '.')
+            return bool(re.match('^' + pat + '$', str(l)))
+        return False
 
     def _project_rows(self, p, base_cols, rows):
         """把行按 SELECT 列表投影成输出列"""
@@ -456,19 +846,59 @@ class Executor:
             projection = expanded
 
         out_cols, idx = [], []
+        consts = []
         for kind, text in projection:
             if kind == 'win':
                 continue
             expr, alias = self._split_alias(str(text))
             out_cols.append(alias or self._strip_qualifier(expr))
-            idx.append(self._col_index_of(base_cols, str(text)))
+            is_lit, val = self._literal_value(expr)
+            if is_lit:
+                # 字面量列（`SELECT 1 FROM orders`）只出现在常量投影里
+                idx.append(-1)
+                consts.append((len(idx) - 1, val))
+            else:
+                idx.append(self._col_index_of(base_cols, str(text)))
 
-        out_rows = [[r[i] if 0 <= i < len(r) else None for i in idx]
-                    for r in rows]
+        out_rows = []
+        for r in rows:
+            out = [r[i] if 0 <= i < len(r) else None for i in idx]
+            for pos, val in consts:
+                out[pos] = val
+            out_rows.append(out)
         return self._finish_select(p, out_cols, out_rows)
+
+    @staticmethod
+    def _literal_value(text):
+        """识别 SQL 字面量，返回 (是否字面量, 值)
+
+        子查询里常见的 `SELECT 1 FROM orders` / `SELECT 'x' FROM t`
+        原来会被当成列名，报 `列 1 不存在`，导致 EXISTS 子查询直接失败
+        （错误信息是 err(1146)，外面看起来还像"表不存在"）。
+        """
+        t = str(text or '').strip()
+        if not t:
+            return False, None
+        if re.match(r'^-?\d+$', t):
+            return True, int(t)
+        if re.match(r'^-?\d+\.\d+$', t):
+            return True, float(t)
+        if len(t) >= 2 and t[0] == "'" and t[-1] == "'":
+            return True, t[1:-1].replace("''", "'")
+        if t.upper() in ('NULL',):
+            return True, None
+        return False, None
 
     def _select_from_relation(self, p, s, rel):
         """从 CTE 内存关系里查询"""
+        where = p.get('where')
+        if self._contains_subquery(where):
+            try:
+                where, _ = self._rewrite_subqueries(
+                    where, s, rel.name, p.get('table_alias'))
+            except Exception as e:
+                return self._err(1105, f"子查询求值失败: {e}")
+            return self._select_advanced(p, rel, where=where)
         return self._select_advanced(p, rel)
 
     def _apply_windows(self, p, base_cols, rows):
