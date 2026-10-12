@@ -386,17 +386,36 @@ GROUP BY 与 DISTINCT 属于**静默错答**：不报错、结果错。仓库自
 顺带修掉 [`vectorized_engine.py:45`](../lightdb/olap/vectorized_engine.py#L45) 的 `store.scan` → `self.store.scan`（未定义名字，构造 `VectorizedScan` 直接 `NameError`，是 OLAP 向量化不可用的直接原因；解掉该报错后向量化路径仍受 COUNT 计 NULL、AVG 未实现等问题限制）。
 
 ### 16.3 仍未支持（诚实清单）
-
 - `WHERE ... IN (SELECT ...)`、`NOT IN (SELECT ...)`、`EXISTS`（后者目前是「子查询非空即全真」的简化实现）
 - `HAVING`（解析器无法处理 `HAVING COUNT(*) > 1` 这类聚合谓词）
-- **带表别名的 JOIN**：`FROM users u JOIN orders o ON ...` 里的 JOIN 会被解析器丢弃（只认 `FROM users JOIN orders`），于是查询退化成单表聚合——这属于静默错答，已确认；顺带导致 `tests/test_batch7.py::test_tpch_simplified` 失败（该用例此前"通过"是因为表为空、`_aggregate` 短路成 None，属于假通过）
-- JOIN 上的聚合（`plan_executor` 无法解析 `SUM(o.amount)` 这类投影）
+- ~~带表别名的 JOIN~~ / ~~JOIN 上的聚合~~ —— **已在后续会话修复**，见 §16.5
 - `LIMIT n OFFSET m` 的 OFFSET、递归 CTE（能解析，结果不保证）
 - 窗口帧（`ROWS BETWEEN ...`）、`FIRST_VALUE/LAST_VALUE/NTILE`
 
 ### 16.4 顺带修掉的测试环境问题
 
 新增 [`tests/conftest.py`](../tests/conftest.py)：把标准流改成「无法编码的字符就替换」。中文 Windows 控制台是 GBK，而测试里有 1800 多处 `print` 带 emoji；这类 `UnicodeEncodeError` 会**在 `db.shutdown()` 之前**中断测试，插入的数据还留在 BufferPool 内存里没落盘，导致后续共用同一数据目录的测试读到空表（这正是 `test_batch7.py::test_union` 长期失败的真正原因）。
+
+### 16.5 带表别名的 JOIN 与 JOIN 聚合（后续会话补）
+
+**根因**：解析器不认识表别名。吃完 `FROM users` 之后再遇到 ` u JOIN orders o ...`，JOIN 正则要求紧跟 `JOIN`，于是在 `u` 处匹配失败 → **整个 JOIN 被静默丢弃**，查询退化成单表查询；而优化器与 `plan_executor` 本来就实现了 `HashJoin` / `NestedLoopJoin` / `GroupBy` / `_resolve_col`（含限定名与歧义检测），能力一直是有的。
+
+**修法**：
+1. 解析器吃可选别名（`u` 或 `AS u`），带关键字黑名单（`JOIN`/`WHERE`/`GROUP`/... 不能被当成别名），别名随 `table_alias` / `joins[i]['alias']` 进入 AST。
+2. 优化器把别名传进 `SeqScan`，`_exec_SeqScan` 的列前缀改用别名（`u.id` 而不是 `users.id`）——否则两表同名列会被 `_resolve_col` 判成歧义。
+3. 单表路径：带限定名的列/条件/排序（`SELECT u.name ... WHERE u.city=?`）原先因存储层只认裸列名而报「列不存在」；现在统一归一化（只改 `column` 字段，`value` 原样保留），并让带限定引用的单表查询走统一高级路径，输出列名按裸名给出（MySQL 风格）。
+
+**实测**（Lead 自测 9 项全通过）：
+
+| 用例 | 结果 |
+|---|---|
+| `SELECT u.city, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id=o.user_id GROUP BY u.city` | `[('BJ',3,60),('SH',3,150)]` |
+| 两表同名列限定投影 `SELECT u.id, o.user_id ...` | 6 行，不报歧义 |
+| `LEFT JOIN` 未匹配行 | `('e', None)` 保留 |
+| 别名单表 `WHERE u.city='BJ'` / `GROUP BY u.city` / `ORDER BY u.name` | ✅ |
+| 无别名 JOIN、普通单表查询、窗口函数 | ✅ 无回归 |
+
+回归测试：`tests/test_v4_sql_features.py::test_aliased_join_and_aggregate`。顺带说明：`tests/test_batch7.py::test_tpch_simplified` 与 `tests/test_batch6.py::test_explain_join` 是两个**过时/环境相关**用例——前者此前"通过"是因为表为空时 `_aggregate` 短路成 `None`（假通过），后者期望的「计划树文本」与 `EXPLAIN` 实际返回的 MySQL 风格表格（`cols=[id, select_type, table, ...]`，`row[0]` 恒为 int）不符，从来不可能通过。
 
 ---
 

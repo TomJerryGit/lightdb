@@ -32,6 +32,7 @@
 - **打包与容器**：[`pyproject.toml`](pyproject.toml) 现在会打包 `lightdb` 并补上 `lightdb-server` 入口，Dockerfile 不再 COPY 不存在的 `main.py`。
 - **多进程模式已接线可用**：[`master.py`](lightdb/net/master.py) 现在会建立每 Worker 的连接队列与响应队列、运行执行服务线程、绑定端口并把 accept 到的连接交给 Worker；[`worker.py`](lightdb/net/worker.py) 通过 RPC 把 SQL 交回 Master 执行，连接句柄用 `socket.share/fromshare` 跨进程交接（Windows）。
 - **SQL 能力补齐（窗口函数 / CTE / UNION）**：[`parser.py`](lightdb/sql/parser.py) 新增 `WITH [RECURSIVE] ... AS (...)` 与 `FUNC(...) OVER (PARTITION BY ... ORDER BY ...)` 解析，[`executor.py`](lightdb/sql/executor.py) 新增 UNION / UNION ALL 执行分支与窗口计算（ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / SUM / AVG / COUNT / MIN / MAX）。同时修掉两个**静默错答**：`GROUP BY` 原先被完全忽略（`SELECT dept, COUNT(*) ... GROUP BY dept` 退化成全表一行）、`DISTINCT` 只在解析器里记录而执行路径从未使用。回归测试见 [`tests/test_v4_sql_features.py`](tests/test_v4_sql_features.py)。
+- **带表别名的 JOIN 与 JOIN 聚合可用**：原先解析器不认识表别名，`FROM users u JOIN orders o ON ...` 的 JOIN 会被**静默丢弃**、查询退化成单表查询（返回看似正常但错误的结果）。现在别名会贯通解析器 → 优化器 → 扫描节点（列前缀用别名，两表同名列不再歧义），实测 `SELECT u.city, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.city` 返回 `[('BJ',3,60),('SH',3,150)]`，LEFT JOIN 正确保留未匹配行，`WHERE`/`GROUP BY`/`ORDER BY` 里的限定名（`u.city`）也已支持。
 
 **SQL 实测**（同实例、真实执行器）：窗口 4 项、CTE 4 项、UNION 4 项、GROUP BY/DISTINCT 4 项、普通路径回归 4 项 —— **17/17 通过**。
 
@@ -59,9 +60,9 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**：**163 通过 / 105 失败**（修复前 150 / 118）。剩余失败中约 32 个来自沙箱限制（禁止写工作区外文件、禁止多进程原语），其余是真实待修项：SQL 解析器不支持 CTE/窗口函数/UNION（`KeyError: 'rows'`）、OLAP 向量化引擎 [`vectorized_engine.py:45`](lightdb/olap/vectorized_engine.py#L45) 的 `NameError`、并行执行无加速等。
+**测试套件**：**203 通过 / 86 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：`IN (SELECT ...)`/`EXISTS` 子查询与 `HAVING` 不支持、OLAP 向量化路径仍受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
 
-**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；`WHERE ... IN (SELECT ...)` / `EXISTS` 子查询、`HAVING`、带表别名的 JOIN（解析器会丢弃别名后的 JOIN）、JOIN 上的聚合、`OFFSET`、递归 CTE 仍不支持；OLAP 向量化引擎与 Cython 仍未接入主路径；`LIKE`/`IS NULL` 之外的谓词能力有限。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
+**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；`WHERE ... IN (SELECT ...)` / `EXISTS` 子查询、`HAVING`、窗口帧（`ROWS BETWEEN`）、`LIMIT ... OFFSET` 的 OFFSET、递归 CTE 仍不支持；OLAP 向量化引擎与 Cython 仍未接入主路径；`LIKE`/`IS NULL` 之外的谓词能力有限；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 
 ---
 
