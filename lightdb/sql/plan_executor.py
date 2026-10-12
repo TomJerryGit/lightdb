@@ -108,6 +108,14 @@ class PlanExecutor:
         if not isinstance(where, dict):
             return True
 
+        # NOT (...)：整体取反（三值语义下 UNKNOWN 取反仍是 UNKNOWN）
+        if isinstance(where.get('not'), dict):
+            inner = self._eval_condition(
+                row, cols, where['not'], agg_values)
+            if inner is None:
+                return None
+            return not inner
+
         if 'and' in where:
             return all(self._eval_condition(row, cols, c, agg_values)
                        for c in where['and'])
@@ -490,6 +498,12 @@ class PlanExecutor:
                 a = str(having['agg']).strip()
                 if a and a not in found:
                     found.append(a)
+            # NOT (...) 里也可能藏着聚合（`HAVING NOT (COUNT(*) > 1)`）
+            inner = having.get('not')
+            if isinstance(inner, dict):
+                for a in cls._collect_having_aggs(inner):
+                    if a not in found:
+                        found.append(a)
             for key in ('and', 'or'):
                 for c in (having.get(key) or []):
                     for a in cls._collect_having_aggs(c):

@@ -324,10 +324,23 @@ class Executor:
         # 常量投影（`SELECT 1 FROM orders`）存储层认不了，必须走投影路径
         literal = any(self._literal_value(c)[0]
                       for c in (p.get('columns') or []) if c != '*')
+        # 投影列表里的算术表达式（`SELECT salary*2 AS d`）：存储层只认
+        # 列名，直接下推会报「列 salary*2 不存在」，必须走投影路径由
+        # _project_rows 的 _parse_arith / _eval_arith 求值
+        arith = any(self._arith_projection_expr(c) is not None
+                    for c in (p.get('columns') or []) if c != '*')
+        # WHERE 里的 NOT (...)：存储层 _match 只认 and/or/column+op+value，
+        # 遇到 {'not': ...} 直接 KeyError，必须走统一求值路径
+        has_not = self._where_has_not(p.get('where'))
+        has_null = self._where_has_is_null(p.get('where'))
+        # 归一化后仍残留 negate 标记（LIKE 取反等存储层无法表达的形态）：
+        # `_base_rows_and_cols` 会在取到行之后自己做三值过滤
+        if self._where_has_negate(self._normalize_where(where)):
+            has_not = True
         if (p.get('windows') or p.get('group_by') or p.get('having')
-                or p.get('distinct') or qualified or literal or has_sub):
+                or p.get('distinct') or qualified or literal or has_sub
+                or arith or has_not or has_null):
             return self._select_advanced(p, tbl, read_view=rv, where=where)
-
         cols, rows = tbl.select(
             p['columns'], where,
             p.get('order_by'),
@@ -352,10 +365,13 @@ class Executor:
 
     @classmethod
     def _contains_subquery(cls, where) -> bool:
-        """WHERE 条件里是否包含 EXISTS / IN (SELECT ...)"""
+        """WHERE 条件里是否包含 EXISTS / IN (SELECT ...) / 标量子查询"""
         if not isinstance(where, dict):
             return False
         if 'subquery' in where:
+            return True
+        inner = where.get('not')
+        if isinstance(inner, dict) and cls._contains_subquery(inner):
             return True
         for key in ('and', 'or'):
             for c in (where.get(key) or []):
@@ -381,6 +397,12 @@ class Executor:
                 a = str(having['agg']).strip()
                 if a and a not in found:
                     found.append(a)
+            # NOT (...) 里也可能藏着聚合（`HAVING NOT (COUNT(*) > 1)`）
+            inner = having.get('not')
+            if isinstance(inner, dict):
+                for a in cls._collect_agg_exprs(inner):
+                    if a not in found:
+                        found.append(a)
             for key in ('and', 'or'):
                 for c in (having.get(key) or []):
                     for a in cls._collect_agg_exprs(c):
@@ -402,13 +424,27 @@ class Executor:
         * col NOT IN (SELECT ...)：同样取集合后改写成
           `col != v1 AND col != v2 AND ...`；空集合时 NOT IN 恒真 → None。
 
-        相关子查询（引用外层列）不在支持范围内，遇到直接报错，
-        避免"看起来有结果其实是错答案"。
+        相关子查询（引用外层列）：本方法没有外层行可折叠，遇到直接报错，
+        避免"看起来有结果其实是错答案"。真正需要逐外层行求值的场景走
+        `_select_correlated` → `_eval_correlated_predicate`（外层列常量折叠
+        + 复用正常执行路径）。
         """
         if not isinstance(where, dict):
             return where, False
         if depth > 8:
             raise ValueError("子查询嵌套过深（>8 层）")
+
+        # NOT (...)：整体取反。恒真/恒假的判定要跟着翻过来。
+        if 'not' in where:
+            inner = where['not']
+            if self._contains_subquery(inner):
+                rc, always_true = self._rewrite_subqueries(
+                    inner, session, outer_table, outer_alias, depth)
+                if rc is None or always_true:
+                    return self._ALWAYS_FALSE, False
+                if rc == self._ALWAYS_FALSE:
+                    return None, True
+            return {'not': rc if rc is not None else self._ALWAYS_FALSE}, False
 
         if 'and' in where:
             out = []
@@ -761,7 +797,30 @@ class Executor:
         return -1
 
     def _base_rows_and_cols(self, src, where, read_view=None):
-        """取「全部列 + 过滤后的行」；src 可以是 Table 或 _CTERelation"""
+        """取「全部列 + 过滤后的行」；src 可以是 Table 或 _CTERelation
+
+        条件里若残留 `{'negate': ...}`（NOT 作用在 LIKE 这类存储层没有
+        取反运算符的形态上），先取全部行再用执行器自己的统一求值器过滤
+        —— 三值语义（NOT UNKNOWN 仍是 UNKNOWN）也由它负责，
+        不会因为 `NOT (c LIKE ...)` 把 NULL 行错误地放行。
+        """
+        if isinstance(where, dict) and 'negate' in where \
+                and isinstance(where['negate'], dict):
+            target = where['negate']
+            if isinstance(src, _CTERelation):
+                cols = list(src.col_names)
+                rows = [list(r) for r in src.rows]
+            else:
+                cols, rows = src.select(['*'], None, None, None, read_view)
+                cols, rows = list(cols), [list(r) for r in rows]
+            kept = []
+            for r in rows:
+                # 三值逻辑：NOT 只在「内层确定为假」时为真；
+                # 内层为 None（UNKNOWN，例如 `NULL LIKE 'A%'`）时不通过，
+                # 与 `is False` 的判定天然一致
+                if self._eval_condition(r, cols, target) is False:
+                    kept.append(r)
+            return cols, kept
         if isinstance(src, _CTERelation):
             rows = [list(r) for r in src.rows]
             if where:
@@ -830,9 +889,22 @@ class Executor:
 
         存储层的 Table._match 只认裸列名；只改 column 字段，
         value 原样保留（字符串常量里也可能含点）。
+
+        `NOT (...)` 存储层完全不认识（`_match` 只认 and/or/column+op+value，
+        遇到 {'not':...} 会 KeyError），因此这里把它改写成等价的德摩根形式：
+            NOT (A AND B)  ->  OR(NOT A, NOT B)
+            NOT (A OR  B)  ->  AND(NOT A, NOT B)
+            NOT (col = v)  ->  col != v
+        叶子比较一律**先取反再交给存储层**（not op），
+        这样 `_base_rows_and_cols` 传给存储层的条件永远是它能认的形态，
+        既避免了 KeyError，也让 NOT 条件能享受存储层的索引/下推，
+        不必把整表读进内存再过滤。
         """
         if not isinstance(where, dict):
             return where
+        if isinstance(where.get('not'), dict):
+            return self._negate_condition(
+                self._normalize_where(where['not']))
         if 'and' in where:
             return {'and': [self._normalize_where(c)
                             for c in where['and']]}
@@ -844,10 +916,51 @@ class Executor:
             out['column'] = self._strip_qualifier(out['column'])
         return out
 
+    # 比较运算符的取反表（>= / <= 的取反要保留等号）
+    _NOT_OP = {
+        '=': '!=', '!=': '=', '<': '>=', '>': '<=',
+        '<=': '>', '>=': '<',
+    }
+
+    @classmethod
+    def _negate_condition(cls, where):
+        """对**已归一化**的条件取反（德摩根律），产出存储层认识的条件"""
+        if not isinstance(where, dict):
+            return where
+        if 'and' in where:
+            return {'or': [cls._negate_condition(c) for c in where['and']]}
+        if 'or' in where:
+            return {'and': [cls._negate_condition(c) for c in where['or']]}
+        if isinstance(where.get('not'), dict):
+            return cls._negate_condition(where['not'])
+        op = where.get('op')
+        val = where.get('value')
+        if 'column' in where and op in cls._NOT_OP:
+            # `NOT (c IS NULL)` 即 `c IS NOT NULL`：value=None 保持不变，
+            # 只翻转运算符（=' -> '!=、'!=' -> '='），NULL 语义自动对齐
+            return {'column': where.get('column'),
+                    'op': cls._NOT_OP[op],
+                    'value': val}
+        if 'agg' in where and op in cls._NOT_OP:
+            return {'agg': where.get('agg'), 'op': cls._NOT_OP[op],
+                    'value': val}
+        if op in ('IN', 'NOT IN'):
+            # IN 列表 / IN (子查询) 直接翻转 IN ↔ NOT IN：三值语义由
+            # _in_predicate / _rewrite_in_lists 负责，含 NULL 时同样正确
+            return {'column': where.get('column'),
+                    'op': 'NOT IN' if op == 'IN' else 'IN',
+                    'values': where.get('values'),
+                    'subquery': where.get('subquery')}
+        # 其它形态（LIKE 等）存储层没有取反运算符：打上 negate 标记，
+        # 由 `_base_rows_and_cols` 取全部行后用统一求值器做三值过滤
+        return {'negate': dict(where)}
+
     def _where_has_qualified(self, where) -> bool:
         """WHERE 里是否出现 `u.city` 这类限定列名"""
         if not isinstance(where, dict):
             return False
+        if 'not' in where:
+            return self._where_has_qualified(where['not'])
         if 'and' in where:
             return any(self._where_has_qualified(c)
                        for c in where['and'])
@@ -856,6 +969,86 @@ class Executor:
                        for c in where['or'])
         col = where.get('column')
         return isinstance(col, str) and '.' in col
+
+    @classmethod
+    def _where_has_not(cls, where) -> bool:
+        """WHERE 里是否出现 `NOT (...)` 节点
+
+        存储层 `Table._match` 只认 and/or/column+op+value，遇到
+        `{'not': ...}` 会直接 KeyError（外层看起来像"表不存在"）。
+        只要出现 NOT 就让查询走统一求值路径 `_eval_condition`。
+        """
+        if not isinstance(where, dict):
+            return False
+        if isinstance(where.get('not'), dict):
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._where_has_not(c):
+                    return True
+        return False
+
+    @classmethod
+    def _where_has_negate(cls, where) -> bool:
+        """条件里是否残留 negate 标记（存储层无法表达的 NOT 取反）
+
+        例如 `NOT (name LIKE 'A%')`：LIKE 没有取反运算符，_negate_condition
+        只能标成 {'negate': {...}}，由 _base_rows_and_cols 用执行器自己的
+        三值求值器过滤。
+        """
+        if not isinstance(where, dict):
+            return False
+        if isinstance(where.get('negate'), dict):
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._where_has_negate(c):
+                    return True
+        return False
+
+    @classmethod
+    def _where_has_is_null(cls, where) -> bool:
+        """WHERE 里是否出现字面量 NULL 比较（`col IS NULL` / `IS NOT NULL`）
+
+        解析器把 IS [NOT] NULL 编码成 value=None 的 =/!= 条件。存储层
+        `Table._match` 虽然能求值，但 `_find_pks` 会用
+        `coerce(None, col_type)` 走索引/主键快路径，结果把 NULL 当成
+        默认值（`amount IS NULL` 返回 0 行、`IS NOT NULL` 返回全部行）。
+        因此含字面量 NULL 的条件统一走执行器的统一求值路径。
+        """
+        if not isinstance(where, dict):
+            return False
+        if 'not' in where:
+            return cls._where_has_is_null(where['not'])
+        if 'value' in where and where.get('value') is None \
+                and 'column' in where:
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._where_has_is_null(c):
+                    return True
+        return False
+
+    @classmethod
+    def _arith_projection_expr(cls, text):
+        """投影项是否是算术表达式（可带 AS 别名），是则返回表达式文本
+
+        `salary*2 AS d` → 'salary*2'；`id` → None；`2*salary` → '2*salary'。
+        要求至少一侧是列名，纯常量算式（`SELECT 1+2`）不在此列（走常量投影）。
+        """
+        expr, _ = cls._split_alias(str(text))
+        spec = cls._parse_arith(expr)
+        if spec is None:
+            return None
+        left, _, right = spec
+        if not (cls._is_plain_literal(left) and cls._is_plain_literal(right)):
+            return expr.strip()
+        return None
+
+    @staticmethod
+    def _is_plain_literal(tok) -> bool:
+        """操作数是否是数字字面量（`2` / `-1.5`）"""
+        return bool(re.match(r'^-?\d+(?:\.\d+)?$', str(tok)))
 
     def _group_rows(self, p, src, base_cols, rows):
         """按 GROUP BY 分组并计算聚合列，返回 (分组后的列名, 分组后的行)
@@ -874,9 +1067,15 @@ class Executor:
         agg_eval = [self._strip_qualifier(c) for c in agg_cols]
 
         having = p.get('having')
+        # HAVING 里的聚合同样要归一化限定符：`HAVING SUM(o.amount) > 25`
+        # 里的 `SUM(o.amount)` 交给存储层 `_aggregate` 前必须变成
+        # `SUM(amount)`，否则报「列 SUM(o.amount) 不存在」。
+        # 归一化前后用同一套键查 agg_vals：eval_cols 存归一化名，
+        # having_aggs 保留原样，下面按归一化名建 extra 映射。
         having_aggs = self._collect_agg_exprs(having)
+        having_aggs_eval = [self._strip_qualifier(a) for a in having_aggs]
         eval_cols = list(agg_eval)
-        for a in having_aggs:
+        for a in having_aggs_eval:
             if a not in eval_cols:
                 eval_cols.append(a)
 
@@ -902,8 +1101,10 @@ class Executor:
             if having:
                 # HAVING 的聚合值单独备好：可能不在 SELECT 列表里
                 # （`SELECT city FROM users GROUP BY city HAVING COUNT(*)>5`），
-                # 此时 SELECT 输出里没有这一列，必须由 agg_vals 提供
-                extra = {a: agg_vals.get(a) for a in having_aggs}
+                # 此时 SELECT 输出里没有这一列，必须由 agg_vals 提供。
+                # 键用用户原样的表达式（_eval_condition 按原样查表）
+                extra = {a: agg_vals.get(e)
+                         for a, e in zip(having_aggs, having_aggs_eval)}
                 if not self._eval_condition(
                         vals, list(keys) + list(eval_cols), having, extra):
                     continue
@@ -922,6 +1123,11 @@ class Executor:
             return True
         if not isinstance(where, dict):
             return True
+
+        # NOT (...)：整体取反（可嵌套，可与 AND/OR 组合）
+        if 'not' in where and isinstance(where['not'], dict):
+            return not self._eval_condition(
+                row, cols, where['not'], agg_values)
 
         if 'and' in where:
             return all(self._eval_condition(row, cols, c, agg_values)
@@ -1256,6 +1462,10 @@ class Executor:
         if isinstance(sub, dict) and self._is_correlated(
                 sub, outer_table, outer_alias):
             return True
+        inner = where.get('not')
+        if isinstance(inner, dict) and self._where_has_correlated(
+                inner, outer_table, outer_alias):
+            return True
         for key in ('and', 'or'):
             for c in (where.get(key) or []):
                 if self._where_has_correlated(c, outer_table, outer_alias):
@@ -1290,6 +1500,25 @@ class Executor:
             if owner and owner in outers and owner not in inner_names:
                 return True
 
+        # 本层 WHERE 里的**嵌套子查询**也可能引用外层列。`inner_names`
+        # 已经包含本层与所有嵌套层自己的表/别名（见方法开头的收集），
+        # 因此这里只判"限定符等于外层表名/别名、又不在这个集合里"。
+        inner_nested = self._nested_subqueries(sub.get('where'))
+        scope = set(inner_names)
+        for nested in inner_nested:
+            for key in ('table', 'table_alias'):
+                if nested.get(key):
+                    scope.add(str(nested[key]).lower())
+            for j in (nested.get('joins') or []):
+                for key in ('table', 'alias'):
+                    if j.get(key):
+                        scope.add(str(j[key]).lower())
+        for nested in inner_nested:
+            for c in self._nested_direct_columns(nested):
+                owner = self._qualified_owner(c)
+                if owner and owner in outers and owner not in scope:
+                    return True
+
         inner = sub.get('table')
         inner_cols = set()
         if inner:
@@ -1317,7 +1546,49 @@ class Executor:
                 continue
             if c.lower() not in inner_cols and c.lower() in outer_cols:
                 return True
+
+        for c in self._nested_direct_columns(sub, local_only=True):
+            c = str(c).strip().strip('`"')
+            if '.' in c:
+                continue
+            if c.lower() not in inner_cols and c.lower() in outer_cols:
+                return True
         return False
+
+    def _nested_direct_columns(self, sub, local_only=False) -> list:
+        """收集 `sub` 本层 WHERE 直接引用的列 + 其嵌套子查询里的列引用
+
+        只用于相关子查询判定：递归进嵌套子查询是必要的（嵌套层也可能
+        引用最外层列），但判定时要配合 *_scope() 排除嵌套层自己的表/别名。
+        local_only=True 时只看本层 WHERE 直接引用的列，不再往嵌套层递归
+        —— 裸列名判据必须这样做：嵌套层的裸列属于嵌套层自己的表，
+        拿它去比对本层表的列名会产生假相关（实测
+        `... FROM orders WHERE user_id IN (SELECT id FROM users ...)` 里的
+        `id` 会被误判成外层 users.id）。
+        """
+        out = list(self._referenced_columns(sub.get('where')))
+        if local_only:
+            return out
+        for nested in self._nested_subqueries(sub.get('where')):
+            out.extend(self._subquery_ast_columns(nested))
+        return out
+
+    def _nested_subqueries(self, where, out=None) -> list:
+        """收集条件树里出现的所有嵌套子查询 AST（不含自身）"""
+        if out is None:
+            out = []
+        if not isinstance(where, dict):
+            return out
+        sub = where.get('subquery')
+        if isinstance(sub, dict):
+            out.append(sub)
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                self._nested_subqueries(c, out)
+        inner = where.get('not')
+        if isinstance(inner, dict):
+            self._nested_subqueries(inner, out)
+        return out
 
     def _select_correlated(self, p, s, src, read_view, outer_name):
         """相关子查询的执行路径
@@ -1350,6 +1621,11 @@ class Executor:
         """外层行上的条件求值（含相关/非相关子查询谓词）"""
         if where is None or not isinstance(where, dict):
             return True
+        # NOT (...)：整体取反（可与 AND/OR 组合、可嵌套）
+        if 'not' in where and isinstance(where['not'], dict):
+            return not self._eval_outer_where(
+                row, cols, where['not'], s, outer_name, outer_alias,
+                cache, read_view)
         if 'and' in where:
             return all(self._eval_outer_where(
                 row, cols, c, s, outer_name, outer_alias, cache, read_view)
@@ -1364,15 +1640,29 @@ class Executor:
 
         sub = where.get('subquery')
         op = where.get('op')
-        if isinstance(sub, dict) and op in ('EXISTS', 'NOT EXISTS',
-                                            'IN', 'NOT IN'):
-            if self._is_correlated(sub, outer_name, outer_alias):
+        if isinstance(sub, dict):
+            # 相关性判定要"宽进"：`_is_correlated` 覆盖裸列/限定列两种判据，
+            # `_sub_owner_is_outer` 兜底"子查询里带 JOIN"等漏判形态。
+            # 任一命中就走逐外层行求值（外层列常量折叠）路径；漏判会走去
+            # 重/标量分支 → 静默给出错误结果（实测 EXISTS 恒为空）。
+            correlated = (self._is_correlated(sub, outer_name, outer_alias)
+                          or self._sub_owner_is_outer(
+                              sub, outer_name, outer_alias))
+            if correlated:
                 return self._eval_correlated_predicate(
                     row, cols, where, s, outer_name, outer_alias,
                     cache, read_view)
+            if op not in ('EXISTS', 'NOT EXISTS', 'IN', 'NOT IN'):
+                # 非相关标量子查询：可以一次性求值（结果按子查询缓存）
+                return self._compare_scoped(
+                    self._eval_scalar_subquery(sub, s, cache),
+                    op, self._scoped_value(
+                        where.get('value'), row, cols, None)
+                    if self._is_column_ref(where.get('value'))
+                    else where.get('value'))
             return self._eval_plain_subquery_predicate(row, cols, where, s,
                                                        cache)
-        # 普通比较 / LIKE / 聚合谓词
+        # 普通比较 / LIKE / IS NULL（编码成 value=None 的 =/!=）/ 聚合谓词
         return self._eval_condition(row, cols, self._normalize_where(where))
 
     def _eval_plain_subquery_predicate(self, row, cols, where, s, cache):
@@ -1398,60 +1688,377 @@ class Executor:
 
     def _eval_correlated_predicate(self, row, cols, where, s, outer_name,
                                    outer_alias, cache, read_view):
-        """相关子查询谓词求值：把外层行作为作用域，过滤一遍内层行"""
+        """相关子查询谓词求值：外层列常量折叠 + 复用正常执行路径
+
+        实现方式（通用做法，能直接复用 JOIN / GROUP BY / HAVING / 窗口 /
+        嵌套子查询等全部既有能力）：
+
+        1. 把子查询 AST 里出现的「外层别名.列」全部替换成该外层行的
+           字面量（WHERE / HAVING / SELECT 列表 / JOIN ON 都要处理）；
+        2. 折叠后的子查询已经**不相关**，交给 `self.execute` 正常执行；
+        3. 按折叠后的结果判定谓词真值：
+           * EXISTS  → 行数 > 0
+           * NOT EXISTS → 行数 == 0
+           * IN / NOT IN → 取投影第一列做三值语义判定
+           * 标量比较（`(SELECT COUNT(*)...) > 1`）→ 取第一行第一列比较
+
+        缓存：同一子查询对象按「折叠用的外层列取值元组」缓存结果，
+        因此相同外层行只算一次、取值相同的外层行共享结果，
+        20 行规模也是瞬时完成。
+
+        无法安全折叠的形态（子查询 JOIN ON 里引用外层列、折叠后仍残留
+        外层引用、FROM 子查询）显式报错，不静默错答。
+        """
         sub = where['subquery']
         op = where['op']
-
-        # 明确不支持的相关形态：子查询内部还有 JOIN / 分组 / 聚合
-        if sub.get('joins'):
-            raise ValueError("不支持相关子查询里出现 JOIN")
-        if sub.get('group_by') or sub.get('having'):
-            raise ValueError("不支持相关子查询里出现 GROUP BY / HAVING")
-        if any(re.match(r'\w+\s*\(', str(c).strip())
-               for c in (sub.get('columns') or [])):
-            raise ValueError("不支持相关子查询里引用外层列做聚合")
-
-        key = ('corr', id(sub))
-        if key not in cache:
-            inner = sub.get('table')
-            src = self._cte_relations.get(str(inner or '').lower())
-            if src is None:
-                src = self.db.get_table(inner)
-            cache[key] = self._base_rows_and_cols(src, None, read_view)
-        icols, irows = cache[key]
-
-        outer = {
-            'names': set(),
-            'cols': cols,
-            'row': row,
-        }
-        if outer_name:
-            outer['names'].add(str(outer_name).lower())
-        if outer_alias:
-            outer['names'].add(str(outer_alias).lower())
-
-        inner_where = sub.get('where')
-        matched = [ir for ir in irows
-                   if self._eval_scoped(ir, icols, inner_where, outer)]
+        cache_key = ('corr', id(sub), self._fold_cache_key(
+            sub, row, cols, outer_name, outer_alias))
+        if cache_key in cache:
+            rows = cache[cache_key]
+        else:
+            rows = self._fold_and_run(sub, row, cols, s,
+                                      outer_name, outer_alias, read_view)
+            cache[cache_key] = rows
 
         if op == 'EXISTS':
-            return len(matched) > 0
+            return len(rows) > 0
         if op == 'NOT EXISTS':
-            return len(matched) == 0
+            return len(rows) == 0
 
-        # IN / NOT IN：取子查询投影的第一列
-        proj = (sub.get('columns') or ['*'])[0]
-        is_lit, lit = self._literal_value(str(proj).strip())
-        if is_lit:
-            idx = -1
-        else:
-            idx = self._col_index_of(icols, str(proj).strip())
-        vals = []
-        for ir in matched:
-            vals.append(lit if is_lit else
-                        (ir[idx] if 0 <= idx < len(ir) else None))
-        lv = self._scoped_value(where.get('column'), row, cols, outer)
-        return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
+        if op in ('IN', 'NOT IN'):
+            vals = [r[0] for r in rows if r]
+            lv = self._scoped_value(where.get('column'), row, cols, None)
+            return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
+
+        # 标量比较：取第一行第一列。
+        # 注意空结果：SQL 里 `(SELECT COUNT(*) ...)` 即使没有匹配行也返回 0
+        # （聚合作用于空集），而 SUM/AVG/MIN/MAX 返回 NULL。执行器对空集
+        # 聚合不产出任何行，因此这里要按投影的聚合函数名补出正确的空集值，
+        # 否则 `(SELECT COUNT(*) ...) = 0` 会把 0 误判成 NULL 而漏掉整行。
+        has_row = bool(rows and rows[0])
+        sv = rows[0][0] if has_row else None
+        if not has_row:
+            sv = self._empty_agg_scalar(sub)
+        rv = where.get('value')
+        if self._is_column_ref(rv):
+            rv = self._scoped_value(rv, row, cols, None)
+            if rv is _MISSING:
+                return False
+        elif sv is not None and not isinstance(rv, type(sv)):
+            try:
+                if isinstance(sv, (int, float)) and isinstance(rv, str):
+                    rv = float(rv) if '.' in rv else int(rv)
+            except (TypeError, ValueError):
+                pass
+        return self._compare_scoped(sv, op, rv)
+
+    @staticmethod
+    def _empty_agg_scalar(sub):
+        """空结果集上的标量子查询取值（聚合作用于空集的 SQL 语义）
+
+        COUNT → 0，其它聚合（SUM/AVG/MIN/MAX）→ NULL；
+        投影不是聚合函数时也返回 NULL。
+        """
+        cols = sub.get('columns') or []
+        expr = str(cols[0]).strip() if cols else ''
+        m = re.match(r'^(\w+)\s*\(', expr)
+        if m and m.group(1).upper() == 'COUNT':
+            return 0
+        return None
+
+    def _eval_scalar_subquery(self, sub, s, cache):
+        """非相关标量子查询求值（结果按子查询缓存）"""
+        key = ('scalar', id(sub))
+        if key not in cache:
+            res = self.execute(sub, s)
+            if not isinstance(res, dict) or res.get('type') == 'error':
+                raise ValueError(
+                    f"子查询执行失败: {(res or {}).get('message', '')}")
+            rows = [tuple(r) for r in (res.get('rows') or [])]
+            cache[key] = rows[0][0] if (rows and rows[0]) else None
+        return cache[key]
+
+    # ---- 外层列常量折叠 ----
+
+    @staticmethod
+    def _is_column_ref(text) -> bool:
+        """文本是否可能是列引用（`u.id` / `id`；排除数字与字符串字面量）"""
+        t = str(text or '').strip().strip('`"')
+        if not t or not re.match(r'^[\w.]+$', t):
+            return False
+        if re.match(r'^-?\d+(?:\.\d+)?$', t):
+            return False
+        return True
+
+    @classmethod
+    def _render_literal(cls, value) -> str:
+        """把 Python 值渲染成 SQL 字面量文本（供折叠后的子查询重新解析）"""
+        if value is None:
+            return 'NULL'
+        if isinstance(value, bool):
+            return '1' if value else '0'
+        if isinstance(value, (int, float)):
+            return repr(value)
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _outer_column_value(self, cols, row, name):
+        """在外层行里取 `name` 的值；取不到返回 _MISSING"""
+        if not isinstance(name, str) or not name.strip():
+            return _MISSING
+        t = name.strip().strip('`"')
+        cands = [t.rsplit('.', 1)[1] if '.' in t else t]
+        for cand in cands:
+            i = self._col_index_of(cols, cand)
+            if 0 <= i < len(row):
+                return row[i]
+        return _MISSING
+
+    def _sub_owner_is_outer(self, sub, outer_name, outer_alias) -> bool:
+        """粗判：子查询 AST 里是否有「外层限定名」引用
+
+        比 `_is_correlated` 宽松（不做裸列名/表列比对），用于兜底识别
+        `_is_correlated` 可能漏掉的相关引用（例如子查询里带了 JOIN）。
+        必须排除**子查询及其嵌套子查询自己的表/别名**：自洽子查询里出现
+        与外层同名的表（`... IN (SELECT ... FROM users WHERE city='BJ')`
+        而外层也叫 users）否则会被误判成相关引用。
+        """
+        outers = set()
+        for n in (outer_name, outer_alias):
+            if n:
+                outers.add(str(n).lower())
+        if not outers:
+            return False
+        inner = self._sub_scope_names(sub)
+        if inner & outers:
+            outers -= inner
+            if not outers:
+                return False
+        for c in self._subquery_ast_columns(sub):
+            owner = self._qualified_owner(c)
+            if owner and owner in outers:
+                return True
+        return False
+
+    def _sub_scope_names(self, sub) -> set:
+        """子查询（含其 WHERE 里的嵌套子查询）自己声明的表名/别名集合"""
+        names = set()
+        if not isinstance(sub, dict):
+            return names
+        for key in ('table', 'table_alias'):
+            if sub.get(key):
+                names.add(str(sub[key]).lower())
+        for j in (sub.get('joins') or []):
+            for key in ('table', 'alias'):
+                if j.get(key):
+                    names.add(str(j[key]).lower())
+        for nested in self._nested_subqueries(sub.get('where')):
+            for key in ('table', 'table_alias'):
+                if nested.get(key):
+                    names.add(str(nested[key]).lower())
+            for j in (nested.get('joins') or []):
+                for key in ('table', 'alias'):
+                    if j.get(key):
+                        names.add(str(j[key]).lower())
+        return names
+
+    def _fold_outer_literals(self, sub, row, cols, outer_names,
+                             depth=0):
+        """把子查询 AST 里的外层列引用替换成外层行的字面量
+
+        outer_names：可以安全折叠的限定符集合（来自 _fold_outer_names）。
+        返回折叠后的新 AST（不改原对象，避免污染缓存）。已知限制：
+        * 子查询 JOIN ON 里引用外层列 → 抛 ValueError（连接键折叠不安全）；
+        * 嵌套子查询里的外层引用 → 抛 ValueError（本实现只折叠一层）。
+        """
+        if depth > 6:
+            raise ValueError("相关子查询嵌套过深（>6 层）")
+        if not isinstance(sub, dict):
+            return sub
+
+        def fold_value(v):
+            """比较右侧 / 聚合右值：是外层列引用就换字面量"""
+            if (isinstance(v, str) and self._is_column_ref(v)
+                    and self._qualified_owner(v) in outer_names):
+                got = self._outer_column_value(cols, row, v)
+                if got is _MISSING:
+                    raise ValueError(
+                        f"相关子查询折叠失败：外层列 {v} 解析不到")
+                return self._render_literal(got)
+            return v
+
+        def fold_node(node, d):
+            if not isinstance(node, dict):
+                return node
+            out = dict(node)
+            for key in ('and', 'or'):
+                if isinstance(out.get(key), list):
+                    out[key] = [fold_node(c, d) for c in out[key]]
+            if 'not' in out:
+                out['not'] = fold_node(out['not'], d)
+            inner_sub = out.get('subquery')
+            if isinstance(inner_sub, dict):
+                # 嵌套子查询：它引用的外层列同样折叠成字面量，
+                # 然后整个嵌套子查询走正常执行路径（可继续嵌套）
+                out['subquery'] = self._fold_outer_literals(
+                    inner_sub, row, cols, outer_names, d + 1)
+            col = out.get('column')
+            if isinstance(col, str) and '.' in col and \
+                    self._qualified_owner(col) in outer_names:
+                got = self._outer_column_value(cols, row, col)
+                if got is _MISSING:
+                    raise ValueError(
+                        f"相关子查询折叠失败：外层列 {col} 解析不到")
+                # 折叠后没有任何比较能留在这一层，直接给常量真
+                return None
+            if 'value' in out:
+                out['value'] = fold_value(out['value'])
+            return out
+
+        out = dict(sub)
+        # SELECT 列表：`SELECT u.x + 1 AS y` → 常量表达式文本
+        # （折叠后用正常路径重新解析，因此标量聚合子查询也能算对）
+        cols_out = []
+        for c in (sub.get('columns') or []):
+            text = str(c)
+            for owner in sorted(outer_names, key=len, reverse=True):
+                pattern = r'\b' + re.escape(owner) + r'\.(\w+)'
+
+                def _sub(m, _o=owner):
+                    got = self._outer_column_value(
+                        cols, row, f'{_o}.{m.group(1)}')
+                    return (m.group(0) if got is _MISSING
+                            else self._render_literal(got))
+                text = re.sub(pattern, _sub, text, flags=re.IGNORECASE)
+            cols_out.append(text)
+        out['columns'] = cols_out
+        # 投影顺序：窗口函数项按原样保留（内层窗口不引用外层列）
+        if isinstance(sub.get('projection'), list):
+            out['projection'] = [
+                (k, t) if k != 'col' else (k, str(t))
+                for k, t in sub['projection']]
+
+        for key in ('where', 'having'):
+            if isinstance(out.get(key), dict):
+                folded = fold_node(out[key], 0)
+                out[key] = None if folded is None else folded
+
+        new_joins = []
+        for j in (sub.get('joins') or []):
+            nj = dict(j)
+            on = nj.get('on')
+            if isinstance(on, dict):
+                # JOIN ON 里的外层列引用同样折叠成字面量，交给 JOIN 路径
+                # 正常执行（例如 `JOIN users u2 ON u2.id = o.user_id AND
+                # u2.id = u.id` → `... AND u2.id = 1`）
+                nj['on'] = fold_node(on, 0)
+            new_joins.append(nj)
+        if new_joins:
+            out['joins'] = new_joins
+        return out
+
+    def _fold_outer_names(self, sub, outer_name, outer_alias):
+        """收集「可以安全折叠」的外层限定符集合
+
+        只认限定符等于外层表名/别名、且子查询自己没有同名表/别名的引用，
+        避免把子查询内部的表别名（例如自连接的 u2）误当外层引用。
+        """
+        outers = set()
+        for n in (outer_name, outer_alias):
+            if n:
+                outers.add(str(n).lower())
+        inner_names = set()
+        for key in ('table', 'table_alias'):
+            if sub.get(key):
+                inner_names.add(str(sub[key]).lower())
+        for j in (sub.get('joins') or []):
+            for key in ('table', 'alias'):
+                if j.get(key):
+                    inner_names.add(str(j[key]).lower())
+        return {o for o in outers if o not in inner_names}
+
+    def _outer_ref_columns(self, sub, names, out=None) -> list:
+        """收集子查询（含嵌套子查询）里引用外层限定符的列名
+
+        只看 `where` 会漏掉 `value` 位置的引用（`WHERE o.uid = u.id` 里的
+        `u.id` 是 value），也漏掉嵌套子查询里的引用。漏掉会让
+        `_fold_cache_key` 返回空键 → 所有外层行共用第一行的结果，
+        实测表现为"最后一行的答案串到所有行"这类静默错答。
+        """
+        if out is None:
+            out = []
+        if not isinstance(sub, dict):
+            return out
+
+        def consider(text):
+            if (isinstance(text, str) and self._is_column_ref(text)
+                    and self._qualified_owner(text) in names):
+                key = str(text).strip().strip('`"').lower()
+                if key not in out:
+                    out.append(key)
+
+        consider(sub.get('column'))
+        consider(sub.get('value'))
+        for key in ('and', 'or'):
+            for c in (sub.get(key) or []):
+                self._outer_ref_columns(c, names, out)
+        if isinstance(sub.get('not'), dict):
+            self._outer_ref_columns(sub['not'], names, out)
+        # 本节点可能是一个条件节点（带 subquery 键指向子查询 AST），
+        # 也可能本身就是子查询 AST。两种都要继续往下走。
+        nested = sub.get('subquery')
+        if isinstance(nested, dict):
+            self._outer_ref_columns(nested, names, out)
+        for key in ('where', 'having'):
+            if isinstance(sub.get(key), dict):
+                self._outer_ref_columns(sub[key], names, out)
+        for j in (sub.get('joins') or []):
+            on = j.get('on')
+            if isinstance(on, dict):
+                self._outer_ref_columns(on, names, out)
+        return out
+
+    def _fold_cache_key(self, sub, row, cols, outer_name, outer_alias):
+        """按「折叠用到的外层列取值」构造缓存键（同值外层行共享结果）
+
+        必须覆盖子查询（含嵌套层）里出现的**所有**外层列引用：
+        漏一个就会让取值不同的外层行命中同一条缓存，产生静默错答。
+        """
+        names = self._fold_outer_names(sub, outer_name, outer_alias)
+        items = []
+        for c in self._outer_ref_columns(sub, names):
+            val = self._outer_column_value(cols, row, c)
+            items.append((c, self._fold_key_value(val)))
+        items.sort(key=lambda kv: kv[0])
+        return tuple(items)
+
+    @classmethod
+    def _fold_key_value(cls, value):
+        """缓存键里的单值归一化（list/dict 等不可比较的值转成字符串）"""
+        if value is _MISSING:
+            return ('__missing__',)
+        if isinstance(value, (int, float, str, bytes, type(None), bool)):
+            return (type(value).__name__, value)
+        return ('repr', repr(value))
+
+    def _fold_and_run(self, sub, row, cols, s, outer_name, outer_alias,
+                      read_view):
+        """折叠外层列 → 正常执行 → 返回结果行列表"""
+        names = self._fold_outer_names(sub, outer_name, outer_alias)
+        if not names:
+            raise ValueError(
+                "相关子查询的外层引用无法安全折叠（找不到外层限定符）")
+        folded = self._fold_outer_literals(
+            sub, row, cols, names)
+        # 折叠后必须不再相关：否则说明还有本实现没覆盖到的外层引用
+        if self._is_correlated(folded, outer_name, outer_alias) or \
+                self._sub_owner_is_outer(folded, outer_name, outer_alias):
+            raise ValueError(
+                "相关子查询的外层引用无法安全折叠（折叠后仍残留外层引用）")
+        res = self.execute(folded, s)
+        if not isinstance(res, dict) or res.get('type') == 'error':
+            raise ValueError(
+                f"相关子查询执行失败: {(res or {}).get('message', '未知错误')}")
+        return [tuple(r) for r in (res.get('rows') or [])]
 
     def _eval_scoped(self, row, cols, where, outer):
         """内层行上的条件求值（列名可用外层行解析）

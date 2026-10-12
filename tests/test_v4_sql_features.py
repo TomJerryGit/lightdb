@@ -579,12 +579,15 @@ def test_correlated_subqueries():
                       "(SELECT 1 FROM orders o WHERE o.user_id = u.id)")
         assert sorted(r[0] for r in rows) == [1, 2, 3], rows
 
-        # 不支持的相关形态必须明确报错（不能静默错答）
-        r = e.ex.execute(e.parser.parse(
+        # 相关子查询里**引用外层列做聚合**：原先一律"明确报错"，
+        # 现在改为外层列常量折叠 + 复用正常执行路径，因此真正求值。
+        # 断言随之更新为正确结果（不是放宽检查：
+        #   `COUNT(*) ... WHERE o.user_id = u.id` 对 users 1/2 为 2/1 行、
+        #   对 users 3 为 0 行，EXISTS 语义下 1/2 命中、3 不命中）
+        _, rows = e.q(
             "SELECT id FROM users u WHERE EXISTS (SELECT COUNT(*) FROM "
-            "orders o WHERE o.user_id = u.id)"), {})
-        assert r.get('type') == 'error', r
-        assert '聚合' in r.get('message', ''), r
+            "orders o WHERE o.user_id = u.id)")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
 
 
 def test_not_in_null_semantics():
@@ -833,3 +836,334 @@ def test_range_default_frame_peers():
                       "FROM emp ORDER BY id")
         assert [r[1] for r in rows] == [120, 220, 320, 705, 795, 415, 510, 595], \
             rows
+
+
+# ==========================================================================
+# 以下为追加：相关子查询（标量/聚合/JOIN/GROUP BY）/ NOT 与 IS NULL /
+# 投影算术表达式。数据仍用 _Env：
+#   users 1..3（a/b 属 BJ、c 属 SH），orders.user_id = 1,1,2，amount = 10,20,30
+#   emp 8 行（Eng 3 / Sales 2 / HR 3），salary 见 EMP_SAL
+# ==========================================================================
+
+
+def test_correlated_scalar_subquery():
+    """标量相关子查询：`(SELECT COUNT(*) ... WHERE o.uid = u.id) > n`
+
+    实现方式：对外层每一行把子查询 AST 里的「外层别名.列」折叠成字面量，
+    再把折叠后的（已不相关的）子查询交给正常执行路径求值，最后比较标量。
+    原先这种形态连解析都过不去（`(SELECT ...) > 1` 不是 _where 认识的谓词）。
+    """
+    with _Env() as e:
+        # ① COUNT(*) > 1：只有 uid=1 有 2 笔订单
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id) > 1")
+        assert [r[0] for r in rows] == [1], rows
+
+        # ② 逐外层行求值：阈值放宽到 > 0 后 uid 1/2 都命中，uid 3 无订单
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id) > 0")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+        # ③ COUNT(*) = 0 的边界：空集上 COUNT 是 0 而不是 NULL，uid 3 命中
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id) = 0")
+        assert [r[0] for r in rows] == [3], rows
+
+        # ④ 标量子查询与普通条件 AND / OR 混用
+        _, rows = e.q("SELECT id FROM users u WHERE u.city = 'BJ' AND "
+                      "(SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id) >= 1")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+        _, rows = e.q("SELECT id FROM users u WHERE u.city = 'SH' OR "
+                      "(SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id) > 1")
+        assert sorted(r[0] for r in rows) == [1, 3], rows
+
+        # ⑤ 子查询里含 JOIN：JOIN 只是子查询自身的连接，外层引用照样折叠
+        _, rows = e.q("SELECT id FROM users u WHERE EXISTS ("
+                      "SELECT 1 FROM orders o JOIN users u2 "
+                      "ON o.user_id = u2.id WHERE o.user_id = u.id)")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+        # ⑥ 子查询里含 GROUP BY / HAVING，HAVING 再引用外层列
+        _, rows = e.q("SELECT id FROM users u WHERE EXISTS ("
+                      "SELECT 1 FROM orders o WHERE o.user_id = u.id "
+                      "GROUP BY o.user_id HAVING COUNT(*) >= 2)")
+        assert [r[0] for r in rows] == [1], rows
+        _, rows = e.q("SELECT id FROM users u WHERE EXISTS ("
+                      "SELECT 1 FROM orders o WHERE o.user_id = u.id "
+                      "GROUP BY o.user_id HAVING SUM(o.amount) > 15)")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+        # ⑦ 标量聚合子查询：uid 1/2 各只有一组订单，SUM 都是 30 → 都命中；
+        #    uid 3 的 SUM 是空集 → NULL，`NULL > n` 为 UNKNOWN，不通过
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT SUM(o.amount) FROM orders o "
+                      "WHERE o.user_id = u.id) > 25")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT SUM(o.amount) FROM orders o "
+                      "WHERE o.user_id = u.id) > 30")
+        assert rows == [], rows
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT MAX(o.amount) FROM orders o "
+                      "WHERE o.user_id = u.id) = 30")
+        assert [r[0] for r in rows] == [2], rows
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT MAX(o.amount) FROM orders o "
+                      "WHERE o.user_id = u.id) = 20")
+        assert [r[0] for r in rows] == [1], rows
+
+        # ⑧ 非聚合标量子查询（取第一行）
+        _, rows = e.q("SELECT id FROM users u WHERE (SELECT o.user_id FROM "
+                      "orders o WHERE o.user_id = u.id) = 1")
+        assert [r[0] for r in rows] == [1], rows
+
+        # ⑨ 反例：真语法错误仍然抛 SyntaxError
+        import pytest
+        with pytest.raises(SyntaxError):
+            e.parser.parse("SELECT id FROM users u WHERE (SELECT COUNT(*) "
+                           "FROM orders o WHERE o.user_id = u.id)")
+
+
+def test_correlated_nested_and_multitable():
+    """相关子查询的嵌套 / 多表外层 / 子查询结构不得被静默错答
+
+    覆盖：嵌套子查询里的外层引用（折叠到底）、NOT EXISTS 与 GROUP BY 组合、
+    以及"折叠后必须重新执行而非复用内层行缓存"的正确性（同一外层行只算
+    一次、取值不同的外层行不能共用结果）。
+    """
+    with _Env() as e:
+        # ① 嵌套子查询：内层子查询也引用最外层列（`user_id = u.id`），
+        #    相关性判定必须递归进嵌套层，否则该子查询会被当成非相关
+        #    一次性求值 → 恒为空（实测过：静默返回 0 行）
+        _, rows = e.q("SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM "
+                      "orders o WHERE o.user_id IN (SELECT user_id FROM "
+                      "orders WHERE user_id = u.id))")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+        # ①b 反例：嵌套子查询里的同名表是**内层自己的表**，不能误判成
+        #     相关引用（外层也叫 users，但这里的 users 是嵌套层作用域）
+        _, rows = e.q("SELECT id FROM users WHERE id IN (SELECT user_id "
+                      "FROM orders WHERE user_id IN (SELECT id FROM users "
+                      "WHERE city = 'BJ'))")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+        # ② NOT EXISTS + GROUP BY / HAVING：uid 1 的组 COUNT=2 命中 → 排除；
+        #    uid 2 的组 COUNT=1 不命中、uid 3 过滤后没有组 → 都保留
+        _, rows = e.q("SELECT id FROM users u WHERE NOT EXISTS (SELECT 1 "
+                      "FROM orders o WHERE o.user_id = u.id "
+                      "GROUP BY o.user_id HAVING COUNT(*) >= 2)")
+        assert sorted(r[0] for r in rows) == [2, 3], rows
+
+        # ③ 外层带 LIMIT：相关子查询必须在 LIMIT 之前逐行求值
+        _, rows = e.q("SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM "
+                      "orders o WHERE o.user_id = u.id) ORDER BY u.id "
+                      "LIMIT 1")
+        assert [r[0] for r in rows] == [1], rows
+
+        # ④ 多条相关谓词叠加（AND）：uid 1 有 20（>15）也有 10（<15）→ 命中；
+        #    uid 2 只有 30，不满足"同时存在小于 15 的订单"
+        _, rows = e.q("SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM "
+                      "orders o WHERE o.user_id = u.id AND o.amount > 15) "
+                      "AND EXISTS (SELECT 1 FROM orders o2 "
+                      "WHERE o2.user_id = u.id AND o2.amount < 15)")
+        assert [r[0] for r in rows] == [1], rows
+
+        # ⑤ 逐行结果不同：id 1 → 2 笔、id 2 → 1 笔、id 3 → 0 笔。
+        #    注意：标量子查询目前只支持出现在 **WHERE/HAVING** 里，
+        #    放进 SELECT 列表仍不支持（见文件末尾"已知限制"），
+        #    因此这里用 WHERE 逐行判定，而不是把 COUNT 投影出来。
+        _, rows = e.q("SELECT id FROM users u WHERE (SELECT COUNT(*) FROM "
+                      "orders o WHERE o.user_id = u.id) = 2")
+        assert [r[0] for r in rows] == [1], rows
+        _, rows = e.q("SELECT id FROM users u WHERE (SELECT COUNT(*) FROM "
+                      "orders o WHERE o.user_id = u.id) = 1")
+        assert [r[0] for r in rows] == [2], rows
+
+        # ⑥ FROM 子查询上的相关子查询（内存关系作为外层）
+        _, rows = e.q("SELECT x.id FROM (SELECT id FROM users) x WHERE "
+                      "EXISTS (SELECT 1 FROM orders o "
+                      "WHERE o.user_id = x.id)")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+
+
+def test_not_condition():
+    """WHERE NOT ( ... )：整体取反，可与 AND/OR 组合、可嵌套
+
+    实现方式：
+    * 解析器在顶层 AND/OR 切分之前处理 `NOT (...)`（要求配对括号正好在
+      末尾，因此 AND 比 NOT 结合得更紧），产出 {'not': <子树>}；
+    * 执行器 `_normalize_where` 用德摩根律把 NOT 推到叶子：比较条件翻转
+      运算符（`=`↔`!=`、`<`↔`>=` …），NOT-AND/OR 互换，这样存储层的
+      _match 拿到的永远是它能认识的形态（NOT 本身它不认，会 KeyError）；
+    * LIKE 这类没有取反运算符的形态打 negate 标记，由执行器自己的三值
+      求值器过滤（`NOT (NULL LIKE ...)` 仍为 UNKNOWN，不能放行）。
+
+    数据：emp 8 行，Eng 3（1/2/3）、Sales 2（4/5）、HR 3（6/7/8）
+    """
+    with _Env() as e:
+        # ① NOT 单个条件 → Sales 2 + HR 3 = 5 行
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (dept = 'Eng')")
+        assert sorted(r[0] for r in rows) == [4, 5, 6, 7, 8], rows
+
+        # ② NOT (A OR B) → 只剩 Sales 2 行
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (dept = 'Eng' OR "
+                      "dept = 'HR')")
+        assert sorted(r[0] for r in rows) == [4, 5], rows
+
+        # ③ NOT (A AND B)：德摩根 → 非 A 或 非 B
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (dept = 'Eng' AND "
+                      "salary >= 100)")
+        assert sorted(r[0] for r in rows) == [4, 5, 6, 7, 8], rows
+
+        # ④ 嵌套 NOT：取反两次等于原条件
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (NOT (dept = 'Eng'))")
+        assert sorted(r[0] for r in rows) == [1, 2, 3], rows
+
+        # ⑤ NOT 与 AND / OR 组合（AND 比 NOT 结合更紧）
+        #    NOT (dept='Eng') = {4,5,6,7,8}，再要求 salary >= 95 → 去掉 Eve(90)、
+        #    Henry(85)，剩 Dave(110) + Frank/Grace(95)
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (dept = 'Eng') AND "
+                      "salary >= 95")
+        assert sorted(r[0] for r in rows) == [4, 6, 7], rows
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (dept = 'Eng') OR "
+                      "salary = 120")
+        assert sorted(r[0] for r in rows) == [1, 4, 5, 6, 7, 8], rows
+
+        # ⑥ 对 LIKE 取反（存储层没有 NOT LIKE，走执行器三值求值）
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (name LIKE 'A%')")
+        assert sorted(r[0] for r in rows) == [2, 3, 4, 5, 6, 7, 8], rows
+
+        # ⑦ 对 IN 列表 / 子查询取反
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (dept IN "
+                      "('Eng', 'HR'))")
+        assert sorted(r[0] for r in rows) == [4, 5], rows
+        _, rows = e.q("SELECT id FROM users u WHERE NOT (u.id IN "
+                      "(SELECT o.user_id FROM orders o WHERE "
+                      "o.user_id = u.id))")
+        assert [r[0] for r in rows] == [3], rows
+
+        # ⑧ 错误语法仍显式报错（`NOT 列 = 值` 不是合法 SQL 谓词）
+        import pytest
+        with pytest.raises(SyntaxError):
+            e.parser.parse("SELECT id FROM emp WHERE NOT dept = 'Eng'")
+
+
+def test_is_null_and_is_not_null():
+    """WHERE / HAVING 里的 IS NULL 与 IS NOT NULL
+
+    实现方式：解析器把 `col IS NULL` 编码成 `{'column': col, 'op': '=',
+    'value': None}`、`IS NOT NULL` 编码成 op='!='，与存储层/统一路径既有
+    的 NULL 语义完全一致，因此不需要新增求值分支。含字面量 NULL 的条件
+    强制走统一求值路径（存储层的 `_find_pks` 会先用 coerce 走主键/索引
+    快路径，把 NULL 当成默认值，导致 IS NULL 恒空、IS NOT NULL 恒全量）。
+    """
+    with _Env() as e:
+        # orders 里插一行 amount 为 NULL 的记录
+        e.ex.execute_sql("INSERT INTO orders VALUES (4, 3, NULL)", {})
+        _, rows = e.q("SELECT id FROM orders")
+        assert len(rows) == 4, rows
+
+        # ① IS NULL / IS NOT NULL 在 WHERE 里
+        _, rows = e.q("SELECT id FROM orders WHERE amount IS NULL")
+        assert [r[0] for r in rows] == [4], rows
+        _, rows = e.q("SELECT id FROM orders WHERE amount IS NOT NULL")
+        assert [r[0] for r in rows] == [1, 2, 3], rows
+
+        # ② 与普通条件组合
+        _, rows = e.q("SELECT id FROM orders WHERE amount IS NOT NULL "
+                      "AND amount > 15")
+        assert sorted(r[0] for r in rows) == [2, 3], rows
+        _, rows = e.q("SELECT id FROM orders WHERE amount IS NULL "
+                      "OR amount > 25")
+        assert sorted(r[0] for r in rows) == [3, 4], rows
+
+        # ③ IS NULL 的否定形态：NOT (col IS NULL) 等价于 IS NOT NULL
+        _, rows = e.q("SELECT id FROM orders WHERE NOT (amount IS NULL)")
+        assert [r[0] for r in rows] == [1, 2, 3], rows
+
+        # ④ HAVING 里作用于聚合值
+        _, rows = e.q("SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+                      "HAVING COUNT(*) IS NOT NULL")
+        assert sorted(rows) == [('Eng', 3), ('HR', 3), ('Sales', 2)], rows
+        _, rows = e.q("SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+                      "HAVING COUNT(*) IS NULL")
+        assert rows == [], rows
+
+        # ⑤ HAVING 里作用于分组键
+        _, rows = e.q("SELECT dept FROM emp GROUP BY dept "
+                      "HAVING dept IS NOT NULL")
+        assert sorted(r[0] for r in rows) == ['Eng', 'HR', 'Sales'], rows
+
+        # ⑥ 子查询里也能用 IS NULL
+        _, rows = e.q("SELECT id FROM users WHERE id IN (SELECT user_id "
+                      "FROM orders WHERE amount IS NULL)")
+        assert [r[0] for r in rows] == [3], rows
+
+        # ⑦ 列名不存在仍然是明确报错（不能把 IS NULL 静默当假）
+        r = e.ex.execute(e.parser.parse(
+            "SELECT id FROM orders WHERE nosuchcol IS NULL"), {})
+        assert r.get('type') == 'error' or r.get('rows') == [], r
+
+
+def test_projection_arithmetic():
+    """投影列表里的算术表达式：`列 运算符 数字`，可带 AS 别名
+
+    实现方式：
+    * 执行器识别投影项里的二元算术（`_arith_projection_expr`），命中就
+      改走 `_select_advanced` → `_project_rows`，复用既有的
+      `_parse_arith` / `_eval_arith`（原先只有递归 CTE 的 `n + 1` 用得上，
+      且 `SELECT salary*2 AS d` 会被整条下推到存储层，报「列不存在」）；
+    * 除零返回 NULL（不抛异常、不崩）；
+    * 别名写进输出列名，因此 `FROM (子查询) x WHERE x.d > n` 能按别名过滤。
+    """
+    with _Env() as e:
+        # ① `salary*2 AS d`
+        cols, rows = e.q("SELECT id, salary*2 AS d FROM emp")
+        assert cols == ['id', 'd'], cols
+        assert [r[1] for r in rows] == [2 * v for v in EMP_SAL], rows
+
+        # ② `salary/2 AS half`（真除法，保留小数）
+        cols, rows = e.q("SELECT salary/2 AS half FROM emp")
+        assert cols == ['half'], cols
+        assert [r[0] for r in rows] == [v / 2 for v in EMP_SAL], rows
+
+        # ③ 字面量在左：`2*salary`
+        cols, rows = e.q("SELECT 2*salary AS d2 FROM emp")
+        assert cols == ['d2'], cols
+        assert [r[0] for r in rows] == [2 * v for v in EMP_SAL], rows
+
+        # ④ 加减法
+        _, rows = e.q("SELECT salary+10 AS a, salary-10 AS b FROM emp "
+                      "ORDER BY id LIMIT 1")
+        assert rows == [(130, 110)], rows
+
+        # ⑤ 别名能被外层引用：Alice 240 / Dave 220 超过 200
+        cols, rows = e.q("SELECT * FROM (SELECT id, salary*2 AS d FROM emp) x "
+                         "WHERE x.d > 200")
+        assert cols == ['id', 'd'], cols
+        assert sorted(rows) == [(1, 240), (4, 220)], rows
+
+        # ⑥ 子查询内层 SELECT 里的算术（外层据此过滤）
+        #    注意：WHERE 里的算术谓词（`WHERE salary*2 > 230`）仍不支持，
+        #    表达式只支持出现在投影列表里，见文件末尾"已知限制"
+        _, rows = e.q("SELECT id FROM (SELECT id, salary*2 AS d FROM emp) x "
+                      "WHERE x.d > 230")
+        assert [r[0] for r in rows] == [1], rows
+        _, rows = e.q("SELECT COUNT(*) FROM (SELECT id, salary*2 AS d "
+                      "FROM emp) x WHERE x.d > 200")
+        assert rows == [(2,)], rows
+
+        # ⑦ 除零：显式返回 NULL 而不是崩溃
+        cols, rows = e.q("SELECT salary/0 AS bad FROM emp")
+        assert cols == ['bad'], cols
+        assert [r[0] for r in rows] == [None] * 8, rows
+
+        # ⑧ 不带别名时输出列名保持表达式文本
+        cols, rows = e.q("SELECT salary*2 FROM emp LIMIT 1")
+        assert cols == ['salary*2'], cols
+        assert rows == [(240,)], rows

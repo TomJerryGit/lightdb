@@ -375,27 +375,144 @@ class Parser:
 
     # ==================== SELECT ====================
 
+    def _matching_paren(self, s: str, open_idx: int) -> int:
+        """返回 `s[open_idx] == '('` 对应右括号的下标（引号内括号不计）
+
+        调用前必须已通过 `_check_paren_balance`，因此正常输入一定配对成功；
+        仍然在找不到时抛 SyntaxError（防御性）。
+        """
+        depth = 0
+        for i, ch, quoted in self._scan_quotes(s):
+            if i < open_idx or quoted:
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+        raise SyntaxError(f"括号不匹配: {s}")
+
+    def _split_select_from(self, sql: str):
+        """把 `SELECT ... FROM ...` 从**顶层** FROM 处切开
+
+        返回 (cols_str, from_rest)；没有 FROM 时返回 (cols_str, None)。
+
+        原实现用 `re.match(r'SELECT\\s+(.+?)\\s+FROM\\s+(.+)$')`，非贪婪的
+        `(.+?)` 会在**子查询里的第一个 FROM** 处断开：投影列表里带标量子
+        查询时（`SELECT u.id, (SELECT COUNT(*) FROM orders o WHERE ...) AS
+        cnt FROM users u`）列表达式被截成半截、括号不平衡，直接误报
+        SyntaxError。这里改成逐字符找「圆括号深度 0」的 FROM。
+        """
+        m = re.match(r'SELECT\s+', sql, re.IGNORECASE)
+        if not m:
+            return None, None
+        n = len(sql)
+        depth = 0
+        i = m.end()
+        while i < n:
+            ch = sql[i]
+            if ch in ("'", '"', '`'):
+                j = i + 1
+                while j < n and sql[j] != ch:
+                    j += 1
+                i = j + 1
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0 and (ch.isalpha() or ch == '_'):
+                if i > 0 and (sql[i - 1].isalnum() or sql[i - 1] == '_'):
+                    i += 1
+                    continue
+                j = i
+                while j < n and (sql[j].isalnum() or sql[j] == '_'):
+                    j += 1
+                if sql[i:j].upper() == 'FROM':
+                    return sql[m.end():i].strip(), sql[j:].strip()
+                i = j
+                continue
+            i += 1
+        return sql[m.end():].strip(), None
+
+    def _find_top_level_keyword(self, s: str, kws):
+        """在圆括号深度 0 处寻找第一个关键字，返回 (起始下标, 关键字)
+
+        用于切开 WHERE / GROUP BY / HAVING / ORDER BY / LIMIT 这些顶层子句：
+        子查询内部的同名子句（`EXISTS (SELECT 1 FROM orders o WHERE ...
+        GROUP BY o.user_id HAVING COUNT(*) >= 2)`）位于括号里，深度不为 0，
+        这里一律跳过 —— 原先用 `re.search(r'\\bWHERE\\s+(.+?)(?=\\s+GROUP\\b|$)')`
+        会在子查询的 GROUP BY 处提前截断，导致括号不平衡而误报 SyntaxError。
+        不在字符串字面量里的关键字才算（`dept = 'GROUP BY'` 不算）。
+        """
+        want = tuple(k.upper() for k in kws)
+        n = len(s)
+        depth = 0
+        i = 0
+        while i < n:
+            ch = s[i]
+            if ch in ("'", '"', '`'):
+                j = i + 1
+                while j < n and s[j] != ch:
+                    j += 1
+                i = j + 1
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0 and (ch.isalpha() or ch == '_'):
+                if i > 0 and (s[i - 1].isalnum() or s[i - 1] == '_'):
+                    i += 1
+                    continue
+                j = i
+                while j < n and (s[j].isalnum() or s[j] == '_'):
+                    j += 1
+                word = s[i:j].upper()
+                if word in want:
+                    if word in ('GROUP', 'ORDER'):
+                        # 只认 `GROUP BY` / `ORDER BY` 两词形式
+                        if re.match(r'\s+BY\b', s[j:], re.IGNORECASE):
+                            return i, word
+                    else:
+                        return i, word
+                i = j
+                continue
+            i += 1
+        return None
+
+    def _extract_clause(self, s: str, kw: str, kws):
+        """取顶层子句 `<kw> ...` 的正文（到下一个顶层子句为止）
+
+        返回 None 表示文本里没有这个顶层子句。括号深度感知，因此
+        `WHERE ... (SELECT ... GROUP BY ...)` 不会被内层 GROUP BY 截断。
+        """
+        head = self._find_top_level_keyword(s, (kw,))
+        if head is None:
+            return None
+        start = head[0] + len(kw)
+        # `GROUP BY` / `ORDER BY` 要把 BY 一起吃掉
+        if kw.upper() in ('GROUP', 'ORDER'):
+            m = re.match(r'\s+BY\b', s[start:], re.IGNORECASE)
+            if not m:
+                return None
+            start += m.end()
+        nxt = self._find_top_level_keyword(s[start:], kws)
+        if nxt is None:
+            return s[start:].strip()
+        return s[start:start + nxt[0]].strip()
+
     def _select(self, sql: str) -> Dict:
         no_from = False
-        m = re.match(
-            r'SELECT\s+(.+?)\s+FROM\s+(.+)$',
-            sql, re.IGNORECASE | re.DOTALL)
-        if not m:
+        cols_str, from_rest = self._split_select_from(sql)
+        if cols_str is None:
+            raise SyntaxError("SELECT 语法错误")
+        if from_rest is None:
             # FROM-less SELECT：递归 CTE 的 base 分支常见写法
             # （`WITH RECURSIVE n AS (SELECT 1 AS n UNION ALL ...)`），
             # 原先直接 SyntaxError，导致整个递归 CTE 用不了
-            m2 = re.match(r'SELECT\s+(.+)$', sql,
-                          re.IGNORECASE | re.DOTALL)
-            if not m2:
-                raise SyntaxError("SELECT 语法错误")
             no_from = True
-
-        if no_from:
-            cols_str = m2.group(1).strip()
-            from_rest = None
-        else:
-            cols_str = m.group(1).strip()
-            from_rest = m.group(2).strip()
 
         # DISTINCT
         distinct = False
@@ -462,9 +579,14 @@ class Parser:
             rest = rest[jm.end():]
             jalias, rest = self._take_alias(rest)
             on_cond = None
+            # ON 文本只切到下一个顶层子句为止。注意 `(.+?)` 是非贪婪的，
+            # `AND` 不会被当成分隔符（JOIN 子句的 AND 属于 ON 条件），
+            # 传给 `_join_condition` 后若形态不认识会显式报错，
+            # 而不是静默丢掉 ON（丢掉就退化成交叉连接 → 静默错答）。
             om = re.match(
-                r'\s+ON\s+(.+?)(?=\s+(?:INNER|LEFT|RIGHT|CROSS)?\s*(?:OUTER\s+)?JOIN\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b|\s+LIMIT\b|$)',
-                rest, re.IGNORECASE | re.DOTALL)
+                r'\s+ON\s+(.+?)(?=\s+(?:INNER|LEFT|RIGHT|CROSS)?\s*'
+                r'(?:OUTER\s+)?JOIN\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b'
+                r'|\s+LIMIT\b|$)', rest, re.IGNORECASE | re.DOTALL)
             if om:
                 on_cond = self._join_condition(
                     om.group(1).strip())
@@ -480,32 +602,32 @@ class Parser:
         columns, windows, projection = self._split_windows(raw_columns)
 
         # WHERE / GROUP / HAVING / ORDER / LIMIT
+        # 全部用「括号深度感知」的扫描器切分（_extract_clause）：子查询
+        # 内部的 GROUP BY / HAVING / LIMIT 位于括号里，不算本层的子句。
+        # 原先用 `re.search(r'\bWHERE\s+(.+?)(?=\s+GROUP\b|$)')`，会在子查询
+        # 的 GROUP BY 处提前截断 → WHERE 正文缺右括号 → 误报 SyntaxError。
         where = None
         order_by = None
         limit = None
         group_by = None
         having = None
 
-        wm = re.search(
-            r'\bWHERE\s+(.+?)(?=\s+(?:GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING)\b|$)',
-            rest, re.IGNORECASE | re.DOTALL)
-        if wm:
-            where = self._where(wm.group(1))
+        wtext = self._extract_clause(
+            rest, 'WHERE', ('GROUP', 'ORDER', 'LIMIT', 'HAVING'))
+        if wtext is not None:
+            where = self._where(wtext)
 
-        gm = re.search(
-            r'\bGROUP\s+BY\s+(.+?)(?=\s+(?:HAVING|ORDER\s+BY|LIMIT)\b|$)',
-            rest, re.IGNORECASE | re.DOTALL)
-        if gm:
+        gtext = self._extract_clause(
+            rest, 'GROUP', ('HAVING', 'ORDER', 'LIMIT'))
+        if gtext is not None:
             group_by = [
                 c.strip()
-                for c in self._split_top_level(gm.group(1))
+                for c in self._split_top_level(gtext)
             ]
 
-        hm = re.search(
-            r'\bHAVING\s+(.+?)(?=\s+(?:ORDER\s+BY|LIMIT)\b|$)',
-            rest, re.IGNORECASE | re.DOTALL)
-        if hm:
-            having = self._where(hm.group(1))
+        htext = self._extract_clause(rest, 'HAVING', ('ORDER', 'LIMIT'))
+        if htext is not None:
+            having = self._where(htext)
 
         om = re.search(
             r'ORDER\s+BY\s+[`"]?([\w.]+)[`"]?(?:\s+(ASC|DESC))?',
@@ -572,11 +694,48 @@ class Parser:
            关键字，因此子查询 `EXISTS (SELECT ... WHERE a AND b)`
            里的 AND 不会被外层拆开。
 
-        已知限制：只做 AND/OR 两级，不做 NOT / XOR / IS NULL 等谓词
-        （原实现也没有，保持原状）。
+        已知限制：AND/OR 两级 + NOT / IS [NOT] NULL / 标量子查询。
+        子查询里的 OR / AND 由 _split_cond_top_level 的深度感知切分保护，
+        不会被外层拆开，所以这里不需要再动切分逻辑。
         """
         s = s.strip()
         self._check_paren_balance(s)
+
+        # `NOT EXISTS (...)` / `NOT IN (...)` 是独立谓词形态（有自己的
+        # {'op': 'NOT EXISTS'} / {'op': 'NOT IN'} 表示），不按整体取反，
+        # 交给下面的 EXISTS / IN 分支处理。
+        is_pred_not = bool(
+            re.match(r'NOT\s+(EXISTS|IN)\b', s, re.IGNORECASE))
+
+        # 整段 `NOT ( ... )`：在 OR/AND 切分**之前**处理，否则
+        # `NOT (a = 1 OR b = 2)` 会被切成 ['NOT (a = 1', 'b = 2)']。
+        # 必须要求配对括号正好在末尾：`NOT (A) AND B` 的右括号不在末尾，
+        # 它等价于 `(NOT (A)) AND B`，交给下面按顶层 AND 切分（AND 比
+        # NOT 结合得更紧），逐段递归后自然得到正确树形。
+        if not is_pred_not:
+            nm = re.match(r'NOT\s*\(', s, re.IGNORECASE)
+            if nm:
+                end = self._matching_paren(s, nm.end() - 1)
+                if end == len(s) - 1:
+                    inner = self._where(s[nm.end():end])
+                    # 规范化：`NOT (c IN (...))` 直接产出 `c NOT IN (...)`
+                    # （含子查询与字面量列表两种形态）。原因：
+                    # 1) `IN (v1, v2)` 的解析结果本身要由外层补 column，
+                    #    嵌在 NOT 里会变成没有 column 的 {'values': ...}，
+                    #    执行器取 column 时报「表不存在: 'value'」；
+                    # 2) 执行器对 NOT IN 的三值语义（列表/子查询含 NULL）
+                    #    已有完整实现，直接复用比再包一层 NOT 更可靠。
+                    if inner.get('op') == 'IN':
+                        inner = dict(inner)
+                        inner['op'] = 'NOT IN'
+                        return inner
+                    # 同理 `NOT (c IS NULL)` -> `c IS NOT NULL`
+                    if 'column' in inner and inner.get('value') is None \
+                            and inner.get('op') in ('=', '!='):
+                        inner = dict(inner)
+                        inner['op'] = '!=' if inner['op'] == '=' else '='
+                        return inner
+                    return {'not': inner}
 
         s = self._strip_outer_parens(s)
 
@@ -587,6 +746,12 @@ class Parser:
         and_parts = self._split_cond_top_level(s, 'AND')
         if len(and_parts) > 1:
             return {'and': [self._where(p) for p in and_parts]}
+
+        # 走到这里说明整段没有顶层 OR/AND：`NOT (...)` 一定是整段形态，
+        # 但前面的括号匹配失败（例如 `NOT (A) 尾随垃圾`），显式报错，
+        # 避免把 `NOT dept = 'Eng'` 之类静默当成别的东西。
+        if not is_pred_not and re.match(r'NOT\b', s, re.IGNORECASE):
+            raise SyntaxError(f"NOT 后面必须是一段括号条件: {s}")
 
         # EXISTS
         em = re.match(
@@ -602,6 +767,38 @@ class Parser:
         if nm:
             inner = self.parse(nm.group(1).strip())
             return {'op': 'NOT EXISTS', 'subquery': inner}
+
+        # 标量（相关）子查询：`(SELECT COUNT(*) FROM o WHERE o.uid = u.id) > 1`
+        # 产出 {'op': '>', 'value': '1', 'subquery': <内层 AST>}，
+        # 与 IN (SELECT ...) 同构，执行器的逐行求值路径据此取标量值再比较。
+        sm = re.match(r'^\s*\(\s*SELECT\b', s, re.IGNORECASE)
+        if sm:
+            end = self._matching_paren(s, s.index('('))
+            tail = s[end + 1:].strip()
+            tm = re.match(r'(=|!=|<>|<=|>=|<|>)\s*(.+?)\s*$',
+                          tail, re.IGNORECASE | re.DOTALL)
+            if tm and tail:
+                inner = self.parse(s[1:end].strip())
+                op = tm.group(1).upper()
+                return {
+                    'op': '!=' if op == '<>' else op,
+                    'value': tm.group(2).strip().strip("'\""),
+                    'subquery': inner,
+                }
+
+        # IS NULL / IS NOT NULL（普通列；聚合形态在下面的聚合谓词里处理）
+        # 统一编码成 op='=' / '!=' + value=None —— 与存储层 _match、
+        # plan_executor._eval_condition、统一路径 _eval_condition 的既有
+        # NULL 语义完全一致，因此两条求值路径都不需要额外分支。
+        zm = re.match(
+            r'\s*[`"]?([\w.]+)[`"]?\s+IS\s+(NOT\s+)?NULL\s*$',
+            s, re.IGNORECASE)
+        if zm:
+            return {
+                'column': zm.group(1),
+                'op': '!=' if zm.group(2) else '=',
+                'value': None,
+            }
 
         # IN (SELECT ...)
         im = re.match(
@@ -635,6 +832,16 @@ class Parser:
         # 导致 `... GROUP BY city HAVING COUNT(*) > 5` 连解析都过不去。
         # 产出 {'agg': 'COUNT(*)', 'op': '>', 'value': 1}，聚合值由
         # GroupBy / 统一分组路径用 _eval_agg_expr 求出后再比较。
+        # 聚合值上的 IS [NOT] NULL 同样编码成 op='=' / '!=' + value=None。
+        agm = re.match(
+            r'\s*(\w+)\s*\(\s*(\*|[^()]*?)\s*\)\s+IS\s+(NOT\s+)?NULL\s*$',
+            s, re.IGNORECASE)
+        if agm:
+            return {
+                'agg': f'{agm.group(1).upper()}({agm.group(2).strip()})',
+                'op': '!=' if agm.group(3) else '=',
+                'value': None,
+            }
         am = re.match(
             r'\s*(\w+)\s*\(\s*(\*|[^()]*?)\s*\)\s*'
             r'(=|!=|<>|<=|>=|<|>)\s*(.+?)\s*$',
@@ -952,12 +1159,21 @@ class Parser:
         return {'command': 'SHOW COLUMNS', 'table': m.group(1)}
 
     def _join_condition(self, s: str) -> Optional[Dict]:
+        """解析 JOIN ON 条件
+
+        当前只支持单个等值连接（`a.x = b.y`）。**不认识的形态一律抛
+        SyntaxError**，不能返回 None —— 返回 None 会让 JOIN 静默退化成
+        交叉连接（`ON a.x=b.x AND b.y=1` 会丢掉后半段、结果行数翻倍），
+        属于典型的静默错答。
+        """
+        text = s.strip()
         m = re.match(
             r'[`"]?([\w.]+)[`"]?\s*=\s*[`"]?([\w.]+)[`"]?\s*$',
-            s.strip())
+            text)
         if m:
             return {'left': m.group(1), 'right': m.group(2)}
-        return None
+        raise SyntaxError(
+            f"JOIN ON 条件只支持单个等值连接（形如 a.x = b.y）: {text}")
 
     def _split_top_level(self, s: str) -> List[str]:
         """按顶层逗号分割"""

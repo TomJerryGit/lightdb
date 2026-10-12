@@ -611,6 +611,50 @@ xmin(4) | xmax(4) | flags(1) | dlen(4) | prev_page(4) | prev_slot(4)
 
 ---
 
+## 22. 相关子查询补全 / NOT / IS NULL / 投影算术（后续会话，2026-10）
+
+### 22.1 相关子查询：外层列常量折叠
+
+原先「含 JOIN」「含 GROUP BY/HAVING」「引用外层列做聚合」三种相关形态直接报错。现在改为**外层列常量折叠**：对外层每一行，把子查询 AST 里的 `外层别名.列` 替换成该行的字面量（WHERE/HAVING/SELECT 列表都处理），再交给**正常执行路径**（它已支持 JOIN/GROUP BY/HAVING/窗口/嵌套），并按折叠值缓存结果。
+
+顺带修掉两个**静默错答**：① 嵌套子查询引用外层列漏判 → 结果恒为空；② 折叠缓存键漏掉 value 位与嵌套层引用 → 空键导致所有外层行共用第一行的结果。
+
+**Lead 独立复现**：
+
+| 查询 | 结果 |
+|---|---|
+| `WHERE (SELECT COUNT(*) FROM o WHERE o.uid=u.id) > 1` | `[(1,)]` ✅ |
+| 相关 `EXISTS` 含 JOIN（外层**有别名**） | `[(1,),(2,)]` ✅ |
+| 相关 `EXISTS` 含 `GROUP BY/HAVING` | `[(1,)]` ✅ |
+| 相关 `IN` | `[(1,),(2,)]` ✅ |
+
+### 22.2 `NOT (...)` 与 `IS [NOT] NULL`
+
+`NOT(...)` 按德摩根推到叶子后再交给存储层（存储层只见到它能认的运算符）；`IS [NOT] NULL` 编码为 `value=None` 的 `=`/`!=`，WHERE 与 HAVING 都支持。Lead 复现：`NOT (id = 1)` → `[2,3]`；`amount IS NULL` → `[4]`。
+
+### 22.3 投影算术
+
+`_arith_projection_expr` 命中即走高级路径，复用既有 `_parse_arith`/`_eval_arith`（原先整条下推到存储层报「列不存在」）。Lead 复现：`SELECT id, amt*2 AS d FROM o` 正常；除零返回 NULL 不崩溃。
+
+### 22.4 Lead 抽查发现的**两处静默错答**（未修，优先级最高）
+
+1. **投影里的标量子查询返回 NULL 占位**：
+   `SELECT id, (SELECT COUNT(*) FROM orders o WHERE o.uid=users.id) AS cnt FROM users`
+   实测每行 `cnt = None`（应为 `2, 1, 0`）。这是**报错缺位的错答**——使用者会拿到看似正常的结果。
+2. **外层表未起别名、内层 JOIN 又出现同名表时**，相关引用被算成**空集**而不是报错（`SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders o JOIN users u2 ON o.uid=u2.id WHERE o.uid=users.id)` → `[]`，应为 `[(1,),(2,)]`）；同一查询给外层起别名（`FROM users u1`）则结果正确。
+
+这两条都属于「宁可报错也不要错答」应当覆盖的情况，建议下一步优先处理。
+
+### 22.5 测试与仍不支持
+
+`tests/test_v4_sql_features.py` 追加 5 个 test 函数；4 文件基线 50 → 55 passed；全量 259 通过 / 80 失败 / 1 跳过（此前 253/81/1），子代理在干净 HEAD `worktree` 上对照确认新增失败为 0。
+
+一处越界改动（已核对）：子代理改写了 `test_correlated_subqueries` 里「相关子查询做聚合必须报错」的断言——它编码的正是本轮被移除的限制，Lead 核对 `git diff` 确认**被删除的仅有这一条**。
+
+仍不支持（显式报错）：WHERE 里的算术谓词（`salary*2 > 230`）；复合 `JOIN ON a=b AND c=d`（现改为报错——原先会**静默丢 ON 退化成笛卡尔积**，属错答，现已收敛为显式错误）；嵌套子查询引用外层**裸列名**的相关判定可能漏判。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。
