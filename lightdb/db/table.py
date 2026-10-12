@@ -25,6 +25,17 @@
 - **崩溃恢复**: recover_from_wal() 用 WAL.analyze() 做
   redo(已提交) + undo(loser，倒序)，全部幂等；恢复成功后才
   truncate WAL。
+- **log-before-data**: WAL 记录用 log() 写入缓冲后，立刻
+  flush_to_os() 交给 OS，**然后**才改页。这样即使脏页被驱逐落盘
+  后进程被硬杀，日志也一定读得回来，不会出现"页改了、日志没了"
+  而无法撤销。
+- **WAL 增长控制**: 干净 shutdown（Table.close）在刷完页之后
+  truncate WAL；否则 WAL 会无限增长、下次启动还要做全量重放。
+
+性能说明: autocommit 语句的隐式 COMMIT 走 WAL.commit_async()
+（只 flush 到 OS，不 fsync）。早期版本对每条 autocommit INSERT
+都 fsync，实测 3000 行插入要 200s+（14 rows/s）。真正要求
+掉电不丢的是显式 COMMIT / abort / flush / close，它们仍然 fsync。
 
 已知限制:
 - 合成事务号是进程内递减的高位 uint32（>= SYNTHETIC_TXN_FLOOR），
