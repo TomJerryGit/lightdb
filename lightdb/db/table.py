@@ -32,6 +32,33 @@
 - **WAL 增长控制**: 干净 shutdown（Table.close）在刷完页之后
   truncate WAL；否则 WAL 会无限增长、下次启动还要做全量重放。
 
+持久化版本链批次（本文件，页/行布局变更）:
+- **行头扩展**: ROW_HEADER 13 → 21 字节，新增 prev_page / prev_slot
+  两个 uint32 指向前一版本在堆里的物理位置：
+      [0:4]   xmin      创建该版本的事务号
+      [4:8]   xmax      淘汰该版本（更新/删除）的事务号，0 = 仍存活
+      [8]     flags     保留
+      [9:13]  dlen      JSON 载荷长度
+      [13:17] prev_page 前一版本所在堆页；0 = 无前驱（版本链起点）
+      [17:21] prev_slot 前一版本槽位（prev_page == 0 时无意义）
+  **旧数据文件不兼容**：旧行头只有 13 字节，解码时 dlen 之后的 8 字节
+  会被当成 prev 指针（读到 JSON 载荷里的字节），版本链会指向垃圾位置。
+  实测数据目录都是新建的（各测试自己的 data_* 子目录），因此不做迁移；
+  若要读旧文件必须重建表。
+- **UPDATE 不再原地覆写**: 旧版本行头 xmax 就地写成本事务号（旧行
+  数据 + 它自己的 prev 指针原样保留），新版本另写一槽，行头
+  xmin = 本事务号、prev = 旧版本位置。索引（BTree，pk -> (page,slot)
+  单一键）仍指向**最新**版本，于是「索引头 + prev 链」构成一条
+  持久化的版本链（方案 A，见 _read_version）。
+- **DELETE 不再摘索引**: 只把行头 xmax 置为真实事务号（墓碑），
+  索引项**保留**指向该墓碑。否则重启后老快照连墓碑的位置都找不到，
+  「删掉的行老快照仍应看得见」无法实现。
+- **重启后老快照可见**: 版本链在页上，重启后 ReadView 只要拿到
+  同样的 (txn_id, active, min_id, max_id, aborted) 就能沿链回溯到
+  被覆盖前的旧值（tests/test_mvcc_persistence.py 实测）。
+- **vacuum**: Table.vacuum(horizon) / Database.vacuum() 回收
+  「对所有活跃快照都不可见」的旧版本，并缝合 prev 链。
+
 性能说明: autocommit 语句的隐式 COMMIT 走 WAL.commit_async()
 （只 flush 到 OS，不 fsync）。早期版本对每条 autocommit INSERT
 都 fsync，实测 3000 行插入要 200s+（14 rows/s）。真正要求
@@ -45,6 +72,22 @@
   WAL 会随写入线性增长直到下次启动 truncate。
 - 非整型主键不建索引（_rebuild_index 只收 isinstance(pk, int)），
   与本次修复无关，保持原状。
+- **没有 vacuum 时空间只增不减**：每次 UPDATE 都会多留一个旧版本行、
+  每次 DELETE 都会留墓碑，堆页只增不回收，直到显式调用 vacuum()。
+- **不做 vacuum 时版本链会变长**：链越长，老快照的回溯扫描越慢
+  （O(版本数) 次单槽读取）。
+- SQL 层（lightdb/sql/plan_executor.py，本批次不允许改动）的
+  SeqScan 只判断索引头那一行的可见性、不走 prev 链，所以
+  **SQL 语句读不到老快照的旧版本**；Python API 的
+  Table.select(..., read_view=...) 才能沿链回溯。
+  （JOIN 走的 PlanExecutor 一定带 read_view，所以墓碑不会"复活"成
+   可见行；DELETE 后索引里留着墓碑，这一点依赖读路径的可见性判断。）
+- 写路径把"本读视图看得见的版本"当作淘汰对象。行锁保证同一主键
+  不会被并发改写，所以它总是索引头；只有拿"重启后重建的历史快照"
+  去写时它才可能是链中间的版本，此时索引前移会让中间版本之后更新的
+  版本暂时不可达（读老快照 + 写同一行 = 不支持）。
+- 主键复用（DELETE 后重新 INSERT 同一主键）会把新版本挂到墓碑后面，
+  于是老快照仍读到被删的旧值 —— 语义上等价于"重插",符合 MVCC。
 """
 import json
 import re
@@ -56,14 +99,24 @@ from typing import Any, Dict, List, Optional
 from ..storage.page import PAGE_TYPE_HEAP
 from ..storage.buffer_pool import BufferPool
 from ..storage.btree import BTree
-from ..storage.wal import WAL
+from ..storage.wal import WAL, is_implicit_commit_tid
 from ..storage.lock_manager import (
     LockManager, LockType, DeadlockError)
 from ..storage.mvcc import MVCCManager, UndoAction
 from ..logger import logger
 
 
-ROW_HEADER = 13  # xmin(4) + xmax(4) + flags(1) + len(4)
+# 行头布局（见文件头说明）：
+#   xmin(4) + xmax(4) + flags(1) + dlen(4) + prev_page(4) + prev_slot(4)
+#   13 字节是"旧布局前缀"，前 13 字节的语义没变，外部按
+#   struct.unpack_from('<IIBI', rb, 0) 读 xmin/xmax/dlen 的代码仍然可用。
+ROW_HEADER = 21
+ROW_HEADER_LEGACY13 = 13
+
+# prev_page == 0 表示"没有前一版本"。
+# 安全性: BufferPool.new_page 的页号从 0（元数据页）开始递增，
+# 堆页永远是 >= 1，所以 0 不可能是一个合法堆页号。
+NO_PREV = 0
 
 # autocommit 语句用的合成事务号。
 #
@@ -143,6 +196,9 @@ class Table:
         # 事务号 -> ReadView（供写路径的可见性判断 + 恢复用）
         self._read_views: Dict[int, Any] = {}
 
+        # 崩溃恢复期的"版本位置重映射"（见 _resolve_old_loc），空闲时为空
+        self._recovery_remap: Dict[tuple, tuple] = {}
+
     # ==================== 事务辅助 ====================
 
     def _stmt_tid(self, txn_id: int) -> int:
@@ -195,6 +251,75 @@ class Table:
             return xmax == 0
         return read_view.is_visible(xmin, xmax)
 
+    # ==================== 持久化版本链 ====================
+
+    def _chain_versions(self, start_loc, limit: int = 4096):
+        """
+        从 start_loc 沿 prev 指针往回走，逐个 yield
+        (page_id, slot_id, rb, values, xmin, xmax, prev_page, prev_slot)。
+
+        为什么需要: 索引只有 pk -> (page,slot) 单一定位，指向最新版本；
+        被 UPDATE 覆盖/被 DELETE 墓碑化的旧版本只能靠行头里的
+        prev_page/prev_slot 回溯 —— 这张"链"是**落在页上**的，
+        所以重启后仍然可走（这正是本次改造的核心）。
+
+        limit 是防御性上界（断链/人为损坏时不至于死循环），
+        同时用 seen 集合防止环。
+        """
+        loc = start_loc
+        seen = set()
+        n = 0
+        while loc is not None and n < limit:
+            if loc in seen:
+                return
+            seen.add(loc)
+            n += 1
+            pid, sid = loc
+            page = self.bp.get_page(pid)
+            rb = page.get_row(sid) if page is not None else None
+            r = self._decode_row_ver(rb)
+            if r is None:
+                return
+            values, xmin, xmax, pp, ps = r
+            yield pid, sid, rb, values, xmin, xmax, pp, ps
+            if pp == NO_PREV or pp is None:
+                return
+            loc = (pp, ps)
+
+    def _read_version(self, pk, read_view):
+        """
+        沿版本链找对 read_view 可见的**最新**版本。
+
+        可见性规则（与 ReadView.is_visible 一致）:
+          xmin 已提交且对本读视图可见，且
+          (xmax == 0 或 xmax 对本读视图不可见 —— 删除/更新它的事务
+           未提交、或已回滚) → 该版本可见。
+        已回滚事务写下的新版本在链上会被跳过（xmax == xmin == 事务号
+        对任何读视图都不可见），回滚后的旧版本（xmax 被复位成 0）
+        自然重新可见。
+
+        返回 (values, xmin, xmax, page_id, slot_id) 或 None。
+        """
+        loc = self.bt.search(pk)
+        if loc is None:
+            return None
+        for pid, sid, _rb, values, xmin, xmax, _pp, _ps in \
+                self._chain_versions(loc):
+            if self._is_visible(xmin, xmax, read_view):
+                return values, xmin, xmax, pid, sid
+        return None
+
+    def _visible_pks(self, read_view):
+        """全表扫描：返回 [(pk, values, xmin, xmax, pid, sid)]（当前读视图可见的版本）"""
+        out = []
+        for k, pid, sid in self.bt.scan():
+            for vpid, vsid, _rb, values, xmin, xmax, _pp, _ps in \
+                    self._chain_versions((pid, sid)):
+                if self._is_visible(xmin, xmax, read_view):
+                    out.append((k, values, xmin, xmax, vpid, vsid))
+                    break
+        return out
+
     # ==================== 元数据 ====================
 
     def _load_btree_root(self):
@@ -212,28 +337,46 @@ class Table:
         """
         索引重建：只在 BTree 为空时扫描 heap 页重建。
 
-        ★ 必须跳过"墓碑"（xmax != 0 的历史版本）：DELETE/UPDATE 会
-        把旧行按 xmax=事务号 留在页上，它们不在索引里也不可读；
-        如果重建时把它们也建进索引，已删除的行就会"复活"。
-        启动时页上 xmax != 0 只可能是**已提交**的删除/更新
-        （未提交的会被回滚改成 xmax=0 或物理移除），所以这里直接
-        按 xmax == 0 过滤是安全的。
+        新布局下页上同一个 pk 会有多个版本（活版本 + 若干墓碑），
+        索引必须指向**版本链的头**（最新的那个版本），否则
+        _read_version 从索引出发会走不到链尾的老版本。
+
+        链头的判定不靠事务号大小：autocommit 的合成事务号是从
+        0xFFFFFFFF 往下递减的高位号，数值上比真实事务号大得多，
+        按 max(xmin) 选头会选错。这里按 prev 指针判定：
+        **没有被本 pk 任何其它版本当作 prev 的版本就是链头**。
+        若页上出现断链（人为损坏），退化为取 xmin 最大者。
+
+        墓碑（xmax != 0）**也要建索引**：DELETE 后索引项必须保留指
+        向墓碑，重启后老快照才可能沿链找到被删除的旧值；可见性由
+        _read_version/_is_visible 负责，已删除的行不会"复活"。
         """
         if self.bt.count() > 0:
             return
+
+        versions = {}       # pk -> [(pid, sid, xmin, prev_page, prev_slot)]
         for pid in range(1, self.bp.total_pages()):
             page = self.bp.get_page(pid)
-            if page and page.page_type == PAGE_TYPE_HEAP:
-                for sid, rb in page.iter_rows():
-                    r = self._decode_row_full(rb)
-                    if not r:
-                        continue
-                    row, _xmin, xmax = r
-                    if xmax != 0:
-                        continue        # 墓碑：不可见，不建索引
-                    pk = row[self.pk_idx]
-                    if isinstance(pk, int):
-                        self.bt.insert(pk, pid, sid)
+            if page is None or page.page_type != PAGE_TYPE_HEAP:
+                continue
+            for sid, rb in page.iter_rows():
+                r = self._decode_row_ver(rb)
+                if not r:
+                    continue
+                row, xmin, _xmax, pp, ps = r
+                pk = row[self.pk_idx]
+                if isinstance(pk, int):
+                    versions.setdefault(pk, []).append(
+                        (pid, sid, xmin, pp, ps))
+
+        for pk, vers in versions.items():
+            referenced = {(v[3], v[4]) for v in vers if v[3] != NO_PREV}
+            heads = [(v[0], v[1], v[2]) for v in vers
+                     if (v[0], v[1]) not in referenced]
+            if not heads:
+                heads = [(v[0], v[1], v[2]) for v in vers]
+            pid, sid, _xmin = max(heads, key=lambda h: h[2])
+            self.bt.insert(pk, pid, sid)
 
     def _calc_next_pk(self) -> int:
         max_pk = 0
@@ -251,25 +394,52 @@ class Table:
     # ==================== 行编解码 ====================
 
     def _encode_row(self, values: List,
-                    xmin: int = 0, xmax: int = 0) -> bytes:
+                    xmin: int = 0, xmax: int = 0,
+                    prev_page: int = NO_PREV,
+                    prev_slot: int = 0) -> bytes:
+        """
+        编码一个版本行。布局见文件头（21 字节行头 + JSON 载荷）。
+
+        prev_page/prev_slot: 本版本的前一版本在堆里的位置，
+        0/0 表示版本链起点（本行是该 pk 的第一个版本）。
+        """
         jd = json.dumps(
             values, ensure_ascii=False, default=str).encode('utf-8')
         return struct.pack(
-            '<IIBI', xmin, xmax, 0, len(jd)) + jd
+            '<IIBIII', xmin, xmax, 0, len(jd),
+            prev_page, prev_slot) + jd
 
-    def _decode_row_full(self, rb: bytes):
-        if len(rb) < ROW_HEADER:
+    def _decode_row_ver(self, rb: bytes):
+        """
+        解出新布局的完整版本信息:
+            (values, xmin, xmax, prev_page, prev_slot)
+        返回 None 表示行字节非法/被截断。
+        """
+        if not rb or len(rb) < ROW_HEADER:
             return None
         try:
-            xmin, xmax, flags, dlen = struct.unpack_from(
-                '<IIBI', rb, 0)
+            xmin, xmax, _flags, dlen, pp, ps = struct.unpack_from(
+                '<IIBIII', rb, 0)
             if len(rb) < ROW_HEADER + dlen:
                 return None
             values = json.loads(
                 rb[ROW_HEADER:ROW_HEADER + dlen].decode('utf-8'))
-            return values, xmin, xmax
+            return values, xmin, xmax, pp, ps
         except Exception:
             return None
+
+    def _decode_row_full(self, rb: bytes):
+        """
+        兼容旧调用方的三元组接口 (values, xmin, xmax)。
+
+        lightdb/sql/plan_executor.py、lightdb/performance/parallel.py
+        以及 tests/ 都按这个形状解包，因此**不能**改成四元组；
+        需要 prev 指针的内部路径请用 _decode_row_ver。
+        """
+        r = self._decode_row_ver(rb)
+        if r is None:
+            return None
+        return r[0], r[1], r[2]
 
     def _decode_row(self, rb: bytes):
         r = self._decode_row_full(rb)
@@ -321,36 +491,42 @@ class Table:
         # 加锁
         self._acquire_row_lock(tid, pk)
 
-        # 检查主键重复
+        # 检查主键重复 + 找"前一版本"（新布局：索引头可能就是墓碑）
+        prev_page, prev_slot = NO_PREV, 0
         loc = self.bt.search(pk)
         if loc is not None:
             page = self.bp.get_page(loc[0])
-            rb = page.get_row(loc[1])
-            r = self._decode_row_full(rb)
-            if r:
-                _, old_xmin, old_xmax = r
+            rb = page.get_row(loc[1]) if page is not None else None
+            r = self._decode_row_ver(rb)
+            if r is not None:
+                _, old_xmin, old_xmax = r[0], r[1], r[2]
                 # 只有"当前可见"的行才算重复；已被本事务或
                 # 其他事务标记删除的历史版本可以复用主键。
                 visible = self._is_visible(
                     old_xmin, old_xmax, read_view)
                 if visible:
                     raise ValueError(f"主键重复: {pk}")
+                # ★ 复用墓碑/不可见旧版本的主键时，把新版本接到它后面，
+                #   否则索引项被覆盖后，老快照就再也找不到被删的旧值。
+                prev_page, prev_slot = loc[0], loc[1]
 
         # WAL（log-before-data）。flush 到 OS 必须发生在改页**之前**：
         # 否则脏页可能被驱逐落盘，而日志还留在 Python 缓冲里 ——
         # 崩溃后就出现"页改了、日志没了"，恢复无法撤销。
         self.wal.log(tid, 'INSERT', {
             'table': self.name, 'pk': pk, 'row': row,
+            'prev': [prev_page, prev_slot],
         })
         self.wal.flush_to_os()
 
-        # 写堆
-        rb = self._encode_row(row, xmin=tid, xmax=0)
+        # 写堆：新版本行头 xmin = 本事务号，prev 指向被复用的旧版本
+        rb = self._encode_row(row, xmin=tid, xmax=0,
+                              prev_page=prev_page, prev_slot=prev_slot)
         page_id, slot_id = self._heap_insert(rb)
         if page_id is None:
             raise RuntimeError("存储空间不足")
 
-        # 写索引
+        # 写索引：指向最新版本（覆盖旧的索引项）
         self.bt.insert(pk, page_id, slot_id)
         self._next_pk = max(self._next_pk, pk + 1)
 
@@ -393,10 +569,11 @@ class Table:
                read_view=None) -> int:
         """更新
 
-        原地覆写时把旧行完整字节压入物理 undo；空间不足需要搬到
-        新页时，额外记录"键->原页原槽位"，回滚时把索引项也搬回去。
-        旧版本行头的 xmax 写真实事务号（autocommit 写负数合成号），
-        供读视图过滤并发未提交的更新。
+        **不再原地覆写**：把目标旧版本的行头 xmax 写成本事务号（旧行
+        数据与它自己的 prev 指针原样留在堆里），然后**另写一个新版本**
+        （xmin = 本事务号，prev = 旧版本位置），索引指向新版本。
+        旧行完整字节同时压入物理 undo，回滚时按原页原槽位写回并把
+        新版本清掉。xmax 用真实事务号，供读视图过滤并发未提交的更新。
         """
         with self._lock:
             tid = self._stmt_tid(txn_id)
@@ -420,18 +597,23 @@ class Table:
             loc = self.bt.search(pk)
             if loc is None:
                 continue
+            head_loc = loc
 
-            page = self.bp.get_page(loc[0])
+            # 要淘汰的是"本读视图看得见的那一版"（正常情况就是索引头）
+            anchor = self._read_version(pk, read_view)
+            if anchor is None:
+                continue
+            _, old_xmin, old_xmax, apid, asid = anchor
+            page = self.bp.get_page(apid)
             if page is None:
                 continue
-            rb = page.get_row(loc[1])
-            r = self._decode_row_full(rb)
+            rb = page.get_row(asid)
+            r = self._decode_row_ver(rb)
             if r is None:
                 continue
+            old_row, old_pp, old_ps = r[0], r[3], r[4]
 
-            old_row, old_xmin, old_xmax = r
-
-            # ★ MVCC 加表名（版本链，供读视图回查）
+            # ★ MVCC 加表名（内存版本链，供本进程内的读视图回查）
             self.mvcc.add_undo(
                 pk, old_xmin, tid, old_row,
                 table=self.name)
@@ -443,38 +625,53 @@ class Table:
                     raise ValueError("不允许修改主键")
                 new[ci] = coerce(val, self.cols[ci]['type'])
 
-            # ★ xmax 写真实事务号：并发读者靠它把这条未提交的
-            #   更新挡在外面（同时保留旧的 xmin 语义在 MVCC 链里）。
+            # ★ 旧版本墓碑化：
+            #   - xmax 写真实事务号（并发读者靠它挡住未提交的更新）；
+            #   - 只改 xmax，旧版本自己的 prev 指针必须原样保留，
+            #     否则链就断在这里、更老的历史版本再也走不到。
+            #   若该版本已经被别的事务标记淘汰（xmax != 0，正常情况
+            #   下会被行锁挡住），保留原有标记不覆盖。
             old_ver = self._encode_row(
-                old_row, xmin=old_xmin, xmax=tid)
-            nrb = self._encode_row(new, xmin=tid, xmax=0)
+                old_row, xmin=old_xmin,
+                xmax=tid if old_xmax == 0 else old_xmax,
+                prev_page=old_pp, prev_slot=old_ps)
+            # ★ 新版本：xmin = 本事务号，prev 指向刚墓碑化的旧版本
+            nrb = self._encode_row(
+                new, xmin=tid, xmax=0,
+                prev_page=apid, prev_slot=asid)
 
             self.wal.log(tid, 'UPDATE', {
                 'table': self.name, 'pk': pk,
                 'old': old_row, 'new': new,
-                'old_loc': [loc[0], loc[1]],
+                'old_loc': [apid, asid],
                 'old_b': self._encode_row(
-                    old_row, xmin=old_xmin, xmax=0).hex(),
+                    old_row, xmin=old_xmin, xmax=0,
+                    prev_page=old_pp, prev_slot=old_ps).hex(),
                 'tomb_b': old_ver.hex(),
+                'ver_b': nrb.hex(),
             })
             self.wal.flush_to_os()      # 先落日志，再改页
 
             if owned:
                 undo_act = self.mvcc.push_undo(tid, UndoAction(
                     'UPDATE', self.name, pk, txn_id=tid, rb=rb,
-                    page_id=loc[0], slot_id=loc[1]))
+                    page_id=apid, slot_id=asid))
 
-            # ★ 先把旧版本按"已删除"标记写回（xmax = 本事务号），
-            #   它就成了页上的历史版本；再把新版本放进去。
-            #   旧实现的旧版本只存在于内存 undo 镜像里。
-            if not page.update_row_inplace(loc[1], old_ver):
-                page.restore_row(loc[1], old_ver)
+            # 旧版本墓碑写回**原槽位**（长度不变，原地覆盖即可）
+            if not page.update_row_inplace(asid, old_ver):
+                page.restore_row(asid, old_ver)
 
             np, ns = self._heap_insert(nrb)
             if np is None:
                 raise RuntimeError("存储空间不足")
-            self.bt.delete(pk)
-            self.bt.insert(pk, np, ns)
+            # 索引指向新版本（版本链的头）。正常情况 anchor 就是索引头
+            # （行锁保证同一主键不会被并发改写），这里把索引前移即可。
+            # 若 anchor 是链中间的旧版本（只有"重建出来的历史快照"去写
+            # 才会遇到），索引前移会让中间那版之后更新的版本暂时不可达
+            # —— 属于已知限制，见文件头"已知限制"。
+            if (np, ns) != head_loc:
+                self.bt.delete(pk)
+                self.bt.insert(pk, np, ns)
 
             # 回滚时还要把这个新版本清掉（否则页上留一个不可见死行）
             if owned and undo_act is not None:
@@ -487,8 +684,10 @@ class Table:
                txn_id: int = 0, read_view=None) -> int:
         """删除
 
-        物理摘除行 + 索引项，同时把旧行完整字节压入物理 undo，
-        回滚时按原页原槽位复活；xmax 写真实事务号。
+        **不物理删行、也不摘索引项**：只把目标版本行头的 xmax 写成
+        真实事务号（墓碑），行数据与 prev 链保留在堆里；索引继续指向
+        这个墓碑，这样重启后老快照沿链仍能读到被删除的旧值。
+        同时把旧行完整字节压入物理 undo，回滚时按原页原槽位复活。
         """
         with self._lock:
             tid = self._stmt_tid(txn_id)
@@ -507,71 +706,69 @@ class Table:
         for pk in pks:
             self._acquire_row_lock(tid, pk)
 
-            loc = self.bt.search(pk)
-            if loc is None:
+            anchor = self._read_version(pk, read_view)
+            if anchor is None:
                 continue
+            _, old_xmin, old_xmax, apid, asid = anchor
 
-            page = self.bp.get_page(loc[0])
+            page = self.bp.get_page(apid)
             if page is None:
                 continue
-            rb = page.get_row(loc[1])
-            r = self._decode_row_full(rb)
+            rb = page.get_row(asid)
+            r = self._decode_row_ver(rb)
             if r is None:
                 continue
+            old_row, old_pp, old_ps = r[0], r[3], r[4]
 
-            old_row, old_xmin, _ = r
-
-            # ★ MVCC 加表名（版本链）
+            # ★ MVCC 加表名（内存版本链）
             self.mvcc.add_undo(
                 pk, old_xmin, tid, old_row,
                 table=self.name)
 
             # ★ 旧版本行头写入真实删除事务号（autocommit 为合成号），
-            #   然后把它作为"墓碑"留在页上：不在索引里、对任何读视图
-            #   都不可见，xmax 才是真实值而不是恒为 0。
+            #   然后把它作为"墓碑"留在页上：索引项**保留**指向它，
+            #   对看得见删除事务的读视图不可见，对看不见的（老快照）
+            #   仍然可见 —— 这就是"删掉的行老快照还能读到"的实现。
             old_ver = self._encode_row(
-                old_row, xmin=old_xmin, xmax=tid)
+                old_row, xmin=old_xmin,
+                xmax=tid if old_xmax == 0 else old_xmax,
+                prev_page=old_pp, prev_slot=old_ps)
 
             self.wal.log(tid, 'DELETE', {
                 'table': self.name, 'pk': pk,
                 'old': old_row,
                 # old_b = 事务前的**干净前像**（xmax=0），撤销时原样写回
                 'old_b': self._encode_row(
-                    old_row, xmin=old_xmin, xmax=0).hex(),
+                    old_row, xmin=old_xmin, xmax=0,
+                    prev_page=old_pp, prev_slot=old_ps).hex(),
                 'tomb_b': old_ver.hex(),
-                'old_loc': [loc[0], loc[1]],
+                'old_loc': [apid, asid],
             })
             self.wal.flush_to_os()      # 先落日志，再改页
 
             if owned:
                 self.mvcc.push_undo(tid, UndoAction(
                     'DELETE', self.name, pk, txn_id=tid, rb=rb,
-                    page_id=loc[0], slot_id=loc[1]))
+                    page_id=apid, slot_id=asid))
 
-            if not page.update_row_inplace(loc[1], old_ver):
-                page.restore_row(loc[1], old_ver)
-            self.bt.delete(pk)
+            if not page.update_row_inplace(asid, old_ver):
+                page.restore_row(asid, old_ver)
+            # ★ 不调用 bt.delete(pk)：索引项必须留着指向墓碑
             n += 1
         return n
 
     # ==================== 读操作 ====================
+    #
+    # 读路径统一走 _read_version()：索引头 -> prev 链，取"对读视图
+    # 可见的最新版本"。内存里的 mvcc.undo_log 只作为本进程内的补充
+    # （页上没有的历史版本），重启后靠页上的链。
+    # 扫描代价: 单主键等值查找是 O(链长) 次单槽读取（无 vacuum 时
+    # 链会随更新次数增长）；全表扫描是 O(索引项数 × 链长)。
 
     def _find_pks(self, where: Optional[Dict],
                   read_view=None) -> List:
         if where is None:
-            result = []
-            for k, pid, sid in self.bt.scan():
-                page = self.bp.get_page(pid)
-                if page is None:
-                    continue
-                rb = page.get_row(sid)
-                r = self._decode_row_full(rb)
-                if r is None:
-                    continue
-                _, xmin, xmax = r
-                if self._is_visible(xmin, xmax, read_view):
-                    result.append(k)
-            return result
+            return [v[0] for v in self._visible_pks(read_view)]
 
         # 主键等值
         if 'column' in where:
@@ -580,26 +777,10 @@ class Table:
             if col == self.pk_col and op == '=':
                 try:
                     pk = coerce(val, self.pk_type)
-                    loc = self.bt.search(pk)
-                    if loc is None:
+                    v = self._read_version(pk, read_view)
+                    if v is None:
                         return []
-                    page = self.bp.get_page(loc[0])
-                    if page is None:
-                        return []
-                    rb = page.get_row(loc[1])
-                    r = self._decode_row_full(rb)
-                    if r is None:
-                        return []
-                    row, xmin, xmax = r
-                    if not self._is_visible(xmin, xmax, read_view):
-                        # 从 MVCC 历史
-                        hist = self.mvcc.find_visible_version(
-                            pk, read_view, table=self.name)
-                        if hist:
-                            row = hist[0]
-                        else:
-                            return []
-                    if self._match(row, where):
+                    if self._match(v[0], where):
                         return [pk]
                     return []
                 except Exception:
@@ -607,23 +788,9 @@ class Table:
 
         # 全表
         result = []
-        for k, pid, sid in self.bt.scan():
-            page = self.bp.get_page(pid)
-            if page is None:
-                continue
-            rb = page.get_row(sid)
-            r = self._decode_row_full(rb)
-            if r is None:
-                continue
-            row, xmin, xmax = r
-            if not self._is_visible(xmin, xmax, read_view):
-                hist = self.mvcc.find_visible_version(
-                    k, read_view, table=self.name)
-                if hist:
-                    row = hist[0]
-                else:
-                    continue
-            if self._match(row, where):
+        for k, values, _xmin, _xmax, _pid, _sid in \
+                self._visible_pks(read_view):
+            if self._match(values, where):
                 result.append(k)
         return result
 
@@ -664,21 +831,10 @@ class Table:
             pks = self._find_pks(where, read_view)
             rows = []
             for pk in pks:
-                loc = self.bt.search(pk)
-                if loc is not None:
-                    page = self.bp.get_page(loc[0])
-                    rb = page.get_row(loc[1]) if page else None
-                    r = self._decode_row_full(rb)
-                    if r:
-                        row, xmin, xmax = r
-                        if self._is_visible(xmin, xmax, read_view):
-                            rows.append(row)
-                            continue
-                if read_view is not None:
-                    hist = self.mvcc.find_visible_version(
-                        pk, read_view, table=self.name)
-                    if hist:
-                        rows.append(hist[0])
+                # _find_pks 已经按可见性挑选过，这里只需取回那一版的行值
+                v = self._read_version(pk, read_view)
+                if v is not None:
+                    rows.append(v[0])
 
         has_agg = any(
             re.match(r'\w+\s*\(', c.strip())
@@ -775,14 +931,27 @@ class Table:
 
     def _undo_one(self, act) -> bool:
         if act.op == 'INSERT':
-            # 事务插入的行 -> 删除
+            # 事务插入的行 -> 删除。
+            # 新布局下 INSERT 可能复用了某个墓碑的主键（新版本 prev
+            # 指向墓碑），所以不能简单 bt.delete(pk)：必须把索引退回
+            # 被复用的旧版本，否则那个墓碑就再也找不到了。
+            prev_loc = None
+            page = (self.bp.get_page(act.page_id)
+                    if act.page_id is not None else None)
+            rb = page.get_row(act.slot_id) if page is not None else None
+            r = self._decode_row_ver(rb)
+            if r is not None and r[3] != NO_PREV:
+                prev_loc = (r[3], r[4])
+
             loc = self.bt.search(act.pk)
-            if loc is not None:
-                self.bt.delete(act.pk)
-            elif act.page_id is not None:
-                page = self.bp.get_page(act.page_id)
-                if page is not None:
-                    page.delete_row(act.slot_id)
+            if loc is not None and (act.page_id is None or
+                                    loc == (act.page_id, act.slot_id)):
+                if prev_loc is not None:
+                    self.bt.insert(act.pk, prev_loc[0], prev_loc[1])
+                else:
+                    self.bt.delete(act.pk)
+            if page is not None:
+                page.delete_row(act.slot_id)
             self._next_pk = self._calc_next_pk()
             return True
 
@@ -874,6 +1043,20 @@ class Table:
             logger.warn(f"WAL 分析失败，跳过恢复 {self.name}: {e}")
             return 0
 
+        # ★ loser 事务号登记进 MVCC 的 aborted 集合：它们写下的新版本
+        #   从此被判为不可见（可见性规则的第 2 条），回滚语义在重启后
+        #   依然成立，不依赖页上的物理清理是否彻底。
+        loser_tids = {tid for _lsn, tid, _t, _d in loser_ops
+                      if not is_implicit_commit_tid(tid)}
+        for t in loser_tids:
+            try:
+                self.mvcc.mark_aborted(t)
+            except Exception:
+                pass
+
+        # 恢复期的"版本位置重映射"表（见 _resolve_old_loc）
+        self._recovery_remap = {}
+
         replayed = 0
         failed = 0
         for lsn, tid, rtype, data in committed_ops:
@@ -888,11 +1071,12 @@ class Table:
         undone = 0
         for lsn, tid, rtype, data in reversed(loser_ops):
             try:
-                if self._undo_wal_op(rtype, data):
+                if self._undo_wal_op(rtype, data, tid=tid):
                     undone += 1
             except Exception as e:
                 failed += 1
                 logger.warn(f"撤销 lsn={lsn} {rtype} 失败: {e}")
+        self._recovery_remap = {}
 
         if replayed or undone:
             logger.info(
@@ -922,58 +1106,201 @@ class Table:
             logger.warn(f"truncate WAL 失败: {e}")
         return replayed
 
+    # ---------- 恢复期的"版本位置重映射" ----------
+    #
+    # WAL 里记录的 old_loc 是**写日志那一刻**旧版本的物理位置。
+    # 崩溃时脏页可能只落了一部分，重放时新版本被 _heap_insert 放到
+    # 别的槽位，后续记录里的 old_loc 就可能指不到东西。_resolve_old_loc
+    # 会去版本链上按"内容相同"找回该版本的真实位置，并登记进
+    # _recovery_remap，后续记录的 prev 指针随之改写。
+    # 代价: 仅在某条记录的位置对不上时才做一次链上查找（O(链长)），
+    # 正常（位置吻合）路径是 O(1) 的一次单槽读取。
+
+    def _rec_loc(self, loc):
+        if not loc:
+            return None
+        return self._recovery_remap.get(
+            (loc[0], loc[1]), (loc[0], loc[1]))
+
+    def _remap_row_prev(self, rb: bytes) -> bytes:
+        """把行镜像里的 prev 指针按恢复期重映射表改写"""
+        if not rb or len(rb) < ROW_HEADER or not self._recovery_remap:
+            return rb
+        pp, ps = struct.unpack_from('<II', rb, 13)
+        if pp == NO_PREV:
+            return rb
+        np_, ns_ = self._rec_loc((pp, ps))
+        if (np_, ns_) == (pp, ps):
+            return rb
+        b = bytearray(rb)
+        struct.pack_into('<II', b, 13, np_, ns_)
+        return bytes(b)
+
+    @staticmethod
+    def _same_content(rb_a, rb_b) -> bool:
+        """两个行镜像的 xmin/xmax/载荷是否一致（忽略 prev 指针）"""
+        if rb_a is None or rb_b is None:
+            return False
+        if rb_a == rb_b:
+            return True
+        try:
+            xa = struct.unpack_from('<II', rb_a, 0)
+            xb = struct.unpack_from('<II', rb_b, 0)
+        except Exception:
+            return False
+        if xa != xb:
+            return False
+        da = json.loads(rb_a[ROW_HEADER:].decode('utf-8'))
+        db_ = json.loads(rb_b[ROW_HEADER:].decode('utf-8'))
+        return da == db_
+
+    @staticmethod
+    def _same_row_payload(rb_a, rb_b) -> bool:
+        """
+        两个行镜像是否"同一个事务写的同一份内容"：
+        只比 xmin 与 JSON 载荷，**忽略 xmax 和 prev**。
+
+        redo 的幂等判定用: 同一条 INSERT/UPDATE 日志写出的版本，
+        xmin 与载荷唯一确定它；xmax 之后可能被别的已提交事务改成墓碑，
+        prev 可能被恢复期的位置重映射改写，都不影响"这条日志已重放"。
+        """
+        if rb_a is None or rb_b is None:
+            return False
+        try:
+            xa = struct.unpack_from('<I', rb_a, 0)[0]
+            xb = struct.unpack_from('<I', rb_b, 0)[0]
+        except Exception:
+            return False
+        if xa != xb:
+            return False
+        try:
+            da = json.loads(rb_a[ROW_HEADER:].decode('utf-8'))
+            db_ = json.loads(rb_b[ROW_HEADER:].decode('utf-8'))
+        except Exception:
+            return False
+        return da == db_
+
+    def _resolve_old_loc(self, pk, old_loc, old_b):
+        """
+        把 WAL 记录的旧版本位置解析成**当前页上的真实位置**。
+        返回 None 表示这条日志没有位置信息（旧格式）。
+        """
+        if not old_loc:
+            return None
+        loc = self._rec_loc(old_loc)
+        want = bytes.fromhex(old_b) if old_b else None
+        if want is None:
+            return loc
+        page = self.bp.get_page(loc[0])
+        cur = page.get_row(loc[1]) if page is not None else None
+        if self._same_content(cur, want):
+            return loc
+        # 位置对不上：沿版本链找内容相同的版本（可能是本进程重放时
+        # 重新分配的槽位），找到就登记映射，后续记录跟着改写。
+        head = self.bt.search(pk)
+        if head is not None:
+            for pid, sid, rb, _v, _xm, _xx, _pp, _ps in \
+                    self._chain_versions(head):
+                if self._same_content(rb, want):
+                    self._recovery_remap[(old_loc[0], old_loc[1])] = \
+                        (pid, sid)
+                    return (pid, sid)
+        return loc
+
     def _redo_op(self, tid, rtype, data) -> bool:
-        """重放一条已提交的操作（幂等）"""
+        """
+        重放一条已提交的操作（幂等）。
+
+        新布局下的语义:
+        - INSERT: 写入新版本（xmin = tid），prev 指向被复用的旧版本
+        - UPDATE: **旧版本 xmax 置位（墓碑化）+ 新版本另写一槽**
+          （xmin = tid，prev = 旧版本位置），索引指向新版本
+        - DELETE: 旧版本 xmax 置位（墓碑化），**索引项保留**指向墓碑
+        """
         if rtype == 'INSERT':
             pk = data['pk']
-            return self._redo_put(pk, data['row'], xmin=tid)
+            prev = data.get('prev') or [NO_PREV, 0]
+            ploc = self._rec_loc(prev) if prev[0] else None
+            rb = self._encode_row(
+                data['row'], xmin=tid, xmax=0,
+                prev_page=(ploc[0] if ploc else NO_PREV),
+                prev_slot=(ploc[1] if ploc else 0))
+            return self._redo_put_img(pk, rb)
         if rtype == 'UPDATE':
-            return self._redo_update(
-                data['pk'], data['new'],
-                data.get('old_b'), data.get('old_loc'),
-                xmin=tid, tomb_b=data.get('tomb_b'))
+            return self._redo_update(tid, data)
         if rtype == 'DELETE':
-            return self._redo_delete(
-                data['pk'], data.get('old_b'),
-                data.get('tomb_b'))
+            return self._redo_delete(tid, data)
         return False
 
-    def _redo_update(self, pk, values, old_b, old_loc,
-                     xmin=0, tomb_b=None) -> bool:
-        """
-        重放已提交的 UPDATE（幂等）：
-        - 若索引当前指向的已经是"新版本"或"墓碑"，说明这条日志
-          已经重放过了，直接返回，别把新版本又覆盖成墓碑；
-        - 否则把旧版本墓碑化（xmax = tid），再把新版本追加写入。
-        """
-        new_ver = self._encode_row(values, xmin=xmin, xmax=0)
-        loc = self.bt.search(pk)
-        if loc is not None and (old_b is not None or tomb_b is not None):
-            page = self.bp.get_page(loc[0])
-            cur = page.get_row(loc[1]) if page is not None else None
-            tomb = (bytes.fromhex(tomb_b) if tomb_b
-                    else self._with_xmax(bytes.fromhex(old_b), xmin))
-            if cur != new_ver and cur != tomb:
-                if not page.update_row_inplace(loc[1], tomb):
-                    page.restore_row(loc[1], tomb)
-        return self._redo_put(pk, values, xmin=xmin)
+    def _redo_update(self, tid, data) -> bool:
+        """重放已提交的 UPDATE（幂等，见 _redo_op 说明）"""
+        pk = data['pk']
+        old_b = data.get('old_b')
+        old_loc = self._resolve_old_loc(pk, data.get('old_loc'), old_b)
 
-    def _redo_delete(self, pk, old_b, tomb_b=None) -> bool:
-        loc = self.bt.search(pk)
-        if loc is None:
+        # 新版本：prev 指向**解析后**的旧版本位置
+        nrb = self._encode_row(
+            data['new'], xmin=tid, xmax=0,
+            prev_page=(old_loc[0] if old_loc else NO_PREV),
+            prev_slot=(old_loc[1] if old_loc else 0))
+
+        # 1) 旧版本墓碑化：只在它当前还是"事务前的干净前像"时写，
+        #    避免把已经推进到更新状态的版本砸回墓碑。
+        if old_loc is not None and old_b is not None:
+            page = self.bp.get_page(old_loc[0])
+            cur = page.get_row(old_loc[1]) if page is not None else None
+            tomb = (bytes.fromhex(data['tomb_b'])
+                    if data.get('tomb_b')
+                    else self._with_xmax(bytes.fromhex(old_b), tid))
+            tomb = self._remap_row_prev(tomb)
+            if cur is not None and cur != tomb and \
+                    self._same_content(cur, bytes.fromhex(old_b)):
+                if not page.update_row_inplace(old_loc[1], tomb):
+                    page.restore_row(old_loc[1], tomb)
+
+        # 2) 新版本另写一槽（幂等：链上已有同样字节就不再写）
+        return self._redo_put_img(pk, nrb)
+
+    def _redo_delete(self, tid, data) -> bool:
+        """
+        重放已提交的 DELETE（幂等）。
+
+        新布局下 DELETE 不摘索引项：墓碑必须留在索引里，重启后
+        老快照才能沿链找到被删的旧值。所以这里把 old_loc 处的行
+        墓碑化，并保证索引指向它。
+        """
+        pk = data['pk']
+        old_b = data.get('old_b')
+        old_loc = self._resolve_old_loc(pk, data.get('old_loc'), old_b)
+        if old_loc is None:
+            old_loc = self.bt.search(pk)
+        if old_loc is None:
             return False
-        page = self.bp.get_page(loc[0])
+        page = self.bp.get_page(old_loc[0])
         if page is None:
             return False
-        if old_b is not None or tomb_b is not None:
-            tomb = (bytes.fromhex(tomb_b) if tomb_b
-                    else bytes.fromhex(old_b))
-            cur = page.get_row(loc[1])
-            if cur != tomb:
-                # 墓碑化（幂等：第二次重放看到的就是墓碑）
-                if not page.update_row_inplace(loc[1], tomb):
-                    page.restore_row(loc[1], tomb)
-        self.bt.delete(pk)
+        if old_b is not None or data.get('tomb_b'):
+            tomb = (bytes.fromhex(data['tomb_b'])
+                    if data.get('tomb_b')
+                    else self._with_xmax(bytes.fromhex(old_b), tid))
+            tomb = self._remap_row_prev(tomb)
+            cur = page.get_row(old_loc[1])
+            if cur is not None and cur != tomb and \
+                    self._same_content(cur, bytes.fromhex(old_b)):
+                if not page.update_row_inplace(old_loc[1], tomb):
+                    page.restore_row(old_loc[1], tomb)
+        # 索引仍然指向这个墓碑（幂等：已经指向就不动）。
+        # 若索引头已经是一个"活版本"（例如页上已经存在 DELETE 之后的
+        # 重插版本），绝不能把索引改指墓碑 —— 那会让重插的行消失。
+        loc = self.bt.search(pk)
+        if loc is None:
+            self.bt.insert(pk, old_loc[0], old_loc[1])
+        elif loc != (old_loc[0], old_loc[1]):
+            page2 = self.bp.get_page(loc[0])
+            head_rb = page2.get_row(loc[1]) if page2 is not None else None
+            hr = self._decode_row_ver(head_rb)
+            if hr is None or hr[2] != 0:
+                self.bt.insert(pk, old_loc[0], old_loc[1])
         return True
 
     @staticmethod
@@ -983,67 +1310,126 @@ class Table:
         struct.pack_into('<I', b, 4, xmax)
         return bytes(b)
 
-    def _redo_put(self, pk, values, xmin=0) -> bool:
+    def _redo_put_img(self, pk, rb: bytes) -> bool:
         """
-        幂等写：主键存在就覆盖（行头 xmax 归零），不存在就插入。
-        使用合成高位事务号的行在重启后依然可见。
+        幂等地把一个"最新版本镜像"写到该主键上：
+        - 链上已经存在**同一事务写的同一份内容**（xmin + 载荷相同）
+          → 这条日志已经重放过，直接返回；
+        - 否则**追加**到堆上并把索引指向它（绝不原地覆写别人，
+          否则会把还没重放的后续版本砸掉）。
+
+        为什么不按"完全相同的字节"判定: xmax 之后可能被别的已提交
+        事务改成墓碑，prev 可能被恢复期的位置重映射改写，字节比不相等
+        但版本其实早就在页上了 —— 若再追加一份就成了重复版本，
+        还会让后续 loser undo 找不到真正的旧版本位置。
         """
-        rb = self._encode_row(values, xmin=xmin, xmax=0)
         loc = self.bt.search(pk)
         if loc is not None:
             page = self.bp.get_page(loc[0])
-            if page is not None:
-                if page.update_row_inplace(loc[1], rb):
+            cur = page.get_row(loc[1]) if page is not None else None
+            if cur == rb:
+                return True
+            if self._same_row_payload(cur, rb):
+                return True
+            for _pid, _sid, rb2, _v, _xm, _xx, _pp, _ps in \
+                    self._chain_versions(loc):
+                if self._same_row_payload(rb2, rb):
                     return True
-                page.delete_row(loc[1])
-                self.bt.delete(pk)
         np, ns = self._heap_insert(rb)
         if np is None:
             return False
         self.bt.insert(pk, np, ns)
-        self._next_pk = max(self._next_pk, int(pk) + 1)
+        if isinstance(pk, int):
+            self._next_pk = max(self._next_pk, pk + 1)
         return True
 
-    def _undo_wal_op(self, rtype, data) -> bool:
-        """用 WAL 里的旧行镜像撤销 loser 事务的一条操作（幂等）"""
+    def _redo_put(self, pk, values, xmin=0) -> bool:
+        """兼容入口：把 values 作为新版本幂等写入（无 prev）"""
+        return self._redo_put_img(
+            pk, self._encode_row(values, xmin=xmin, xmax=0))
+
+    def _kill_loser_successors(self, loc, tid) -> int:
+        """
+        把 loser 事务写在 loc 之上的"新版本"标记为死（xmax = tid）。
+
+        为什么需要: loser 的 UPDATE 在页上留下了一个 xmin = loser 号、
+        xmax = 0 的新版本；进程内 ROLLBACK 会物理删掉它，但崩溃恢复
+        只能靠 WAL。把它的 xmax 置成 loser 号，配合 MVCC 里
+        mark_aborted(tid)，即使它因为断链被走到也会被判为不可见。
+
+        代价: 一次全堆页扫描（只在恢复 loser 事务时调用）；
+        只处理 prev == loc 且 xmin == tid 的版本；同一行被同一 loser
+        改多次时，更深的后继版本虽然不在这里处理，但它们的 xmin 也是
+        loser 号，靠 aborted 集合同样不可见。
+        """
+        if loc is None:
+            return 0
+        n = 0
+        target = (loc[0], loc[1])
+        for pid in range(1, self.bp.total_pages()):
+            page = self.bp.get_page(pid)
+            if page is None or page.page_type != PAGE_TYPE_HEAP:
+                continue
+            for sid, rb in list(page.iter_rows()):
+                r = self._decode_row_ver(rb)
+                if r is None:
+                    continue
+                if r[1] != tid or r[2] != 0 or (r[3], r[4]) != target:
+                    continue
+                b = bytearray(rb)
+                struct.pack_into('<I', b, 4, tid)
+                if not page.update_row_inplace(sid, bytes(b)):
+                    page.restore_row(sid, bytes(b))
+                n += 1
+        return n
+
+    def _undo_wal_op(self, rtype, data, tid=0) -> bool:
+        """
+        用 WAL 里的旧行镜像撤销 loser 事务的一条操作（幂等）。
+
+        新布局下 UPDATE 的撤销要把 loser 写出的**新版本**判为不可见
+        （xmax = loser 号，配合 mvcc.mark_aborted），并把**旧版本**
+        的前像（xmax = 0、prev 保留）写回原位、索引指回它；DELETE 的
+        撤销把墓碑还原成 xmax = 0 的活版本。
+        """
         pk = data.get('pk')
         old_b = data.get('old_b')
         old_loc = data.get('old_loc')
 
         if rtype == 'INSERT':
             loc = self.bt.search(pk)
-            if loc is not None:
-                page = self.bp.get_page(loc[0])
-                if page is not None:
-                    page.delete_row(loc[1])
+            if loc is None:
+                return False
+            page = self.bp.get_page(loc[0])
+            rb = page.get_row(loc[1]) if page is not None else None
+            r = self._decode_row_ver(rb)
+            # 只撤销"本 loser 插入的那一版"，别误删别的版本
+            if r is None or (tid and r[1] != tid):
+                return False
+            prev = (r[3], r[4]) if r[3] != NO_PREV else None
+            if prev is not None:
+                # 该主键原本有旧版本（复用了墓碑/不可见版本的主键）→
+                # 索引退回旧版本，绝不能把索引项直接删掉
+                self.bt.insert(pk, prev[0], prev[1])
+            else:
                 self.bt.delete(pk)
-                return True
-            return False
+            if page is not None:
+                page.delete_row(loc[1])
+            self._next_pk = self._calc_next_pk()
+            return True
 
         if old_b is None:
             return False
-        rb = bytes.fromhex(old_b)
+        rb = self._remap_row_prev(bytes.fromhex(old_b))
+        page_id, slot_id = (old_loc[0], old_loc[1]) if old_loc else (None, None)
+        resolved = self._resolve_old_loc(pk, old_loc, old_b)
+        if resolved is not None:
+            page_id, slot_id = resolved
 
         if rtype == 'UPDATE':
-            page_id = old_loc[0] if old_loc else None
-            slot_id = old_loc[1] if old_loc else None
-            if page_id is None:
-                return self._redo_put(pk, data['old'])
-            acted = self._put_row_back(page_id, slot_id, rb)
-            if not acted:
-                np, ns = self._heap_insert(rb)
-                if np is None:
-                    return False
-                page_id, slot_id = np, ns
-            cur = self.bt.search(pk)
-            if cur is None or cur != (page_id, slot_id):
-                self.bt.delete(pk)
-                self.bt.insert(pk, page_id, slot_id)
-            return True
-
-        if rtype == 'DELETE':
-            page_id = old_loc[0] if old_loc else None
-            slot_id = old_loc[1] if old_loc else None
+            # ★ 先把 loser 写下的新版本标记为死
+            self._kill_loser_successors(
+                (page_id, slot_id) if page_id is not None else None, tid)
             if page_id is None:
                 return self._redo_put(
                     pk, data['old'], xmin=self._row_xmin(rb))
@@ -1052,6 +1438,23 @@ class Table:
                 if np is None:
                     return False
                 page_id, slot_id = np, ns
+                self._recovery_remap[(old_loc[0], old_loc[1])] = (np, ns)
+            cur = self.bt.search(pk)
+            if cur is None or cur != (page_id, slot_id):
+                self.bt.delete(pk)
+                self.bt.insert(pk, page_id, slot_id)
+            return True
+
+        if rtype == 'DELETE':
+            if page_id is None:
+                return self._redo_put(
+                    pk, data['old'], xmin=self._row_xmin(rb))
+            if not self._put_row_back(page_id, slot_id, rb):
+                np, ns = self._heap_insert(rb)
+                if np is None:
+                    return False
+                page_id, slot_id = np, ns
+                self._recovery_remap[(old_loc[0], old_loc[1])] = (np, ns)
             if self.bt.search(pk) is None:
                 self.bt.insert(pk, page_id, slot_id)
             self._next_pk = max(self._next_pk, int(pk) + 1)
@@ -1065,6 +1468,103 @@ class Table:
             return struct.unpack_from('<I', rb, 0)[0]
         except Exception:
             return 0
+
+    # ==================== vacuum（版本回收）====================
+
+    def vacuum(self, horizon: int = None) -> int:
+        """
+        最小可用 vacuum：回收"对任何快照都不可能再被读到"的旧版本。
+
+        判定: 版本 V 可回收 ⟺ V.xmax != 0 且 V.xmax <= horizon。
+        - xmax != 0 表示 V 已被某个事务淘汰（更新/删除）；
+        - 任何快照 RV 的 max_id 都 > 本进程最小的活跃事务号，
+          所以 xmax <= horizon 时 RV.is_visible 对 V 恒为 False；
+        - horizon = None 时取 mvcc.oldest_active_txn()（没有活跃事务
+          时就是下一个待分配号），是本进程能做到的最保守上界。
+
+        回收时**必须缝合 prev 链**：把"prev 指向被删版本"的后继版本
+        的 prev 改写成被删版本的 prev，否则链会断在空洞上，
+        更老的版本就再也读不到了。若某个主键的版本被删光，索引项
+        一并摘除；若索引头被删掉，索引改指剩下的最新版本。
+
+        返回回收的版本数。不会删除任何仍可能被读到的版本。
+
+        已知限制: 只释放槽位与链节点（Page.delete_row），**不做页内
+        紧凑化**，所以数据文件不会变小；且重启后重建的"历史快照"不在
+        mvcc 的活跃事务表里，horizon 保护不了它们 —— 还想读老快照
+        就不要对相关版本调用 vacuum。
+        """
+        with self._lock:
+            if horizon is None:
+                horizon = self.mvcc.oldest_active_txn()
+            self._recovery_remap = {}
+
+            # 1) 收集所有版本
+            versions = {}       # pk -> [(pid, sid, rb, xmin, xmax, pp, ps)]
+            for pid in range(1, self.bp.total_pages()):
+                page = self.bp.get_page(pid)
+                if page is None or page.page_type != PAGE_TYPE_HEAP:
+                    continue
+                for sid, rb in page.iter_rows():
+                    r = self._decode_row_ver(rb)
+                    if r is None:
+                        continue
+                    pk = r[0][self.pk_idx]
+                    if not isinstance(pk, int):
+                        continue
+                    versions.setdefault(pk, []).append(
+                        (pid, sid, rb, r[1], r[2], r[3], r[4]))
+
+            removed = 0
+            for pk, vers in versions.items():
+                dead = set()
+                for pid, sid, _rb, _xmin, xmax, _pp, _ps in vers:
+                    if xmax != 0 and xmax <= horizon:
+                        dead.add((pid, sid))
+                if not dead:
+                    continue
+
+                # 位置 -> prev，用于缝合
+                prev_of = {(v[0], v[1]): (v[5], v[6]) for v in vers}
+                alive = [v for v in vers if (v[0], v[1]) not in dead]
+
+                # 2) 缝合仍然存活的后继版本
+                for pid, sid, rb, xmin, xmax, pp, ps in alive:
+                    if pp == NO_PREV or (pp, ps) not in dead:
+                        continue
+                    seen = set()
+                    while (pp, ps) in dead and (pp, ps) not in seen:
+                        seen.add((pp, ps))
+                        pp, ps = prev_of.get((pp, ps), (NO_PREV, 0))
+                    page = self.bp.get_page(pid)
+                    if page is None:
+                        continue
+                    b = bytearray(rb)
+                    struct.pack_into('<II', b, 13, pp, ps)
+                    if not page.update_row_inplace(sid, bytes(b)):
+                        page.restore_row(sid, bytes(b))
+
+                # 3) 删掉死版本的数据（槽位）
+                for pid, sid in dead:
+                    page = self.bp.get_page(pid)
+                    if page is not None:
+                        page.delete_row(sid)
+                    removed += 1
+
+                # 4) 索引：指向仍然存活链头；全被删光就摘掉索引项
+                if not alive:
+                    self.bt.delete(pk)
+                    continue
+                referenced = {(v[5], v[6]) for v in alive
+                              if v[5] != NO_PREV}
+                heads = [(v[0], v[1], v[3]) for v in alive
+                         if (v[0], v[1]) not in referenced]
+                if not heads:
+                    heads = [(v[0], v[1], v[3]) for v in alive]
+                hpid, hsid, _xm = max(heads, key=lambda h: h[2])
+                self.bt.insert(pk, hpid, hsid)
+
+            return removed
 
     def flush(self):
         self.bp.flush()

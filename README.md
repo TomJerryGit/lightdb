@@ -44,6 +44,15 @@
   - `_where` 重写为**按括号深度与子查询边界**切分 `AND`/`OR`（跟踪 `( )` 深度与 `' " \`` 字面量，先校验括号平衡、剥离平衡外层括号、再顶层 OR→AND）。因此 `WHERE (dept='Eng' OR dept='HR') AND salary > 99`、`WHERE EXISTS (SELECT 1 FROM o WHERE o.uid=u.id AND o.amt>=20)` 都能正确求值（实测分别 3 行、`[1,2]`）；括号不匹配/未闭合字符串显式报 `SyntaxError`。
   - `FROM (子查询) 别名` 原先直接报「暂不支持」，且解析器会把外层的 WHERE/ORDER BY/LIMIT **整段静默丢弃**；现在内层求值后以别名注册为内存关系复用高级路径，实测 `SELECT * FROM (SELECT dept, SUM(salary) AS tot FROM emp GROUP BY dept) t WHERE t.tot > 250 ORDER BY t.tot DESC` → `[('Eng',320),('HR',275)]`，`... LIMIT 2 OFFSET 1` → 正确偏移，嵌套两层也生效。
   - 窗口帧新增 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`（对等组语义，实测 Eng 全 320 / HR 全 595 / Sales 全 795）；其余 `RANGE` 组合与 `GROUPS` 仍显式报错。
+- **UPDATE/DELETE 的旧版本真正落盘（快照隔离可跨重启）**：行头由 13 字节扩展为 **21 字节**（`xmin|xmax|flags|dlen|prev_page|prev_slot`），UPDATE 不再原地覆写——旧版本的 `xmax` **就地写入真实事务号**并保留在堆里，新版本另写一槽并通过 `prev` 指回旧槽，索引移向新版本；DELETE 只写墓碑（`xmax`）并保留索引项。因此**重启后用记录的快照参数重建读视图，仍能读到被覆盖前的旧值**。Lead 独立验证（含直接解析页上行头字节）：
+
+  | 步骤 | 结果 |
+  |---|---|
+  | UPDATE 提交后 当前读 / 老快照读 | `[[1,'new']]` / `[[1,'old']]` |
+  | 页上版本链（原始字节） | `@(2,0) [1,'old'] xmax=2 prev=(0,0)`、`@(2,1) [1,'new'] prev=(2,0)` |
+  | shutdown 后重开：当前读 / 重建老快照读 | `[[1,'new']]` / **`[[1,'old']]`** |
+
+  另实现 `Table.vacuum(horizon)` / `Database.vacuum()` 回收对所有活跃快照都不可见的旧版本并缝合 `prev` 链。**注意：旧 `.dat` 数据文件不兼容**（行头布局变了，需重新建库）。
 
 **SQL 实测**（同实例、真实执行器）：窗口 4 项、CTE 4 项、UNION 4 项、GROUP BY/DISTINCT 4 项、普通路径回归 4 项 —— **17/17 通过**。
 

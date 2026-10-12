@@ -561,6 +561,56 @@ SELECT id FROM emp WHERE (dept = 'Eng' OR dept = 'HR') AND salary > 99
 
 ---
 
+## 21. UPDATE/DELETE 旧版本落盘（MVCC 跨重启，后续会话 2026-10）
+
+审计时的结论是「快照隔离只在单次运行内成立：页上 UPDATE 原地覆写、DELETE 物理删行，旧版本的 `xmax` 从不落盘，内存 MVCC 链重启即清空」。本次把它补上了。
+
+### 21.1 布局变更
+
+行头 **13 → 21 字节**：
+
+```
+xmin(4) | xmax(4) | flags(1) | dlen(4) | prev_page(4) | prev_slot(4)
+```
+
+`prev_page == 0` 表示版本链链头（堆页号从 1 起）。索引仍是 `pk → (page, slot)` 单键——取**方案 A**：索引指向最新版本，**版本链持久化在行头里**。
+
+- **UPDATE**：旧版本行的 `xmax` 就地写入真实事务号（保留它自己的 `prev`），新版本另写一个槽且 `prev` 指向旧槽，索引移向新版本。
+- **DELETE**：只把 `xmax` 置为真实事务号（墓碑），行数据保留，索引项**继续指向墓碑**。
+- **恢复**：`recover_from_wal` 的 redo 重建「新版本 + 旧版本 xmax」，loser undo 把 loser 写的后继版本判死并把索引指回旧版本、旧版本 `xmax` 复位；`mvcc.mark_aborted()` 让 loser 事务号对所有读视图不可见。
+- **vacuum**：`Table.vacuum(horizon)` / `Database.vacuum()`（horizon = 最小活跃事务号）回收 `xmax != 0 且 xmax <= horizon` 的版本，**缝合 `prev` 链**，必要时重指/摘除索引项。
+
+### 21.2 Lead 独立验证（不依赖子代理的测试代码）
+
+用 SQL 层做 UPDATE+COMMIT，再用**自己解析的页上行头字节**核对版本链：
+
+```
+1) update 前老快照读 : [[1,'old']]
+2) 提交后当前读     : [[1,'new']]
+3) 提交后老快照读   : [[1,'old']]
+4) 页上 id=1 的版本链: @(2,0) [1,'old'] xmin=4294967294 xmax=2 prev=(0,0)
+                      @(2,1) [1,'new'] xmin=2          xmax=0 prev=(2,0)
+5) shutdown 后重开：
+   当前读            : [[1,'new']]
+   重建老快照读      : [[1,'old']]        ← 核心要求达成
+6) 重启后页上版本链 : 与第 4 步一致（链跨重启完好）
+```
+
+原测试文件 `tests/test_mvcc_persistence.py`（9 用例）与 `tests/test_txn_atomicity.py` 追加的 2 个用例均通过；目标组 31 → 42 passed。
+
+### 21.3 回归对照方法（值得沿用）
+
+子代理在 `git worktree` 里检出**干净的 HEAD 副本**跑全量作对照：干净副本 79 failed / 244 passed，改后 82 failed / 252 passed；失败差集仅 3 个，且都能在未改代码下复现（`test_dashboard_generation` 是工作区 `dashboards/*.json` 的 ACL 拒写、`test_row_format_performance` 是 JSON vs 二进制微基准抖动、`test_federated_governance` 是 hash 序相关），**新增失败为 0**。
+
+### 21.4 仍存在的限制
+
+- **旧 `.dat` 数据文件不兼容**（行头布局变化，需重新建库）。
+- 不经 vacuum 时空间只增不减，版本链变长（回溯 O(版本数)）；vacuum 只释放槽位、不做页内紧凑（文件不变小）。
+- SQL 层 `plan_executor.SeqScan` 不走 `prev` 链（JOIN 必带 `read_view`，墓碑不会复活；受影响仅是「用 SQL 读历史快照」）。
+- 用重启后重建的历史快照去**写**同一行，或 vacuum 掉仍要被读的历史快照，均不支持。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。

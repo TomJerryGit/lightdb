@@ -558,3 +558,116 @@ def test_no_lock_leak_after_autocommit_insert():
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-v', '-s']))
+
+# ======================================================================
+# 追加：持久化版本链批次（行头 13 → 21 字节，新增 prev_page/prev_slot）
+#
+# 上面文件头里"已知限制"的一条已经被修掉了：
+#   旧: "重启后内存 MVCC 链清空，老快照无法回查被覆盖前的旧版本内容"
+#   新: 旧版本的定位(prev_page/prev_slot)落在页上行头里，DELETE 的墓碑
+#        也保留在索引里，所以重启后只要重建等价 ReadView 就能沿链回溯。
+# 详见 lightdb/db/table.py 文件头与 tests/test_mvcc_persistence.py。
+# 下面这条用例只覆盖**崩溃恢复路径**与链布局的自洽性（其余在
+# test_mvcc_persistence.py 里）。
+# ======================================================================
+
+ROW_HEADER_V2 = 21
+
+
+def read_versions(tbl):
+    """扫堆页返回 [(pk, page, slot, values, xmin, xmax, pp, ps)]"""
+    from lightdb.storage.page import PAGE_TYPE_HEAP
+    out = []
+    for pid in range(1, tbl.bp.total_pages()):
+        page = tbl.bp.get_page(pid)
+        if page is None or page.page_type != PAGE_TYPE_HEAP:
+            continue
+        for sid, rb in page.iter_rows():
+            r = tbl._decode_row_ver(rb)
+            if r:
+                out.append((r[0][tbl.pk_idx], pid, sid, r[0],
+                            r[1], r[2], r[3], r[4]))
+    return out
+
+
+def test_update_old_version_and_prev_pointer_persist():
+    """
+    新布局的落盘证据：UPDATE 之后页上必须同时有
+      - 旧版本: xmin = 旧事务号, xmax = 更新事务号, prev 保留
+      - 新版本: xmin = 更新事务号, xmax = 0, prev 指向旧版本槽位
+    且索引指向新版本（版本链的头）。重启后这条链仍然可读。
+    """
+    from lightdb.db.database import Database
+    d = fresh_dir('prev_pointer_persist')
+    db = Database(d)
+    db.create_table('t', COLS)
+    tbl = db.get_table('t')
+    t1 = db.begin()
+    tbl.insert([1, 'old'], txn_id=t1['txn_id'],
+               read_view=t1['read_view'])
+    db.commit(t1)
+
+    t2 = db.begin()
+    tbl.update({'v': 'new'}, {'column': 'id', 'op': '=', 'value': 1},
+               txn_id=t2['txn_id'], read_view=t2['read_view'])
+    db.commit(t2)
+    vers = read_versions(tbl)
+    print(f'    UPDATE 后页上版本: {vers}')
+    old = [v for v in vers if v[3] == [1, 'old']][0]
+    new = [v for v in vers if v[3] == [1, 'new']][0]
+    assert old[5] == t2['txn_id'], f'旧版本 xmax 应为更新事务号: {old}'
+    assert new[4] == t2['txn_id'], f'新版本 xmin 应为更新事务号: {new}'
+    assert (new[6], new[7]) == (old[1], old[2]), \
+        f'新版本 prev 应指向旧版本槽位: {new} vs {old}'
+    assert tbl.bt.search(1) == (new[1], new[2]), '索引应指向最新版本'
+
+    db.shutdown()
+    db2 = Database(d)
+    vers2 = read_versions(db2.get_table('t'))
+    print(f'    重启后页上版本: {vers2}')
+    assert vers2 == vers, '版本链必须原样落盘、重启后不变'
+    db2.shutdown()
+
+
+def test_crash_redo_update_rebuilds_version_chain():
+    """
+    "已提交 UPDATE 只在 WAL、页未刷盘"崩溃后，redo 必须按新布局
+    重放：旧版本 xmax 置位 + 新版本另写一槽且 prev 指向旧版本。
+    这样重建的老快照重启后还能读到被覆盖前的旧值。
+    """
+    from lightdb.db.database import Database
+    from lightdb.storage.mvcc import ReadView
+    d = build_base('crash_redo_prev')      # id=1'a', id=2'b' 已提交落盘
+
+    db = Database(d)
+    tbl = db.get_table('t')
+    R = db.begin()
+    snap = (R['read_view'].txn_id, set(R['read_view'].active),
+            R['read_view'].min_id, R['read_view'].max_id)
+
+    t = db.begin()
+    assert tbl.update({'v': 'B'},
+                      {'column': 'id', 'op': '=', 'value': 2},
+                      txn_id=t['txn_id'], read_view=t['read_view']) == 1
+    tbl.wal.commit(t['txn_id'])            # 只落 WAL，不刷页
+    del t
+    crash(db)
+
+    db2 = Database(d)
+    tbl2 = db2.get_table('t')
+    rows = show('重开后(redo UPDATE)', tbl2)
+    assert rows == [[1, 'a'], [2, 'B']], f'已提交 UPDATE 未被 redo: {rows}'
+    vers = read_versions(tbl2)
+    print(f'    redo 后页上版本: {vers}')
+    old = [v for v in vers if v[3] == [2, 'b']]
+    new = [v for v in vers if v[3] == [2, 'B']]
+    assert old and new, f'redo 后必须新旧版本都在页上: {vers}'
+    assert (new[0][6], new[0][7]) == (old[0][1], old[0][2]), \
+        f'redo 的新版本 prev 必须指向旧版本: {new} vs {old}'
+
+    rv = ReadView(snap[0], snap[1], snap[2], snap[3])
+    seen = tbl2.select(['*'], read_view=rv)[1]
+    print(f'    redo 后重建的老快照读到: {seen}')
+    assert seen == [[1, 'a'], [2, 'b']], \
+        f'redo 后老快照必须沿链读到被覆盖前的旧值: {seen}'
+    db2.shutdown()

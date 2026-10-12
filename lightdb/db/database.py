@@ -245,6 +245,28 @@ class Database:
 
     # ==================== 生命周期 ====================
 
+    def vacuum(self, horizon: int = None) -> int:
+        """
+        版本回收入口：删除"对所有活跃快照都不可见"的旧版本/墓碑。
+
+        horizon 取**最小的活跃事务号**（mvcc.oldest_active_txn()）：
+        任何活跃读视图的 max_id 都 > 它，所以 xmax <= horizon 的
+        被淘汰版本对它们恒不可见；horizon = None 时没有活跃事务，
+        oldest_active_txn() 返回下一个待分配的事务号，安全。
+
+        注意: 只回收已提交淘汰的版本；未提交事务写的版本 xmax 是
+        活跃事务号（> horizon），不会被误删。返回回收的版本数。
+        """
+        if horizon is None:
+            horizon = self.mvcc.oldest_active_txn()
+        total = 0
+        for tbl in self.tables.values():
+            try:
+                total += tbl.vacuum(horizon)
+            except Exception as e:
+                logger.warn(f"vacuum {tbl.name} 失败: {e}")
+        return total
+
     def shutdown(self):
         for tbl in self.tables.values():
             try:

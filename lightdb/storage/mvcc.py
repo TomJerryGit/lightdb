@@ -191,6 +191,21 @@ class MVCCManager:
             else:
                 self.aborted_txns.add(txn_id)
 
+    def mark_aborted(self, txn_id: int):
+        """
+        把某个事务号登记为"已回滚"。
+
+        崩溃恢复用: WAL 分析出的 loser 事务（页上可能留下了它们写的
+        新版本，xmin = loser 号）重启后在内存里没有回滚记录，如果不
+        登记，读视图会把 xmin < max_id 的它们判成"已提交可见"。
+        登记后 ReadView.is_visible 的 xmin in aborted → False，
+        老快照/当前读都会跳过这些版本，回滚语义跨重启成立。
+        """
+        with self.lock:
+            self.aborted_txns.add(txn_id)
+            self.active_txns.pop(txn_id, None)
+            self.committed_txns.discard(txn_id)
+
     # ==================== Undo ====================
 
     def add_undo(self, pk, xmin=None, xmax=None, old_data=None,

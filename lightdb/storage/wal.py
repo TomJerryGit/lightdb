@@ -55,7 +55,8 @@ def is_implicit_commit_tid(txn_id: int) -> bool:
     return txn_id == 0 or txn_id >= SYNTHETIC_TXN_FLOOR
 
 
-ROW_HEADER = 13  # xmin(4) + xmax(4) + flags(1) + len(4)
+ROW_HEADER = 21  # xmin(4)+xmax(4)+flags(1)+len(4)+prev_page(4)+prev_slot(4)
+ROW_HEADER_LEGACY13 = 13
 
 
 def fix_loser_undo_image(data: dict) -> bool:
@@ -72,6 +73,10 @@ def fix_loser_undo_image(data: dict) -> bool:
     正确的前像应当是 xmax = 0（事务前该行是活的）。这里按 old 值 +
     原 xmin 重建镜像；如果 Table 侧哪天改对了（xmax 本来就是 0），
     重建结果字节完全相同，本补丁自动变成空操作。
+
+    ★ 行头已扩展为 21 字节（多出 prev_page/prev_slot 版本链指针）：
+    重建时必须把原镜像里的 prev 指针原样搬过来，否则版本链会断，
+    重启后老快照回溯不到更早的版本。
 
     返回是否真的改写了镜像。
     """
@@ -93,8 +98,15 @@ def fix_loser_undo_image(data: dict) -> bool:
         jd = json.dumps(old, ensure_ascii=False, default=str).encode('utf-8')
     except Exception:
         return False
+    prev = b'\x00' * 8
+    try:
+        dlen = struct.unpack_from('<I', rb, 9)[0]
+    except Exception:
+        dlen = -1
+    if len(rb) >= ROW_HEADER and len(rb) == ROW_HEADER + dlen:
+        prev = rb[13:21]          # 新布局（21 字节行头）才有 prev 指针
     data['old_b'] = (
-        struct.pack('<IIBI', xmin, 0, 0, len(jd)) + jd).hex()
+        struct.pack('<IIBI', xmin, 0, 0, len(jd)) + prev + jd).hex()
     data['old_xmax'] = 0
     return True
 
