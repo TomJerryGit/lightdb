@@ -864,7 +864,14 @@ class Parser:
             op = m.group(2).upper()
             if op == '<>':
                 op = '!='
-            val = m.group(3).strip().strip("'\"")
+            raw_val = m.group(3).strip()
+            # 右侧若还含**顶层**（引号/括号之外）的逗号或比较运算符，
+            # 说明这段条件本身是坏的（典型：`WHERE a = b, c > 5` 用逗号
+            # 当 AND 用）。原实现把 `b, c > 5` 整段当字面量存进 value，
+            # 执行时比较永远不成立 → 静默返回空集/0 行。这里直接报语法错。
+            if self._has_top_level_break(raw_val):
+                raise SyntaxError(f"WHERE 条件错误（缺少 AND/OR？）: {s}")
+            val = raw_val.strip("'\"")
             return {
                 'column': m.group(1), 'op': op, 'value': val,
             }
@@ -1223,6 +1230,26 @@ class Parser:
                     yield i, ch, True
                 else:
                     yield i, ch, False
+
+    @classmethod
+    def _has_top_level_break(cls, s: str) -> bool:
+        """文本里是否含顶层（不在引号/括号内）的逗号或比较运算符
+
+        用于识别「比较右侧还塞了另一段条件」的坏形态，例如
+        `WHERE o.user_id = users.id, o.amount > 5`（用逗号当 AND）。
+        这种文本被当成字面量后比较永远不成立，会静默返回空集。
+        """
+        depth = 0
+        for _, ch, quoted in cls._scan_quotes(s):
+            if quoted:
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0 and (ch == ',' or ch in '=<>!'):
+                return True
+        return False
 
     def _check_paren_balance(self, s: str) -> None:
         """括号/引号平衡校验：不平衡即真语法错误 → SyntaxError

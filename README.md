@@ -57,7 +57,7 @@
   - 相关子查询原先遇到「含 JOIN」「含 GROUP BY/HAVING」「引用外层列做聚合」就直接报错；现在改为**外层列常量折叠后交正常执行路径**（对相同折叠值做按值缓存），实测 `WHERE (SELECT COUNT(*) FROM orders o WHERE o.uid=u.id) > 1` → `[(1,)]`、相关 `EXISTS` 含 JOIN → `[(1,),(2,)]`、相关 `EXISTS` 含 `GROUP BY/HAVING` → `[(1,)]`。过程中还修掉两个静默错答（嵌套子查询漏判外层引用 → 恒空；折叠缓存键漏 value 位 → 所有外层行共用第一行结果）。
   - `WHERE NOT (...)`（可嵌套、德摩根推到叶子）与 `col IS [NOT] NULL`（WHERE 与 HAVING 均支持）可用：实测 `NOT (dept='Eng')` → 5 行、`NOT (dept='Eng' OR dept='HR')` → 2 行、`amount IS NULL` → 1 行。
   - 投影算术：`SELECT id, salary*2 AS d FROM emp`、`salary/2`、`2*salary` 及 `FROM (... ) x WHERE x.d > 200` 均可用（除零返回 NULL 而非崩溃）。
-  - **⚠️ 本轮发现的静默错答（未修）**：`SELECT id, (SELECT COUNT(*) ...) AS cnt FROM users` 这类**投影里的标量子查询返回 `NULL` 占位**（应为真实值，实测三行全是 None）；另外外层表未起别名、而内层 JOIN 出现同名表时，相关引用会被算成空集而不是报错。
+  - **投影里的标量子查询已可求值**（原先逐行静默返回 `NULL`，是典型的「报错缺位」错答）：`SELECT id, (SELECT COUNT(*) FROM orders o WHERE o.uid=users.id) AS cnt FROM users` → `[(1,2),(2,1),(3,0)]`；`SUM` 无匹配行时返回**正确的 NULL**；非相关标量子查询只算一次（`[(1,3),(2,3),(3,3)]`）。**语义边界一律显式报错**：返回多行、多列、无法安全折叠时都报错，另有 6 处原先会「填 NULL」的分支（未知列哨兵、算术操作数解析失败、窗口取列失败、投影标量函数被误当聚合等）全部改为报错。外层表未起别名而被内层同名表遮蔽时也**报错并提示起别名**（原先静默返回空集），起别名后结果正确。
 
 **SQL 实测**（同实例、真实执行器）：窗口 4 项、CTE 4 项、UNION 4 项、GROUP BY/DISTINCT 4 项、普通路径回归 4 项 —— **17/17 通过**。
 
@@ -85,7 +85,7 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**：**259 通过 / 80 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：投影里的标量子查询返回 NULL 占位、WHERE 里的算术谓词（`salary*2 > 230`）不支持、复合 `JOIN ON a=b AND c=d` 现已显式报错（原先静默退化成笛卡尔积）、OLAP 向量化路径仍受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
+**测试套件**：**270 通过 / 80 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：WHERE 里的算术谓词（`salary*2 > 230`）、投影里的标量函数（`LOWER(name)`）、JOIN 查询投影里的标量子查询、复合 `JOIN ON a=b AND c=d`（现已显式报错，原先静默退化成笛卡尔积）——以上均**显式报错**；另有 OLAP 向量化路径受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
 
 **仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；WHERE 里的 `NOT (...)` 与 `IS NULL`、`FROM (子查询)` 之后直接 `JOIN`、子查询内层 SELECT 的算术投影、非默认 `RANGE`/`GROUPS` 帧、相关子查询里含 JOIN/GROUP BY 或引用外层列做聚合的形态，均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）、墓碑无 vacuum。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 

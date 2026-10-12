@@ -1167,3 +1167,208 @@ def test_projection_arithmetic():
         cols, rows = e.q("SELECT salary*2 FROM emp LIMIT 1")
         assert cols == ['salary*2'], cols
         assert rows == [(240,)], rows
+
+
+# ==========================================================================
+# 以下为追加：投影列表里的标量子查询（逐外层行求值）/ 外层引用被同名表遮蔽
+#
+# 数据同 _Env：users 1..3（a/b 属 BJ、c 属 SH），orders.user_id = 1,1,2，
+# amount = 10,20,30；emp 8 行（salary 见 EMP_SAL）。
+# 实现方式见 executor.Executor._eval_projection_scalar / _project_rows。
+# ==========================================================================
+
+
+def _assert_err(e, sql):
+    """执行 SQL 并断言返回显式 error，返回错误信息文本"""
+    r = e.ex.execute_sql(sql, {})
+    assert isinstance(r, dict) and r.get('type') == 'error', \
+        f'应当显式报错，实际返回: {r}'
+    return str(r.get('message') or '')
+
+
+def test_projection_scalar_subquery_count():
+    """投影里的相关标量子查询：COUNT(*) 逐外层行求值
+
+    原实现把认不出来的投影项静默投影成 NULL（实测三行 cnt 全是 None）。
+    现在按外层行折叠外层列后重新执行子查询，uid 3 没有订单 → COUNT 是 0
+    （空集上的 COUNT 为 0，不是 NULL）。
+    """
+    with _Env() as e:
+        cols, rows = e.q("SELECT id, (SELECT COUNT(*) FROM orders o "
+                         "WHERE o.user_id = users.id) AS cnt FROM users "
+                         "ORDER BY id")
+        assert cols == ['id', 'cnt'], cols
+        assert rows == [(1, 2), (2, 1), (3, 0)], rows
+
+        # 外层带别名（u.id 形式）结果一致
+        _, rows = e.q("SELECT u.id, (SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id) AS c FROM users u "
+                      "ORDER BY u.id")
+        assert rows == [(1, 2), (2, 1), (3, 0)], rows
+
+
+def test_projection_scalar_subquery_with_join_group_having():
+    """投影里的相关标量子查询：子查询内含 JOIN / GROUP BY / HAVING"""
+    with _Env() as e:
+        # 子查询里 JOIN：orders JOIN users，逐外层行折叠 u.id
+        _, rows = e.q("SELECT u.id, (SELECT COUNT(*) FROM orders o "
+                      "JOIN users u2 ON o.user_id = u2.id "
+                      "WHERE o.user_id = u.id) AS c FROM users u "
+                      "ORDER BY u.id")
+        assert rows == [(1, 2), (2, 1), (3, 0)], rows
+
+        # 子查询里 GROUP BY / HAVING：uid 3 过滤后没有分组 → 空集 → COUNT 0
+        _, rows = e.q("SELECT u.id, (SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id GROUP BY o.user_id "
+                      "HAVING COUNT(*) >= 1) AS g FROM users u "
+                      "ORDER BY u.id")
+        assert rows == [(1, 2), (2, 1), (3, 0)], rows
+
+
+def test_projection_scalar_subquery_sum_null_row():
+    """相关 SUM/MIN/MAX/AVG：某外层行没有匹配 → 该行取 NULL（正确的 NULL）"""
+    with _Env() as e:
+        _, rows = e.q("SELECT u.id, (SELECT SUM(o.amount) FROM orders o "
+                      "WHERE o.user_id = u.id) AS s FROM users u "
+                      "ORDER BY u.id")
+        assert rows == [(1, 30), (2, 30), (3, None)], rows
+
+        _, rows = e.q(
+            "SELECT u.id, "
+            "(SELECT MIN(o.amount) FROM orders o WHERE o.user_id = u.id) AS mn, "
+            "(SELECT MAX(o.amount) FROM orders o WHERE o.user_id = u.id) AS mx, "
+            "(SELECT AVG(o.amount) FROM orders o WHERE o.user_id = u.id) AS av "
+            "FROM users u ORDER BY u.id")
+        assert rows == [(1, 10, 20, 15.0), (2, 30, 30, 30.0),
+                        (3, None, None, None)], rows
+
+
+def test_projection_noncorrelated_scalar_subquery():
+    """非相关标量子查询：整体只求值一次，每行同值；别名可被外层引用"""
+    with _Env() as e:
+        cols, rows = e.q("SELECT id, (SELECT COUNT(*) FROM orders) AS total "
+                         "FROM users ORDER BY id")
+        assert cols == ['id', 'total'], cols
+        assert rows == [(1, 3), (2, 3), (3, 3)], rows
+
+        # 别名（AS cnt）可被外层 FROM 子查询引用
+        cols, rows = e.q(
+            "SELECT * FROM (SELECT id, (SELECT COUNT(*) FROM orders o "
+            "WHERE o.user_id = users.id) AS cnt FROM users) x "
+            "WHERE x.cnt > 0 ORDER BY x.id")
+        assert cols == ['id', 'cnt'], cols
+        assert rows == [(1, 2), (2, 1)], rows
+
+
+def test_projection_scalar_subquery_with_group_order_limit():
+    """投影标量子查询与 GROUP BY/HAVING/算术/ORDER BY/LIMIT+OFFSET 共存"""
+    with _Env() as e:
+        # GROUP BY + HAVING + 非相关标量子查询
+        _, rows = e.q("SELECT city, COUNT(*) AS c, "
+                      "(SELECT COUNT(*) FROM orders) AS t FROM users "
+                      "GROUP BY city HAVING COUNT(*) > 0 ORDER BY city")
+        assert rows == [('BJ', 2, 3), ('SH', 1, 3)], rows
+
+        # 相关标量子查询挂在 GROUP BY 的键上（u.city 是分组键）
+        _, rows = e.q("SELECT u.city, COUNT(*) AS c, (SELECT COUNT(*) FROM "
+                      "orders o JOIN users u2 ON o.user_id = u2.id "
+                      "WHERE u2.city = u.city) AS oc FROM users u "
+                      "GROUP BY u.city ORDER BY u.city")
+        assert rows == [('BJ', 2, 3), ('SH', 1, 0)], rows
+
+        # 与投影算术表达式共存
+        _, rows = e.q("SELECT id, salary*2 AS d, (SELECT COUNT(*) FROM "
+                      "orders) AS t FROM emp ORDER BY id LIMIT 1")
+        assert rows == [(1, 240, 3)], rows
+
+        # ORDER BY + LIMIT/OFFSET（标量子查询要在裁剪之前逐行求值）
+        _, rows = e.q("SELECT id, (SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = users.id) AS cnt FROM users "
+                      "ORDER BY id LIMIT 2 OFFSET 1")
+        assert rows == [(2, 1), (3, 0)], rows
+
+
+def test_projection_scalar_subquery_multi_row_errors():
+    """标量子查询返回多行 → 显式报错（绝不随便取一行）"""
+    with _Env() as e:
+        msg = _assert_err(
+            e, "SELECT id, (SELECT o.user_id FROM orders o "
+               "WHERE o.user_id = users.id) AS x FROM users")
+        assert '多行' in msg, msg
+
+
+def test_projection_scalar_subquery_multi_column_errors():
+    """标量子查询返回多列 → 显式报错"""
+    with _Env() as e:
+        msg = _assert_err(
+            e, "SELECT id, (SELECT o.user_id, o.amount FROM orders o "
+               "WHERE o.user_id = users.id) AS x FROM users")
+        assert '多列' in msg, msg
+
+
+def test_projection_unresolvable_item_errors():
+    """无法求值的投影项 → 显式报错，不再静默投影成 NULL
+
+    * `u.uid`（限定名指向不存在的列）原实现输出 (None, None)；
+    * `LOWER(name)` 原实现被存储层当成聚合，静默返回 1 行 (1, None)。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT u.uid FROM users u")
+        assert 'uid' in msg, msg
+        msg = _assert_err(e, "SELECT id, LOWER(name) FROM users")
+        assert 'LOWER' in msg, msg
+
+
+def test_ambiguous_outer_ref_same_name_table():
+    """外层未起别名 + 子查询里同名表被别名遮蔽 → 显式报错
+
+    原实现：`users.id` 被判成子查询内层引用（子查询里的 users u2），
+    整个 EXISTS 被当成非相关子查询一次性求值 → 静默返回空集 []。
+    给外层起别名后名字不冲突，结果必须保持正确。
+    """
+    with _Env() as e:
+        msg = _assert_err(
+            e, "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders o "
+               "JOIN users u2 ON o.user_id = u2.id WHERE o.user_id = users.id)")
+        assert '无法无歧义' in msg, msg
+        assert 'users' in msg, msg
+
+        # 投影位置的同形态也要显式报错（不能静默填 NULL）
+        msg = _assert_err(
+            e, "SELECT id, (SELECT COUNT(*) FROM orders o JOIN users u2 "
+               "ON o.user_id = u2.id WHERE o.user_id = users.id) AS c "
+               "FROM users")
+        assert '无法无歧义' in msg, msg
+
+        # 带别名（既有正确用法）不能被破坏
+        _, rows = e.q("SELECT u1.id FROM users u1 WHERE EXISTS (SELECT 1 "
+                      "FROM orders o JOIN users u2 ON o.user_id = u2.id "
+                      "WHERE o.user_id = u1.id) ORDER BY u1.id")
+        assert rows == [(1,), (2,)], rows
+
+
+def test_correlated_string_column_folding():
+    """相关子查询里「内层列 = 外层字符串列」：折叠后不能给值带 SQL 引号
+
+    原实现把外层字符串渲染成 SQL 文本（含引号）塞进 AST 的 value，
+    折叠后条件变成 `u2.city = "'BJ'"` → 永远匹配不上，静默返回空集/0 行。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT u.id FROM users u WHERE EXISTS (SELECT 1 "
+                      "FROM orders o JOIN users u2 ON o.user_id = u2.id "
+                      "WHERE u2.city = u.city) ORDER BY u.id")
+        assert rows == [(1,), (2,)], rows
+
+
+def test_malformed_where_missing_and_is_explicit_error():
+    """WHERE 里用逗号代替 AND → 语法错误（原来静默返回空集）"""
+    import pytest
+
+    with _Env() as e:
+        with pytest.raises(SyntaxError):
+            e.parser.parse("SELECT id FROM users WHERE city = 'BJ', id = 1")
+        # 合法字符串字面量里含 AND / 逗号不能被误判
+        _, rows = e.q("SELECT id FROM users WHERE name = 'A AND B'")
+        assert rows == [], rows
+        _, rows = e.q("SELECT id FROM users WHERE name = 'a,b'")
+        assert rows == [], rows

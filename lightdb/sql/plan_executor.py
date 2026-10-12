@@ -368,10 +368,16 @@ class PlanExecutor:
                     raw_cols.append(c)
                     consts.append((len(target_idx) - 1, val))
                     continue
+                if c.lstrip('(').upper().startswith('SELECT'):
+                    # 投影列表里的标量子查询：JOIN 计划执行器没有逐外层行
+                    # 求值的能力。显式报错，不要落到 _resolve_col 的
+                    # 「列不存在」上（错误信息会误导使用者）。
+                    raise ValueError(
+                        "JOIN 查询的投影列表里暂不支持标量子查询"
+                        f"（SELECT 列表）: {c}")
                 i = self._resolve_col(cols, c)
                 target_idx.append(i)
                 raw_cols.append(cols[i])
-
         # 输出短名（避免歧义时保留全名）
         seen = {}
         short_cols = []

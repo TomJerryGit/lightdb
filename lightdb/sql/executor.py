@@ -93,6 +93,12 @@ class Executor:
 
     def execute(self, parsed: Dict, session: Dict) -> Dict:
         start = time.time()
+        # 记录"当前会话"：投影列表里的标量子查询需要把折叠后的子查询
+        # 重新交给 self.execute 执行（复用事务读视图 / CTE 关系）。
+        # 有些内部路径（FROM 子查询物化、JOIN 计划执行）拿不到 session，
+        # 由这里兜底，避免子查询在无事务上下文里重新执行。
+        prev_session = getattr(self, '_active_session', None)
+        self._active_session = session
         try:
             if isinstance(parsed, dict) and parsed.get('ctes'):
                 result = self._execute_with_ctes(parsed, session)
@@ -120,6 +126,15 @@ class Executor:
         except Exception as e:
             logger.error(f"执行错误: {e}")
             return self._err(1105, str(e))
+        finally:
+            self._active_session = prev_session
+
+    def _use_session(self, session):
+        """取本次执行使用的会话（显式传参优先，其次 execute() 记录的会话）"""
+        if isinstance(session, dict):
+            return session
+        active = getattr(self, '_active_session', None)
+        return active if isinstance(active, dict) else {}
 
     def execute_sql(self, sql: str, session: Dict = None) -> Dict:
         """便捷方法：直接执行 SQL 字符串"""
@@ -272,6 +287,15 @@ class Executor:
         if rel is not None:
             return self._select_from_relation(p, s, rel)
 
+        # 外层引用无法无歧义解析（外层未起别名、子查询里又有同名表被别名
+        # 遮蔽）时显式报错：这种形态原来会被判成"非相关子查询"，一次性
+        # 求值成空集后静默返回 0 行，属于会误导使用者的错答。
+        amb = self._ambiguous_outer_ref(
+            p.get('where'), table, p.get('table_alias'))
+        if amb:
+            return self._err(1062, self._ambiguous_outer_ref_message(
+                amb, table, p.get('table_alias')))
+
         # 有 JOIN → 用计划执行器
         joins = p.get('joins') or []
         if joins:
@@ -329,6 +353,22 @@ class Executor:
         # _project_rows 的 _parse_arith / _eval_arith 求值
         arith = any(self._arith_projection_expr(c) is not None
                     for c in (p.get('columns') or []) if c != '*')
+        # 投影列表里的标量子查询（`SELECT id, (SELECT COUNT(*) ...) AS cnt`）
+        # ——必须走 _project_rows 的逐行求值路径，否则要么被存储层当未知列
+        # （视有无点号）静默填 NULL，要么直接报"列不存在"。
+        proj_sub = any(
+            self._projection_subquery_ast(self._split_alias(str(c))[0])[0]
+            is not None
+            for c in (p.get('columns') or []) if c != '*')
+        # 投影里的标量函数（`SELECT LOWER(name)`）：存储层 select 用
+        # `\w+\s*\(` 判断"是否有聚合"，于是把标量函数也交给 _aggregate
+        # —— 非聚合项取「第一行的值」，实测 `SELECT id, LOWER(name) FROM
+        # users` 静默返回 1 行 (1, None)（NULL + 丢行），是同类错答。
+        # 这里强制走投影路径，由 `_projection_item_plan` 显式报「列不存在」
+        # （引擎没有标量函数求值能力），不再静默给出错答。
+        scalar_func = any(
+            self._is_scalar_function_projection(c)
+            for c in (p.get('columns') or []) if c != '*')
         # WHERE 里的 NOT (...)：存储层 _match 只认 and/or/column+op+value，
         # 遇到 {'not': ...} 直接 KeyError，必须走统一求值路径
         has_not = self._where_has_not(p.get('where'))
@@ -339,8 +379,9 @@ class Executor:
             has_not = True
         if (p.get('windows') or p.get('group_by') or p.get('having')
                 or p.get('distinct') or qualified or literal or has_sub
-                or arith or has_not or has_null):
-            return self._select_advanced(p, tbl, read_view=rv, where=where)
+                or arith or proj_sub or scalar_func or has_not or has_null):
+            return self._select_advanced(
+                p, tbl, read_view=rv, where=where, session=s)
         cols, rows = tbl.select(
             p['columns'], where,
             p.get('order_by'),
@@ -830,7 +871,8 @@ class Executor:
         cols, rows = src.select(['*'], where, None, None, read_view)
         return list(cols), [list(r) for r in rows]
 
-    def _select_advanced(self, p, src, read_view=None, where=_UNSET):
+    def _select_advanced(self, p, src, read_view=None, where=_UNSET,
+                         session=None):
         """GROUP BY / 窗口函数 / 普通投影的统一执行路径
 
         分组与窗口都必须先拿到「全部列的行」，因此流程固定为：
@@ -838,6 +880,8 @@ class Executor:
 
         where: WHERE 子查询求值改写后的条件。默认 _UNSET 表示"调用方没改写"，
         此时用 p['where']；显式传 None 表示"条件已被改写成恒真、不再需要过滤"。
+        session: 投影里的标量子查询要重新执行（折叠后）子查询，需要会话
+        （事务读视图）；拿不到时 `_project_rows` 会退回 `_active_session`。
         """
         src_where = p.get('where') if where is _UNSET else where
         base_cols, rows = self._base_rows_and_cols(
@@ -846,8 +890,12 @@ class Executor:
                 or self._has_bare_aggregate(p)):
             base_cols, rows = self._group_rows(p, src, base_cols, rows)
         if p.get('windows'):
-            return self._apply_windows(p, base_cols, rows)
-        return self._project_rows(p, base_cols, rows)
+            return self._apply_windows(p, base_cols, rows, session=session,
+                                       read_view=read_view)
+        return self._project_rows(p, base_cols, rows, session=session,
+                                  read_view=read_view,
+                                  outer_name=p.get('table'),
+                                  outer_alias=p.get('table_alias'))
 
     # 存储层 Table._aggregate 支持的聚合函数（用于识别「无 GROUP BY 聚合」）
     _AGG_FUNCS = ('COUNT', 'SUM', 'AVG', 'MIN', 'MAX')
@@ -1196,8 +1244,29 @@ class Executor:
             return bool(re.match('^' + pat + '$', str(l)))
         return False
 
-    def _project_rows(self, p, base_cols, rows):
-        """把行按 SELECT 列表投影成输出列"""
+    def _project_rows(self, p, base_cols, rows, session=None, read_view=None,
+                      outer_name=None, outer_alias=None):
+        """把行按 SELECT 列表投影成输出列
+
+        投影项支持：`*` / 普通列（含表限定名）/ 常量 / 二元算术表达式 /
+        **标量子查询 `(SELECT ...)`**。
+
+        标量子查询实现方式（与 WHERE 里的相关谓词共用同一套机制）：
+        逐个外层行把子查询 AST 里的「外层限定名.列」折叠成该行的字面量
+        （`_fold_outer_literals`），折叠后的子查询已不相关，交给正常执行
+        路径求值（因此内层 JOIN / GROUP BY / HAVING / 嵌套子查询都能用）；
+        结果按「折叠用到的外层列取值」缓存，相同外层行只算一次。非相关的
+        标量子查询整体只求值一次，所有行共用结果。
+
+        语义边界（全部显式处理，绝不静默填 NULL）：
+        * 子查询 0 行 → 聚合补空集值（COUNT→0，SUM/AVG/MIN/MAX→NULL），
+          非聚合 → NULL（SQL 标准语义）；
+        * 子查询 >1 行 → 抛 ValueError（标量子查询返回了多行）；
+        * 子查询 >1 列 → 抛 ValueError（标量子查询返回了多列）；
+        * 未知列 / 无法求值的投影表达式 → 抛 ValueError，不再降级成 NULL
+          （原实现用 `('col', -1)` 的哨兵把所有认不出来的投影项静默输出
+          NULL，`SELECT u.uid FROM users u` 会返回一堆 None 而不是报错）。
+        """
         projection = p.get('projection') or [
             ('col', c) for c in (p.get('columns') or ['*'])]
 
@@ -1211,41 +1280,218 @@ class Executor:
                     expanded.append((k, t))
             projection = expanded
 
+        session = self._use_session(session)
+        if outer_name is None:
+            outer_name = p.get('table')
+        if outer_alias is None:
+            outer_alias = p.get('table_alias')
+        sub_cache = {}
+
         out_cols, plan_items = [], []
         for kind, text in projection:
             if kind == 'win':
                 continue
-            expr, alias = self._split_alias(str(text))
-            out_cols.append(alias or self._strip_qualifier(expr))
-            is_lit, val = self._literal_value(expr)
-            if is_lit:
-                # 字面量列（`SELECT 1 FROM orders`）只出现在常量投影里
-                plan_items.append(('const', val))
-                continue
-            i = self._col_index_of(base_cols, str(text))
-            if i >= 0:
-                plan_items.append(('col', i))
-                continue
-            arith = self._parse_arith(expr)
-            if arith is not None:
-                # 简单算术表达式（`SELECT n + 1`）：递归 CTE 的迭代步长
-                # 常见写法，原实现会当成未知列静默投影成 NULL
-                plan_items.append(('arith', arith))
-                continue
-            plan_items.append(('col', -1))   # 未知列：保持旧的 None 行为
+            item = self._projection_item_plan(str(text), base_cols)
+            out_cols.append(item[2])
+            plan_items.append(item)
 
         out_rows = []
         for r in rows:
             out = []
-            for kind, spec in plan_items:
-                if kind == 'const':
-                    out.append(spec)
-                elif kind == 'col':
-                    out.append(r[spec] if 0 <= spec < len(r) else None)
-                else:
-                    out.append(self._eval_arith(spec, base_cols, r))
+            for item in plan_items:
+                out.append(self._eval_projection_item(
+                    item, r, base_cols, session, read_view,
+                    outer_name, outer_alias, sub_cache))
             out_rows.append(out)
         return self._finish_select(p, out_cols, out_rows)
+
+    def _projection_item_plan(self, text, base_cols):
+        """单个投影项 -> (kind, spec, 输出列名)
+
+        kind ∈ {'const','col','arith','sub'}。认不出来的形态抛 ValueError：
+        投影是用户直接看得到的结果，宁可变报错也不能安静地输出 NULL。
+        """
+        expr, alias = self._split_alias(str(text))
+        sub, bad = self._projection_subquery_ast(expr)
+        if bad:
+            raise ValueError(f"投影表达式无法求值: {expr}（{bad}）")
+        if sub is not None:
+            # 输出列名保留子查询原文（不要做限定符归一化，否则列名会被改写）
+            return ('sub', sub, alias or expr.strip())
+        label = alias or self._strip_qualifier(expr)
+        is_lit, val = self._literal_value(expr)
+        if is_lit:
+            # 字面量列（`SELECT 1 FROM orders`）只出现在常量投影里
+            return ('const', val, label)
+        i = self._col_index_of(base_cols, str(text))
+        if i >= 0:
+            return ('col', i, label)
+        arith = self._parse_arith(expr)
+        if arith is not None:
+            # 简单算术表达式（`SELECT n + 1`）：递归 CTE 的迭代步长
+            # 常见写法，原实现会当成未知列静默投影成 NULL
+            for tok in (arith[0], arith[2]):
+                if self._is_plain_literal(tok):
+                    continue
+                if self._col_index_of(base_cols, tok) < 0:
+                    # 操作数解析不到时 `_eval_arith` 会返回 NULL：静默填 NULL，
+                    # 显式报错更安全
+                    raise ValueError(
+                        f"列 '{tok}' 不存在（算术表达式 {expr} 的列操作数）")
+            return ('arith', arith, label)
+        raise ValueError(f"列 '{expr}' 不存在")
+
+    def _eval_projection_item(self, item, row, base_cols, session, read_view,
+                              outer_name, outer_alias, sub_cache):
+        """求值一个投影项在当前行上的取值"""
+        kind, spec, label = item
+        if kind == 'const':
+            return spec
+        if kind == 'col':
+            if 0 <= spec < len(row):
+                return row[spec]
+            raise ValueError(f"投影列 '{label}' 在当前行里取不到值")
+        if kind == 'arith':
+            return self._eval_arith(spec, base_cols, row)
+        return self._eval_projection_scalar(
+            spec, row, base_cols, session, read_view,
+            outer_name, outer_alias, sub_cache)
+
+    # ---- 投影列表里的标量子查询 ----
+
+    # 投影项以 `(SELECT` 开头即视为标量子查询（是否括号正好包住整段再校验）
+    _SCALAR_SUB_LEAD = re.compile(r'^\(\s*SELECT\b', re.IGNORECASE)
+
+    @classmethod
+    def _projection_subquery_ast(cls, expr):
+        """把投影项 `(SELECT ...)` 解析成内层 AST
+
+        返回 (AST 或 None, 不支持的原因或 None)：
+        * 不是以 `(SELECT` 开头 → (None, None)；
+        * 括号正好包住整段且能解析成 SELECT → (AST, None)；
+        * 以 `(SELECT` 开头但括号不匹配整段（`(SELECT 1) + 1`）或解析失败
+          → (None, 原因文本)，由调用方显式报错。
+        """
+        t = str(expr or '').strip()
+        if not cls._SCALAR_SUB_LEAD.match(t):
+            return None, None
+        end = cls._scan_matching_paren(t, 0)
+        if end is None or t[end + 1:].strip():
+            return None, "标量子查询必须独占一个投影项（不能参与运算）"
+        try:
+            from .parser import parser as _parser
+            ast = _parser.parse(t[1:end].strip())
+        except SyntaxError as exc:
+            return None, f"标量子查询语法错误: {exc}"
+        except Exception as exc:
+            return None, f"标量子查询无法解析: {exc}"
+        if not isinstance(ast, dict) or ast.get('command') != 'SELECT':
+            return None, "标量子查询无法解析成 SELECT"
+        return ast, None
+
+    @staticmethod
+    def _scan_matching_paren(text: str, start: int):
+        """返回 text[start] == '(' 对应右括号的下标（跳过字符串字面量）"""
+        depth = 0
+        i = start
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "'":
+                i += 1
+                while i < n:
+                    if text[i] == "'":
+                        if i + 1 < n and text[i + 1] == "'":
+                            i += 2
+                            continue
+                        break
+                    i += 1
+            elif ch == '"':
+                i += 1
+                while i < n and text[i] != '"':
+                    i += 1
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    @staticmethod
+    def _scalar_static_width(sub):
+        """标量子查询的静态列数（无法判断时返回 None，例如 `SELECT *`）"""
+        proj = sub.get('projection')
+        if not isinstance(proj, list) or not proj:
+            proj = [('col', c) for c in (sub.get('columns') or [])]
+        items = [t for k, t in proj if k != 'win']
+        if any(str(t).strip() == '*' for t in items):
+            return None
+        return len(items)
+
+    def _eval_projection_scalar(self, sub, row, cols, session, read_view,
+                                outer_name, outer_alias, cache):
+        """求值投影里的标量子查询（对当前外层行）
+
+        相关子查询 → 折叠外层列后执行并按折叠值缓存；
+        非相关子查询 → 整体执行一次并缓存。
+        多行/多列/无法求值一律抛 ValueError（显式报错，不静默填 NULL）。
+        """
+        # 外层限定名被内层同名表遮蔽时无法无歧义解析：显式报错
+        amb = self._ambiguous_outer_ref(
+            {'subquery': sub}, outer_name, outer_alias)
+        if amb:
+            raise ValueError(self._ambiguous_outer_ref_message(
+                amb, outer_name, outer_alias))
+
+        static_w = self._scalar_static_width(sub)
+        if static_w is not None and static_w > 1:
+            raise ValueError(
+                f"标量子查询返回了多列（{static_w} 列）："
+                f"投影里的标量子查询只能返回一列")
+
+        correlated = bool(outer_name) and (
+            self._is_correlated(sub, outer_name, outer_alias)
+            or self._sub_owner_is_outer(sub, outer_name, outer_alias))
+
+        if correlated:
+            names = self._fold_outer_names(sub, outer_name, outer_alias)
+            if not names:
+                raise ValueError(
+                    "投影里的相关标量子查询无法求值：外层引用无法安全折叠"
+                    "（请检查外层限定名是否被子查询里的同名表遮蔽）")
+            key = ('psub', id(sub), self._fold_cache_key(
+                sub, row, cols, outer_name, outer_alias))
+            if key not in cache:
+                cache[key] = self._fold_and_run(
+                    sub, row, cols, session, outer_name, outer_alias,
+                    read_view)
+            rows = cache[key]
+        else:
+            key = ('psub-nc', id(sub))
+            if key not in cache:
+                res = self.execute(sub, session)
+                if not isinstance(res, dict) or res.get('type') == 'error':
+                    raise ValueError(
+                        "标量子查询执行失败: "
+                        f"{(res or {}).get('message', '未知错误')}")
+                cache[key] = [tuple(r) for r in (res.get('rows') or [])]
+            rows = cache[key]
+
+        if len(rows) > 1:
+            raise ValueError(
+                f"标量子查询返回了多行（{len(rows)} 行）："
+                f"标量上下文最多只允许返回 1 行")
+        if not rows or not rows[0]:
+            # 空结果集：聚合按 SQL 语义补值（COUNT→0，其余→NULL），
+            # 非聚合 → NULL（这是正确的 NULL，不是占位）
+            return self._empty_agg_scalar(sub)
+        if len(rows[0]) > 1:
+            raise ValueError(
+                f"标量子查询返回了多列（{len(rows[0])} 列）："
+                f"标量上下文只允许返回 1 列")
+        return rows[0][0]
 
     # 简单的二元算术表达式：`col + 1` / `salary * 2` / `a - b` / `a / b`
     _ARITH_RE = re.compile(
@@ -1284,6 +1530,17 @@ class Executor:
             return None
         return None
 
+    @classmethod
+    def _is_scalar_function_projection(cls, text) -> bool:
+        """投影项是否是「标量函数调用」（形如 LOWER(name) / NOW()）
+
+        只认函数名不是存储层支持的 5 个聚合函数的 `名字(` 开头形态；
+        子查询项（`(SELECT ...)`）与 `COUNT(*) OVER ()` 都不会命中。
+        """
+        expr, _ = cls._split_alias(str(text))
+        m = re.match(r'^(\w+)\s*\(', expr.strip())
+        return bool(m) and m.group(1).upper() not in cls._AGG_FUNCS
+
     @staticmethod
     def _literal_value(text):
         """识别 SQL 字面量，返回 (是否字面量, 值)
@@ -1313,6 +1570,12 @@ class Executor:
             p['where'] = self._rewrite_in_lists(p['where'])
             where = p['where']
         if self._contains_subquery(where):
+            # 外层限定名被内层同名表遮蔽 → 显式报错（原来静默返回空集）
+            amb = self._ambiguous_outer_ref(
+                where, rel.name, p.get('table_alias'))
+            if amb:
+                return self._err(1062, self._ambiguous_outer_ref_message(
+                    amb, rel.name, p.get('table_alias')))
             if self._where_has_correlated(where, rel.name,
                                           p.get('table_alias')):
                 return self._select_correlated(
@@ -1322,8 +1585,8 @@ class Executor:
                     where, s, rel.name, p.get('table_alias'))
             except Exception as e:
                 return self._err(1105, f"子查询求值失败: {e}")
-            return self._select_advanced(p, rel, where=where)
-        return self._select_advanced(p, rel)
+            return self._select_advanced(p, rel, where=where, session=s)
+        return self._select_advanced(p, rel, session=s)
 
     def _select_no_from(self, p, s):
         """FROM-less SELECT（`SELECT 1 AS n`）
@@ -1331,7 +1594,7 @@ class Executor:
         递归 CTE 的 base 分支常写成 `SELECT 1 AS n`，解析器现在允许没有
         FROM；执行时用「一行的空关系」承接，常量投影直接算出结果行。
         """
-        return self._select_advanced(p, _CTERelation('', [], [[]]))
+        return self._select_advanced(p, _CTERelation('', [], [[]]), session=s)
 
     def _select_from_subquery(self, p, s, sub):
         """`FROM (子查询) 别名`：把子查询物化成内存关系再执行外层查询
@@ -1613,8 +1876,12 @@ class Executor:
                 or self._has_bare_aggregate(p)):
             base_cols, rows = self._group_rows(p, src, base_cols, rows)
         if p.get('windows'):
-            return self._apply_windows(p, base_cols, rows)
-        return self._project_rows(p, base_cols, rows)
+            return self._apply_windows(p, base_cols, rows, session=s,
+                                       read_view=read_view)
+        return self._project_rows(p, base_cols, rows, session=s,
+                                  read_view=read_view,
+                                  outer_name=outer_name,
+                                  outer_alias=outer_alias)
 
     def _eval_outer_where(self, row, cols, where, s, outer_name,
                           outer_alias, cache, read_view):
@@ -1792,7 +2059,7 @@ class Executor:
 
     @classmethod
     def _render_literal(cls, value) -> str:
-        """把 Python 值渲染成 SQL 字面量文本（供折叠后的子查询重新解析）"""
+        """把 Python 值渲染成 SQL 字面量文本（供折叠后的 SQL 文本重新解析）"""
         if value is None:
             return 'NULL'
         if isinstance(value, bool):
@@ -1801,16 +2068,50 @@ class Executor:
             return repr(value)
         return "'" + str(value).replace("'", "''") + "'"
 
+    @classmethod
+    def _ast_literal(cls, value):
+        """把 Python 值折叠进 AST 的 value 字段（不是 SQL 文本！）
+
+        解析器存进 AST 的比较右侧是**去掉引号**的原始值
+        （`name = 'BJ'` → value='BJ'、`n = 1` → value='1'），折叠必须与之一致。
+        原来这里一律用 `_render_literal`（SQL 文本），字符串会被带上引号，
+        折叠后的条件变成 `u2.city = "'BJ'"`（value 里含引号）→ 永远匹配不上，
+        实测 `WHERE u2.city = u.city` 静默返回 0 行。数值本来就是文本形态，
+        保持 repr()，NULL 保持 'NULL'（与解析器/求值器的 NULL 编码一致）。
+        """
+        if value is None:
+            return 'NULL'
+        if isinstance(value, bool):
+            return '1' if value else '0'
+        if isinstance(value, (int, float)):
+            return repr(value)
+        return value
+
     def _outer_column_value(self, cols, row, name):
-        """在外层行里取 `name` 的值；取不到返回 _MISSING"""
+        """在外层行里取 `name` 的值；取不到返回 _MISSING
+
+        先按精确名 / 去限定符名找列；都找不到时再按「列名末段」匹配，
+        因为外层列名本身可能带限定符（`GROUP BY u.city` 之后外层列名是
+        `u.city`，而子查询里引用的是 `u.city` 或裸 `city` 两种写法）。
+        匹配不上仍返回 _MISSING，由调用方显式报错（不静默当 NULL）。
+        """
         if not isinstance(name, str) or not name.strip():
             return _MISSING
         t = name.strip().strip('`"')
-        cands = [t.rsplit('.', 1)[1] if '.' in t else t]
+        cands = [t]
+        if '.' in t:
+            cands.append(t.rsplit('.', 1)[1])
         for cand in cands:
             i = self._col_index_of(cols, cand)
             if 0 <= i < len(row):
                 return row[i]
+        want = t.rsplit('.', 1)[-1].lower()
+        for i, c in enumerate(cols):
+            if not isinstance(c, str):
+                continue
+            if c.strip().strip('`"').rsplit('.', 1)[-1].lower() == want:
+                if 0 <= i < len(row):
+                    return row[i]
         return _MISSING
 
     def _sub_owner_is_outer(self, sub, outer_name, outer_alias) -> bool:
@@ -1861,6 +2162,87 @@ class Executor:
                         names.add(str(j[key]).lower())
         return names
 
+    # ---- 外层引用被内层同名表遮蔽（无法无歧义解析） ----
+
+    @staticmethod
+    def _sub_binding_names(sub):
+        """子查询里的 FROM 项 -> (可见引用名集合, 表名集合)
+
+        * 可见名：写了别名就用别名（SQL 里别名会遮蔽表名），否则用表名；
+        * 表名集合：FROM/JOIN 项实际指向的表名（FROM 子查询记其别名）。
+
+        两者的差集就是「被别名遮蔽掉的表名」：这种名字在子查询里
+        既可能是外层引用、又对应一张内层表，引擎无法无歧义解析。
+        """
+        visible, tables = set(), set()
+        if not isinstance(sub, dict):
+            return visible, tables
+        items = [(sub.get('table'), sub.get('table_alias'))]
+        for j in (sub.get('joins') or []):
+            items.append((j.get('table'), j.get('alias')))
+        for t, a in items:
+            if t:
+                tables.add(str(t).lower())
+            if a:
+                visible.add(str(a).lower())
+            elif t:
+                visible.add(str(t).lower())
+        return visible, tables
+
+    def _all_nested_subqueries(self, where, out=None) -> list:
+        """条件树里所有（含嵌套层）的子查询 AST（按出现顺序去重）"""
+        if out is None:
+            out = []
+        for sub in self._nested_subqueries(where):
+            if any(s is sub for s in out):
+                continue
+            out.append(sub)
+            for key in ('where', 'having'):
+                if isinstance(sub.get(key), dict):
+                    self._all_nested_subqueries(sub[key], out)
+        return out
+
+    def _ambiguous_outer_ref(self, where, outer_table, outer_alias=None):
+        """找出「外层限定名被内层同名表遮蔽」的引用，返回限定符；无则 None
+
+        典型形态（实测原来静默返回空集）：
+
+            SELECT id FROM users WHERE EXISTS (
+              SELECT 1 FROM orders o JOIN users u2 ON o.user_id = u2.id
+              WHERE o.user_id = users.id)
+
+        外层没起别名时，`users.id` 既可能是外层 users、又对应子查询里
+        被别名 u2 遮蔽的那张 users——引擎的作用域判定（`_is_correlated` /
+        `_sub_scope_names`）会把它算成**内层**引用，于是整个子查询被当成
+        非相关、一次性求值成空集，静默返回 0 行。这里显式报错，要求给
+        外层表起别名（起别名后名字不再冲突，正常用法不受影响）。
+        """
+        outers = {str(n).lower() for n in (outer_table, outer_alias) if n}
+        if not isinstance(where, dict) or not outers:
+            return None
+        for sub in self._all_nested_subqueries(where):
+            if not isinstance(sub, dict):
+                continue
+            visible, tables = self._sub_binding_names(sub)
+            hidden = tables - visible          # 被别名遮蔽掉的表名
+            conflict = outers & hidden
+            if not conflict:
+                continue
+            for c in self._subquery_ast_columns(sub):
+                owner = self._qualified_owner(c)
+                if owner and owner in conflict:
+                    return owner
+        return None
+
+    @staticmethod
+    def _ambiguous_outer_ref_message(owner, outer_table, outer_alias=None):
+        """外层引用无法无歧义解析时的报错信息"""
+        return (
+            f"子查询里的 '{owner}.' 无法无歧义解析：外层表 "
+            f"'{outer_table}' 与子查询里被别名遮蔽的同名表 '{owner}' 冲突。"
+            f"请给外层表起别名（例如 FROM {outer_table} {owner[:1]}x），"
+            f"并在子查询里用该别名引用外层列")
+
     def _fold_outer_literals(self, sub, row, cols, outer_names,
                              depth=0):
         """把子查询 AST 里的外层列引用替换成外层行的字面量
@@ -1876,14 +2258,18 @@ class Executor:
             return sub
 
         def fold_value(v):
-            """比较右侧 / 聚合右值：是外层列引用就换字面量"""
+            """比较右侧 / 聚合右值：是外层列引用就换字面量
+
+            注意用 `_ast_literal`（AST 值）而不是 `_render_literal`（SQL 文本）：
+            折叠结果是直接喂给执行器的 AST，字符串不能带引号。
+            """
             if (isinstance(v, str) and self._is_column_ref(v)
                     and self._qualified_owner(v) in outer_names):
                 got = self._outer_column_value(cols, row, v)
                 if got is _MISSING:
                     raise ValueError(
                         f"相关子查询折叠失败：外层列 {v} 解析不到")
-                return self._render_literal(got)
+                return self._ast_literal(got)
             return v
 
         def fold_node(node, d):
@@ -2054,11 +2440,55 @@ class Executor:
                 self._sub_owner_is_outer(folded, outer_name, outer_alias):
             raise ValueError(
                 "相关子查询的外层引用无法安全折叠（折叠后仍残留外层引用）")
+        leftover = self._leftover_outer_pattern(folded, names)
+        if leftover:
+            # 例如 `WHERE o.uid = u.id, o.amount > 5`（逗号当 AND 用）：
+            # 解析器把整段塞进了 value，折叠后既不是字面量、又含外层引用，
+            # 直接执行会静默给出 0 行。这种形态没有安全语义 → 显式报错。
+            raise ValueError(
+                f"相关子查询无法安全折叠：条件里还残留外层引用 '{leftover}'"
+                f"（该形态无法求值，请检查 WHERE 条件是否缺少 AND/OR）")
         res = self.execute(folded, s)
         if not isinstance(res, dict) or res.get('type') == 'error':
             raise ValueError(
                 f"相关子查询执行失败: {(res or {}).get('message', '未知错误')}")
         return [tuple(r) for r in (res.get('rows') or [])]
+
+    def _leftover_outer_pattern(self, node, outer_names):
+        """折叠后的 AST 里是否还残留 `外层名.列` 文本（返回该文本或 None）"""
+        if not isinstance(node, dict):
+            return None
+        for key in ('column', 'value'):
+            v = node.get(key)
+            if isinstance(v, str):
+                for owner in outer_names:
+                    if re.search(r'\b' + re.escape(owner) + r'\.\w+',
+                                 v, re.IGNORECASE):
+                        return v
+        for key in ('and', 'or'):
+            for c in (node.get(key) or []):
+                got = self._leftover_outer_pattern(c, outer_names)
+                if got:
+                    return got
+        if isinstance(node.get('not'), dict):
+            got = self._leftover_outer_pattern(node['not'], outer_names)
+            if got:
+                return got
+        if isinstance(node.get('subquery'), dict):
+            got = self._leftover_outer_pattern(node['subquery'], outer_names)
+            if got:
+                return got
+        for key in ('where', 'having'):
+            if isinstance(node.get(key), dict):
+                got = self._leftover_outer_pattern(node[key], outer_names)
+                if got:
+                    return got
+        for j in (node.get('joins') or []):
+            if isinstance(j.get('on'), dict):
+                got = self._leftover_outer_pattern(j['on'], outer_names)
+                if got:
+                    return got
+        return None
 
     def _eval_scoped(self, row, cols, where, outer):
         """内层行上的条件求值（列名可用外层行解析）
@@ -2195,8 +2625,14 @@ class Executor:
             return False
         return a == b
 
-    def _apply_windows(self, p, base_cols, rows):
-        """计算窗口列并按投影顺序拼装结果行"""
+    def _apply_windows(self, p, base_cols, rows, session=None,
+                       read_view=None):
+        """计算窗口列并按投影顺序拼装结果行
+
+        非窗口投影项复用 `_projection_item_plan` / `_eval_projection_item`：
+        原来这里用 `_col_index_of` 取不到列就静默输出 None，同样属于
+        「静默填 NULL」，现在认不出来的投影项会显式报错。
+        """
         windows = p.get('windows') or []
         projection = p.get('projection') or [
             ('col', c) for c in (p.get('columns') or ['*'])]
@@ -2216,24 +2652,31 @@ class Executor:
         for w in windows:
             computed[id(w)] = self._compute_window(w, base_cols, rows)
 
-        out_cols = []
+        session = self._use_session(session)
+        outer_name = p.get('table')
+        outer_alias = p.get('table_alias')
+        sub_cache = {}
+
+        out_cols, plan_items = [], []
         for kind, text in projection:
             if kind == 'win':
                 out_cols.append(text['alias'])
-            else:
-                expr, alias = self._split_alias(str(text))
-                out_cols.append(alias or expr)
+                plan_items.append(('win', id(text), text['alias']))
+                continue
+            item = self._projection_item_plan(str(text), base_cols)
+            out_cols.append(item[2])
+            plan_items.append(item)
 
         out_rows = []
-        for ri in range(len(rows)):
+        for ri, r in enumerate(rows):
             out = []
-            for kind, text in projection:
-                if kind == 'win':
-                    out.append(computed[id(text)][ri])
-                else:
-                    i = self._col_index_of(base_cols, str(text))
-                    out.append(rows[ri][i] if 0 <= i < len(rows[ri])
-                               else None)
+            for item in plan_items:
+                if item[0] == 'win':
+                    out.append(computed[item[1]][ri])
+                    continue
+                out.append(self._eval_projection_item(
+                    item, r, base_cols, session, read_view,
+                    outer_name, outer_alias, sub_cache))
             out_rows.append(out)
         return self._finish_select(p, out_cols, out_rows)
 
