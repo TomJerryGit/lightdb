@@ -9,6 +9,13 @@ SQL 解析器 - 正则驱动（修复版）
 import re
 from typing import Optional, List, Dict, Any
 
+# `FROM (子查询)` 之后的词若不是别名就一定是这些子句关键字，
+# 用于避免把 `FROM (SELECT ...) WHERE ...` 里的 WHERE 误当别名
+_FROM_SUBQUERY_KEYWORDS = {
+    'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'HAVING', 'JOIN', 'INNER',
+    'LEFT', 'RIGHT', 'CROSS', 'OUTER', 'FULL', 'UNION', 'ON', 'AS',
+}
+
 
 class Parser:
     """SQL 解析器"""
@@ -268,11 +275,17 @@ class Parser:
 
         返回 (frame 或 None, 去掉帧之后的 spec)。frame 形如::
 
-            {'start': ('PRECEDING', 2), 'end': ('CURRENT ROW', None)}
+            {'start': ('PRECEDING', 2), 'end': ('CURRENT ROW', None),
+             'type': 'ROWS'}
 
-        只支持 ROWS 帧（按物理行取行）。RANGE / GROUPS 明确报错而不是
-        静默按 ROWS 处理 —— 引擎没有值域/分组帧的语义，静默降级会给出
-        看似正常但错误的边界值。
+        帧类型支持：
+        * ROWS：按物理行取帧（任意边界组合）；
+        * RANGE：只支持 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`
+          （及简写 `RANGE UNBOUNDED PRECEDING`）——即 SQL 默认帧，按
+          **对等行组（peer）** 取帧：CURRENT ROW 表示与当前行 ORDER BY
+          值相同的最后一行。RANGE 的其它组合（数值偏移、CURRENT ROW 作
+          起始边界等）与 GROUPS 一律明确报错，绝不静默按 ROWS 处理 ——
+          引擎没有值域帧语义，静默降级会给出看似正常但错误的边界值。
         """
         if not spec:
             return None, spec
@@ -285,8 +298,8 @@ class Parser:
             return None, spec
 
         ftype = m.group('type').upper()
-        if ftype != 'ROWS':
-            raise SyntaxError(f"暂不支持 {ftype} 窗口帧，仅支持 ROWS")
+        if ftype == 'GROUPS':
+            raise SyntaxError("暂不支持 GROUPS 窗口帧，仅支持 ROWS / RANGE")
 
         if m.group('start'):
             start_txt, end_txt = m.group('start'), m.group('end')
@@ -304,7 +317,16 @@ class Parser:
         if self._bound_pos(start) > self._bound_pos(end):
             raise SyntaxError(f"窗口帧起始边界不能晚于结束边界: {spec}")
 
-        frame = {'start': start, 'end': end, 'raw': m.group(0).strip()}
+        if ftype == 'RANGE' and not (
+                start[0] == 'UNBOUNDED PRECEDING'
+                and end[0] == 'CURRENT ROW'):
+            raise SyntaxError(
+                f"暂不支持 RANGE 帧 {m.group(0).strip()}："
+                f"只支持 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+                f"（其它 RANGE 组合请显式写成 ROWS）")
+
+        frame = {'start': start, 'end': end, 'type': ftype,
+                 'raw': m.group(0).strip()}
         return frame, spec[:m.start()].strip()
 
     @staticmethod
@@ -404,12 +426,19 @@ class Parser:
             inner_sql = from_rest[1:end].strip()
             tail = from_rest[end+1:].strip()
             am = re.match(r'(?:AS\s+)?(\w+)', tail, re.IGNORECASE)
-            alias = am.group(1) if am else 'sub'
-            tail = tail[am.end():] if am else tail
+            alias = 'sub'
+            # `FROM (SELECT ...) WHERE ...`（省略别名）时不能把 WHERE
+            # 当成别名，故挡掉 SQL 关键字
+            if am and am.group(1).upper() not in _FROM_SUBQUERY_KEYWORDS:
+                alias = am.group(1)
+                tail = tail[am.end():]
             subquery = {
                 'sql': inner_sql, 'alias': alias, 'rest': tail,
             }
-            rest = ''
+            # 关键：别名之后的 WHERE / GROUP BY / HAVING / ORDER BY /
+            # LIMIT 属于**外层**查询，必须交给下面的通用解析流程
+            # （原实现直接置 rest=''，外层子句被整段静默丢弃）
+            rest = tail
         else:
             tm = re.match(r'[`"]?(\w+)[`"]?', from_rest)
             if not tm:
@@ -530,14 +559,32 @@ class Parser:
     # ==================== WHERE ====================
 
     def _where(self, s: str) -> Dict:
-        s = s.strip()
+        """解析 WHERE / HAVING 条件，产出 and/or/比较 条件树
 
-        or_parts = re.split(r'\s+OR\s+', s, flags=re.IGNORECASE)
+        实现方式（本次重写，原实现是裸 `re.split(r'\\s+AND\\s+')`）：
+
+        1. 先做括号平衡校验，真语法错误（`(a = 1`、`a = 1)`）直接
+           抛 SyntaxError，不再靠"后面碰巧匹配不上"来兜底；
+        2. 剥掉「整段被一对平衡括号包住」的外层括号（`(A OR B)` ->
+           `A OR B`），这样括号分组才能参与递归求值；
+        3. 先按**顶层** OR 切（OR 优先级低于 AND），再按**顶层**
+           AND 切；切分只认「圆括号深度 0 且不在字符串字面量里」的
+           关键字，因此子查询 `EXISTS (SELECT ... WHERE a AND b)`
+           里的 AND 不会被外层拆开。
+
+        已知限制：只做 AND/OR 两级，不做 NOT / XOR / IS NULL 等谓词
+        （原实现也没有，保持原状）。
+        """
+        s = s.strip()
+        self._check_paren_balance(s)
+
+        s = self._strip_outer_parens(s)
+
+        or_parts = self._split_cond_top_level(s, 'OR')
         if len(or_parts) > 1:
             return {'or': [self._where(p) for p in or_parts]}
 
-        and_parts = re.split(r'\s+AND\s+', s,
-                             flags=re.IGNORECASE)
+        and_parts = self._split_cond_top_level(s, 'AND')
         if len(and_parts) > 1:
             return {'and': [self._where(p) for p in and_parts]}
 
@@ -937,6 +984,122 @@ class Parser:
         if current.strip():
             parts.append(current.strip())
         return parts
+
+    # ============ 条件文本的「深度感知」切分（WHERE 用） ============
+
+    @staticmethod
+    def _scan_quotes(s: str):
+        """逐字符扫描，产出 (字符下标, 该字符是否处于字符串字面量内)
+
+        字符串字面量按 SQL 约定用 ' / " / ` 包起来；引号内的括号与
+        关键字（`'a AND b'`）一律不算结构字符。转义用成对引号（`''`）
+        表示，成对写法在状态机里自然闭合，不需要额外处理。
+        """
+        in_str = None
+        for i, ch in enumerate(s):
+            if in_str:
+                yield i, ch, True
+                if ch == in_str:
+                    in_str = None
+            else:
+                if ch in ("'", '"', '`'):
+                    in_str = ch
+                    yield i, ch, True
+                else:
+                    yield i, ch, False
+
+    def _check_paren_balance(self, s: str) -> None:
+        """括号/引号平衡校验：不平衡即真语法错误 → SyntaxError
+
+        原先 `WHERE (a = 1` 靠后续正则匹配不上才报错，错误信息含糊；
+        显式校验后报错位置明确，且 `a = 1)` 这种多余右括号也会被拦下
+        （而不是把 `1)` 当成字面量静默接受）。
+        """
+        depth = 0
+        in_str = None
+        for _, ch, quoted in self._scan_quotes(s):
+            if quoted:
+                if in_str is None:
+                    in_str = ch          # 字符串开始
+                elif ch == in_str:
+                    in_str = None        # 字符串结束
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth < 0:
+                    raise SyntaxError(f"WHERE 条件括号不匹配: {s}")
+        if depth != 0:
+            raise SyntaxError(f"WHERE 条件括号不匹配: {s}")
+        # 未闭合的字符串字面量（`name = 'A`）同样是语法错误
+        if in_str is not None:
+            raise SyntaxError(f"WHERE 条件字符串未闭合: {s}")
+
+    def _strip_outer_parens(self, s: str) -> str:
+        """剥掉整段被一对平衡括号包住的外层括号
+
+        只有「第一个 '(' 的配对 ')' 正好在末尾」时才剥，且可重复剥：
+        `((a = 1 OR b = 2))` -> `a = 1 OR b = 2`。
+        `(a = 1 OR b = 2) AND c = 3` 的配对 ')' 不在末尾，原样返回，
+        括号的优先级覆盖交由 AND/OR 切分处理。
+        """
+        while True:
+            t = s.strip()
+            if not t.startswith('('):
+                return t
+            depth = 0
+            end = -1
+            for i, ch, quoted in self._scan_quotes(t):
+                if quoted:
+                    continue
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end != len(t) - 1:
+                return t
+            s = t[1:end]
+
+    def _split_cond_top_level(self, s: str, kw: str) -> List[str]:
+        """按顶层的 AND / OR 切分条件文本（kw 传大写 'AND' / 'OR'）
+
+        只切「圆括号深度 0 且不在字符串字面量里」的关键字，且关键字
+        两侧必须是空白字符，避免切开 `band = 1` / `ORACLE` 这类标识符。
+        未切到关键字时返回单元素列表（调用方据此判断是否有顶层运算符）。
+        """
+        kw = kw.upper()
+        klen = len(kw)
+        parts, start = [], 0
+        depth = 0
+        i, n = 0, len(s)
+        while i < n:
+            ch = s[i]
+            if ch in ("'", '"', '`'):
+                # 跳过一个完整的字符串字面量
+                j = i + 1
+                while j < n and s[j] != ch:
+                    j += 1
+                i = j + 1
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif (depth == 0 and ch.isspace()
+                    and s[i + 1:i + 1 + klen].upper() == kw
+                    and i + 1 + klen < n
+                    and s[i + 1 + klen].isspace()):
+                parts.append(s[start:i].strip())
+                start = i + 1 + klen
+                i = start
+                continue
+            i += 1
+        parts.append(s[start:].strip())
+        return [p for p in parts if p]
 
 
 # 全局解析器实例

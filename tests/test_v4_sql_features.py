@@ -621,3 +621,215 @@ def test_not_in_null_semantics():
         assert [r[0] for r in rows] == [3], rows
         _, rows = e.q("SELECT id FROM users WHERE id IN (1, 3)")
         assert sorted(r[0] for r in rows) == [1, 3], rows
+
+
+def test_where_top_level_split_by_paren_and_subquery():
+    """WHERE 的 AND/OR 只在顶层切分（括号深度 + 字符串字面量感知）
+
+    原实现用裸 `re.split(r'\\s+AND\\s+')`，没有深度概念，导致：
+    * 子查询内部的 AND 被外层拆开 → 相关 EXISTS 直接 SyntaxError；
+    * `(A OR B) AND C` 里的括号被当成普通字符 → SyntaxError。
+    现在先剥平衡外层括号、再按顶层 OR（低优先级）→ 顶层 AND 切分。
+    """
+    import pytest
+
+    with _Env() as e:
+        # ① 相关 EXISTS：子查询里的 AND 属于子查询
+        #    数据：orders = (uid 1, amt 10) (uid 1, amt 20) (uid 2, amt 30)
+        #    → uid 1 命中 amt=20，uid 2 命中 amt=30，uid 3 没有订单
+        _, rows = e.q(
+            "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM orders o "
+            "WHERE o.user_id = u.id AND o.amount > 15)")
+        assert sorted(r[0] for r in rows) == [1, 2], rows
+        # 收紧阈值证明是「逐外层行」求值而不是把子查询一次性常量折叠
+        _, rows = e.q(
+            "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM orders o "
+            "WHERE o.user_id = u.id AND o.amount > 25)")
+        assert [r[0] for r in rows] == [2], rows
+        _, rows = e.q(
+            "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM orders o "
+            "WHERE o.user_id = u.id AND o.amount > 35)")
+        assert rows == [], rows
+
+        # ② 括号分组 + 外层 AND：(Eng OR HR) AND salary >= 100
+        _, rows = e.q(
+            "SELECT id FROM emp WHERE (dept = 'Eng' OR dept = 'HR') "
+            "AND salary >= 100")
+        assert [r[0] for r in rows] == [1, 2, 3], rows
+
+        # ③ 括号分组在内层：Eng AND (120 OR 100) → 3 行
+        _, rows = e.q(
+            "SELECT id FROM emp WHERE dept = 'Eng' "
+            "AND (salary = 120 OR salary = 100)")
+        assert sorted(r[0] for r in rows) == [1, 2, 3], rows
+        assert len(rows) == 3, rows
+
+        # ④ OR 与括号分组混用：Alice + HR 中 salary > 90 的 Frank/Grace
+        _, rows = e.q(
+            "SELECT id FROM emp WHERE name LIKE 'A%' "
+            "OR (dept = 'HR' AND salary > 90)")
+        assert sorted(r[0] for r in rows) == [1, 6, 7], rows
+
+        # ⑤ 优先级：AND 比 OR 紧 → HR 全部 + Eng 中 salary=120 的 Alice
+        _, rows = e.q(
+            "SELECT id FROM emp WHERE dept = 'HR' "
+            "OR dept = 'Eng' AND salary = 120")
+        assert sorted(r[0] for r in rows) == [1, 6, 7, 8], rows
+
+        # ⑥ 字符串字面量里的 AND / OR 不是运算符
+        _, rows = e.q("SELECT id FROM emp WHERE name = 'A AND B' "
+                      "OR dept = 'HR'")
+        assert sorted(r[0] for r in rows) == [6, 7, 8], rows
+        # 标识符里的 AND/OR 子串也不能被切开（'band' 是值，不是运算符）
+        _, rows = e.q("SELECT id FROM emp WHERE name = 'band' "
+                      "AND dept = 'Eng'")
+        assert rows == [], rows
+
+        # ⑦ 反例：真语法错误仍然抛 SyntaxError，不静默返回结果
+        with pytest.raises(SyntaxError):
+            e.parser.parse("SELECT id FROM emp WHERE dept = ")
+        with pytest.raises(SyntaxError):
+            e.parser.parse("SELECT id FROM emp WHERE (a = 1")
+        # 多余的右括号同样是错误（不能把 `1)` 当字面量咽下去）
+        with pytest.raises(SyntaxError):
+            e.parser.parse("SELECT id FROM emp WHERE a = 1)")
+
+        # ⑧ 既有单条件/多条件形态保持不变
+        _, rows = e.q("SELECT id FROM emp WHERE salary >= 100 "
+                      "AND dept = 'Eng' OR dept = 'HR'")
+        assert sorted(r[0] for r in rows) == [1, 2, 3, 6, 7, 8], rows
+
+
+def test_from_subquery_alias():
+    """FROM (子查询) 别名：物化成内存关系后按普通单表执行
+
+    实现走 CTE 同一条「内存关系」路径：子查询先求值成
+    `_CTERelation(别名, columns, rows)`，外层查询的 table 指向该别名，
+    WHERE / GROUP BY / HAVING / ORDER BY / LIMIT+OFFSET / 限定列名
+    全部复用既有实现，执行完注销临时关系。
+    """
+    with _Env() as e:
+        # ① 外层 WHERE 用别名限定列
+        cols, rows = e.q(
+            "SELECT * FROM (SELECT id, name, salary FROM emp "
+            "WHERE dept = 'Eng') e WHERE e.salary > 100")
+        assert cols == ['id', 'name', 'salary'], cols
+        assert rows == [(1, 'Alice', 120)], rows
+
+        # ② 外层 GROUP BY + ORDER BY（COUNT 之和 = 8 行）
+        cols, rows = e.q(
+            "SELECT e.dept, COUNT(*) FROM (SELECT dept, salary FROM emp) e "
+            "GROUP BY e.dept ORDER BY e.dept")
+        assert cols == ['dept', 'COUNT(*)'], cols
+        assert rows == [('Eng', 3), ('HR', 3), ('Sales', 2)], rows
+        assert sum(r[1] for r in rows) == 8, rows
+
+        # ③ 子查询内部 GROUP BY + 聚合，外层 ORDER BY 聚合别名
+        cols, rows = e.q(
+            "SELECT * FROM (SELECT dept, SUM(salary) AS tot FROM emp "
+            "GROUP BY dept) t ORDER BY tot DESC")
+        assert cols == ['dept', 'tot'], cols
+        assert len(rows) == 3, rows
+        assert rows[0] == ('Eng', 320), rows
+
+        # ④ 外层 LIMIT + OFFSET（子查询已排序，物化顺序保持）
+        _, rows = e.q("SELECT * FROM (SELECT id FROM emp ORDER BY id) x "
+                      "LIMIT 2 OFFSET 1")
+        assert rows == [(2,), (3,)], rows
+
+        # ⑤ 嵌套 FROM 子查询
+        _, rows = e.q("SELECT * FROM (SELECT * FROM (SELECT id FROM emp) a) b "
+                      "LIMIT 1")
+        assert rows == [(1,)], rows
+
+        # ⑥ 无 GROUP BY 的聚合作用在子查询结果上（整表一组）
+        _, rows = e.q("SELECT COUNT(*) FROM (SELECT id FROM emp) x")
+        assert rows == [(8,)], rows
+
+        # ⑦ 外层 HAVING
+        _, rows = e.q(
+            "SELECT dept, COUNT(*) AS c FROM (SELECT dept FROM emp) e "
+            "GROUP BY dept HAVING COUNT(*) > 2 ORDER BY dept")
+        assert rows == [('Eng', 3), ('HR', 3)], rows
+
+        # ⑧ 尚不支持的形态要明确报错，不能静默错答
+        r = e.ex.execute(e.parser.parse(
+            "SELECT * FROM (SELECT id FROM emp) e "
+            "JOIN orders o ON e.id = o.user_id"), {})
+        assert r.get('type') == 'error', r
+        assert 'JOIN' in r.get('message', ''), r
+
+
+def test_range_default_frame_peers():
+    """RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW（SQL 默认帧）
+
+    与 ROWS 的差别：RANGE 的 CURRENT ROW 是「对等行组（ORDER BY 值相同的
+    整组）」，ROWS 只是一行。本实现只放开这一种 RANGE 形态（含简写
+    `RANGE UNBOUNDED PRECEDING`），其它 RANGE 组合与 GROUPS 继续显式报错。
+    注意：不写帧子句时的既有语义（有 ORDER BY 就逐行累计）保持不变。
+    """
+    import pytest
+
+    with _Env() as e:
+        # ① 不分区、ORDER BY dept：每个 dept 整组进帧
+        _, rows = e.q(
+            "SELECT id, SUM(salary) OVER (ORDER BY dept RANGE BETWEEN "
+            "UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM emp ORDER BY id")
+        assert [r[1] for r in rows] == [320, 320, 320, 795, 795, 595, 595, 595], \
+            rows
+
+        # ② 简写 RANGE UNBOUNDED PRECEDING 等价于 BETWEEN ... AND CURRENT ROW
+        _, rows = e.q(
+            "SELECT id, SUM(salary) OVER (ORDER BY dept RANGE UNBOUNDED "
+            "PRECEDING) AS s FROM emp ORDER BY id")
+        assert [r[1] for r in rows] == [320, 320, 320, 795, 795, 595, 595, 595], \
+            rows
+
+        # ③ 分区 + 值域 peer：Eng 的 (100,100) 同组 → 两条都是 200
+        #    （外层 ORDER BY 只认单列，所以按 id 输出，便于逐行核对）
+        _, rows = e.q(
+            "SELECT id, dept, salary, SUM(salary) OVER (PARTITION BY dept "
+            "ORDER BY salary RANGE BETWEEN UNBOUNDED PRECEDING AND "
+            "CURRENT ROW) AS s FROM emp ORDER BY id")
+        assert [r[3] for r in rows] == [320, 200, 200, 200, 90, 275, 275, 85], \
+            rows
+
+        # ④ ROWS 与 RANGE 的差异被真实区分（不能静默等价）
+        _, rows = e.q(
+            "SELECT id, SUM(salary) OVER (ORDER BY dept ROWS BETWEEN "
+            "UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_s, SUM(salary) "
+            "OVER (ORDER BY dept RANGE BETWEEN UNBOUNDED PRECEDING AND "
+            "CURRENT ROW) AS range_s FROM emp ORDER BY id")
+        assert [r[1] for r in rows] == [120, 220, 320, 705, 795, 415, 510, 595], \
+            rows
+        assert [r[2] for r in rows] == [320, 320, 320, 795, 795, 595, 595, 595], \
+            rows
+        assert [r[1] for r in rows] != [r[2] for r in rows], rows
+
+        # ⑤ COUNT(*) / MAX 同样按 peer 组取帧
+        _, rows = e.q(
+            "SELECT id, COUNT(*) OVER (ORDER BY dept RANGE BETWEEN UNBOUNDED "
+            "PRECEDING AND CURRENT ROW) AS c FROM emp ORDER BY id")
+        assert [r[1] for r in rows] == [3, 3, 3, 8, 8, 6, 6, 6], rows
+
+        # ⑥ 其它 RANGE 组合 / GROUPS 必须显式报错（不静默降级成 ROWS）
+        for bad in (
+            "SELECT SUM(salary) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING "
+            "AND CURRENT ROW) AS s FROM emp",
+            "SELECT SUM(salary) OVER (ORDER BY id RANGE BETWEEN CURRENT ROW "
+            "AND UNBOUNDED FOLLOWING) AS s FROM emp",
+            "SELECT SUM(salary) OVER (ORDER BY id RANGE BETWEEN UNBOUNDED "
+            "PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM emp",
+            "SELECT SUM(salary) OVER (ORDER BY id GROUPS BETWEEN UNBOUNDED "
+            "PRECEDING AND CURRENT ROW) AS s FROM emp",
+            "SELECT SUM(salary) OVER (ORDER BY id GROUPS 2 PRECEDING) AS s "
+            "FROM emp",
+        ):
+            with pytest.raises(SyntaxError):
+                e.parser.parse(bad)
+
+        # ⑦ 不写帧子句时的既有行为不得回归（逐行累计，不是 peer 整组）
+        _, rows = e.q("SELECT id, SUM(salary) OVER (ORDER BY dept) AS s "
+                      "FROM emp ORDER BY id")
+        assert [r[1] for r in rows] == [120, 220, 320, 705, 795, 415, 510, 595], \
+            rows

@@ -251,7 +251,11 @@ class Executor:
         if not table:
             if p.get('no_from'):
                 return self._select_no_from(p, s)
-            # FROM 子查询：parser 能解析，但执行器尚未实现
+            # FROM (子查询) 别名：物化成内存关系后走「以内存关系为数据源」
+            # 的既有路径（与 CTE 同一条路径）
+            sub = p.get('subquery')
+            if isinstance(sub, dict) and sub.get('sql'):
+                return self._select_from_subquery(p, s, sub)
             return self._err(1105, "暂不支持 FROM 子查询")
 
         # information_schema
@@ -779,11 +783,38 @@ class Executor:
         src_where = p.get('where') if where is _UNSET else where
         base_cols, rows = self._base_rows_and_cols(
             src, self._normalize_where(src_where), read_view)
-        if p.get('group_by') or p.get('having'):
+        if (p.get('group_by') or p.get('having')
+                or self._has_bare_aggregate(p)):
             base_cols, rows = self._group_rows(p, src, base_cols, rows)
         if p.get('windows'):
             return self._apply_windows(p, base_cols, rows)
         return self._project_rows(p, base_cols, rows)
+
+    # 存储层 Table._aggregate 支持的聚合函数（用于识别「无 GROUP BY 聚合」）
+    _AGG_FUNCS = ('COUNT', 'SUM', 'AVG', 'MIN', 'MAX')
+
+    @classmethod
+    def _has_bare_aggregate(cls, p) -> bool:
+        """SELECT 列表里有聚合函数、且没写 GROUP BY（整表聚成一组）
+
+        内存关系（CTE / FROM 子查询）路径原先直接按行投影，`SELECT
+        COUNT(*) FROM (SELECT ...) x` 会输出「每行一个 NULL」——静默错答。
+        这里识别出来交给 `_group_rows` 的「零分组键」形态：key=() 只产生
+        一个分组，再复用存储层 `_aggregate`。
+
+        只认存储层支持的 5 个聚合函数，避免把标量函数
+        （`SELECT LOWER(name) FROM cte`）误当成聚合。
+        """
+        if p.get('group_by') or p.get('windows'):
+            return False
+        for c in (p.get('columns') or []):
+            s = str(c).strip()
+            if s == '*':
+                continue
+            m = re.match(r'^(\w+)\s*\(', cls._split_alias(s)[0].strip())
+            if m and m.group(1).upper() in cls._AGG_FUNCS:
+                return True
+        return False
 
     @staticmethod
     def _strip_qualifier(text: str) -> str:
@@ -1096,6 +1127,62 @@ class Executor:
         """
         return self._select_advanced(p, _CTERelation('', [], [[]]))
 
+    def _select_from_subquery(self, p, s, sub):
+        """`FROM (子查询) 别名`：把子查询物化成内存关系再执行外层查询
+
+        实现方式（方案 A，复用 CTE 机制）：
+
+        1. 解析并执行内层子查询，拿到 (columns, rows)。内层可以含
+           GROUP BY / 聚合 / 窗口函数 / 多层嵌套子查询（嵌套时内层又会
+           递归走一遍本方法）；
+        2. 用别名注册一个临时 `_CTERelation`（与 WITH 物化同一条路径，
+           不落盘、不建真实表，因此子查询结果允许有重复值）；
+        3. 外层查询的 table 指向该别名，交给 `_select_from_relation`
+           —— WHERE / GROUP BY / HAVING / ORDER BY / LIMIT+OFFSET /
+           限定列名（`e.salary`）都由这条已有路径处理，
+           限定符会由 `_normalize_where` / `_strip_qualifier` 归一化；
+        4. finally 里注销临时关系（若同名 CTE 已存在则还原），
+           避免泄漏到下一次执行。
+
+        已知限制：
+        * `FROM (子查询) x JOIN t ON ...` 暂不支持（显式报错，不静默错答）；
+        * 子查询里的 `ORDER BY` 只影响物化顺序，外层不写 ORDER BY 时
+          依赖该顺序（本实现保持物化顺序，与 SQLite 行为一致）。
+        """
+        from .parser import parser as _parser
+
+        if p.get('joins'):
+            return self._err(1105, "FROM 子查询暂不支持再 JOIN")
+        alias = str(sub.get('alias') or 'sub')
+        try:
+            inner = _parser.parse(str(sub.get('sql') or ''))
+        except SyntaxError as e:
+            return self._err(1064, f"FROM 子查询语法错误: {e}")
+        if not isinstance(inner, dict):
+            return self._err(
+                1064, f"FROM 子查询无法解析: {str(sub.get('sql'))[:80]}")
+
+        res = self.execute(inner, s)
+        if not isinstance(res, dict) or res.get('type') == 'error':
+            return res if isinstance(res, dict) else self._err(
+                1105, "FROM 子查询执行失败")
+
+        key = alias.lower()
+        saved = self._cte_relations.get(key, _UNSET)
+        self._cte_relations[key] = _CTERelation(
+            alias, res.get('columns') or [], res.get('rows') or [])
+        try:
+            outer = dict(p)
+            outer['table'] = alias
+            outer['subquery'] = None
+            return self._select_from_relation(
+                outer, s, self._cte_relations[key])
+        finally:
+            if saved is _UNSET:
+                self._cte_relations.pop(key, None)
+            else:
+                self._cte_relations[key] = saved
+
     def _rv_of(self, s):
         """取当前会话的读视图（没有事务就临时建一个）"""
         txn = s.get('txn')
@@ -1251,7 +1338,8 @@ class Executor:
                 kept.append(r)
         rows = kept
 
-        if p.get('group_by') or p.get('having'):
+        if (p.get('group_by') or p.get('having')
+                or self._has_bare_aggregate(p)):
             base_cols, rows = self._group_rows(p, src, base_cols, rows)
         if p.get('windows'):
             return self._apply_windows(p, base_cols, rows)
@@ -1638,11 +1726,15 @@ class Executor:
             elif func in ('SUM', 'AVG', 'COUNT', 'MIN', 'MAX'):
                 frame = spec.get('frame')
                 if frame is not None:
-                    # ★ 显式 ROWS 帧：每个位置按帧区间（物理行）重算。
-                    # 帧只在聚合类窗口函数上生效；ROW_NUMBER/RANK/
-                    # DENSE_RANK/LAG/LEAD 按标准忽略帧（见上面的分支）。
+                    # ★ 显式帧：ROWS 按物理行取帧；RANGE 只支持默认帧
+                    # （UNBOUNDED PRECEDING → CURRENT ROW，CURRENT ROW
+                    # 按 peer 组解释）。帧只在聚合类窗口函数上生效；
+                    # ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD 按标准忽略帧。
+                    peers = (self._peer_ends(idxs, rows, oidx)
+                             if str(frame.get('type') or 'ROWS').upper()
+                             == 'RANGE' else None)
                     for pos, i in enumerate(idxs):
-                        lo, hi = self._frame_bounds(frame, pos, n)
+                        lo, hi = self._frame_bounds(frame, pos, n, peers)
                         seg = vals[lo:hi + 1] if hi >= lo else []
                         out[i] = self._agg_over_frame(seg, func, arg_idx)
                     continue
@@ -1674,19 +1766,45 @@ class Executor:
                 logger.warn(f"未实现的窗口函数: {func}")
         return out
 
-    # ==================== 窗口帧（ROWS 语义） ====================
+    # ==================== 窗口帧（ROWS / RANGE 语义） ====================
 
     @staticmethod
-    def _frame_bounds(frame, pos, n):
-        """把 ROWS 帧换算成当前分区内的下标闭区间 [lo, hi]
+    def _peer_ends(idxs, rows, oidx):
+        """RANGE 帧用的 peer 边界表：每个位置所属「对等行组」的末位下标
 
-        严格按「分区内排序位置」取行（ROWS 语义），不做值域合并。
+        peer = 分区内 ORDER BY 值完全相同的行（SQL 的 RANGE 按值域取帧，
+        CURRENT ROW 作为结束边界表示当前对等组的最后一行）。无 ORDER BY
+        时整个分区互为 peer，因此末位恒为分区最后一行。
+        返回值的下标是「分区内排序位置」，与 `_frame_bounds` 的 pos 对齐。
+        """
+        n = len(idxs)
+        if not oidx:
+            return [n - 1] * n
+        keys = [tuple(rows[i][j] for j, _ in oidx
+                      if 0 <= j < len(rows[i])) for i in idxs]
+        out = [0] * n
+        last = n - 1
+        for pos in range(n - 1, -1, -1):
+            if pos < n - 1 and keys[pos] != keys[pos + 1]:
+                last = pos
+            out[pos] = last
+        return out
+
+    @staticmethod
+    def _frame_bounds(frame, pos, n, peers=None):
+        """把窗口帧换算成当前分区内的下标闭区间 [lo, hi]
+
+        ROWS：严格按「分区内排序位置」取行，不做值域合并。
+        RANGE（仅 UNBOUNDED PRECEDING → CURRENT ROW）：CURRENT ROW 取
+        当前 peer 组的末位（peers[pos]），即对等值行整组一起进帧。
         区间不裁剪到合法范围之外，因此越界时会返回 lo > hi（空帧），
         而不是错误地退化成边界那一行。
 
         边界形式：UNBOUNDED PRECEDING / <n> PRECEDING / CURRENT ROW /
-        <n> FOLLOWING / UNBOUNDED FOLLOWING（已在解析器里校验过顺序）。
+        <n> FOLLOWING / UNBOUNDED FOLLOWING（已在解析器里校验过组合）。
         """
+        ftype = str(frame.get('type') or 'ROWS').upper()
+
         def to_pos(bound):
             kind, k = bound
             if kind == 'UNBOUNDED PRECEDING':
@@ -1694,7 +1812,12 @@ class Executor:
             if kind == 'UNBOUNDED FOLLOWING':
                 return n - 1
             if kind == 'CURRENT ROW':
+                if ftype == 'RANGE':
+                    return peers[pos] if peers else pos
                 return pos
+            if ftype == 'RANGE':
+                # 解析器已挡掉；这里是防御性检查，避免静默按 ROWS 取帧
+                raise ValueError("RANGE 帧不支持数值偏移，请显式写成 ROWS")
             if kind == 'PRECEDING':
                 return pos - k
             return pos + k          # FOLLOWING

@@ -526,6 +526,41 @@ SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id)
 
 ---
 
+## 20. 括号/子查询边界感知的 WHERE，与 FROM 子查询（后续会话，2026-10）
+
+### 20.1 `_where` 按括号深度与子查询边界切分
+
+**根因（§19 记录的同一个架构问题）**：`_where` 用 `re.split(r'\s+AND\s+')` / `\s+OR\s+` **无深度感知**地拆文本，于是子查询内部的 `AND`、括号分组都会被外层拆坏：
+
+```sql
+-- 修改前报 SyntaxError
+SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.amt >= 20)
+SELECT id FROM emp WHERE (dept = 'Eng' OR dept = 'HR') AND salary > 99
+```
+
+**修法**：`_where` 重写——先 `_check_paren_balance` 校验括号平衡（`' " \`` 字面量用 `_scan_quotes` 跳过），再 `_strip_outer_parens` 剥离平衡的外层括号，然后用 `_split_cond_top_level` 做**顶层** `OR` 再顶层 `AND` 切分（关键字两侧必须空白，且必须位于括号深度 0）。真语法错误仍抛 `SyntaxError`，不静默。
+
+**Lead 独立复现**：`(dept='Eng' OR dept='HR') AND salary > 99` → `[(1,),(2,),(3,)]`；`EXISTS (SELECT 1 FROM o WHERE o.uid=u.id AND o.amt>=20)` → `[(1,),(2,)]`；括号不匹配 → `SyntaxError`。
+
+### 20.2 `FROM (子查询) 别名`
+
+原先 `executor._cmd_select` 直接返回「暂不支持 FROM 子查询」（这是早先为「不静默错答」加的挡板）；更要命的是 `parser._select` 的 FROM 子查询分支把 `rest` 置空，导致**外层的 WHERE / GROUP BY / ORDER BY / LIMIT 被整段静默丢弃**。
+
+修法（复用 CTE 机制）：内层求值后以别名注册一个临时 `_CTERelation`，把外层查询的 `table` 指向该别名并走 `_select_from_relation`，`finally` 注销还原；另修掉内存关系上「无 GROUP BY 聚合」每行输出 NULL 的静默错答（`_has_bare_aggregate`）。
+
+**Lead 独立复现**：`SELECT * FROM (SELECT dept, SUM(salary) AS tot FROM emp GROUP BY dept) t WHERE t.tot > 250 ORDER BY t.tot DESC` → `[('Eng',320),('HR',275)]`；`... LIMIT 2 OFFSET 1` → `[(2,),(3,)]`；两层嵌套 → 1 行；`FROM (子查询) JOIN` 显式报错 1105。
+
+### 20.3 `RANGE` 默认帧
+
+放开 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`（及简写），`CURRENT ROW` 取**对等组末位**：实测 `ORDER BY dept` 下 Eng 三行全 320、HR 全 595、Sales 全 795。其余 `RANGE` 组合与 `GROUPS` 仍显式 `SyntaxError`。
+
+### 20.4 一处修正与仍不支持
+
+- 子代理指出（并纠正）我在任务书里写错的期望值：`EXISTS(... o.amt > 15)` 在 `orders=(uid1,10)(uid1,20)(uid2,30)` 下应为 **2 行**（uid 1 有 20>15），不是 1 行；它按真值断言并补了 `>25`→`[2]`、`>35`→`[]` 两组反证，证明是**逐外层行**求值。
+- 仍不支持：WHERE 里的 `NOT (...)` 与 `IS NULL`；`FROM (子查询)` 后面直接 `JOIN`；子查询内层 SELECT 列表的算术投影；非默认 `RANGE`/`GROUPS` 帧；不写帧子句时聚合窗口仍是逐行累计（既有行为，被旧测试锁定）。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。

@@ -40,6 +40,10 @@
   - 递归 CTE：`WITH RECURSIVE t AS (base UNION [ALL] recursive)` 迭代到定点，**上限 1000 轮**、超限显式报错；实测 `SELECT 1 AS x UNION ALL SELECT x+1 FROM n WHERE x<5` → `1..5`。
   - 相关子查询：`WHERE EXISTS/NOT EXISTS/IN (SELECT ... WHERE 内层列 = 外层列)` 真正求值（内层行按子查询缓存，20 行 0.04s）；含 JOIN、GROUP BY/HAVING、或引用外层列做聚合的相关形态仍**显式报错**。
   - `NOT IN` 三值语义：子查询结果含 NULL 时整体不通过（实测 `NOT IN (SELECT uid ...)` → 0 行），`IN` 只匹配真值；字面量列表 `NOT IN (1,2,NULL)` 同样处理。
+- **括号条件与 FROM 子查询可用**：
+  - `_where` 重写为**按括号深度与子查询边界**切分 `AND`/`OR`（跟踪 `( )` 深度与 `' " \`` 字面量，先校验括号平衡、剥离平衡外层括号、再顶层 OR→AND）。因此 `WHERE (dept='Eng' OR dept='HR') AND salary > 99`、`WHERE EXISTS (SELECT 1 FROM o WHERE o.uid=u.id AND o.amt>=20)` 都能正确求值（实测分别 3 行、`[1,2]`）；括号不匹配/未闭合字符串显式报 `SyntaxError`。
+  - `FROM (子查询) 别名` 原先直接报「暂不支持」，且解析器会把外层的 WHERE/ORDER BY/LIMIT **整段静默丢弃**；现在内层求值后以别名注册为内存关系复用高级路径，实测 `SELECT * FROM (SELECT dept, SUM(salary) AS tot FROM emp GROUP BY dept) t WHERE t.tot > 250 ORDER BY t.tot DESC` → `[('Eng',320),('HR',275)]`，`... LIMIT 2 OFFSET 1` → 正确偏移，嵌套两层也生效。
+  - 窗口帧新增 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`（对等组语义，实测 Eng 全 320 / HR 全 595 / Sales 全 795）；其余 `RANGE` 组合与 `GROUPS` 仍显式报错。
 
 **SQL 实测**（同实例、真实执行器）：窗口 4 项、CTE 4 项、UNION 4 项、GROUP BY/DISTINCT 4 项、普通路径回归 4 项 —— **17/17 通过**。
 
@@ -67,9 +71,9 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**：**239 通过 / 81 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：子查询内的 `AND`/`OR` 会被外层 WHERE 拆分（解析器不识别子查询/括号边界，见下）、OLAP 向量化路径仍受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
+**测试套件**：**244 通过 / 79 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：WHERE 里的 `NOT (...)` 与 `IS NULL`、OLAP 向量化路径仍受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
 
-**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；**相关子查询**与 `FROM` 子查询、窗口帧（`ROWS BETWEEN`）、`LIMIT ... OFFSET` 的 OFFSET、递归 CTE 仍不支持；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
+**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；WHERE 里的 `NOT (...)` 与 `IS NULL`、`FROM (子查询)` 之后直接 `JOIN`、子查询内层 SELECT 的算术投影、非默认 `RANGE`/`GROUPS` 帧、相关子查询里含 JOIN/GROUP BY 或引用外层列做聚合的形态，均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）、墓碑无 vacuum。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 
 > 更正记录：`tests/test_batch7.py::test_union_all` 曾长期失败（`assert 24 == 8`），一度被误判为「重复行 / 测试隔离」缺陷。实际是**该用例的期望值算错**：`setup()` 的城市列表 `['Beijing','Shanghai','Beijing','Beijing','Shenzhen']` 里有三处 'Beijing'，因此 `i % 5 ∈ {2,3,4}` 都是 Beijing（12 行），正确期望是 `12 × 2 = 24`；原断言只按 `i % 5 == 2` 算成 4 行。实测索引 20 条、堆 20 行、`_find_pks` 返回 12 个**互不重复**的 pk —— 存储层无缺陷。期望值现已改为从同一份 `cities` 列表推导，`test_batch7.py` 9/9 全绿。
 
