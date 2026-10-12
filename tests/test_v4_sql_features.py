@@ -917,10 +917,21 @@ def test_correlated_scalar_subquery():
                       "WHERE o.user_id = u.id) = 20")
         assert [r[0] for r in rows] == [1], rows
 
-        # ⑧ 非聚合标量子查询（取第一行）
+        # ⑧ 非聚合标量子查询：返回多行时**必须显式报错**
+        #    （原断言 `assert [r[0] for r in rows] == [1]` 锁定了
+        #     「静默取第一行」这个错误行为，已按正确语义改写，见文件末尾
+        #     「标量上下文的行数语义」一节）
+        msg = _assert_err(
+            e, "SELECT id FROM users u WHERE (SELECT o.user_id FROM "
+               "orders o WHERE o.user_id = u.id) = 1")
+        assert '多行' in msg, msg
+
+        # ⑧b 恰好返回 1 行的非聚合标量子查询仍要正确取值参与比较
+        #     （uid=2 只有一笔订单 30；uid=1 的两笔都被 amount > 25 滤掉
+        #      → 0 行 → NULL → 不通过）
         _, rows = e.q("SELECT id FROM users u WHERE (SELECT o.user_id FROM "
-                      "orders o WHERE o.user_id = u.id) = 1")
-        assert [r[0] for r in rows] == [1], rows
+                      "orders o WHERE o.user_id = u.id AND o.amount > 25) = 2")
+        assert [r[0] for r in rows] == [2], rows
 
         # ⑨ 反例：真语法错误仍然抛 SyntaxError
         import pytest
@@ -1372,3 +1383,238 @@ def test_malformed_where_missing_and_is_explicit_error():
         assert rows == [], rows
         _, rows = e.q("SELECT id FROM users WHERE name = 'a,b'")
         assert rows == [], rows
+
+
+# ==========================================================================
+# 以下为追加：**标量上下文的行数语义**（WHERE / HAVING 位置）
+#
+# 现状（修复前）：`WHERE (SELECT ...) = 5` 这类标量比较在子查询返回多于
+# 1 行时静默取第一行、返回多列时静默取第一列参与比较——静默错答。
+# 修复后统一为：0 行 → NULL（与任何值比较都是 UNKNOWN → 该行不通过，
+# 不是报错）；1 行 1 列 → 取值；多行或多列 → 显式报错。
+#
+# 数据（与验收脚本完全一致，列名用 uid/amt）：
+#   users(id, city)      → (1,'BJ') (2,'BJ') (3,'SH')
+#   orders(id, uid, amt) → (1,1,10) (2,1,20) (3,2,30)
+# ==========================================================================
+
+SCALAR_DATA_DIR = os.path.join(ROOT, 'data_scalar_semantics_test')
+
+
+class _ScalarEnv:
+    """验收用的最小数据集：users(id, city) / orders(id, uid, amt)"""
+
+    def __enter__(self):
+        from lightdb.db.database import Database
+        from lightdb.sql.executor import Executor
+        from lightdb.sql.parser import parser
+
+        shutil.rmtree(SCALAR_DATA_DIR, ignore_errors=True)
+        self.db = Database(SCALAR_DATA_DIR)
+        self.ex = Executor(self.db)
+        self.parser = parser
+        self.ex.execute_sql(
+            "CREATE TABLE users (id INT PRIMARY KEY, city VARCHAR(10))", {})
+        self.ex.execute_sql(
+            "CREATE TABLE orders (id INT PRIMARY KEY, uid INT, amt INT)", {})
+        for i, city in [(1, 'BJ'), (2, 'BJ'), (3, 'SH')]:
+            self.ex.execute_sql(
+                "INSERT INTO users VALUES (%d,'%s')" % (i, city), {})
+        for oid, uid, amt in [(1, 1, 10), (2, 1, 20), (3, 2, 30)]:
+            self.ex.execute_sql(
+                "INSERT INTO orders VALUES (%d,%d,%d)" % (oid, uid, amt), {})
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.db.shutdown()
+        except Exception:
+            pass
+        shutil.rmtree(SCALAR_DATA_DIR, ignore_errors=True)
+        return False
+
+    def q(self, sql):
+        r = self.ex.execute(self.parser.parse(sql), {})
+        assert r.get('type') == 'resultset', \
+            f'查询失败: {sql} -> {r.get("message")}'
+        return r['columns'], [tuple(x) for x in r['rows']]
+
+    def err(self, sql):
+        r = self.ex.execute(self.parser.parse(sql), {})
+        assert isinstance(r, dict) and r.get('type') == 'error', \
+            f'应当显式报错，实际返回: {sql} -> {r}'
+        return str(r.get('message') or '')
+
+
+def test_scalar_predicate_multi_row_errors():
+    """验收①：WHERE 标量子查询返回多行 → 显式报错（原来静默取第一行）
+
+    u.id=1 命中的是 orders 里 uid=1 的 2 行（10/20），原来取第一行 10
+    参与 `= 10` 的比较后静默返回 [(1,)]——错误结果。
+    """
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT id FROM users u WHERE "
+                    "(SELECT o.amt FROM orders o WHERE o.uid=u.id) = 10")
+        assert '多行' in msg, msg
+        assert '2' in msg, msg
+
+
+def test_scalar_predicate_single_row_ok():
+    """验收②：子查询只可能返回一行时，标量比较结果正确"""
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT MAX(o.amt) FROM orders o "
+                      "WHERE o.uid=u.id) = 30")
+        assert rows == [(2,)], rows
+
+
+def test_scalar_predicate_empty_is_null_not_error():
+    """验收③：0 行 → NULL → 与任何值比较都是 UNKNOWN → 不通过，且不报错"""
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT o.amt FROM orders o "
+                      "WHERE o.uid=u.id AND o.amt > 1000) = 5")
+        assert rows == [], rows
+        # 非聚合空集 → NULL；聚合空集按 SQL 语义（COUNT→0，其余→NULL）
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT SUM(o.amt) FROM orders o "
+                      "WHERE o.uid=u.id AND o.amt > 1000) = 0")
+        assert rows == [], rows
+        _, rows = e.q("SELECT id FROM users u WHERE "
+                      "(SELECT COUNT(*) FROM orders o "
+                      "WHERE o.uid=u.id AND o.amt > 1000) = 0")
+        assert sorted(r[0] for r in rows) == [1, 2, 3], rows
+        # NULL 的比较结果是三值逻辑的 UNKNOWN：NOT 下仍是 UNKNOWN，
+        # 不能让该行通过（uid=3 的 MAX 是 NULL）
+        _, rows = e.q("SELECT id FROM users u WHERE NOT "
+                      "((SELECT MAX(o.amt) FROM orders o "
+                      "WHERE o.uid=u.id) = 30)")
+        assert [r[0] for r in rows] == [1], rows
+
+
+def test_scalar_predicate_multi_column_errors():
+    """验收④：WHERE 标量子查询返回多列 → 显式报错（原来静默取第一列）"""
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT id FROM users u WHERE "
+                    "(SELECT o.uid, o.amt FROM orders o "
+                    "WHERE o.uid=u.id) = 1")
+        assert '多列' in msg, msg
+
+
+def test_scalar_predicate_all_comparison_operators():
+    """验收⑤：= != <> < > <= >= 全部比较符都要按同一套行数语义求值
+
+    用「每行最多返回 1 行」的聚合形态（MIN/MAX）保证语义可判定，
+    并额外覆盖 `<>` 与 `!=` 的等价性。
+    """
+    with _ScalarEnv() as e:
+        cases = [
+            ("SELECT id FROM users u WHERE (SELECT MIN(o.amt) FROM orders o "
+             "WHERE o.uid=u.id) = 10", [1]),
+            ("SELECT id FROM users u WHERE (SELECT MAX(o.amt) FROM orders o "
+             "WHERE o.uid=u.id) != 10", [1, 2]),
+            ("SELECT id FROM users u WHERE (SELECT MAX(o.amt) FROM orders o "
+             "WHERE o.uid=u.id) <> 10", [1, 2]),
+            ("SELECT id FROM users u WHERE (SELECT MIN(o.amt) FROM orders o "
+             "WHERE o.uid=u.id) < 25", [1]),
+            ("SELECT id FROM users u WHERE (SELECT MIN(o.amt) FROM orders o "
+             "WHERE o.uid=u.id) > 25", [2]),
+            ("SELECT id FROM users u WHERE (SELECT MIN(o.amt) FROM orders o "
+             "WHERE o.uid=u.id) <= 10", [1]),
+            ("SELECT id FROM users u WHERE (SELECT MAX(o.amt) FROM orders o "
+             "WHERE o.uid=u.id) >= 30", [2]),
+        ]
+        for sql, want in cases:
+            _, rows = e.q(sql)
+            assert sorted(r[0] for r in rows) == want, (sql, rows)
+        # uid=3 没有任何订单：MIN 空集 → NULL，所有比较都不通过（UNKNOWN）
+        for op in ('=', '!=', '<', '>', '<=', '>='):
+            _, rows = e.q(
+                "SELECT id FROM users u WHERE 3 = u.id AND "
+                "(SELECT MAX(o.amt) FROM orders o WHERE o.uid=u.id) "
+                f"{op} 30")
+            assert rows == [], (op, rows)
+
+
+def test_having_scalar_subquery():
+    """验收⑥：HAVING 位置的标量子查询
+
+    * 引用分组键（`u.city`）→ 逐分组折叠求值，结果正确；
+    * 引用非分组键（`u.id`，GROUP BY 之后取不到）→ 显式报错
+      （原实现 `_eval_condition` 见到没有左值的 subquery 节点直接
+      `return True`，把整个 HAVING 静默丢掉 → 所有分组都被保留）；
+    * 非相关标量子查询：多行 → 显式报错，1 行 → 正确判定；
+    * 与聚合谓词 AND 混用也要正确。
+    """
+    with _ScalarEnv() as e:
+        # ① 非相关标量子查询返回多行 → 显式报错
+        msg = e.err(
+            "SELECT u.city, COUNT(*) FROM users u GROUP BY u.city "
+            "HAVING (SELECT o.amt FROM orders o) > 0")
+        assert '多行' in msg, msg
+
+        # ② 非相关标量子查询返回 1 行 → 每个分组都用该标量判定
+        _, rows = e.q(
+            "SELECT u.city, COUNT(*) FROM users u GROUP BY u.city "
+            "HAVING (SELECT MAX(o.amt) FROM orders o) = 30")
+        assert sorted(rows) == [('BJ', 2), ('SH', 1)], rows
+
+        # ③ 相关（引用分组键 u.city）：BJ 有 3 笔订单、SH 0 笔 → 只留 BJ
+        _, rows = e.q(
+            "SELECT u.city, COUNT(*) FROM users u GROUP BY u.city "
+            "HAVING (SELECT COUNT(*) FROM orders o JOIN users u2 "
+            "ON o.uid = u2.id WHERE u2.city = u.city) > 0")
+        assert rows == [('BJ', 2)], rows
+
+        # ④ 与聚合谓词 AND 混用
+        _, rows = e.q(
+            "SELECT u.city, COUNT(*) FROM users u GROUP BY u.city "
+            "HAVING COUNT(*) > 0 AND (SELECT COUNT(*) FROM orders o "
+            "JOIN users u2 ON o.uid = u2.id WHERE u2.city = u.city) > 0")
+        assert rows == [('BJ', 2)], rows
+
+        # ⑤ 引用非分组键（u.id）：GROUP BY city 之后取不到 → 显式报错，
+        #    不能静默把所有分组都保留
+        msg = e.err(
+            "SELECT u.city, COUNT(*) FROM users u GROUP BY u.city "
+            "HAVING (SELECT COUNT(*) FROM orders o WHERE o.uid = u.id) > 0")
+        assert 'GROUP BY' in msg, msg
+
+
+def test_scalar_subquery_fold_cache_and_20_rows():
+    """性能/缓存：外层 20+ 行逐行求值瞬时完成，且按折叠值缓存
+
+    子查询只引用 `u.city`，可用折叠值只有 2 种（BJ/SH），因此
+    `_fold_and_run` 只应被调用 ≤2 次（同值外层行共享缓存结果）；
+    如果缓存失效会退化成 22 次。
+    """
+    import time
+
+    with _ScalarEnv() as e:
+        for i in range(10, 30):
+            e.ex.execute_sql(
+                "INSERT INTO users VALUES (%d,'%s')"
+                % (i, 'BJ' if i % 2 == 0 else 'SH'), {})
+        calls = []
+        orig = e.ex._fold_and_run
+
+        def counting(*a, **kw):
+            calls.append(1)
+            return orig(*a, **kw)
+
+        e.ex._fold_and_run = counting
+        try:
+            start = time.time()
+            _, rows = e.q(
+                "SELECT u.id FROM users u WHERE "
+                "(SELECT COUNT(*) FROM orders o JOIN users u2 "
+                "ON o.uid = u2.id WHERE u2.city = u.city) > 0 "
+                "ORDER BY u.id")
+            elapsed = time.time() - start
+        finally:
+            e.ex._fold_and_run = orig
+        assert [r[0] for r in rows] == [1, 2] + \
+            [i for i in range(10, 30) if i % 2 == 0], rows
+        assert elapsed < 2.0, f'20+ 行逐行求值过慢: {elapsed:.3f}s'
+        assert len(calls) <= 2, f'折叠缓存失效，子查询被执行 {len(calls)} 次'
+

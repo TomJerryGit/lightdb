@@ -689,6 +689,55 @@ xmin(4) | xmax(4) | flags(1) | dlen(4) | prev_page(4) | prev_slot(4)
 
 ---
 
+## 24. 标量上下文的行数语义（本族最后一块静默错答，2026-10）
+
+### 24.1 问题
+
+`WHERE (SELECT ...) = 5` 在子查询返回**多于 1 行**时**默默取第一行**。它与 §23 是同一族缺陷，但危害更大：谓词位置的决定直接影响**选行**，错得无声无息。
+
+### 24.2 修法：把标量收敛收敛到一个函数
+
+新增 `_scalar_from_rows(sub, rows, pos)` 作为**唯一**的标量收敛实现：
+
+| 子查询结果 | 语义 |
+|---|---|
+| 0 行 | `NULL`/空集聚合值 ⇒ 比较为 `UNKNOWN` ⇒ 该行不通过（**不报错**） |
+| 1 行 1 列 | 取值参与比较 |
+| > 1 行 | **显式报错**（「标量子查询返回了多行（N 行）」） |
+| > 1 列 | **显式报错** |
+
+原先三处 `rows[0][0]` 式兜底（`_eval_correlated_predicate`、`_eval_scalar_subquery`、`_eval_projection_scalar`）全部改调它；`_where_has_scalar_subquery` 把标量比较谓词路由到逐行折叠路径（原先掉进 `_rewrite_subqueries` 兜底、丢条件后报误导性的 err 1146「缺少: column」）。
+
+### 24.3 顺带关闭的三处「整段静默丢弃」
+
+1. **HAVING 里的子查询**：`_eval_condition` 见到无左值的 subquery 节点直接 `return True` ⇒ **整个 HAVING 被静默丢掉**（所有分组都保留）。现在逐分组/逐键折叠求值并缓存；引用非分组键列则报错并提示「把该列加入 GROUP BY」。
+2. **JOIN 查询的 `WHERE (SELECT..)=1`**：`plan_executor._eval_condition` 的 `col_name is None → return True` ⇒ **静默返回全部连接行**。现在显式报错。
+3. **`_rewrite_subqueries` 兜底**：原先 `pop` 掉无法处理的条件 ⇒ 条件凭空消失。现在显式报错。
+4. 另修 `_eval_outer_where` 的 NULL 比较：`NOT UNKNOWN` 现在保持 `UNKNOWN`（原先 `not False` 为真，会让无匹配行错误通过）。
+
+### 24.4 Lead 独立验证
+
+| 抽查 | 结果 |
+|---|---|
+| 多行 `= 10` | 显式报错「标量子查询返回了多行（2 行）」 |
+| 单行 `MAX(...) = 30` | `[(2,)]` |
+| 0 行 `= 5` | `[]`，**不报错**（正确 NULL 语义） |
+| `NOT ((SELECT MAX …) = 30)` | `[(1,)]`（无订单行的 UNKNOWN 不再被放行） |
+| HAVING 引用非分组键 | 显式报错 + 可操作指引 |
+| JOIN 查询 `WHERE (SELECT..)=1` | 显式报错（原先返回全部连接行） |
+
+### 24.5 越界改动与测试
+
+唯一被改动的既有断言：`test_v4_sql_features.py::test_correlated_scalar_subquery` 断言⑧——原文注释即写作「# ⑧ 非聚合标量子查询（**取第一行**）」并断言 `== [1]`，**它把错误行为写进了测试**。现改为断言报错含「多行」，并补单行正例。Lead 核对 `git diff`：被删除的**仅此一条**。另追加 7 个测试。
+
+4 文件 66 → **73 passed**；全量 268/82/1 → **275 通过 / 82 失败 / 1 跳过**（失败数不变）。
+
+### 24.6 仍显式报错 / 已知偏差
+
+JOIN 外层查询的 WHERE/HAVING/投影标量子查询（计划执行器尚无逐行折叠能力）；HAVING 引用非分组键；`IN (SELECT a,b)` 行值 IN（只认第一列，属 IN 既有语义）。已知偏差（刻意未改，已在 `_empty_agg_scalar` docstring 写明）：带 GROUP BY 的标量子查询 0 行且投影为 `COUNT` 时仍补 `0`（SQL 标准为 `NULL`），与投影位置既定语义一致，收紧会改动已锁定的断言，需统一决策。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。

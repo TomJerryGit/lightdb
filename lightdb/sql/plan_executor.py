@@ -182,6 +182,18 @@ class PlanExecutor:
         # ---------- 普通比较 ----------
         col_name = where.get('column')
         if col_name is None:
+            # 带 subquery 但没有左值的节点 = WHERE/HAVING 里的标量（相关）
+            # 子查询比较 `(SELECT ...) > 1`。计划执行器没有逐外层行折叠
+            # 外层列的能力，取不到行数语义（多行该报错、0 行该是 NULL），
+            # 原实现直接 `return True` 把整个谓词静默丢掉（实测
+            # `JOIN ... WHERE (SELECT ...) = 1` 返回全部连接行）。
+            # 与投影位置（下面 _exec_Project）一致，显式报错，绝不静默
+            # 给出可能错误的结果。
+            if 'subquery' in where:
+                raise ValueError(
+                    "JOIN 查询的 WHERE/HAVING 里暂不支持标量子查询比较"
+                    f"（op={where.get('op')}）：该谓词需要逐行折叠外层列，"
+                    "计划执行路径没有这个能力")
             return True
         try:
             ci = self._resolve_col(cols, col_name)
@@ -518,7 +530,15 @@ class PlanExecutor:
         return found
 
     def _build_group_row(self, agg_cols, src_cols, gkey, grows):
-        """根据聚合表达式列表构建一行"""
+        """根据聚合表达式列表构建一行
+
+        已知限制（本次未改，仅显式记录）：非聚合列一律取「组内第一行」
+        的值作为代表。对**分组键**列这是安全的（组内取值恒等）；对
+        **非分组键**的裸列（`SELECT city, name, COUNT(*) ... GROUP BY city`）
+        则是任取一行——SQL 标准会直接拒绝，MySQL 会任取一行。
+        执行器的统一路径（executor._group_rows + _project_rows）在这种
+        形态下会显式报「列不存在」；JOIN/计划路径仍是任取第一行。
+        """
         row = []
         # 用 key 里可迭代出来的值填充非聚合列
         key_iter = iter(gkey)

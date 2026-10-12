@@ -315,9 +315,17 @@ class Executor:
         has_sub = self._contains_subquery(p.get('where'))
         where = p.get('where')
         # 相关子查询不能一次性求值改写（它的真值依赖外层行），
-        # 必须走逐行求值路径；非相关子查询仍走原来的「求值 + 改写」
-        correlated = has_sub and self._where_has_correlated(
-            where, table, p.get('table_alias'))
+        # 必须走逐行求值路径；非相关 EXISTS / IN 子查询仍走原来的
+        # 「求值 + 改写」路径（它们是一次性集合语义，改写后能继续下推）。
+        # **标量比较谓词**（`(SELECT ...) = 5`）同样必须逐外层行求值：
+        # 它需要按行数语义收敛（0 行 → NULL、1 行 1 列 → 取值、
+        # 多行/多列 → 显式报错），一次性改写无法表达这套语义。
+        # 原实现让这种谓词掉进 _rewrite_subqueries 的兜底分支，把 subquery
+        # 直接丢掉，产出没有左值的条件后报出误导性的 err 1146「缺少:
+        # column」；逐行路径按折叠值缓存，非相关标量子查询只执行一次。
+        correlated = has_sub and (
+            self._where_has_correlated(where, table, p.get('table_alias'))
+            or self._where_has_scalar_subquery(where))
         if has_sub and not correlated:
             try:
                 where, _ = self._rewrite_subqueries(
@@ -538,6 +546,9 @@ class Executor:
                 column = where.get('column')
                 if not isinstance(column, str) or not column:
                     raise ValueError("IN 子查询缺少左值列")
+                # IN 是**集合语义**（允许多行），只取每行第一列做候选值；
+                # 已知限制：`c IN (SELECT a, b ...)` 的行值 IN 不支持，
+                # 多出来的列被忽略（不报错）。IN 不在标量语义的收紧范围内。
                 values, seen = [], set()
                 for r in rows:
                     if not r:
@@ -575,7 +586,16 @@ class Executor:
                             'value': non_null[0]}, False
                 return self._eq_conditions(column, non_null), False
 
-        # 兜底：结构上不像已知形态，原样返回（保持旧行为）
+        # 兜底：带 subquery 但不是 EXISTS/IN，也不是标量比较（正常情况
+        # 下列子查询已在 _cmd_select / _select_from_relation 里被路由到
+        # 逐行求值路径，走不到这里）。原实现把 subquery 直接丢掉，产出
+        # `{'op': '=', 'value': '10'}` 这种没有左值的条件，下游报
+        # 「缺少: 'column'」（误导性错误），还可能把条件静默放过。
+        # 显式报错，绝不静默丢条件。
+        if isinstance(sub, dict):
+            raise ValueError(
+                f"无法求值的子查询谓词（op={op}）：该形态没有一次性求值的语义")
+        # 结构上不像已知形态，原样返回（保持旧行为）
         rw = dict(where)
         rw.pop('subquery', None)
         return rw, False
@@ -888,7 +908,9 @@ class Executor:
             src, self._normalize_where(src_where), read_view)
         if (p.get('group_by') or p.get('having')
                 or self._has_bare_aggregate(p)):
-            base_cols, rows = self._group_rows(p, src, base_cols, rows)
+            base_cols, rows = self._group_rows(
+                p, src, base_cols, rows, session=session,
+                read_view=read_view)
         if p.get('windows'):
             return self._apply_windows(p, base_cols, rows, session=session,
                                        read_view=read_view)
@@ -1098,11 +1120,15 @@ class Executor:
         """操作数是否是数字字面量（`2` / `-1.5`）"""
         return bool(re.match(r'^-?\d+(?:\.\d+)?$', str(tok)))
 
-    def _group_rows(self, p, src, base_cols, rows):
+    def _group_rows(self, p, src, base_cols, rows, session=None,
+                    read_view=None):
         """按 GROUP BY 分组并计算聚合列，返回 (分组后的列名, 分组后的行)
 
         原实现把 group_by 完全忽略，`SELECT dept, COUNT(*) ... GROUP BY dept`
         会退化成「全表一行」，属于静默错答。
+
+        session / read_view：HAVING 里的子查询需要（重新）执行子查询，
+        必须沿用同一个事务读视图；拿不到时由 `_use_session` 兜底。
         """
         keys = [str(k).strip() for k in (p.get('group_by') or [])]
         kidx = [self._col_index_of(base_cols, k) for k in keys]
@@ -1126,6 +1152,10 @@ class Executor:
         for a in having_aggs_eval:
             if a not in eval_cols:
                 eval_cols.append(a)
+        # HAVING 里有子查询 → 每个分组行单独求值（分组键作为外层行折叠），
+        # 结果按折叠值缓存；没有子查询时仍走原来的 _eval_condition 快路径
+        having_has_sub = self._contains_subquery(having)
+        having_cache = {}
 
         groups, order = {}, []
         for r in rows:
@@ -1153,11 +1183,95 @@ class Executor:
                 # 键用用户原样的表达式（_eval_condition 按原样查表）
                 extra = {a: agg_vals.get(e)
                          for a, e in zip(having_aggs, having_aggs_eval)}
-                if not self._eval_condition(
-                        vals, list(keys) + list(eval_cols), having, extra):
+                hcols = list(keys) + list(eval_cols)
+                if having_has_sub:
+                    # GROUP BY 之后的行只剩分组键 + 聚合值：子查询里的
+                    # 外层引用只能折叠成「分组键」的取值（引用别的列要
+                    # 显式报错，见 _eval_having_with_subquery）
+                    if not self._eval_having_with_subquery(
+                            vals, hcols, having, extra, p, session,
+                            read_view, having_cache):
+                        continue
+                elif not self._eval_condition(vals, hcols, having, extra):
                     continue
             out_rows.append(vals)
         return keys + agg_cols, out_rows
+
+    def _eval_having_with_subquery(self, row, cols, where, agg_values, p,
+                                   session, read_view, cache):
+        """HAVING 里带子查询的条件求值（逐分组行）
+
+        HAVING 在 GROUP BY 之后求值，此时「外层行」是分组行：列只有
+        分组键 + 聚合值。因此：
+
+        * `{'and'/'or'/'not'}` 递归处理；
+        * 不含子查询的叶子节点交给 `_eval_condition`（聚合谓词靠
+          agg_values 取聚合值）；
+        * 含子查询的叶子节点：
+          - 相关（引用外层/分组键）→ `_eval_correlated_predicate`，
+            把分组键取值折叠成字面量后执行子查询；
+          - 非相关 → `_eval_outer_where` 的非相关分支（EXISTS/IN 一次性
+            求值；标量比较走 `_eval_scalar_subquery`，整体只算一次）；
+        * 引用不到分组键的列（例如 `HAVING (SELECT ... WHERE o.uid = u.id)`
+          而 GROUP BY 只有 city）→ 显式报错。原实现直接 `return True`，
+          把 HAVING 条件静默丢掉（实测所有分组都保留）。
+
+        缓存：按折叠用到的分组键取值缓存子查询结果（同值分组共享一次
+        执行），因此分组很多时也不会重复跑子查询。
+        """
+        if not isinstance(where, dict):
+            return True
+        # NOT (...)：三值逻辑下 NOT UNKNOWN 仍是 UNKNOWN → 该分组不通过
+        if 'not' in where and isinstance(where['not'], dict):
+            inner = self._eval_having_with_subquery(
+                row, cols, where['not'], agg_values, p, session,
+                read_view, cache)
+            if inner is None:
+                return None
+            return not inner
+        if 'and' in where:
+            return all(self._eval_having_with_subquery(
+                row, cols, c, agg_values, p, session, read_view, cache)
+                for c in where['and'])
+        if 'or' in where:
+            parts = where['or']
+            if not parts:
+                return False
+            return any(self._eval_having_with_subquery(
+                row, cols, c, agg_values, p, session, read_view, cache)
+                for c in parts)
+
+        sub = where.get('subquery')
+        if not isinstance(sub, dict):
+            # 普通列比较 / 聚合谓词：沿用统一求值器
+            return self._eval_condition(row, cols, where, agg_values)
+
+        outer_name = p.get('table')
+        outer_alias = p.get('table_alias')
+        session = self._use_session(session)
+        correlated = (
+            self._is_correlated(sub, outer_name, outer_alias)
+            or self._sub_owner_is_outer(sub, outer_name, outer_alias))
+        if correlated:
+            # 先做「外层引用能否在分组行里取到值」的前置检查：取不到时
+            # 给出比折叠失败更明确的信息（GROUP BY 之后只保留分组键）
+            names = self._fold_outer_names(sub, outer_name, outer_alias)
+            missing = [
+                c for c in self._outer_ref_columns(sub, names)
+                if self._outer_column_value(cols, row, c) is _MISSING]
+            if missing:
+                raise ValueError(
+                    f"HAVING 里的相关子查询引用了 '{missing[0]}'，"
+                    f"但 GROUP BY 之后只保留分组键与聚合值，取不到该列："
+                    f"请把该列加入 GROUP BY，或改成引用分组键")
+            return self._eval_correlated_predicate(
+                row, cols, where, session, outer_name, outer_alias,
+                cache, read_view)
+        # 非相关子查询：EXISTS / IN 走集合语义，标量比较按行数语义收敛，
+        # 两者都按子查询缓存（整体只求值一次）
+        return self._eval_outer_where(
+            row, cols, where, session, outer_name, outer_alias,
+            cache, read_view)
 
     # ==================== 条件求值（统一路径） ====================
 
@@ -1479,17 +1593,41 @@ class Executor:
                 cache[key] = [tuple(r) for r in (res.get('rows') or [])]
             rows = cache[key]
 
+        # 行数/列数语义统一交给 _scalar_from_rows（与 WHERE/HAVING 同一份
+        # 实现）：0 行 → 空集聚合值/NULL、1 行 1 列 → 取值、
+        # 多行/多列 → 显式报错。绝不再取第一行/第一列。
+        return self._scalar_from_rows(sub, rows, '投影里的')
+
+    def _scalar_from_rows(self, sub, rows, where_text=""):
+        """把子查询的结果行按**标量语义**收敛成一个值（统一实现）
+
+        WHERE / HAVING / 投影三个位置的标量上下文共用这一份语义：
+
+        * 多于 1 行 → 抛 ValueError（显式报错，绝不取第一行）；
+        * 0 行 → 空集聚合值（COUNT→0，SUM/AVG/MIN/MAX→NULL），
+          非聚合投影 → NULL（SQL 标准语义，这是正确的 NULL）；
+        * 1 行但多于 1 列 → 抛 ValueError（绝不取第一列）；
+        * 1 行 1 列 → 返回该值。
+
+        静态列数可判（`SELECT a, b` / `SELECT *` 之外的形态）时先报多列，
+        这样即使某个外层行恰好匹配 0 行也能显式报出多列子查询。
+        where_text 只用于把出错位置写进信息（例如 'WHERE/HAVING 里的'）。
+        """
+        pos = str(where_text or '')
+        static_w = self._scalar_static_width(sub)
+        if static_w is not None and static_w > 1:
+            raise ValueError(
+                f"{pos}标量子查询返回了多列（{static_w} 列）："
+                f"标量上下文只允许返回 1 列")
         if len(rows) > 1:
             raise ValueError(
-                f"标量子查询返回了多行（{len(rows)} 行）："
+                f"{pos}标量子查询返回了多行（{len(rows)} 行）："
                 f"标量上下文最多只允许返回 1 行")
         if not rows or not rows[0]:
-            # 空结果集：聚合按 SQL 语义补值（COUNT→0，其余→NULL），
-            # 非聚合 → NULL（这是正确的 NULL，不是占位）
             return self._empty_agg_scalar(sub)
         if len(rows[0]) > 1:
             raise ValueError(
-                f"标量子查询返回了多列（{len(rows[0])} 列）："
+                f"{pos}标量子查询返回了多列（{len(rows[0])} 列）："
                 f"标量上下文只允许返回 1 列")
         return rows[0][0]
 
@@ -1577,7 +1715,8 @@ class Executor:
                 return self._err(1062, self._ambiguous_outer_ref_message(
                     amb, rel.name, p.get('table_alias')))
             if self._where_has_correlated(where, rel.name,
-                                          p.get('table_alias')):
+                                          p.get('table_alias')) \
+                    or self._where_has_scalar_subquery(where):
                 return self._select_correlated(
                     p, s, rel, self._rv_of(s), rel.name)
             try:
@@ -1735,6 +1874,31 @@ class Executor:
                     return True
         return False
 
+    @classmethod
+    def _where_has_scalar_subquery(cls, where) -> bool:
+        """条件里是否存在「标量子查询比较」节点（`(SELECT ...) <op> v`）
+
+        与 EXISTS / IN 不同，这类谓词没有一次性求值的语义：每个外层行
+        都要把子查询结果按行数/列数收敛（0 行 → NULL、1 行 1 列 → 取值、
+        多行或多列 → 显式报错），因此必须走 `_select_correlated` 的
+        逐行求值路径（`_eval_outer_where` → `_eval_correlated_predicate`
+        / `_eval_scalar_subquery`）。漏判会让条件走一次性改写路径，
+        原实现会把 subquery 静默丢掉。
+        """
+        if not isinstance(where, dict):
+            return False
+        if 'subquery' in where and where.get('op') not in (
+                'EXISTS', 'NOT EXISTS', 'IN', 'NOT IN'):
+            return True
+        inner = where.get('not')
+        if isinstance(inner, dict) and cls._where_has_scalar_subquery(inner):
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._where_has_scalar_subquery(c):
+                    return True
+        return False
+
     def _is_correlated(self, sub, outer_table, outer_alias=None) -> bool:
         """判断子查询是否相关（引用了外层表的列）
 
@@ -1874,7 +2038,8 @@ class Executor:
 
         if (p.get('group_by') or p.get('having')
                 or self._has_bare_aggregate(p)):
-            base_cols, rows = self._group_rows(p, src, base_cols, rows)
+            base_cols, rows = self._group_rows(
+                p, src, base_cols, rows, session=s, read_view=read_view)
         if p.get('windows'):
             return self._apply_windows(p, base_cols, rows, session=s,
                                        read_view=read_view)
@@ -1885,14 +2050,24 @@ class Executor:
 
     def _eval_outer_where(self, row, cols, where, s, outer_name,
                           outer_alias, cache, read_view):
-        """外层行上的条件求值（含相关/非相关子查询谓词）"""
+        """外层行上的条件求值（含相关/非相关子查询谓词）
+
+        返回值：True / False / **None（三值逻辑的 UNKNOWN）**。
+        UNKNOWN 在调用方（`_select_correlated` 的 `if`、and/or 的 all/any）
+        里按「不通过」处理，与 SQL 的行过滤语义一致；只有 `NOT` 需要显式
+        区分：`NOT UNKNOWN` 仍是 UNKNOWN，**不能**变成真。
+        """
         if where is None or not isinstance(where, dict):
             return True
-        # NOT (...)：整体取反（可与 AND/OR 组合、可嵌套）
+        # NOT (...)：整体取反（可与 AND/OR 组合、可嵌套）。
+        # 三值逻辑：NOT UNKNOWN 仍是 UNKNOWN（该行不通过），不能取反成真。
         if 'not' in where and isinstance(where['not'], dict):
-            return not self._eval_outer_where(
+            inner = self._eval_outer_where(
                 row, cols, where['not'], s, outer_name, outer_alias,
                 cache, read_view)
+            if inner is None:
+                return None
+            return not inner
         if 'and' in where:
             return all(self._eval_outer_where(
                 row, cols, c, s, outer_name, outer_alias, cache, read_view)
@@ -1921,12 +2096,19 @@ class Executor:
                     cache, read_view)
             if op not in ('EXISTS', 'NOT EXISTS', 'IN', 'NOT IN'):
                 # 非相关标量子查询：可以一次性求值（结果按子查询缓存）
-                return self._compare_scoped(
-                    self._eval_scalar_subquery(sub, s, cache),
-                    op, self._scoped_value(
-                        where.get('value'), row, cols, None)
-                    if self._is_column_ref(where.get('value'))
-                    else where.get('value'))
+                sv = self._eval_scalar_subquery(sub, s, cache)
+                rv = where.get('value')
+                if self._is_column_ref(rv):
+                    rv = self._scoped_value(rv, row, cols, None)
+                    if rv is _MISSING:
+                        return False
+                if sv is None and rv is not None:
+                    # 标量是 NULL（0 行 → NULL）→ 比较结果是 UNKNOWN，
+                    # 不是 False：AND/OR 里表现相同，但 NOT 下必须保持
+                    # UNKNOWN（不能变成真）。见 `_eval_outer_where` 的
+                    # NOT 分支。
+                    return None
+                return self._compare_scoped(sv, op, rv)
             return self._eval_plain_subquery_predicate(row, cols, where, s,
                                                        cache)
         # 普通比较 / LIKE / IS NULL（编码成 value=None 的 =/!=）/ 聚合谓词
@@ -1949,6 +2131,10 @@ class Executor:
             return len(rows) > 0
         if op == 'NOT EXISTS':
             return len(rows) == 0
+        # IN / NOT IN 是**集合语义**（允许多行），只取每行的第一列做候选值
+        # ——这是 IN(SELECT) 的标准形态，不属于标量降级，故保持原样；
+        # 已知限制：`c IN (SELECT a, b ...)` 这种「行值 IN」本引擎不支持，
+        # 多出来的列会被忽略（不会报错）。此处刻意不动 IN 的语义。
         vals = [r[0] for r in rows if r]
         lv = self._scoped_value(where.get('column'), row, cols, None)
         return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
@@ -1993,19 +2179,22 @@ class Executor:
             return len(rows) == 0
 
         if op in ('IN', 'NOT IN'):
+            # IN / NOT IN（子查询形态）：集合语义，允许多行，取第一列作为
+            # 候选集合（与 _eval_plain_subquery_predicate 一致）。
+            # 已知限制：多列子查询在 IN 里只认第一列（行值 IN 不支持），
+            # 这是 IN 的既有语义，刻意不改。
             vals = [r[0] for r in rows if r]
             lv = self._scoped_value(where.get('column'), row, cols, None)
             return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
 
-        # 标量比较：取第一行第一列。
-        # 注意空结果：SQL 里 `(SELECT COUNT(*) ...)` 即使没有匹配行也返回 0
-        # （聚合作用于空集），而 SUM/AVG/MIN/MAX 返回 NULL。执行器对空集
-        # 聚合不产出任何行，因此这里要按投影的聚合函数名补出正确的空集值，
+        # 标量比较：按标量行数/列数语义收敛后再比较（统一走
+        # _scalar_from_rows）。注意空结果：SQL 里 `(SELECT COUNT(*) ...)`
+        # 即使没有匹配行也返回 0（聚合作用于空集），而 SUM/AVG/MIN/MAX
+        # 返回 NULL，因此空集要按投影的聚合函数名补出正确的空集值，
         # 否则 `(SELECT COUNT(*) ...) = 0` 会把 0 误判成 NULL 而漏掉整行。
-        has_row = bool(rows and rows[0])
-        sv = rows[0][0] if has_row else None
-        if not has_row:
-            sv = self._empty_agg_scalar(sub)
+        # 原实现无条件取 `rows[0][0]`：多行静默取第一行、多列静默取第一列，
+        # 属于会给出错误结果的静默降级（WHERE 位置的主验收点）。
+        sv = self._scalar_from_rows(sub, rows, 'WHERE/HAVING 里的')
         rv = where.get('value')
         if self._is_column_ref(rv):
             rv = self._scoped_value(rv, row, cols, None)
@@ -2017,6 +2206,11 @@ class Executor:
                     rv = float(rv) if '.' in rv else int(rv)
             except (TypeError, ValueError):
                 pass
+        if sv is None and rv is not None:
+            # 标量是 NULL（0 行 → NULL，或空集上的 SUM/AVG/MIN/MAX）
+            # → 比较结果是三值逻辑的 UNKNOWN（该行不通过），但**不是 False**：
+            # NOT 下必须保持 UNKNOWN（见 `_eval_outer_where` 的 NOT 分支）。
+            return None
         return self._compare_scoped(sv, op, rv)
 
     @staticmethod
@@ -2025,6 +2219,19 @@ class Executor:
 
         COUNT → 0，其它聚合（SUM/AVG/MIN/MAX）→ NULL；
         投影不是聚合函数时也返回 NULL。
+
+        已知偏差（本次刻意不改，仅显式记录）：本引擎对空集不产出任何行，
+        因此「0 行」有两种来源——① 无 GROUP BY 的裸聚合作用于空集
+        （SQL 定义为 COUNT=0，这个补值是正确的）；② 带 GROUP BY/HAVING
+        且没有任何分组存活（SQL 标准下整个标量子查询是 NULL，即使投影是
+        COUNT）。这里对两种情况一律按「COUNT → 0」补值，第二种情况下
+        `(SELECT COUNT(*) ... GROUP BY g HAVING ...) = 0` 会命中、
+        而 PostgreSQL/SQLite/MySQL 下应为 NULL（UNKNOWN）不命中。
+        收紧这一点会同时改变**投影位置**已锁定的语义
+        （tests/test_v4_sql_features.py 中 `... GROUP BY o.user_id
+        HAVING COUNT(*) >= 1) AS g` 对无订单用户的期望值 0），
+        属于上一轮已决策的范围，因此留待统一决策；WHERE/HAVING 位置
+        与投影位置保持一致，不单独偏离。
         """
         cols = sub.get('columns') or []
         expr = str(cols[0]).strip() if cols else ''
@@ -2034,7 +2241,15 @@ class Executor:
         return None
 
     def _eval_scalar_subquery(self, sub, s, cache):
-        """非相关标量子查询求值（结果按子查询缓存）"""
+        """非相关标量子查询求值（结果按子查询缓存）
+
+        与相关路径共用 `_scalar_from_rows` 的行数/列数语义：
+        0 行 → 空集聚合值（COUNT→0，其余→NULL）、1 行 1 列 → 取值、
+        多行/多列 → 显式报错。原实现是
+        `cache[key] = rows[0][0] if (rows and rows[0]) else None`
+        ——多行静默取第一行、多列静默取第一列、空集上的 COUNT 还会
+        错成 NULL，三重静默错答。
+        """
         key = ('scalar', id(sub))
         if key not in cache:
             res = self.execute(sub, s)
@@ -2042,7 +2257,7 @@ class Executor:
                 raise ValueError(
                     f"子查询执行失败: {(res or {}).get('message', '')}")
             rows = [tuple(r) for r in (res.get('rows') or [])]
-            cache[key] = rows[0][0] if (rows and rows[0]) else None
+            cache[key] = self._scalar_from_rows(sub, rows, 'WHERE/HAVING 里的')
         return cache[key]
 
     # ---- 外层列常量折叠 ----
