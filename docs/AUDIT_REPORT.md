@@ -501,6 +501,31 @@ GROUP BY 与 DISTINCT 属于**静默错答**：不报错、结果错。仓库自
 
 ---
 
+## 19. 窗口帧 / OFFSET / 递归 CTE / 相关子查询 / NULL 三值（后续会话，2026-10）
+
+| 能力 | 原先 | 现在（Lead 独立复现的结果） |
+|---|---|---|
+| 窗口帧 | `ROWS BETWEEN ...` 被整段忽略（当整分区累计） | 支持 `n PRECEDING/FOLLOWING`、`CURRENT ROW`、`UNBOUNDED` 各组合与简写 `ROWS UNBOUNDED PRECEDING`，作用于 SUM/AVG/COUNT/MIN/MAX；实测 `ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` → `120,220,200,210,200,185,190,180`（对 120,100,100,110,90,95,95,85），`CURRENT ROW AND 1 FOLLOWING` → `220,200,210,200,185,190,180,85`。排名/LAG/LEAD 忽略帧。`RANGE`/`GROUPS` 帧显式报错 |
+| `LIMIT ... OFFSET` | 正则匹配到了 OFFSET 但**丢弃不用** | `LIMIT n OFFSET m` 与 `LIMIT m, n` 都生效（实测 `LIMIT 2 OFFSET 3` → `[4,5]`、`LIMIT 1,2` → `[2,3]`）；`Limit` 节点新增 `offset`，JOIN 计划路径同样生效 |
+| 递归 CTE | 只解析不执行 | 迭代到定点（`UNION` 去重 / `UNION ALL` 不去重），**上限 1000 轮**、超限显式报错；实测 `SELECT 1 AS x UNION ALL SELECT x+1 FROM n WHERE x<5` → `[1,2,3,4,5]` |
+| 相关子查询 | `_check_correlated` 直接报错 | `WHERE EXISTS/NOT EXISTS/IN (SELECT ... WHERE 内层列 = 外层列)` 真正求值（内层按子查询缓存，20 行 0.04s）；实测 EXISTS → `[1,2]`、NOT EXISTS → `[3]`、相关 IN → `[1,2]` |
+| `NOT IN` NULL | 按普通 `!=` 处理 | 实现三值语义：子查询结果含 NULL 时整体不通过（实测 → 0 行），`IN` 只匹配真值；字面量列表 `NOT IN (1,2,NULL)` 同样处理 |
+
+**Lead 复核**：4 个目标测试文件 45/45 通过；全量套件 239 通过 / 81 失败 / 1 跳过（本轮之前 234/81，**失败数不变即零新增回归**）。
+
+**新发现的限制（我的抽查发现，已记入）**：`_where` 先按 `\s+AND\s+` / `\s+OR\s+` 拆文本、**不识别子查询与括号边界**，因此子查询内部含顶层 `AND`/`OR` 时会被外层拆坏并抛 `SyntaxError`：
+
+```sql
+-- 报 SyntaxError（子查询内的 AND 被外层拆开）
+SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.amt > 15)
+-- 可用（子查询内无顶层 AND）
+SELECT id FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id)
+```
+
+这是解析器「正则拆分」架构的固有问题（与 §16.3 的 `HAVING` 同源），要根治需要按括号深度切分或以真正的词法/语法分析替换，属重写级工作。其余仍显式报错的形态：子查询含 JOIN / GROUP BY / HAVING、引用外层列做聚合、相关子查询内再嵌套子查询。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。

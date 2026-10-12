@@ -152,9 +152,14 @@ class Optimizer:
             desc = bool(order_by[1]) if len(order_by) > 1 else False
             node = Sort(node, col, desc)
 
-        # ---------- LIMIT ----------
-        if limit:
-            node = Limit(node, int(limit))
+        # ---------- LIMIT / OFFSET ----------
+        # LIMIT 之前必须已经排好序（Sort 在上一步），OFFSET 也在这里裁剪，
+        # 否则 JOIN 查询的 `LIMIT n OFFSET m` 会把 offset 静默丢掉
+        offset = int(parsed.get('offset') or 0)
+        if limit is not None:
+            node = Limit(node, int(limit), offset)
+        elif offset:
+            node = Limit(node, None, offset)
 
         return node
 

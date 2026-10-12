@@ -95,13 +95,16 @@ class Sort(PlanNode):
 
 
 class Limit(PlanNode):
-    def __init__(self, child, n):
+    def __init__(self, child, n, offset=0):
         super().__init__('Limit')
-        self.n = n
+        self.n = n                  # None 表示只做 OFFSET、不限制行数
+        self.offset = int(offset or 0)
         self.add_child(child)
 
     def explain_row(self, indent=0):
-        return f"{'  ' * indent}-> Limit: {self.n}"
+        off = f" OFFSET {self.offset}" if self.offset else ""
+        n = self.n if self.n is not None else 'ALL'
+        return f"{'  ' * indent}-> Limit: {n}{off}"
 
 
 class Aggregate(PlanNode):

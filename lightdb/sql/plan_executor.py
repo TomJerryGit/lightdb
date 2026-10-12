@@ -157,8 +157,7 @@ class PlanExecutor:
                 return False
             val = row[ci]
             values = self._exec_subquery_values(where['subquery'])
-            in_set = val in values
-            return in_set if op == 'IN' else (not in_set)
+            return self._in_semantics(val, values, neg=(op == 'NOT IN'))
 
         # ---------- IN (v1, v2, ...) ----------
         if op in ('IN', 'NOT IN') and 'values' in where:
@@ -167,9 +166,10 @@ class PlanExecutor:
             except ValueError:
                 return False
             val = row[ci]
-            # ★ 类型感知比较
-            in_set = any(self._value_eq(val, v) for v in where['values'])
-            return in_set if op == 'IN' else (not in_set)
+            # 字面量列表里的 NULL 同样走三值语义
+            vals = [None if str(v).upper() == 'NULL' else v
+                    for v in where['values']]
+            return self._in_semantics(val, vals, neg=(op == 'NOT IN'))
 
         # ---------- 普通比较 ----------
         col_name = where.get('column')
@@ -201,6 +201,22 @@ class PlanExecutor:
             pat = str(r).replace('%', '.*').replace('_', '.')
             return bool(re.match('^' + pat + '$', str(l)))
         return False
+
+    @classmethod
+    def _in_semantics(cls, value, values, neg=False):
+        """IN / NOT IN 的 NULL 三值语义（简化为真/假）
+
+        * 左值为 NULL → UNKNOWN → 不通过；
+        * NOT IN 且候选含 NULL → UNKNOWN → 不通过（SQL 标准）；
+        * 否则按类型感知等值匹配。
+        """
+        if value is None:
+            return False
+        has_null = any(v is None for v in values)
+        if neg and has_null:
+            return False
+        hit = any(v is not None and cls._value_eq(value, v) for v in values)
+        return (not hit) if neg else hit
 
     @staticmethod
     def _value_eq(a, b):
@@ -382,6 +398,12 @@ class PlanExecutor:
 
     def _exec_Limit(self, node):
         cols, rows = self.execute(node.children[0])
+        # OFFSET 先裁剪，再套 LIMIT（n is None 表示只偏移不截断）
+        off = int(getattr(node, 'offset', 0) or 0)
+        if off:
+            rows = rows[off:]
+        if node.n is None:
+            return cols, rows
         return cols, rows[:node.n]
 
     def _exec_Distinct(self, node):

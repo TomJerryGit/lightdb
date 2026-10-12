@@ -18,6 +18,9 @@ from ..db.table import Table as _StorageTable
 # 哨兵：区分"调用方没传 where"与"where 被改写成恒真(None)"
 _UNSET = object()
 
+# 哨兵：作用域里解析不到某个列引用
+_MISSING = object()
+
 
 class _CTERelation:
     """WITH 子句物化出来的内存关系
@@ -236,8 +239,19 @@ class Executor:
     def _cmd_select(self, p, s):
         table = p['table']
 
-        # FROM 子查询：parser 能解析，但执行器尚未实现
+        # WHERE 里的字面量 IN 列表（`id IN (1,2,NULL)`）解析出来是
+        # {'values': [...]}，存储层的 _match / 统一投影都不认这种形态
+        # （会 KeyError 或恒假）。先统一改写成 and/or 链，并在这里处理
+        # 三值逻辑（列表含 NULL 时 NOT IN 整体为 UNKNOWN）。
+        if self._contains_in_list(p.get('where')):
+            p = dict(p)
+            p['where'] = self._rewrite_in_lists(p['where'])
+
+        # FROM-less SELECT（`SELECT 1 AS n`）：递归 CTE 的 base 分支常见写法
         if not table:
+            if p.get('no_from'):
+                return self._select_no_from(p, s)
+            # FROM 子查询：parser 能解析，但执行器尚未实现
             return self._err(1105, "暂不支持 FROM 子查询")
 
         # information_schema
@@ -272,7 +286,11 @@ class Executor:
         # and/or/column+op+value，不认 subquery）
         has_sub = self._contains_subquery(p.get('where'))
         where = p.get('where')
-        if has_sub:
+        # 相关子查询不能一次性求值改写（它的真值依赖外层行），
+        # 必须走逐行求值路径；非相关子查询仍走原来的「求值 + 改写」
+        correlated = has_sub and self._where_has_correlated(
+            where, table, p.get('table_alias'))
+        if has_sub and not correlated:
             try:
                 where, _ = self._rewrite_subqueries(
                     where, s, table, p.get('table_alias'))
@@ -287,6 +305,9 @@ class Executor:
         else:
             tid = self.db.mvcc.next_txn_id()
             rv = self.db.mvcc.create_readview(tid)
+
+        if correlated:
+            return self._select_correlated(p, s, tbl, rv, table)
 
         # GROUP BY / DISTINCT / 窗口函数 / 带限定列名的单表查询：
         # 都要在拿到行之后再加工
@@ -305,8 +326,16 @@ class Executor:
 
         cols, rows = tbl.select(
             p['columns'], where,
-            p.get('order_by'), p.get('limit'),
+            p.get('order_by'),
+            # 存储层只认 limit；OFFSET 靠多取 offset 行再切片实现
+            (int(p['limit']) + int(p.get('offset') or 0))
+            if p.get('limit') is not None else None,
             read_view=rv)
+        off = int(p.get('offset') or 0)
+        if off:
+            rows = rows[off:]
+            if p.get('limit') is not None:
+                rows = rows[:int(p['limit'])]
         return self._rs(cols, rows)
 
     # ==================== 子查询条件求值（WHERE） ====================
@@ -438,16 +467,32 @@ class Executor:
                     seen.add(k)
                     values.append(r[0])
 
+                # NULL 三值语义：
+                #   结果集含 NULL 时 `c NOT IN (...)` 整体为 UNKNOWN
+                #   → 恒不通过（原实现会写成 `c != NULL` 之类的错误条件）；
+                #   `c IN (...)` 里 NULL 匹配不了任何值（连 NULL 左值也不行）
+                #   → 直接把 NULL 从等值链里丢掉。
+                has_null = any(v is None for v in values)
+                non_null = [v for v in values if v is not None]
+
                 neg = (op == 'NOT IN')
                 if neg:
+                    if has_null:
+                        return self._ALWAYS_FALSE, False
                     # NOT IN 空集合恒真（含 NULL 左值，语义上也是真）
-                    if not values:
+                    if not non_null:
                         return None, True
+                    if len(non_null) == 1:
+                        return {'column': column, 'op': '!=',
+                                'value': non_null[0]}, False
                     return {'and': [{'column': column, 'op': '!=',
-                                     'value': v} for v in values]}, False
-                if not values:
+                                     'value': v} for v in non_null]}, False
+                if not non_null:
                     return self._ALWAYS_FALSE, False
-                return self._eq_conditions(column, values), False
+                if len(non_null) == 1:
+                    return {'column': column, 'op': '=',
+                            'value': non_null[0]}, False
+                return self._eq_conditions(column, non_null), False
 
         # 兜底：结构上不像已知形态，原样返回（保持旧行为）
         rw = dict(where)
@@ -583,7 +628,8 @@ class Executor:
         """物化 WITH 子句，然后执行主体语句
 
         CTE 存为内存关系并逐个求值，因此后面的 CTE 可以引用前面的 CTE。
-        递归 CTE 只保证能解析，不保证结果正确。
+        递归 CTE（`WITH RECURSIVE t AS (base UNION [ALL] recursive)`）
+        走迭代定点路径，见 _run_recursive_cte。
         """
         saved = dict(self._cte_relations)
         try:
@@ -592,7 +638,10 @@ class Executor:
                 if sub is None:
                     return self._err(
                         1064, f"CTE {cte['name']} 无法解析")
-                res = self.execute(sub, session)
+                if cte.get('recursive') and self._is_recursive_body(sub):
+                    res = self._run_recursive_cte(cte, session)
+                else:
+                    res = self.execute(sub, session)
                 if res.get('type') == 'error':
                     return res
                 self._cte_relations[cte['name'].lower()] = _CTERelation(
@@ -603,6 +652,86 @@ class Executor:
             return self.execute(body, session)
         finally:
             self._cte_relations = saved
+
+    # 递归 CTE 的最大迭代轮数（防止 `UNION ALL` 写错导致死循环）
+    MAX_CTE_ITERATIONS = 1000
+
+    @staticmethod
+    def _is_recursive_body(query) -> bool:
+        """递归体的形态：`base UNION [ALL] recursive`（两个分支）"""
+        return (isinstance(query, dict)
+                and query.get('command') == 'UNION'
+                and len(query.get('segments') or []) == 2)
+
+    def _run_recursive_cte(self, cte, session):
+        """迭代求解递归 CTE
+
+        第 0 轮先算 base 分支；之后每一轮把 CTE 名绑定为「上一轮新增的行」
+        再求值递归分支并追加，直到某轮没有新增行为止。
+        `UNION` 需要跨全局去重，`UNION ALL` 原样追加（只按递归分支返回空
+        来终止，因此必须依赖迭代上限兜底）。
+        """
+        name = cte['name']
+        query = cte['query']
+        segments = query['segments']
+        flags = query.get('unions_all') or []
+        union_all = bool(flags[0]) if flags else False
+
+        # 第 0 轮：base 分支（此时 CTE 还不能引用自己）
+        res = self.execute(segments[0], session)
+        if not isinstance(res, dict) or res.get('type') == 'error':
+            return self._err(
+                1105, f"递归 CTE {name} 的 base 分支失败: "
+                      f"{(res or {}).get('message', '未知错误')}")
+        cols = res.get('columns') or []
+        rows = [list(r) for r in (res.get('rows') or [])]
+        seen = set(self._row_key(r) for r in rows)
+
+        prev = rows
+        iterations = 0
+        while prev:
+            if iterations >= self.MAX_CTE_ITERATIONS:
+                return self._err(
+                    1105, f"递归 CTE {name} 超过最大迭代次数 "
+                          f"({self.MAX_CTE_ITERATIONS})，可能存在无限递归")
+            iterations += 1
+
+            # 关键：绑定「上一轮新增的行」，而不是全部累积结果
+            self._cte_relations[name.lower()] = _CTERelation(
+                name, cols, prev)
+            rres = self.execute(segments[1], session)
+            if not isinstance(rres, dict) or rres.get('type') == 'error':
+                return self._err(
+                    1105, f"递归 CTE {name} 的递归分支失败: "
+                          f"{(rres or {}).get('message', '未知错误')}")
+            produced = [list(r) for r in (rres.get('rows') or [])]
+            if not produced:
+                break
+
+            if union_all:
+                new = produced
+            else:
+                new = []
+                for r in produced:
+                    k = self._row_key(r)
+                    if k not in seen:
+                        seen.add(k)
+                        new.append(r)
+                if not new:
+                    break
+
+            rows.extend(new)
+            prev = new
+
+        return self._rs(cols, rows)
+
+    @staticmethod
+    def _row_key(row):
+        """行去重用的键（list/dict 不可哈希，先转成可哈希形态）"""
+        return tuple(
+            v if isinstance(v, (int, float, str, bytes, type(None), bool))
+            else str(v)
+            for v in row)
 
     @staticmethod
     def _split_alias(text: str):
@@ -845,8 +974,7 @@ class Executor:
                     expanded.append((k, t))
             projection = expanded
 
-        out_cols, idx = [], []
-        consts = []
+        out_cols, plan_items = [], []
         for kind, text in projection:
             if kind == 'win':
                 continue
@@ -855,18 +983,69 @@ class Executor:
             is_lit, val = self._literal_value(expr)
             if is_lit:
                 # 字面量列（`SELECT 1 FROM orders`）只出现在常量投影里
-                idx.append(-1)
-                consts.append((len(idx) - 1, val))
-            else:
-                idx.append(self._col_index_of(base_cols, str(text)))
+                plan_items.append(('const', val))
+                continue
+            i = self._col_index_of(base_cols, str(text))
+            if i >= 0:
+                plan_items.append(('col', i))
+                continue
+            arith = self._parse_arith(expr)
+            if arith is not None:
+                # 简单算术表达式（`SELECT n + 1`）：递归 CTE 的迭代步长
+                # 常见写法，原实现会当成未知列静默投影成 NULL
+                plan_items.append(('arith', arith))
+                continue
+            plan_items.append(('col', -1))   # 未知列：保持旧的 None 行为
 
         out_rows = []
         for r in rows:
-            out = [r[i] if 0 <= i < len(r) else None for i in idx]
-            for pos, val in consts:
-                out[pos] = val
+            out = []
+            for kind, spec in plan_items:
+                if kind == 'const':
+                    out.append(spec)
+                elif kind == 'col':
+                    out.append(r[spec] if 0 <= spec < len(r) else None)
+                else:
+                    out.append(self._eval_arith(spec, base_cols, r))
             out_rows.append(out)
         return self._finish_select(p, out_cols, out_rows)
+
+    # 简单的二元算术表达式：`col + 1` / `salary * 2` / `a - b` / `a / b`
+    _ARITH_RE = re.compile(
+        r'^\s*([\w.]+|-?\d+(?:\.\d+)?)\s*([+\-*/])\s*'
+        r'([\w.]+|-?\d+(?:\.\d+)?)\s*$')
+
+    @classmethod
+    def _parse_arith(cls, text):
+        """识别二元算术表达式，返回 (左操作数, 运算符, 右操作数)"""
+        m = cls._ARITH_RE.match(str(text or ''))
+        if not m:
+            return None
+        return (m.group(1), m.group(2), m.group(3))
+
+    def _eval_arith(self, spec, cols, row):
+        """求值二元算术表达式；操作数取不到或为 NULL 时返回 NULL"""
+        left, op, right = spec
+
+        def operand(tok):
+            if re.match(r'^-?\d+(?:\.\d+)?$', str(tok)):
+                return float(tok) if '.' in str(tok) else int(tok)
+            i = self._col_index_of(cols, tok)
+            if i < 0 or i >= len(row):
+                return _UNSET
+            return row[i]
+
+        l, r = operand(left), operand(right)
+        if l is _UNSET or r is _UNSET or l is None or r is None:
+            return None
+        try:
+            if op == '+': return l + r
+            if op == '-': return l - r
+            if op == '*': return l * r
+            if op == '/': return l / r if r != 0 else None
+        except TypeError:
+            return None
+        return None
 
     @staticmethod
     def _literal_value(text):
@@ -892,7 +1071,15 @@ class Executor:
     def _select_from_relation(self, p, s, rel):
         """从 CTE 内存关系里查询"""
         where = p.get('where')
+        if self._contains_in_list(where):
+            p = dict(p)
+            p['where'] = self._rewrite_in_lists(p['where'])
+            where = p['where']
         if self._contains_subquery(where):
+            if self._where_has_correlated(where, rel.name,
+                                          p.get('table_alias')):
+                return self._select_correlated(
+                    p, s, rel, self._rv_of(s), rel.name)
             try:
                 where, _ = self._rewrite_subqueries(
                     where, s, rel.name, p.get('table_alias'))
@@ -900,6 +1087,418 @@ class Executor:
                 return self._err(1105, f"子查询求值失败: {e}")
             return self._select_advanced(p, rel, where=where)
         return self._select_advanced(p, rel)
+
+    def _select_no_from(self, p, s):
+        """FROM-less SELECT（`SELECT 1 AS n`）
+
+        递归 CTE 的 base 分支常写成 `SELECT 1 AS n`，解析器现在允许没有
+        FROM；执行时用「一行的空关系」承接，常量投影直接算出结果行。
+        """
+        return self._select_advanced(p, _CTERelation('', [], [[]]))
+
+    def _rv_of(self, s):
+        """取当前会话的读视图（没有事务就临时建一个）"""
+        txn = s.get('txn')
+        if txn:
+            return txn['read_view']
+        tid = self.db.mvcc.next_txn_id()
+        return self.db.mvcc.create_readview(tid)
+
+    # ==================== 字面量 IN 列表（三值逻辑） ====================
+
+    @classmethod
+    def _contains_in_list(cls, where) -> bool:
+        """条件里是否含字面量 IN 列表（{'op':'IN','values':[...]}）"""
+        if not isinstance(where, dict):
+            return False
+        if 'values' in where and where.get('op') in ('IN', 'NOT IN'):
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._contains_in_list(c):
+                    return True
+        return False
+
+    @classmethod
+    def _rewrite_in_lists(cls, where):
+        """把字面量 IN 列表改写成 and/or 比较链（带上 NULL 三值语义）
+
+        * `c IN (v1, v2, NULL)`：NULL 匹配不了任何值（连 NULL 左值也不行，
+          SQL 里 `NULL IN (...)` 是 UNKNOWN），所以直接丢掉 NULL 项；
+        * `c NOT IN (..., NULL)`：SQL 标准下整体为 UNKNOWN → 恒不通过；
+        * 空列表：IN 恒假、NOT IN 恒真（保持既有行为）。
+        """
+        if not isinstance(where, dict):
+            return where
+        if 'and' in where:
+            return {'and': [cls._rewrite_in_lists(c) for c in where['and']]}
+        if 'or' in where:
+            return {'or': [cls._rewrite_in_lists(c) for c in where['or']]}
+        if 'values' not in where or where.get('op') not in ('IN', 'NOT IN'):
+            return where
+
+        col = where.get('column')
+        neg = where.get('op') == 'NOT IN'
+        raw = list(where.get('values') or [])
+        has_null = any(v is None or str(v).upper() == 'NULL' for v in raw)
+        values = [v for v in raw
+                  if not (v is None or str(v).upper() == 'NULL')]
+
+        if neg:
+            if has_null:
+                return cls._ALWAYS_FALSE
+            if not values:
+                return None
+            if len(values) == 1:
+                return {'column': col, 'op': '!=', 'value': values[0]}
+            return {'and': [{'column': col, 'op': '!=', 'value': v}
+                            for v in values]}
+        if not values:
+            return cls._ALWAYS_FALSE
+        if len(values) == 1:
+            return {'column': col, 'op': '=', 'value': values[0]}
+        return cls._eq_conditions(col, values)
+
+    # ==================== 相关子查询（逐外层行求值） ====================
+
+    def _where_has_correlated(self, where, outer_table, outer_alias) -> bool:
+        """WHERE 里是否存在「引用了外层列」的子查询条件"""
+        if not isinstance(where, dict):
+            return False
+        sub = where.get('subquery')
+        if isinstance(sub, dict) and self._is_correlated(
+                sub, outer_table, outer_alias):
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if self._where_has_correlated(c, outer_table, outer_alias):
+                    return True
+        return False
+
+    def _is_correlated(self, sub, outer_table, outer_alias=None) -> bool:
+        """判断子查询是否相关（引用了外层表的列）
+
+        判据：
+        1. 列名限定符等于外层表名/别名，且不是子查询自己的表/别名；
+        2. WHERE 里的裸列名在子查询表里不存在、却在外层表里存在。
+        `SELECT 1 FROM orders` 这类自洽子查询一律放行。
+        """
+        if not outer_table or not isinstance(sub, dict):
+            return False
+        outers = {str(outer_table).lower()}
+        if outer_alias:
+            outers.add(str(outer_alias).lower())
+
+        inner_names = set()
+        for key in ('table', 'table_alias'):
+            if sub.get(key):
+                inner_names.add(str(sub[key]).lower())
+        for j in (sub.get('joins') or []):
+            for key in ('table', 'alias'):
+                if j.get(key):
+                    inner_names.add(str(j[key]).lower())
+
+        for c in self._subquery_ast_columns(sub):
+            owner = self._qualified_owner(c)
+            if owner and owner in outers and owner not in inner_names:
+                return True
+
+        inner = sub.get('table')
+        inner_cols = set()
+        if inner:
+            try:
+                inner_tbl = self.db.get_table(inner)
+                inner_cols = {col['name'].lower() for col in inner_tbl.cols}
+            except KeyError:
+                rel = self._cte_relations.get(str(inner).lower())
+                if rel is not None:
+                    inner_cols = {c.lower() for c in rel.col_names}
+        outer_cols = set()
+        try:
+            outer_tbl = self.db.get_table(outer_table)
+            outer_cols = {col['name'].lower() for col in outer_tbl.cols}
+        except KeyError:
+            rel = self._cte_relations.get(str(outer_table).lower())
+            if rel is not None:
+                outer_cols = {c.lower() for c in rel.col_names}
+
+        if not inner_cols or not outer_cols:
+            return False
+        for c in self._referenced_columns(sub.get('where')):
+            c = str(c).strip().strip('`"')
+            if '.' in c:
+                continue
+            if c.lower() not in inner_cols and c.lower() in outer_cols:
+                return True
+        return False
+
+    def _select_correlated(self, p, s, src, read_view, outer_name):
+        """相关子查询的执行路径
+
+        不能像非相关子查询那样「一次求值 + 改写条件」，因为每个外层行的
+        真值都不同。这里先一次性取出「全部列的行」（只扫一遍表），再逐行
+        用作用域求值器判断条件；子查询的内层行也按子查询缓存，因此单表
+        相关子查询不会每行重新打开表。
+        """
+        outer_alias = p.get('table_alias')
+        base_cols, rows = self._base_rows_and_cols(src, None, read_view)
+        cache = {}
+        kept = []
+        for r in rows:
+            if self._eval_outer_where(r, base_cols, p.get('where'), s,
+                                      outer_name, outer_alias, cache,
+                                      read_view):
+                kept.append(r)
+        rows = kept
+
+        if p.get('group_by') or p.get('having'):
+            base_cols, rows = self._group_rows(p, src, base_cols, rows)
+        if p.get('windows'):
+            return self._apply_windows(p, base_cols, rows)
+        return self._project_rows(p, base_cols, rows)
+
+    def _eval_outer_where(self, row, cols, where, s, outer_name,
+                          outer_alias, cache, read_view):
+        """外层行上的条件求值（含相关/非相关子查询谓词）"""
+        if where is None or not isinstance(where, dict):
+            return True
+        if 'and' in where:
+            return all(self._eval_outer_where(
+                row, cols, c, s, outer_name, outer_alias, cache, read_view)
+                for c in where['and'])
+        if 'or' in where:
+            parts = where['or']
+            if not parts:
+                return False
+            return any(self._eval_outer_where(
+                row, cols, c, s, outer_name, outer_alias, cache, read_view)
+                for c in parts)
+
+        sub = where.get('subquery')
+        op = where.get('op')
+        if isinstance(sub, dict) and op in ('EXISTS', 'NOT EXISTS',
+                                            'IN', 'NOT IN'):
+            if self._is_correlated(sub, outer_name, outer_alias):
+                return self._eval_correlated_predicate(
+                    row, cols, where, s, outer_name, outer_alias,
+                    cache, read_view)
+            return self._eval_plain_subquery_predicate(row, cols, where, s,
+                                                       cache)
+        # 普通比较 / LIKE / 聚合谓词
+        return self._eval_condition(row, cols, self._normalize_where(where))
+
+    def _eval_plain_subquery_predicate(self, row, cols, where, s, cache):
+        """相关 WHERE 里混进来的非相关子查询（结果按子查询缓存）"""
+        sub = where['subquery']
+        op = where['op']
+        key = ('sub', id(sub))
+        if key not in cache:
+            res = self.execute(sub, s)
+            if not isinstance(res, dict) or res.get('type') == 'error':
+                raise ValueError(
+                    f"子查询执行失败: {(res or {}).get('message', '')}")
+            cache[key] = [tuple(r) for r in (res.get('rows') or [])]
+        rows = cache[key]
+
+        if op == 'EXISTS':
+            return len(rows) > 0
+        if op == 'NOT EXISTS':
+            return len(rows) == 0
+        vals = [r[0] for r in rows if r]
+        lv = self._scoped_value(where.get('column'), row, cols, None)
+        return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
+
+    def _eval_correlated_predicate(self, row, cols, where, s, outer_name,
+                                   outer_alias, cache, read_view):
+        """相关子查询谓词求值：把外层行作为作用域，过滤一遍内层行"""
+        sub = where['subquery']
+        op = where['op']
+
+        # 明确不支持的相关形态：子查询内部还有 JOIN / 分组 / 聚合
+        if sub.get('joins'):
+            raise ValueError("不支持相关子查询里出现 JOIN")
+        if sub.get('group_by') or sub.get('having'):
+            raise ValueError("不支持相关子查询里出现 GROUP BY / HAVING")
+        if any(re.match(r'\w+\s*\(', str(c).strip())
+               for c in (sub.get('columns') or [])):
+            raise ValueError("不支持相关子查询里引用外层列做聚合")
+
+        key = ('corr', id(sub))
+        if key not in cache:
+            inner = sub.get('table')
+            src = self._cte_relations.get(str(inner or '').lower())
+            if src is None:
+                src = self.db.get_table(inner)
+            cache[key] = self._base_rows_and_cols(src, None, read_view)
+        icols, irows = cache[key]
+
+        outer = {
+            'names': set(),
+            'cols': cols,
+            'row': row,
+        }
+        if outer_name:
+            outer['names'].add(str(outer_name).lower())
+        if outer_alias:
+            outer['names'].add(str(outer_alias).lower())
+
+        inner_where = sub.get('where')
+        matched = [ir for ir in irows
+                   if self._eval_scoped(ir, icols, inner_where, outer)]
+
+        if op == 'EXISTS':
+            return len(matched) > 0
+        if op == 'NOT EXISTS':
+            return len(matched) == 0
+
+        # IN / NOT IN：取子查询投影的第一列
+        proj = (sub.get('columns') or ['*'])[0]
+        is_lit, lit = self._literal_value(str(proj).strip())
+        if is_lit:
+            idx = -1
+        else:
+            idx = self._col_index_of(icols, str(proj).strip())
+        vals = []
+        for ir in matched:
+            vals.append(lit if is_lit else
+                        (ir[idx] if 0 <= idx < len(ir) else None))
+        lv = self._scoped_value(where.get('column'), row, cols, outer)
+        return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
+
+    def _eval_scoped(self, row, cols, where, outer):
+        """内层行上的条件求值（列名可用外层行解析）
+
+        支持 and/or 与普通比较（比较右侧也可以引用外层列，例如
+        `WHERE o.user_id = u.id`），以及字面量 IN 列表；遇到聚合谓词或
+        嵌套子查询时明确报错，避免静默给出错误真值。
+        """
+        if where is None or not isinstance(where, dict):
+            return True
+        if 'and' in where:
+            return all(self._eval_scoped(row, cols, c, outer)
+                       for c in where['and'])
+        if 'or' in where:
+            parts = where['or']
+            return any(self._eval_scoped(row, cols, c, outer)
+                       for c in parts) if parts else False
+        if 'agg' in where:
+            raise ValueError("不支持相关子查询里的聚合谓词")
+        if isinstance(where.get('subquery'), dict):
+            raise ValueError("不支持相关子查询里再嵌套子查询")
+
+        op = where.get('op')
+        if op in ('IN', 'NOT IN') and 'values' in where:
+            lv = self._scoped_value(where.get('column'), row, cols, outer)
+            vals = [None if str(v).upper() == 'NULL' else v
+                    for v in (where.get('values') or [])]
+            return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
+        if op in ('EXISTS', 'NOT EXISTS', 'IN', 'NOT IN'):
+            raise ValueError("不支持相关子查询里再嵌套子查询")
+
+        lv = self._scoped_value(where.get('column'), row, cols, outer)
+        rv = where.get('value')
+        # 右侧可能是外层列引用（`o.user_id = u.id`）：能解析成列就当列用，
+        # 否则保持原来的字面量语义
+        if isinstance(rv, str) and '.' in rv:
+            ov = self._scoped_value(rv, row, cols, outer)
+            if ov is not _MISSING:
+                rv = ov
+        if lv is _MISSING:
+            return False
+        return self._compare_scoped(lv, op, rv)
+
+    @staticmethod
+    def _compare_scoped(l, op, r):
+        """作用域比较（与 _eval_condition 的语义保持一致）"""
+        if l is None:
+            return op == '=' and r is None
+        if r is None:
+            return op == '!='
+        try:
+            if isinstance(l, (int, float)) and isinstance(r, str):
+                r = float(r) if '.' in r else int(r)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if op == '=':  return l == r
+            if op == '!=': return l != r
+            if op == '<':  return l < r
+            if op == '>':  return l > r
+            if op == '<=': return l <= r
+            if op == '>=': return l >= r
+            if op == 'LIKE':
+                pat = str(r).replace('%', '.*').replace('_', '.')
+                return bool(re.match('^' + pat + '$', str(l)))
+        except TypeError:
+            return False
+        return False
+
+    def _scoped_value(self, name, row, cols, outer):
+        """按作用域解析列引用
+
+        解析顺序：外层限定名 → 内层列（裸名或内层限定名）→ 外层裸列。
+        外层限定名优先是必须的：内外层都有 `id` 时（users/orders），
+        `u.id` 不能解析成内层的 `id`。解析不到返回 _MISSING。
+        """
+        t = str(name or '').strip().strip('`"')
+        if not t:
+            return _MISSING
+        qual = ''
+        if '.' in t and re.match(r'^[\w.]+$', t):
+            qual = t.rsplit('.', 1)[0].lower()
+
+        # 1) 外层限定名（`u.id`）
+        if outer is not None and qual and qual in outer['names']:
+            j = self._col_index_of(outer['cols'], t.rsplit('.', 1)[1])
+            if 0 <= j < len(outer['row']):
+                return outer['row'][j]
+            return _MISSING
+
+        # 2) 内层列（裸名或内层限定名）
+        i = self._col_index_of(cols, t)
+        if 0 <= i < len(row):
+            return row[i]
+
+        # 3) 外层裸列 / 其它限定名
+        if outer is not None:
+            j = self._col_index_of(outer['cols'],
+                                   t.rsplit('.', 1)[1] if qual else t)
+            if 0 <= j < len(outer['row']):
+                return outer['row'][j]
+        return _MISSING
+
+    @staticmethod
+    def _in_predicate(value, values, neg=False):
+        """IN / NOT IN 的三值语义（简化为真/假）
+
+        * 左值为 NULL / 解析不到 → UNKNOWN → 不通过；
+        * NOT IN 且候选里含 NULL → UNKNOWN → 不通过；
+        * 否则按等值匹配。
+        """
+        if value is _MISSING or value is None:
+            return False
+        has_null = any(v is None for v in values)
+        if neg and has_null:
+            return False
+        hit = any(v is not None and Executor._value_eq(value, v)
+                  for v in values)
+        return (not hit) if neg else hit
+
+    @staticmethod
+    def _value_eq(a, b):
+        """类型感知等值比较（数字与数字字符串视为相等）"""
+        if a is None or b is None:
+            return a is None and b is None
+        if type(a) is type(b):
+            return a == b
+        try:
+            if isinstance(a, (int, float)) and isinstance(b, str):
+                b = float(b) if '.' in b else int(b)
+            elif isinstance(b, (int, float)) and isinstance(a, str):
+                a = float(a) if '.' in a else int(a)
+        except (TypeError, ValueError):
+            return False
+        return a == b
 
     def _apply_windows(self, p, base_cols, rows):
         """计算窗口列并按投影顺序拼装结果行"""
@@ -967,9 +1566,13 @@ class Executor:
                 out_rows.sort(key=lambda r: (r[i] is None, r[i]),
                               reverse=bool(desc))
 
+        # LIMIT / OFFSET：都在 ORDER BY 之后、对最终结果裁剪
+        offset = int(p.get('offset') or 0)
         limit = p.get('limit')
-        if limit:
-            out_rows = out_rows[:int(limit)]
+        if limit is not None:
+            out_rows = out_rows[offset:offset + int(limit)]
+        elif offset:
+            out_rows = out_rows[offset:]
         return self._rs(out_cols, out_rows)
 
     def _compute_window(self, spec, base_cols, rows):
@@ -1033,6 +1636,16 @@ class Executor:
                     q = pos - offset if func == 'LAG' else pos + offset
                     out[i] = vals[q] if 0 <= q < n else None
             elif func in ('SUM', 'AVG', 'COUNT', 'MIN', 'MAX'):
+                frame = spec.get('frame')
+                if frame is not None:
+                    # ★ 显式 ROWS 帧：每个位置按帧区间（物理行）重算。
+                    # 帧只在聚合类窗口函数上生效；ROW_NUMBER/RANK/
+                    # DENSE_RANK/LAG/LEAD 按标准忽略帧（见上面的分支）。
+                    for pos, i in enumerate(idxs):
+                        lo, hi = self._frame_bounds(frame, pos, n)
+                        seg = vals[lo:hi + 1] if hi >= lo else []
+                        out[i] = self._agg_over_frame(seg, func, arg_idx)
+                    continue
                 acc, seen_vals = None, []
                 for pos, i in enumerate(idxs):
                     v = vals[pos]
@@ -1060,6 +1673,58 @@ class Executor:
             else:
                 logger.warn(f"未实现的窗口函数: {func}")
         return out
+
+    # ==================== 窗口帧（ROWS 语义） ====================
+
+    @staticmethod
+    def _frame_bounds(frame, pos, n):
+        """把 ROWS 帧换算成当前分区内的下标闭区间 [lo, hi]
+
+        严格按「分区内排序位置」取行（ROWS 语义），不做值域合并。
+        区间不裁剪到合法范围之外，因此越界时会返回 lo > hi（空帧），
+        而不是错误地退化成边界那一行。
+
+        边界形式：UNBOUNDED PRECEDING / <n> PRECEDING / CURRENT ROW /
+        <n> FOLLOWING / UNBOUNDED FOLLOWING（已在解析器里校验过顺序）。
+        """
+        def to_pos(bound):
+            kind, k = bound
+            if kind == 'UNBOUNDED PRECEDING':
+                return 0
+            if kind == 'UNBOUNDED FOLLOWING':
+                return n - 1
+            if kind == 'CURRENT ROW':
+                return pos
+            if kind == 'PRECEDING':
+                return pos - k
+            return pos + k          # FOLLOWING
+
+        lo = max(0, to_pos(frame['start']))
+        hi = min(n - 1, to_pos(frame['end']))
+        return lo, hi
+
+    @staticmethod
+    def _agg_over_frame(seg, func, arg_idx):
+        """在帧内的行上求聚合值（NULL 一律跳过，符合 SQL 语义）"""
+        if func == 'COUNT':
+            if arg_idx < 0:          # COUNT(*)：帧内所有行
+                return len(seg)
+            return sum(1 for v in seg if v is not None)
+        nums = [v for v in seg if v is not None]
+        if not nums:
+            return None
+        try:
+            if func == 'SUM':
+                return sum(nums)
+            if func == 'AVG':
+                return sum(nums) / len(nums)
+            if func == 'MIN':
+                return min(nums)
+            if func == 'MAX':
+                return max(nums)
+        except TypeError:
+            return None
+        return None
 
     # ==================== UNION ====================
 

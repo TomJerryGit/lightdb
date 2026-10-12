@@ -216,6 +216,10 @@ class Parser:
                 continue
 
             spec = (m.group('spec') or '').strip()
+            # 帧子句（ROWS ...）必须先摘出来：不然 `ORDER BY x ROWS ...`
+            # 会把帧文本当成排序键的一部分，而 `PARTITION BY d ROWS ...`
+            # 会把 "d ROWS ..." 当成一个分区列名
+            frame, spec = self._parse_window_frame(spec)
             partition, order = [], []
             pm = re.search(
                 r'PARTITION\s+BY\s+(.+?)(?=\s+ORDER\s+BY\b|$)',
@@ -242,10 +246,91 @@ class Parser:
                 'partition_by': partition,
                 'order_by': order,
                 'alias': alias or f'{func}()',
+                # 帧子句（None 表示没写，执行器按默认语义：有 ORDER BY
+                # 累计、无 ORDER BY 整分区）
+                'frame': frame,
             }
             windows.append(win)
             projection.append(('win', win))
         return base, windows, projection
+
+    # ==================== 窗口帧（ROWS ...） ====================
+
+    # 帧子句：ROWS BETWEEN <bound> AND <bound> 或简写 ROWS <bound>
+    _FRAME_RE = re.compile(
+        r'\b(?P<type>ROWS|RANGE|GROUPS)\s+'
+        r'(?:BETWEEN\s+(?P<start>.+?)\s+AND\s+(?P<end>.+?)'
+        r'|(?P<short>.+?))\s*$',
+        re.IGNORECASE | re.DOTALL)
+
+    def _parse_window_frame(self, spec: str):
+        """从 `OVER (...)` 的 spec 里摘出帧子句
+
+        返回 (frame 或 None, 去掉帧之后的 spec)。frame 形如::
+
+            {'start': ('PRECEDING', 2), 'end': ('CURRENT ROW', None)}
+
+        只支持 ROWS 帧（按物理行取行）。RANGE / GROUPS 明确报错而不是
+        静默按 ROWS 处理 —— 引擎没有值域/分组帧的语义，静默降级会给出
+        看似正常但错误的边界值。
+        """
+        if not spec:
+            return None, spec
+        m = self._FRAME_RE.search(spec)
+        if not m:
+            # 有帧关键字但不匹配已知语法 -> 明确报错，不要静默忽略
+            if re.search(r'\b(BETWEEN|PRECEDING|FOLLOWING|CURRENT\s+ROW)\b',
+                         spec, re.IGNORECASE):
+                raise SyntaxError(f"窗口帧子句语法错误: {spec}")
+            return None, spec
+
+        ftype = m.group('type').upper()
+        if ftype != 'ROWS':
+            raise SyntaxError(f"暂不支持 {ftype} 窗口帧，仅支持 ROWS")
+
+        if m.group('start'):
+            start_txt, end_txt = m.group('start'), m.group('end')
+        else:
+            # 简写 `ROWS UNBOUNDED PRECEDING` = UNBOUNDED PRECEDING
+            # → CURRENT ROW
+            start_txt, end_txt = m.group('short'), 'CURRENT ROW'
+        if not start_txt or not end_txt:
+            raise SyntaxError(f"窗口帧子句语法错误: {spec}")
+
+        start = self._parse_frame_bound(start_txt)
+        end = self._parse_frame_bound(end_txt)
+        if start[0] == 'UNBOUNDED FOLLOWING' or end[0] == 'UNBOUNDED PRECEDING':
+            raise SyntaxError(f"窗口帧边界顺序不合法: {spec}")
+        if self._bound_pos(start) > self._bound_pos(end):
+            raise SyntaxError(f"窗口帧起始边界不能晚于结束边界: {spec}")
+
+        frame = {'start': start, 'end': end, 'raw': m.group(0).strip()}
+        return frame, spec[:m.start()].strip()
+
+    @staticmethod
+    def _parse_frame_bound(text: str):
+        """解析单个帧边界"""
+        t = ' '.join(str(text).upper().split())
+        if t in ('UNBOUNDED PRECEDING', 'UNBOUNDED FOLLOWING', 'CURRENT ROW'):
+            return (t, None)
+        m = re.match(r'^(\d+)\s+(PRECEDING|FOLLOWING)$', t)
+        if m:
+            return (m.group(2), int(m.group(1)))
+        raise SyntaxError(f"窗口帧边界不合法: {text}")
+
+    @staticmethod
+    def _bound_pos(bound):
+        """把边界换算成可比较的位置权重（用于校验 start <= end）"""
+        kind, n = bound
+        if kind == 'UNBOUNDED PRECEDING':
+            return float('-inf')
+        if kind == 'UNBOUNDED FOLLOWING':
+            return float('inf')
+        if kind == 'CURRENT ROW':
+            return 0.0
+        if kind == 'PRECEDING':
+            return -float(n)
+        return float(n)
 
     # ==================== 表别名 ====================
 
@@ -269,14 +354,26 @@ class Parser:
     # ==================== SELECT ====================
 
     def _select(self, sql: str) -> Dict:
+        no_from = False
         m = re.match(
             r'SELECT\s+(.+?)\s+FROM\s+(.+)$',
             sql, re.IGNORECASE | re.DOTALL)
         if not m:
-            raise SyntaxError("SELECT 语法错误")
+            # FROM-less SELECT：递归 CTE 的 base 分支常见写法
+            # （`WITH RECURSIVE n AS (SELECT 1 AS n UNION ALL ...)`），
+            # 原先直接 SyntaxError，导致整个递归 CTE 用不了
+            m2 = re.match(r'SELECT\s+(.+)$', sql,
+                          re.IGNORECASE | re.DOTALL)
+            if not m2:
+                raise SyntaxError("SELECT 语法错误")
+            no_from = True
 
-        cols_str = m.group(1).strip()
-        from_rest = m.group(2).strip()
+        if no_from:
+            cols_str = m2.group(1).strip()
+            from_rest = None
+        else:
+            cols_str = m.group(1).strip()
+            from_rest = m.group(2).strip()
 
         # DISTINCT
         distinct = False
@@ -289,7 +386,9 @@ class Parser:
         main_table = None
         main_alias = None
 
-        if from_rest.startswith('('):
+        if no_from:
+            rest = ''
+        elif from_rest.startswith('('):
             depth = 0
             end = -1
             for i, ch in enumerate(from_rest):
@@ -387,17 +486,34 @@ class Parser:
                 om.group(1),
                 (om.group(2) or '').upper() == 'DESC')
 
-        lm = re.search(
-            r'LIMIT\s+(\d+)(?:\s+OFFSET\s+(\d+))?',
-            rest, re.IGNORECASE)
+        # LIMIT：三种写法都要认
+        #   LIMIT n                 -> limit=n
+        #   LIMIT n OFFSET m        -> limit=n, offset=m
+        #   LIMIT m, n              -> offset=m, limit=n（MySQL 风格）
+        # 原实现只取 n，OFFSET / `LIMIT m, n` 的偏移被静默丢掉。
+        offset = None
+        lm = re.search(r'LIMIT\s+(\d+)\s+OFFSET\s+(\d+)',
+                       rest, re.IGNORECASE)
         if lm:
             limit = int(lm.group(1))
+            offset = int(lm.group(2))
+        else:
+            lm = re.search(r'LIMIT\s+(\d+)\s*,\s*(\d+)',
+                           rest, re.IGNORECASE)
+            if lm:
+                offset = int(lm.group(1))
+                limit = int(lm.group(2))
+            else:
+                lm = re.search(r'LIMIT\s+(\d+)', rest, re.IGNORECASE)
+                if lm:
+                    limit = int(lm.group(1))
 
         return {
             'command': 'SELECT',
             'table': main_table,
             'table_alias': main_alias,
             'subquery': subquery,
+            'no_from': no_from,
             'joins': joins,
             'columns': columns,
             'windows': windows,
@@ -408,6 +524,7 @@ class Parser:
             'having': having,
             'order_by': order_by,
             'limit': limit,
+            'offset': offset,
         }
 
     # ==================== WHERE ====================
