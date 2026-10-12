@@ -456,6 +456,42 @@ GROUP BY 与 DISTINCT 属于**静默错答**：不报错、结果错。仓库自
 
 ---
 
+## 18. 子查询条件 / HAVING / Cython 回退（后续会话，2026-10）
+
+### 18.1 IN / NOT IN / EXISTS 子查询条件
+
+**根因同 §16.5**：解析器（`_where`）**已经**能产出 `{'op': 'IN'|'NOT IN'|'EXISTS', 'subquery': <parsed>}`，`plan_executor` 也有 `_eval_subquery_exists`；缺的是求值接线——单表路径的 `Table._match` 只认 `column+op+value`（连 `IN+values` 都不支持），于是测试报 `KeyError: 'rows'`。
+
+**修法**：执行器侧预处理，把子查询条件改写成存储层能处理的形式再下推（未改 `db/`）：
+- `EXISTS(sub)` → 执行一次子查询，非空即真；恒真就地删除条件，恒假用空 `or` 列表（`any([]) == False`），并在 and/or 里做布尔化简；
+- `col IN (sub)` → 取子查询首列去重值集 → `{'or': [等值链]}`；空集显式恒假；
+- `col NOT IN (sub)` → `{'and': [不等链]}`；空集显式恒真；
+- 子查询经 `self.execute` 递归求值，支持嵌套；**相关子查询显式报错**（不静默错答）。
+
+实测：`IN` → 15 行、`NOT IN` → 5 行、`EXISTS` → 20 行、`NOT EXISTS` → 0 行、空子查询 `IN`→0 / `NOT IN`→20。
+
+### 18.2 HAVING
+
+`_where` 处理不了左值为聚合函数的谓词（`HAVING COUNT(*) > 1` 直接 `SyntaxError`）。现在产出 `{'agg': 'COUNT(*)', 'op': '>', 'value': 1}`；统一路径在 `executor._group_rows` 分组时算出 SELECT 与 HAVING 两侧聚合后用 `_eval_condition` 过滤，计划路径在 `plan_executor._exec_GroupBy` 预算 HAVING 聚合经 `agg_values` 传入。实测：`HAVING COUNT(*) > 5` → `[('Beijing',12)]`；`HAVING city='Beijing'` 也可用。为支持 `EXISTS (SELECT 1 FROM orders)` 顺带补了常量投影。
+
+### 18.3 Cython 接入与回退
+
+**环境事实**：本机无 Cython（`ModuleNotFoundError`）、**无任何 C 编译器**（gcc/cl/clang 全缺）、PyPI 不可达 → **无法编译验证**。
+
+已交付且可验证的部分：`lightdb/cython/fallback/` 薄包装既有纯 Python 实现（btree/page/row_codec/predicate/buffer_pool；hash_table 无对应物故逐行复刻），`__init__` 改为「编译版优先 → 纯 Python 回退」，`status()` 标明来源；`setup.py` 不再静默 `exts=[]`、去掉硬编码 `/arch:AVX2`；`build_cython.sh` 缺条件时明确报错并非零退出；静态修复 6 处必然编译失败的 `.pyx` 错误（缺 `cimport`、`cpdef` 指针参数、`cdef` 内 `import`、`nogil` 带 Python 对象等）。
+
+实测 `status()`：6 项全 `python-fallback`、`all_available: true`、`any_accelerated: false`、`compiled: []`。`test_v4_batch3` + `test_cython_compat` 由「6 个模块全为 None、8 个测试 `if mod is None: return` 空跑」变为真正执行；新增 `tests/test_cython_fallback.py` 24 项通过。
+
+**诚实性收尾**：`row_format_v4.py` / `predicate_v4.py` 原先用 `_cy is not None` 判断加速，回退上线后恒为 True、会谎报「使用 Cython」，改为读 `status()['any_accelerated']`；`regression_v4/test_performance_v4.py::test_cython_row_codec` 原先在无编译版时拿 Python 比 Python（假通过），现在无编译版即跳过加速断言。
+
+**未验证**：`.pyx` 能否真正编译（需 Cython ≥3.0 + MSVC/gcc）；回退与 `.pyx` 的逐字节等价性（5 处边界差异已记入 `fallback/__init__.py`）；`build_cython.sh` 的 bash 运行（沙箱禁命名管道）。
+
+### 18.4 一处未定位的测试隔离缺陷（如实记录）
+
+`tests/test_batch7.py::test_union_all` 报 `assert 24 == 8`，即 `users` 读到了 3 倍行数。可复现范围：同一 pytest 进程内跑 `test_group_by` + `test_union_all` 即可复现。但两次最小复现（2 行写入不 shutdown 连续打开 3 次；20 行 `Table.insert` + shutdown + 连续打开 3 次）**都未重现**，重放日志显示 `redo 2 条` 且行数稳定。因此**不能断定是「WAL 重放不幂等」**，根因待专项排查。
+
+---
+
 ## 附录：审计方法与边界
 
 - **静态**：全量阅读核心模块 + grep 扫描（`TODO`/`pass`/`import random` 等模式）+ AST 导入图可达性分析（自建脚本，含相对导入解析）。

@@ -32,7 +32,8 @@
 - **打包与容器**：[`pyproject.toml`](pyproject.toml) 现在会打包 `lightdb` 并补上 `lightdb-server` 入口，Dockerfile 不再 COPY 不存在的 `main.py`。
 - **多进程模式已接线可用**：[`master.py`](lightdb/net/master.py) 现在会建立每 Worker 的连接队列与响应队列、运行执行服务线程、绑定端口并把 accept 到的连接交给 Worker；[`worker.py`](lightdb/net/worker.py) 通过 RPC 把 SQL 交回 Master 执行，连接句柄用 `socket.share/fromshare` 跨进程交接（Windows）。
 - **SQL 能力补齐（窗口函数 / CTE / UNION）**：[`parser.py`](lightdb/sql/parser.py) 新增 `WITH [RECURSIVE] ... AS (...)` 与 `FUNC(...) OVER (PARTITION BY ... ORDER BY ...)` 解析，[`executor.py`](lightdb/sql/executor.py) 新增 UNION / UNION ALL 执行分支与窗口计算（ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / SUM / AVG / COUNT / MIN / MAX）。同时修掉两个**静默错答**：`GROUP BY` 原先被完全忽略（`SELECT dept, COUNT(*) ... GROUP BY dept` 退化成全表一行）、`DISTINCT` 只在解析器里记录而执行路径从未使用。回归测试见 [`tests/test_v4_sql_features.py`](tests/test_v4_sql_features.py)。
-- **带表别名的 JOIN 与 JOIN 聚合可用**：原先解析器不认识表别名，`FROM users u JOIN orders o ON ...` 的 JOIN 会被**静默丢弃**、查询退化成单表查询（返回看似正常但错误的结果）。现在别名会贯通解析器 → 优化器 → 扫描节点（列前缀用别名，两表同名列不再歧义），实测 `SELECT u.city, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.city` 返回 `[('BJ',3,60),('SH',3,150)]`，LEFT JOIN 正确保留未匹配行，`WHERE`/`GROUP BY`/`ORDER BY` 里的限定名（`u.city`）也已支持。
+- **带表别名的 JOIN 与 JOIN 聚合可用**：原先解析器不认识表别名，`FROM users u JOIN orders o ON ...` 的 JOIN 会被**静默丢弃**、查询退化成单表查询（返回看似正常但错误的结果）。现在别名会贯通解析器 → 优化器 → 扫描节点（列前缀用别名，两表同名列不再歧义），实测 `SELECT u.city, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.city` 返回 `[('BJ',3,60),('SH',3,150)]`，LEFT JOIN 正确保留未匹配行，- **子查询条件与 HAVING 可用**：`WHERE id IN (SELECT ...)` / `NOT IN` / `EXISTS` 原先只解析不求值（单表路径报 `KeyError: 'rows'`），现在执行器先求值再下推（IN 展开为等值 or 链、EXISTS 非空即真、空集显式恒假/恒真，支持嵌套）；`HAVING COUNT(*) > 1` 这类聚合谓词原先直接 `SyntaxError`，现在解析为 `{'agg':...}` 并在分组阶段用聚合值过滤。实测：`IN`→15 行、`NOT IN`→5 行、`EXISTS`→20 行、`HAVING COUNT(*)>5`→`[('Beijing',12)]`。相关子查询仍不支持，但会显式报错而不是静默错答。
+- **Cython 已实现纯 Python 回退（但从未编译）**：`lightdb/cython/fallback/` 薄包装既有纯 Python 实现（btree/page/row_codec/predicate/buffer_pool；hash_table 无对应物故复刻），`__init__` 改为「编译版优先 → 回退」，`status()` 标明来源；`setup.py` 不再静默 `exts=[]`、去掉硬编码 `/arch:AVX2`，`build_cython.sh` 缺条件时明确报错并非零退出；另静态修复 6 处必然编译失败的 `.pyx` 错误。`status()` 实测：6 项全 `python-fallback`、`any_accelerated=False`。**本机无 Cython 且无 C 编译器，编译未验证**；`row_format_v4`/`predicate_v4` 原先用 `_cy is not None` 谎报「使用 Cython」，已改为读 `any_accelerated`。
 
 **SQL 实测**（同实例、真实执行器）：窗口 4 项、CTE 4 项、UNION 4 项、GROUP BY/DISTINCT 4 项、普通路径回归 4 项 —— **17/17 通过**。
 
@@ -60,9 +61,9 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**：**203 通过 / 86 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：`IN (SELECT ...)`/`EXISTS` 子查询与 `HAVING` 不支持、OLAP 向量化路径仍受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
+**测试套件**：**234 通过 / 81 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：相关子查询与 `FROM` 子查询、OLAP 向量化路径仍受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。
 
-**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；`WHERE ... IN (SELECT ...)` / `EXISTS` 子查询、`HAVING`、窗口帧（`ROWS BETWEEN`）、`LIMIT ... OFFSET` 的 OFFSET、递归 CTE 仍不支持；OLAP 向量化引擎与 Cython 仍未接入主路径；`LIKE`/`IS NULL` 之外的谓词能力有限；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
+**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；**相关子查询**与 `FROM` 子查询、窗口帧（`ROWS BETWEEN`）、`LIMIT ... OFFSET` 的 OFFSET、递归 CTE 仍不支持；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）。已知一处**未定位**的测试隔离缺陷：`tests/test_batch7.py::test_union_all` 在共享 `data_b7` 目录时会读到 3 倍行数，但两次最小复现（含 20 行写法）都未能重现，根因待查。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 
 ---
 
