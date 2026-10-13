@@ -59,6 +59,8 @@
   - 投影算术：`SELECT id, salary*2 AS d FROM emp`、`salary/2`、`2*salary` 及 `FROM (... ) x WHERE x.d > 200` 均可用（除零返回 NULL 而非崩溃）。
   - **投影里的标量子查询已可求值**（原先逐行静默返回 `NULL`，是典型的「报错缺位」错答）：`SELECT id, (SELECT COUNT(*) FROM orders o WHERE o.uid=users.id) AS cnt FROM users` → `[(1,2),(2,1),(3,0)]`；`SUM` 无匹配行时返回**正确的 NULL**；非相关标量子查询只算一次（`[(1,3),(2,3),(3,3)]`）。**语义边界一律显式报错**：返回多行、多列、无法安全折叠时都报错，另有 6 处原先会「填 NULL」的分支（未知列哨兵、算术操作数解析失败、窗口取列失败、投影标量函数被误当聚合等）全部改为报错。外层表未起别名而被内层同名表遮蔽时也**报错并提示起别名**（原先静默返回空集），起别名后结果正确。
   - **WHERE/HAVING 标量上下文的行数语义已统一**（原先「取第一行」，是本族最后一块静默错答）：0 行→`NULL`（比较为 UNKNOWN，该行不通过，**不报错**）；1 行 1 列→取值比较；**多行/多列→显式报错**。实测多行报「标量子查询返回了多行（2 行）」、`NOT ((SELECT MAX …)=30)` → `[(1,)]`（无订单行的 UNKNOWN 不再被错误放行）。同时关闭三处**整段静默丢弃**：HAVING 里的子查询原先被 `return True` 丢掉（现在逐分组求值，引用非分组键则报错并提示）；JOIN 查询的 `WHERE (SELECT..)=1` 原先静默返回全部连接行（现在显式报错）；`_rewrite_subqueries` 的兜底原先 `pop` 掉条件（现在报错）。
+  - **JOIN 查询里的标量子查询已接通**（此前是最后一处「标量子查询被拒绝」的地方）：JOIN 查询若含需逐连接行求值的子查询，计划执行器只算 `FROM+JOIN(ON)`（投影 `*`、列名保留 `u.`/`o.` 前缀），物化为内存关系后交**逐行折叠路径**（与单表相关子查询同一机制：`_fold_and_run` + `_scalar_from_rows`），WHERE/GROUP BY/HAVING/投影/DISTINCT/ORDER BY/LIMIT 全在执行器侧。实测 `SELECT u.id, (SELECT COUNT(*) FROM orders x WHERE x.uid=u.id) AS cnt FROM users u JOIN orders o ON o.uid=u.id` → `[(1,2),(1,2),(2,1)]`；相关子查询按折叠值缓存（3 连接行只算 2 次）、非相关只算 1 次。
+  - **顺带修掉两处静默错答**：`ON o.uid=u.id`（JOIN 表写在左边）原先连接键解析不到 → **静默退化成笛卡尔积**（3×3=9 行，现 3 行）；`ORDER BY` 引用限定列名（`ORDER BY o.amt DESC`）在计划路径被**静默忽略**（现正确排序）。
 
 **SQL 实测**（同实例、真实执行器）：窗口 4 项、CTE 4 项、UNION 4 项、GROUP BY/DISTINCT 4 项、普通路径回归 4 项 —— **17/17 通过**。
 
@@ -86,9 +88,9 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**：**275 通过 / 82 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：**JOIN 外层查询**的 WHERE/HAVING/投影标量子查询（计划执行器尚无逐行折叠能力，现显式报错）、WHERE 里的算术谓词（`salary*2 > 230`）、投影里的标量函数（`LOWER(name)`）、`IN (SELECT a,b)` 行值 IN（只认第一列）、OLAP 向量化路径受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。注意失败数会因环境性用例（`test_dashboard_generation`、`test_row_format_performance`、`test_federated_governance`、`test_where_after_join`、`test_react_agent`）逐次抖动 ±2，**判据是改动领域零失败 + 干净 HEAD 副本对照**。
+**测试套件**：**290 通过 / 82 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值（均**显式报错**，不静默）、`IN (SELECT a,b)` 行值 IN（只认第一列）、WHERE 里的算术谓词、投影标量函数、OLAP 向量化路径受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。注意失败数会因环境性用例（`test_dashboard_generation`、`test_row_format_performance`、`test_federated_governance`、`test_where_after_join`、`test_react_agent`）逐次抖动 ±2，**判据是改动领域零失败 + 干净 HEAD 副本对照**。
 
-**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；WHERE 里的 `NOT (...)` 与 `IS NULL`、`FROM (子查询)` 之后直接 `JOIN`、子查询内层 SELECT 的算术投影、非默认 `RANGE`/`GROUPS` 帧、相关子查询里含 JOIN/GROUP BY 或引用外层列做聚合的形态，均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；事务侧 UPDATE/DELETE 的旧版本不落盘（重启后老快照查不到）、墓碑无 vacuum。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
+**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值、`IN (SELECT a,b)` 行值 IN 只认第一列、WHERE 里的算术谓词、投影标量函数、`FROM (子查询)` 之后直接 `JOIN` —— 以上均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；存储侧 `Database.vacuum()` 只释放槽位、不做页内紧凑，且旧 `.dat` 行头布局不兼容（需重建库）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 
 > 更正记录：`tests/test_batch7.py::test_union_all` 曾长期失败（`assert 24 == 8`），一度被误判为「重复行 / 测试隔离」缺陷。实际是**该用例的期望值算错**：`setup()` 的城市列表 `['Beijing','Shanghai','Beijing','Beijing','Shenzhen']` 里有三处 'Beijing'，因此 `i % 5 ∈ {2,3,4}` 都是 Beijing（12 行），正确期望是 `12 × 2 = 24`；原断言只按 `i % 5 == 2` 算成 4 行。实测索引 20 条、堆 20 行、`_find_pks` 返回 12 个**互不重复**的 pk —— 存储层无缺陷。期望值现已改为从同一份 `cities` 列表推导，`test_batch7.py` 9/9 全绿。
 

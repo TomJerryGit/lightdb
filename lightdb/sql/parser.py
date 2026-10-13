@@ -586,7 +586,8 @@ class Parser:
             om = re.match(
                 r'\s+ON\s+(.+?)(?=\s+(?:INNER|LEFT|RIGHT|CROSS)?\s*'
                 r'(?:OUTER\s+)?JOIN\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b'
-                r'|\s+LIMIT\b|$)', rest, re.IGNORECASE | re.DOTALL)
+                r'|\s+HAVING\b|\s+LIMIT\b|$)',
+                rest, re.IGNORECASE | re.DOTALL)
             if om:
                 on_cond = self._join_condition(
                     om.group(1).strip())

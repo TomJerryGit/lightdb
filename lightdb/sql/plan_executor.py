@@ -413,13 +413,30 @@ class PlanExecutor:
         cols, rows = self.execute(node.children[0])
         try:
             ci = self._resolve_col(cols, node.column)
+        except ValueError:
+            # Sort 位于 Project **之上**，此时列名已被压成短名（`o.amt` 变成
+            # `amt`），而 ORDER BY 里通常还写着限定名。`_resolve_col` 的
+            # 后缀匹配方向是「cols 里的名字以 .name 结尾」，正好反了，于是
+            # `JOIN ... ORDER BY o.amt` 解析失败 → **静默不排序**（实测
+            # 反向 ON 修复后 `ORDER BY o.amt DESC LIMIT 2` 仍返回
+            # [(1,10),(1,20)]）。这里按「列名末段」再解析一次。
+            ci = None
+            want = str(node.column).strip().strip('`"')
+            want = want.rsplit('.', 1)[-1].lower()
+            hits = [i for i, c in enumerate(cols)
+                    if str(c).strip().strip('`"')
+                    .rsplit('.', 1)[-1].lower() == want]
+            if len(hits) == 1:
+                ci = hits[0]
+        if ci is not None:
             rows = sorted(
                 rows,
                 key=lambda r: (r[ci] is None, r[ci] if r[ci] is not None else 0),
                 reverse=node.desc,
             )
-        except ValueError:
-            pass
+        # 仍解析不到（例如 ORDER BY 引用没有出现在投影里的列）时保持既有行为：
+        # 不排序。已知限制，本次不改（改成报错会影响 `IN (SELECT ... ORDER BY
+        # 未投影列)` 这类既有可用形态）。
         return cols, rows
 
     def _exec_Limit(self, node):
@@ -649,15 +666,35 @@ class PlanExecutor:
 
     # ==================== JOIN ====================
 
+    def _resolve_join_keys(self, lcols, rcols, lkey, rkey):
+        """等值连接的键解析（`ON` 两侧谁写在左边都可以）
+
+        `ON u.id = o.uid` 与 `ON o.uid = u.id` 语义完全等价，但 AST 里保留的
+        是 SQL 文本顺序。原实现一律把 `on['left']` 当作**左输入**的列：反过来
+        写时（JOIN 进来的表写在左边）左键在左输入里解析不到 → `li/ri` 变成
+        None → **静默退化成笛卡尔积**（实测 `FROM users u JOIN orders o
+        ON o.uid=u.id` 返回 3×3=9 行，其上的 WHERE / GROUP BY / 子查询
+        全部跟着算错）。
+
+        这里按「原顺序 → 交换一次」两轮解析；两轮都失败才返回 (None, None)，
+        保持既有的「无等值键 → 笛卡尔积」行为（CROSS JOIN / 无 ON 场景）。
+        """
+        for lk, rk in ((lkey, rkey), (rkey, lkey)):
+            if not lk or not rk:
+                continue
+            try:
+                return (self._resolve_col(lcols, lk),
+                        self._resolve_col(rcols, rk))
+            except (ValueError, AttributeError):
+                continue
+        return None, None
+
     def _exec_HashJoin(self, node):
         lcols, lrows = self.execute(node.left)
         rcols, rrows = self.execute(node.right)
 
-        try:
-            li = self._resolve_col(lcols, node.left_key)
-            ri = self._resolve_col(rcols, node.right_key)
-        except (ValueError, AttributeError):
-            li = ri = None
+        li, ri = self._resolve_join_keys(
+            lcols, rcols, node.left_key, node.right_key)
 
         out_cols = lcols + rcols
 
@@ -703,11 +740,8 @@ class PlanExecutor:
 
         li = ri = None
         if node.left_key and node.right_key:
-            try:
-                li = self._resolve_col(lcols, node.left_key)
-                ri = self._resolve_col(rcols, node.right_key)
-            except ValueError:
-                li = ri = None
+            li, ri = self._resolve_join_keys(
+                lcols, rcols, node.left_key, node.right_key)
 
         jt = (node.join_type or 'INNER').upper()
         out_rows = []

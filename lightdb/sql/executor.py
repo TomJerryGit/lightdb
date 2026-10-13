@@ -51,9 +51,23 @@ class _CTERelation:
         return 'VARCHAR'
 
     def _col_idx(self, name: str) -> int:
+        """列名 -> 下标
+
+        精确匹配失败后再按「列名末段」唯一匹配一次：JOIN 结果物化成的内存
+        关系列名带限定前缀（`u.id` / `o.amt`），而存储层的 `_aggregate` /
+        `_match` 只认裸列名（`amt`）。末段歧义时仍然报错，绝不任取一列。
+        """
         for i, c in enumerate(self.cols):
             if c['name'] == name:
                 return i
+        want = str(name).strip().strip('`"').rsplit('.', 1)[-1].lower()
+        hits = [i for i, c in enumerate(self.cols)
+                if str(c['name']).strip().strip('`"')
+                .rsplit('.', 1)[-1].lower() == want]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise KeyError(f"列 {name} 歧义，请加表名前缀")
         raise KeyError(f"列 {name} 不存在")
 
 
@@ -845,7 +859,14 @@ class Executor:
 
     @staticmethod
     def _col_index_of(cols, name: str) -> int:
-        """在列名列表里定位，支持 `t.col` 与 `col AS x` 形式"""
+        """在列名列表里定位，支持 `t.col` 与 `col AS x` 形式
+
+        JOIN 路径产出的列名带限定前缀（`u.id` / `o.amt`），因此精确匹配全部
+        失败后，再按「列名末段」唯一匹配一次（`amt` → `o.amt`）。末段歧义
+        （`u.id` 与 `o.id` 并存时的裸 `id`）仍返回 -1，由调用方显式报错，
+        绝不随便挑一列 —— 与计划执行器 `_resolve_col` 的语义保持一致，
+        这样 JOIN 的后置处理路径与纯计划路径对裸列名的解析结果相同。
+        """
         if name == '*':
             return -1
         expr, _ = Executor._split_alias(name)
@@ -855,6 +876,15 @@ class Executor:
         for c in candidates:
             if c in cols:
                 return cols.index(c)
+        want = str(expr or name).strip().strip('`"').rsplit('.', 1)[-1].lower()
+        if not want:
+            return -1
+        hits = [i for i, c in enumerate(cols)
+                if isinstance(c, str)
+                and str(c).strip().strip('`"').rsplit('.', 1)[-1].lower()
+                == want]
+        if len(hits) == 1:
+            return hits[0]
         return -1
 
     def _base_rows_and_cols(self, src, where, read_view=None):
@@ -954,7 +984,7 @@ class Executor:
         """
         return re.sub(r'\b\w+\.(\w+)', r'\1', str(text))
 
-    def _normalize_where(self, where):
+    def _normalize_where(self, where, strip=True):
         """把 WHERE 条件里的限定列名归一化（`u.city` -> `city`）
 
         存储层的 Table._match 只认裸列名；只改 column 字段，
@@ -969,20 +999,25 @@ class Executor:
         这样 `_base_rows_and_cols` 传给存储层的条件永远是它能认的形态，
         既避免了 KeyError，也让 NOT 条件能享受存储层的索引/下推，
         不必把整表读进内存再过滤。
+
+        strip=False：**JOIN 后置处理路径**里保留限定列名不动。连接结果的
+        列名本身带前缀（`u.id` / `o.amt`），一旦归一化成裸名就会歧义
+        （`id` 同时属于两张表）甚至解析失败；该路径不经过存储层
+        `_match`（行已经在内存里），因此不需要归一化。
         """
         if not isinstance(where, dict):
             return where
         if isinstance(where.get('not'), dict):
             return self._negate_condition(
-                self._normalize_where(where['not']))
+                self._normalize_where(where['not'], strip))
         if 'and' in where:
-            return {'and': [self._normalize_where(c)
+            return {'and': [self._normalize_where(c, strip)
                             for c in where['and']]}
         if 'or' in where:
-            return {'or': [self._normalize_where(c)
+            return {'or': [self._normalize_where(c, strip)
                            for c in where['or']]}
         out = dict(where)
-        if isinstance(out.get('column'), str):
+        if strip and isinstance(out.get('column'), str):
             out['column'] = self._strip_qualifier(out['column'])
         return out
 
@@ -1121,7 +1156,7 @@ class Executor:
         return bool(re.match(r'^-?\d+(?:\.\d+)?$', str(tok)))
 
     def _group_rows(self, p, src, base_cols, rows, session=None,
-                    read_view=None):
+                    read_view=None, extra_names=None):
         """按 GROUP BY 分组并计算聚合列，返回 (分组后的列名, 分组后的行)
 
         原实现把 group_by 完全忽略，`SELECT dept, COUNT(*) ... GROUP BY dept`
@@ -1129,6 +1164,8 @@ class Executor:
 
         session / read_view：HAVING 里的子查询需要（重新）执行子查询，
         必须沿用同一个事务读视图；拿不到时由 `_use_session` 兜底。
+        extra_names：JOIN 后置处理路径传入的连接表名/别名，供 HAVING 里的
+        子查询折叠使用（见 `_eval_having_with_subquery`）。
         """
         keys = [str(k).strip() for k in (p.get('group_by') or [])]
         kidx = [self._col_index_of(base_cols, k) for k in keys]
@@ -1190,7 +1227,7 @@ class Executor:
                     # 显式报错，见 _eval_having_with_subquery）
                     if not self._eval_having_with_subquery(
                             vals, hcols, having, extra, p, session,
-                            read_view, having_cache):
+                            read_view, having_cache, extra_names):
                         continue
                 elif not self._eval_condition(vals, hcols, having, extra):
                     continue
@@ -1198,7 +1235,8 @@ class Executor:
         return keys + agg_cols, out_rows
 
     def _eval_having_with_subquery(self, row, cols, where, agg_values, p,
-                                   session, read_view, cache):
+                                   session, read_view, cache,
+                                   extra_names=None):
         """HAVING 里带子查询的条件求值（逐分组行）
 
         HAVING 在 GROUP BY 之后求值，此时「外层行」是分组行：列只有
@@ -1218,6 +1256,9 @@ class Executor:
 
         缓存：按折叠用到的分组键取值缓存子查询结果（同值分组共享一次
         执行），因此分组很多时也不会重复跑子查询。
+
+        extra_names：JOIN 后置处理路径传入的连接表名/别名（外层行由多表
+        连接而来），相关判定与折叠都要把它们算作外层限定符。
         """
         if not isinstance(where, dict):
             return True
@@ -1225,20 +1266,22 @@ class Executor:
         if 'not' in where and isinstance(where['not'], dict):
             inner = self._eval_having_with_subquery(
                 row, cols, where['not'], agg_values, p, session,
-                read_view, cache)
+                read_view, cache, extra_names)
             if inner is None:
                 return None
             return not inner
         if 'and' in where:
             return all(self._eval_having_with_subquery(
-                row, cols, c, agg_values, p, session, read_view, cache)
+                row, cols, c, agg_values, p, session, read_view, cache,
+                extra_names)
                 for c in where['and'])
         if 'or' in where:
             parts = where['or']
             if not parts:
                 return False
             return any(self._eval_having_with_subquery(
-                row, cols, c, agg_values, p, session, read_view, cache)
+                row, cols, c, agg_values, p, session, read_view, cache,
+                extra_names)
                 for c in parts)
 
         sub = where.get('subquery')
@@ -1250,12 +1293,14 @@ class Executor:
         outer_alias = p.get('table_alias')
         session = self._use_session(session)
         correlated = (
-            self._is_correlated(sub, outer_name, outer_alias)
-            or self._sub_owner_is_outer(sub, outer_name, outer_alias))
+            self._is_correlated(sub, outer_name, outer_alias, extra_names)
+            or self._sub_owner_is_outer(sub, outer_name, outer_alias,
+                                        extra_names))
         if correlated:
             # 先做「外层引用能否在分组行里取到值」的前置检查：取不到时
             # 给出比折叠失败更明确的信息（GROUP BY 之后只保留分组键）
-            names = self._fold_outer_names(sub, outer_name, outer_alias)
+            names = self._fold_outer_names(sub, outer_name, outer_alias,
+                                           extra_names)
             missing = [
                 c for c in self._outer_ref_columns(sub, names)
                 if self._outer_column_value(cols, row, c) is _MISSING]
@@ -1266,12 +1311,13 @@ class Executor:
                     f"请把该列加入 GROUP BY，或改成引用分组键")
             return self._eval_correlated_predicate(
                 row, cols, where, session, outer_name, outer_alias,
-                cache, read_view)
+                cache, read_view, extra_names)
         # 非相关子查询：EXISTS / IN 走集合语义，标量比较按行数语义收敛，
-        # 两者都按子查询缓存（整体只求值一次）
+        # 两者都按子查询缓存（整体只求值一次）。`_eval_outer_where` 里还会
+        # 做一次「外层引用藏在表达式里」的残留检查（命中即显式报错）。
         return self._eval_outer_where(
             row, cols, where, session, outer_name, outer_alias,
-            cache, read_view)
+            cache, read_view, extra_names)
 
     # ==================== 条件求值（统一路径） ====================
 
@@ -1335,6 +1381,10 @@ class Executor:
             return True
         i = self._col_index_of(cols, col)
         if i < 0:
+            # 末段歧义（JOIN 结果里 `u.id` 与 `o.id` 并存时的裸 `id`）必须
+            # 显式报错：静默返回"条件为假"会把整个结果集变成空集，用户看不出
+            # 是「没有匹配行」还是「列名有歧义」。
+            self._raise_if_ambiguous_col(cols, col)
             return False
         l = row[i] if i < len(row) else None
         r = where.get('value')
@@ -1358,8 +1408,23 @@ class Executor:
             return bool(re.match('^' + pat + '$', str(l)))
         return False
 
+    @staticmethod
+    def _raise_if_ambiguous_col(cols, name):
+        """列名末段歧义时显式报错（`u.id` / `o.id` 并存时的裸 `id`）
+
+        与计划执行器 `_resolve_col` 的「列 'x' 歧义，请加表名前缀」保持一致：
+        多表连接的结果行必须用限定名引用同名列，绝不任取一侧。
+        """
+        want = str(name).strip().strip('`"').rsplit('.', 1)[-1].lower()
+        hits = [c for c in cols
+                if isinstance(c, str)
+                and str(c).strip().strip('`"').rsplit('.', 1)[-1].lower()
+                == want]
+        if len(hits) > 1:
+            raise ValueError(f"列 '{name}' 歧义，请加表名前缀")
+
     def _project_rows(self, p, base_cols, rows, session=None, read_view=None,
-                      outer_name=None, outer_alias=None):
+                      outer_name=None, outer_alias=None, extra_names=None):
         """把行按 SELECT 列表投影成输出列
 
         投影项支持：`*` / 普通列（含表限定名）/ 常量 / 二元算术表达式 /
@@ -1371,6 +1436,9 @@ class Executor:
         路径求值（因此内层 JOIN / GROUP BY / HAVING / 嵌套子查询都能用）；
         结果按「折叠用到的外层列取值」缓存，相同外层行只算一次。非相关的
         标量子查询整体只求值一次，所有行共用结果。
+
+        extra_names：外层行来自多表连接（JOIN 后置处理路径）时，连接进来的
+        表名/别名 —— 子查询里引用连接表的列也能被折叠。
 
         语义边界（全部显式处理，绝不静默填 NULL）：
         * 子查询 0 行 → 聚合补空集值（COUNT→0，SUM/AVG/MIN/MAX→NULL），
@@ -1415,7 +1483,7 @@ class Executor:
             for item in plan_items:
                 out.append(self._eval_projection_item(
                     item, r, base_cols, session, read_view,
-                    outer_name, outer_alias, sub_cache))
+                    outer_name, outer_alias, sub_cache, extra_names))
             out_rows.append(out)
         return self._finish_select(p, out_cols, out_rows)
 
@@ -1456,7 +1524,8 @@ class Executor:
         raise ValueError(f"列 '{expr}' 不存在")
 
     def _eval_projection_item(self, item, row, base_cols, session, read_view,
-                              outer_name, outer_alias, sub_cache):
+                              outer_name, outer_alias, sub_cache,
+                              extra_names=None):
         """求值一个投影项在当前行上的取值"""
         kind, spec, label = item
         if kind == 'const':
@@ -1469,7 +1538,7 @@ class Executor:
             return self._eval_arith(spec, base_cols, row)
         return self._eval_projection_scalar(
             spec, row, base_cols, session, read_view,
-            outer_name, outer_alias, sub_cache)
+            outer_name, outer_alias, sub_cache, extra_names)
 
     # ---- 投影列表里的标量子查询 ----
 
@@ -1545,12 +1614,16 @@ class Executor:
         return len(items)
 
     def _eval_projection_scalar(self, sub, row, cols, session, read_view,
-                                outer_name, outer_alias, cache):
+                                outer_name, outer_alias, cache,
+                                extra_names=None):
         """求值投影里的标量子查询（对当前外层行）
 
         相关子查询 → 折叠外层列后执行并按折叠值缓存；
         非相关子查询 → 整体执行一次并缓存。
         多行/多列/无法求值一律抛 ValueError（显式报错，不静默填 NULL）。
+
+        extra_names：外层行来自多表连接（JOIN 后置处理路径）时，
+        连接进来的表名/别名同样可以折叠。
         """
         # 外层限定名被内层同名表遮蔽时无法无歧义解析：显式报错
         amb = self._ambiguous_outer_ref(
@@ -1566,23 +1639,29 @@ class Executor:
                 f"投影里的标量子查询只能返回一列")
 
         correlated = bool(outer_name) and (
-            self._is_correlated(sub, outer_name, outer_alias)
-            or self._sub_owner_is_outer(sub, outer_name, outer_alias))
+            self._is_correlated(sub, outer_name, outer_alias, extra_names)
+            or self._sub_owner_is_outer(sub, outer_name, outer_alias,
+                                        extra_names))
 
         if correlated:
-            names = self._fold_outer_names(sub, outer_name, outer_alias)
+            names = self._fold_outer_names(sub, outer_name, outer_alias,
+                                           extra_names)
             if not names:
                 raise ValueError(
                     "投影里的相关标量子查询无法求值：外层引用无法安全折叠"
                     "（请检查外层限定名是否被子查询里的同名表遮蔽）")
             key = ('psub', id(sub), self._fold_cache_key(
-                sub, row, cols, outer_name, outer_alias))
+                sub, row, cols, outer_name, outer_alias, extra_names))
             if key not in cache:
                 cache[key] = self._fold_and_run(
                     sub, row, cols, session, outer_name, outer_alias,
-                    read_view)
+                    read_view, extra_names)
             rows = cache[key]
         else:
+            # 疑似非相关：确认里面没有「藏在表达式里的外层引用」，
+            # 否则会被当成非相关子查询一次性求值后静默给出错值
+            self._guard_residual_outer_ref(sub, outer_name, outer_alias,
+                                           extra_names)
             key = ('psub-nc', id(sub))
             if key not in cache:
                 res = self.execute(sub, session)
@@ -1899,19 +1978,27 @@ class Executor:
                     return True
         return False
 
-    def _is_correlated(self, sub, outer_table, outer_alias=None) -> bool:
+    def _is_correlated(self, sub, outer_table, outer_alias=None,
+                       extra_names=None) -> bool:
         """判断子查询是否相关（引用了外层表的列）
 
         判据：
         1. 列名限定符等于外层表名/别名，且不是子查询自己的表/别名；
         2. WHERE 里的裸列名在子查询表里不存在、却在外层表里存在。
         `SELECT 1 FROM orders` 这类自洽子查询一律放行。
+
+        extra_names：外层行来自多表连接（JOIN 后置处理路径）时，连接进来的
+        表名/别名同样是外层限定符 —— 漏掉会让「引用连接表」的子查询被误判成
+        非相关、一次性求值（实测会静默返回空集/0 行）。
         """
         if not outer_table or not isinstance(sub, dict):
             return False
         outers = {str(outer_table).lower()}
         if outer_alias:
             outers.add(str(outer_alias).lower())
+        for n in (extra_names or ()):
+            if n:
+                outers.add(str(n).lower())
 
         inner_names = set()
         for key in ('table', 'table_alias'):
@@ -2017,13 +2104,18 @@ class Executor:
             self._nested_subqueries(inner, out)
         return out
 
-    def _select_correlated(self, p, s, src, read_view, outer_name):
+    def _select_correlated(self, p, s, src, read_view, outer_name,
+                           extra_names=None):
         """相关子查询的执行路径
 
         不能像非相关子查询那样「一次求值 + 改写条件」，因为每个外层行的
         真值都不同。这里先一次性取出「全部列的行」（只扫一遍表），再逐行
         用作用域求值器判断条件；子查询的内层行也按子查询缓存，因此单表
         相关子查询不会每行重新打开表。
+
+        extra_names：外层行由多表连接而来时（JOIN 后置处理路径）传入的连接
+        表名/别名列表；非 None 同时表示「多表行」，此时普通比较的列名保留
+        限定前缀、按连接结果的列名精确解析。
         """
         outer_alias = p.get('table_alias')
         base_cols, rows = self._base_rows_and_cols(src, None, read_view)
@@ -2032,30 +2124,37 @@ class Executor:
         for r in rows:
             if self._eval_outer_where(r, base_cols, p.get('where'), s,
                                       outer_name, outer_alias, cache,
-                                      read_view):
+                                      read_view, extra_names):
                 kept.append(r)
         rows = kept
 
         if (p.get('group_by') or p.get('having')
                 or self._has_bare_aggregate(p)):
             base_cols, rows = self._group_rows(
-                p, src, base_cols, rows, session=s, read_view=read_view)
+                p, src, base_cols, rows, session=s, read_view=read_view,
+                extra_names=extra_names)
         if p.get('windows'):
             return self._apply_windows(p, base_cols, rows, session=s,
-                                       read_view=read_view)
+                                       read_view=read_view,
+                                       extra_names=extra_names)
         return self._project_rows(p, base_cols, rows, session=s,
                                   read_view=read_view,
                                   outer_name=outer_name,
-                                  outer_alias=outer_alias)
+                                  outer_alias=outer_alias,
+                                  extra_names=extra_names)
 
     def _eval_outer_where(self, row, cols, where, s, outer_name,
-                          outer_alias, cache, read_view):
+                          outer_alias, cache, read_view, extra_names=None):
         """外层行上的条件求值（含相关/非相关子查询谓词）
 
         返回值：True / False / **None（三值逻辑的 UNKNOWN）**。
         UNKNOWN 在调用方（`_select_correlated` 的 `if`、and/or 的 all/any）
         里按「不通过」处理，与 SQL 的行过滤语义一致；只有 `NOT` 需要显式
         区分：`NOT UNKNOWN` 仍是 UNKNOWN，**不能**变成真。
+
+        extra_names：外层行来自多表连接（JOIN 后置处理路径）时，连接进来的
+        表名/别名列表 —— 相关子查询要能折叠这些表的列。该参数同时充当
+        「多表行」标志：普通比较的列名不做限定符归一化（见 `_normalize_where`）。
         """
         if where is None or not isinstance(where, dict):
             return True
@@ -2064,20 +2163,22 @@ class Executor:
         if 'not' in where and isinstance(where['not'], dict):
             inner = self._eval_outer_where(
                 row, cols, where['not'], s, outer_name, outer_alias,
-                cache, read_view)
+                cache, read_view, extra_names)
             if inner is None:
                 return None
             return not inner
         if 'and' in where:
             return all(self._eval_outer_where(
-                row, cols, c, s, outer_name, outer_alias, cache, read_view)
+                row, cols, c, s, outer_name, outer_alias, cache, read_view,
+                extra_names)
                 for c in where['and'])
         if 'or' in where:
             parts = where['or']
             if not parts:
                 return False
             return any(self._eval_outer_where(
-                row, cols, c, s, outer_name, outer_alias, cache, read_view)
+                row, cols, c, s, outer_name, outer_alias, cache, read_view,
+                extra_names)
                 for c in parts)
 
         sub = where.get('subquery')
@@ -2087,13 +2188,19 @@ class Executor:
             # `_sub_owner_is_outer` 兜底"子查询里带 JOIN"等漏判形态。
             # 任一命中就走逐外层行求值（外层列常量折叠）路径；漏判会走去
             # 重/标量分支 → 静默给出错误结果（实测 EXISTS 恒为空）。
-            correlated = (self._is_correlated(sub, outer_name, outer_alias)
+            correlated = (self._is_correlated(sub, outer_name, outer_alias,
+                                              extra_names)
                           or self._sub_owner_is_outer(
-                              sub, outer_name, outer_alias))
+                              sub, outer_name, outer_alias, extra_names))
             if correlated:
                 return self._eval_correlated_predicate(
                     row, cols, where, s, outer_name, outer_alias,
-                    cache, read_view)
+                    cache, read_view, extra_names)
+            # 疑似非相关：再确认一次里面没有「藏在表达式里的外层引用」
+            # （`x.uid = MIN(u.id)` 这类识别不到的相关引用），命中即报错，
+            # 绝不当成非相关子查询一次性求值后静默返回 0 行。
+            self._guard_residual_outer_ref(sub, outer_name, outer_alias,
+                                           extra_names)
             if op not in ('EXISTS', 'NOT EXISTS', 'IN', 'NOT IN'):
                 # 非相关标量子查询：可以一次性求值（结果按子查询缓存）
                 sv = self._eval_scalar_subquery(sub, s, cache)
@@ -2109,15 +2216,45 @@ class Executor:
                     # NOT 分支。
                     return None
                 return self._compare_scoped(sv, op, rv)
-            return self._eval_plain_subquery_predicate(row, cols, where, s,
-                                                       cache)
+            return self._eval_plain_subquery_predicate(
+                row, cols, where, s, cache, outer_name, outer_alias,
+                extra_names)
         # 普通比较 / LIKE / IS NULL（编码成 value=None 的 =/!=）/ 聚合谓词
-        return self._eval_condition(row, cols, self._normalize_where(where))
+        return self._eval_plain_condition(
+            row, cols, self._normalize_where(where, strip=not extra_names))
 
-    def _eval_plain_subquery_predicate(self, row, cols, where, s, cache):
+    def _eval_plain_condition(self, row, cols, where):
+        """不含子查询的普通条件求值（三值语义，含 `negate` 标记）
+
+        `_normalize_where` 对 LIKE 这类存储层没有取反运算符的形态会打上
+        `{'negate': ...}` 标记。`_eval_condition` 不认识它，遇到会顺着
+        「column 不是字符串 → return True」的分支把条件**静默丢掉**
+        （实测 `NOT (name LIKE 'A%')` 被判成恒真）。这里把 negate 标记按
+        三值语义就地展开后再交给 `_eval_condition`。
+        """
+        if isinstance(where, dict):
+            if isinstance(where.get('negate'), dict):
+                inner = self._eval_plain_condition(row, cols, where['negate'])
+                return None if inner is None else (not inner)
+            if 'and' in where:
+                return all(self._eval_plain_condition(row, cols, c)
+                           for c in where['and'])
+            if 'or' in where:
+                parts = where['or']
+                if not parts:
+                    return False
+                return any(self._eval_plain_condition(row, cols, c)
+                           for c in parts)
+        return self._eval_condition(row, cols, where)
+
+    def _eval_plain_subquery_predicate(self, row, cols, where, s, cache,
+                                       outer_name=None, outer_alias=None,
+                                       extra_names=None):
         """相关 WHERE 里混进来的非相关子查询（结果按子查询缓存）"""
         sub = where['subquery']
         op = where['op']
+        self._guard_residual_outer_ref(sub, outer_name, outer_alias,
+                                       extra_names)
         key = ('sub', id(sub))
         if key not in cache:
             res = self.execute(sub, s)
@@ -2140,7 +2277,8 @@ class Executor:
         return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
 
     def _eval_correlated_predicate(self, row, cols, where, s, outer_name,
-                                   outer_alias, cache, read_view):
+                                   outer_alias, cache, read_view,
+                                   extra_names=None):
         """相关子查询谓词求值：外层列常量折叠 + 复用正常执行路径
 
         实现方式（通用做法，能直接复用 JOIN / GROUP BY / HAVING / 窗口 /
@@ -2165,12 +2303,13 @@ class Executor:
         sub = where['subquery']
         op = where['op']
         cache_key = ('corr', id(sub), self._fold_cache_key(
-            sub, row, cols, outer_name, outer_alias))
+            sub, row, cols, outer_name, outer_alias, extra_names))
         if cache_key in cache:
             rows = cache[cache_key]
         else:
             rows = self._fold_and_run(sub, row, cols, s,
-                                      outer_name, outer_alias, read_view)
+                                      outer_name, outer_alias, read_view,
+                                      extra_names)
             cache[cache_key] = rows
 
         if op == 'EXISTS':
@@ -2329,7 +2468,8 @@ class Executor:
                     return row[i]
         return _MISSING
 
-    def _sub_owner_is_outer(self, sub, outer_name, outer_alias) -> bool:
+    def _sub_owner_is_outer(self, sub, outer_name, outer_alias,
+                            extra_names=None) -> bool:
         """粗判：子查询 AST 里是否有「外层限定名」引用
 
         比 `_is_correlated` 宽松（不做裸列名/表列比对），用于兜底识别
@@ -2337,9 +2477,15 @@ class Executor:
         必须排除**子查询及其嵌套子查询自己的表/别名**：自洽子查询里出现
         与外层同名的表（`... IN (SELECT ... FROM users WHERE city='BJ')`
         而外层也叫 users）否则会被误判成相关引用。
+
+        extra_names：外层行来自多表连接（JOIN 后置处理路径）时，
+        连接进来的表名/别名同样是可引用的外层限定符。
         """
         outers = set()
         for n in (outer_name, outer_alias):
+            if n:
+                outers.add(str(n).lower())
+        for n in (extra_names or ()):
             if n:
                 outers.add(str(n).lower())
         if not outers:
@@ -2557,14 +2703,21 @@ class Executor:
             out['joins'] = new_joins
         return out
 
-    def _fold_outer_names(self, sub, outer_name, outer_alias):
+    def _fold_outer_names(self, sub, outer_name, outer_alias,
+                          extra_names=None):
         """收集「可以安全折叠」的外层限定符集合
 
         只认限定符等于外层表名/别名、且子查询自己没有同名表/别名的引用，
         避免把子查询内部的表别名（例如自连接的 u2）误当外层引用。
+
+        extra_names：外层行由**多张表连接**而来时（JOIN 后置处理路径），
+        除 `outer_name` / `outer_alias` 之外还可以折叠的连接表名/别名。
         """
         outers = set()
         for n in (outer_name, outer_alias):
+            if n:
+                outers.add(str(n).lower())
+        for n in (extra_names or ()):
             if n:
                 outers.add(str(n).lower())
         inner_names = set()
@@ -2618,13 +2771,15 @@ class Executor:
                 self._outer_ref_columns(on, names, out)
         return out
 
-    def _fold_cache_key(self, sub, row, cols, outer_name, outer_alias):
+    def _fold_cache_key(self, sub, row, cols, outer_name, outer_alias,
+                        extra_names=None):
         """按「折叠用到的外层列取值」构造缓存键（同值外层行共享结果）
 
         必须覆盖子查询（含嵌套层）里出现的**所有**外层列引用：
         漏一个就会让取值不同的外层行命中同一条缓存，产生静默错答。
         """
-        names = self._fold_outer_names(sub, outer_name, outer_alias)
+        names = self._fold_outer_names(sub, outer_name, outer_alias,
+                                       extra_names)
         items = []
         for c in self._outer_ref_columns(sub, names):
             val = self._outer_column_value(cols, row, c)
@@ -2642,17 +2797,20 @@ class Executor:
         return ('repr', repr(value))
 
     def _fold_and_run(self, sub, row, cols, s, outer_name, outer_alias,
-                      read_view):
+                      read_view, extra_names=None):
         """折叠外层列 → 正常执行 → 返回结果行列表"""
-        names = self._fold_outer_names(sub, outer_name, outer_alias)
+        names = self._fold_outer_names(sub, outer_name, outer_alias,
+                                       extra_names)
         if not names:
             raise ValueError(
                 "相关子查询的外层引用无法安全折叠（找不到外层限定符）")
         folded = self._fold_outer_literals(
             sub, row, cols, names)
         # 折叠后必须不再相关：否则说明还有本实现没覆盖到的外层引用
-        if self._is_correlated(folded, outer_name, outer_alias) or \
-                self._sub_owner_is_outer(folded, outer_name, outer_alias):
+        if self._is_correlated(folded, outer_name, outer_alias,
+                               extra_names) or \
+                self._sub_owner_is_outer(folded, outer_name, outer_alias,
+                                         extra_names):
             raise ValueError(
                 "相关子查询的外层引用无法安全折叠（折叠后仍残留外层引用）")
         leftover = self._leftover_outer_pattern(folded, names)
@@ -2704,6 +2862,44 @@ class Executor:
                 if got:
                     return got
         return None
+
+    def _residual_outer_ref(self, sub, outer_name, outer_alias,
+                            extra_names=None):
+        """「疑似非相关」的子查询里是否还藏有外层引用（返回该文本或 None）
+
+        `_is_correlated` / `_sub_owner_is_outer` 的判据只认 `别名.列` 这种
+        **纯列引用**（正则 `[\\w.]+`）。真值藏在表达式里的外层引用
+        （`WHERE x.uid = MIN(u.id)`、`WHERE x.amt = u.amt + 1`）识别不到，
+        会被当成非相关子查询一次性执行：内层解析不到该列 → 要么报「列不存在」，
+        要么被存储层当成字符串比较后**静默返回 0 行**。这里做一次文本级残留
+        检查，命中就显式报错（见 `_guard_residual_outer_ref`）。
+
+        计算外层限定符时要扣掉**子查询及其嵌套子查询**自己声明的表名/别名，
+        否则 `... FROM orders WHERE uid IN (SELECT id FROM users WHERE
+        users.city='BJ')` 这类自洽子查询会被误判（users 只是嵌套层自己的表）。
+        """
+        names = set()
+        for n in (outer_name, outer_alias):
+            if n:
+                names.add(str(n).lower())
+        for n in (extra_names or ()):
+            if n:
+                names.add(str(n).lower())
+        names -= self._sub_scope_names(sub)
+        if not names:
+            return None
+        return self._leftover_outer_pattern(sub, names)
+
+    def _guard_residual_outer_ref(self, sub, outer_name, outer_alias,
+                                  extra_names=None):
+        """非相关子查询里仍残留外层引用 → 显式报错（绝不静默给错结果）"""
+        got = self._residual_outer_ref(sub, outer_name, outer_alias,
+                                       extra_names)
+        if got:
+            raise ValueError(
+                f"子查询里的 '{got}' 无法安全折叠：本引擎只支持把"
+                f"「别名.列」形式的纯列引用折叠成外层行的取值，"
+                f"不支持在外层引用上套聚合/函数（该形态无法求值）")
 
     def _eval_scoped(self, row, cols, where, outer):
         """内层行上的条件求值（列名可用外层行解析）
@@ -2841,12 +3037,14 @@ class Executor:
         return a == b
 
     def _apply_windows(self, p, base_cols, rows, session=None,
-                       read_view=None):
+                       read_view=None, extra_names=None):
         """计算窗口列并按投影顺序拼装结果行
 
         非窗口投影项复用 `_projection_item_plan` / `_eval_projection_item`：
         原来这里用 `_col_index_of` 取不到列就静默输出 None，同样属于
         「静默填 NULL」，现在认不出来的投影项会显式报错。
+
+        extra_names：JOIN 后置处理路径传入的连接表名/别名（见 `_project_rows`）。
         """
         windows = p.get('windows') or []
         projection = p.get('projection') or [
@@ -2891,7 +3089,7 @@ class Executor:
                     continue
                 out.append(self._eval_projection_item(
                     item, r, base_cols, session, read_view,
-                    outer_name, outer_alias, sub_cache))
+                    outer_name, outer_alias, sub_cache, extra_names))
             out_rows.append(out)
         return self._finish_select(p, out_cols, out_rows)
 
@@ -3156,7 +3354,24 @@ class Executor:
         return self._rs(out_cols or [], result)
 
     def _exec_join_query(self, p, s):
-        """多表 JOIN"""
+        """多表 JOIN
+
+        两条路径：
+
+        1. **纯计划路径**（既有行为，零改动）：查询里没有需要逐连接行求值的
+           子查询时，整条查询交给优化器 + 计划执行器（Filter/Project/
+           GroupBy/Sort/Limit 都在计划里）。
+        2. **后置处理路径**：WHERE 里有标量子查询比较 / 引用连接表的子查询、
+           HAVING 里有子查询、或投影列表里有标量子查询时，计划执行器只负责
+           「FROM + JOIN（含 ON）」，产出带限定列名的连接结果；随后由执行器
+           逐连接行把子查询折叠求值（`_fold_and_run` + `_scalar_from_rows`，
+           与单表相关子查询完全同一套机制与缓存）。
+
+        为什么不让计划执行器只处理一半条件：`A OR (SELECT ...) > 1` 这种形态
+        只摘掉子查询那一半会让真值表变错（要么全放行、要么丢太多行），
+        因此只要 WHERE 里出现必须在执行器里求值的子查询，整个 WHERE 都改由
+        执行器逐行求值（`_eval_plain_condition` 保留限定列名精确解析）。
+        """
         from .plan_executor import PlanExecutor
 
         txn = s.get('txn')
@@ -3169,12 +3384,86 @@ class Executor:
         if self.optimizer is None:
             return self._err(1105, "优化器未初始化")
 
+        join_names = self._join_qualifiers(p)
+        if self._join_needs_row_eval(p, join_names):
+            return self._exec_join_query_with_subqueries(
+                p, s, rv, join_names)
+
         plan = self.optimizer.optimize(p)
         self._last_plan = plan
 
         executor = PlanExecutor(self.db, read_view=rv)
         cols, rows = executor.execute(plan)
         return self._rs(cols, rows)
+
+    def _join_qualifiers(self, p) -> list:
+        """JOIN 查询里所有可作外层限定符的名字（别名优先，其次表名）
+
+        计划执行器的 SeqScan 用别名（没有别名则用表名）作列前缀，因此连接
+        结果的列名是 `u.id` / `o.uid`；这份名单同时用于「相关判定」和
+        「外层列折叠」，漏一个就会把引用连接表的子查询误判成非相关。
+        """
+        names = []
+        items = [(p.get('table'), p.get('table_alias'))]
+        for j in (p.get('joins') or []):
+            items.append((j.get('table'), j.get('alias')))
+        for t, a in items:
+            for n in (a, t):
+                if n and str(n).lower() not in [x.lower() for x in names]:
+                    names.append(str(n))
+        return names
+
+    def _join_needs_row_eval(self, p, join_names) -> bool:
+        """JOIN 查询里是否存在「必须逐连接行求值」的子查询
+
+        * WHERE 里的标量比较（`(SELECT ...) > 1`）：行数语义要逐行收敛；
+        * WHERE 里引用任一连接表的相关子查询（EXISTS / IN / 标量）：
+          计划执行器没有逐行折叠外层列的能力（原来会静默返回空集/0 行）；
+        * HAVING 里的任何子查询（分组键折叠必须逐分组做）；
+        * 投影列表里的标量子查询。
+        """
+        where = p.get('where')
+        if self._where_has_scalar_subquery(where):
+            return True
+        for sub in self._all_nested_subqueries(where):
+            if self._is_correlated(sub, p.get('table'),
+                                   p.get('table_alias'), join_names) or \
+                    self._sub_owner_is_outer(
+                        sub, p.get('table'), p.get('table_alias'),
+                        join_names):
+                return True
+        if self._contains_subquery(p.get('having')):
+            return True
+        return any(
+            self._projection_subquery_ast(self._split_alias(str(c))[0])[0]
+            is not None
+            for c in (p.get('columns') or []) if c != '*')
+
+    def _exec_join_query_with_subqueries(self, p, s, rv, join_names):
+        """JOIN 查询的后置处理路径：先算连接，再逐连接行处理子查询
+
+        1. 计划执行器只算 `FROM ... JOIN ... ON ...`（投影成 `*`，列名保留
+           限定前缀 `u.id` / `o.uid`）；
+        2. 结果物化成内存关系，交给 `_select_correlated` 的逐行路径：
+           WHERE（含标量/相关子查询）→ GROUP BY/HAVING（含标量子查询）→
+           投影（含标量子查询）→ DISTINCT/ORDER BY/LIMIT+OFFSET。
+        """
+        from .plan_executor import PlanExecutor
+
+        join_p = dict(p)
+        join_p.update({
+            'columns': ['*'], 'projection': None, 'where': None,
+            'having': None, 'group_by': None, 'order_by': None,
+            'limit': None, 'offset': None, 'distinct': False,
+            'windows': [],
+        })
+        plan = self.optimizer.optimize(join_p)
+        self._last_plan = plan
+        executor = PlanExecutor(self.db, read_view=rv)
+        cols, rows = executor.execute(plan)
+        rel = _CTERelation('join', cols, rows)
+        return self._select_correlated(
+            p, s, rel, rv, p.get('table'), extra_names=join_names)
 
     def _cmd_update(self, p, s):
         tbl = self.db.get_table(p['table'])

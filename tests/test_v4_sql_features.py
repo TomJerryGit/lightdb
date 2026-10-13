@@ -985,9 +985,10 @@ def test_correlated_nested_and_multitable():
         assert [r[0] for r in rows] == [1], rows
 
         # ⑤ 逐行结果不同：id 1 → 2 笔、id 2 → 1 笔、id 3 → 0 笔。
-        #    注意：标量子查询目前只支持出现在 **WHERE/HAVING** 里，
-        #    放进 SELECT 列表仍不支持（见文件末尾"已知限制"），
-        #    因此这里用 WHERE 逐行判定，而不是把 COUNT 投影出来。
+        #    注意：这里用 WHERE 逐行判定（单表相关子查询路径）；
+        #    投影列表里的标量子查询见文件后面的
+        #    test_projection_scalar_subquery_*，JOIN 查询里的标量子查询见
+        #    文件末尾的 test_join_*_scalar_subquery_*。
         _, rows = e.q("SELECT id FROM users u WHERE (SELECT COUNT(*) FROM "
                       "orders o WHERE o.user_id = u.id) = 2")
         assert [r[0] for r in rows] == [1], rows
@@ -1617,4 +1618,232 @@ def test_scalar_subquery_fold_cache_and_20_rows():
             [i for i in range(10, 30) if i % 2 == 0], rows
         assert elapsed < 2.0, f'20+ 行逐行求值过慢: {elapsed:.3f}s'
         assert len(calls) <= 2, f'折叠缓存失效，子查询被执行 {len(calls)} 次'
+
+
+# ==========================================================================
+# 以下为追加：**JOIN 查询里的标量子查询**（最后一处「标量子查询被拒绝」）
+#
+# 修复前（均显式报错，属功能缺口）：
+#   * WHERE/HAVING 位置 → err「JOIN 查询的 WHERE/HAVING 里暂不支持标量子查询比较」
+#   * 投影位置        → err「JOIN 查询的投影列表里暂不支持标量子查询」
+#
+# 实现方式（后置处理，计划执行器只算连接本身）：
+#   1. 只要 JOIN 查询里有「必须逐连接行求值」的子查询（WHERE 标量比较 /
+#      引用连接表的相关子查询 / HAVING 子查询 / 投影标量子查询），就不再把
+#      整条查询交给计划执行器：先构造一个只含 `FROM + JOIN(ON)` 的计划
+#      （投影成 `*`，列名保留 `u.id` / `o.uid` 限定前缀），拿到连接结果；
+#   2. 结果物化成内存关系（`_CTERelation`），交给 `_select_correlated` 的
+#      逐行路径 —— 与单表相关子查询**完全同一套机制**：
+#      `_eval_outer_where` 逐连接行折叠「外层限定名.列」→ `_fold_and_run`
+#      重新执行折叠后的子查询 → `_scalar_from_rows` 统一收敛
+#      （0 行→NULL/COUNT→0、多行→显式报错、多列→显式报错）；
+#   3. 折叠结果按「折叠用到的外层列取值」缓存（`_fold_cache_key`），
+#      非相关子查询按子查询缓存、整体只算一次；
+#   4. HAVING 的子查询在 `_group_rows` 之后逐分组折叠（分组键作为外层行），
+#      引用不到分组键的列（GROUP BY 之后取不到）→ 显式报错；
+#   5. 反方向：`ON o.uid = u.id`（JOIN 表写在左边）原来会因为连接键解析不到
+#      而静默退化成笛卡尔积（3×3=9 行）→ 现已修正（plan_executor
+#      `_resolve_join_keys`），否则上面所有验收点都建立在错误的行集上。
+#
+# 数据同 _ScalarEnv：users(id, city) = (1,'BJ') (2,'BJ') (3,'SH')；
+#                  orders(id, uid, amt) = (1,1,10) (2,1,20) (3,2,30)。
+# ==========================================================================
+
+JOIN_SQ = "FROM users u JOIN orders o ON o.uid=u.id"
+
+
+def test_join_where_scalar_subquery_filters_rows():
+    """验收①：JOIN 查询的 WHERE 标量子查询逐连接行过滤（原来直接报错）
+
+    uid=1 有 2 笔订单（COUNT>1 成立）→ 该用户的 **2 个连接行**都保留；
+    uid=2 只有 1 笔（不成立）→ 连接行被剔除。
+    **不做去重**：(1,) 出现两次才是 SQL 的正确语义（JOIN 结果本来就是
+    3 行，子查询只做行过滤、不改变行数）；要唯一值必须显式写 DISTINCT，
+    这里用第二条断言把这一点也锁住。
+    """
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT u.id " + JOIN_SQ +
+                      " WHERE (SELECT COUNT(*) FROM orders x "
+                      "WHERE x.uid=u.id) > 1")
+        assert rows == [(1,), (1,)], rows
+        _, rows = e.q("SELECT DISTINCT u.id " + JOIN_SQ +
+                      " WHERE (SELECT COUNT(*) FROM orders x "
+                      "WHERE x.uid=u.id) > 1")
+        assert rows == [(1,)], rows
+
+
+def test_join_projection_scalar_subquery_per_row():
+    """验收②：JOIN 查询投影里的标量子查询——每个连接行带自己的计数"""
+    with _ScalarEnv() as e:
+        cols, rows = e.q(
+            "SELECT u.id, (SELECT COUNT(*) FROM orders x WHERE x.uid=u.id) "
+            "AS cnt " + JOIN_SQ)
+        assert (cols, rows) == (['id', 'cnt'], [(1, 2), (1, 2), (2, 1)])
+
+
+def test_join_having_scalar_subquery_per_group():
+    """验收③：JOIN + GROUP BY 的 HAVING 标量子查询按分组求值
+
+    LEFT JOIN 让 BJ / SH 两个分组都存在；HAVING 里的子查询折叠的是
+    **分组键** u.city：BJ 组 → 该城市用户共 3 笔订单（>0 成立，保留）；
+    SH 组 → 该城市用户没有订单（0 > 0 不成立，剔除）。
+    如果 HAVING 被整体丢掉（原实现）或只按第一个分组求值，都会得到错结果。
+    """
+    with _ScalarEnv() as e:
+        _, rows = e.q(
+            "SELECT u.city, COUNT(*) FROM users u LEFT JOIN orders o "
+            "ON o.uid=u.id GROUP BY u.city "
+            "HAVING (SELECT COUNT(*) FROM orders x JOIN users u2 "
+            "ON x.uid=u2.id WHERE u2.city = u.city) > 0")
+        assert rows == [('BJ', 3)], rows
+
+
+def test_join_having_noncorrelated_scalar_subquery():
+    """验收③b：HAVING 里的**非相关**标量子查询整体只算一次，每个分组同值"""
+    with _ScalarEnv() as e:
+        _, rows = e.q(
+            "SELECT u.city, COUNT(*) FROM users u LEFT JOIN orders o "
+            "ON o.uid=u.id GROUP BY u.city "
+            "HAVING (SELECT COUNT(*) FROM orders) = 3")
+        assert rows == [('BJ', 3), ('SH', 1)], rows
+
+
+def test_join_noncorrelated_scalar_subquery_evaluated_once():
+    """验收④：非相关标量子查询在 JOIN 查询里只算一次 → 全部连接行保留"""
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT u.id " + JOIN_SQ +
+                      " WHERE (SELECT COUNT(*) FROM orders) = 3")
+        assert rows == [(1,), (1,), (2,)], rows
+
+
+def test_join_where_scalar_subquery_multi_row_errors():
+    """验收⑤：JOIN 查询的 WHERE 标量子查询返回多行 → 显式报错（绝不取第一行）"""
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT u.id " + JOIN_SQ +
+                    " WHERE (SELECT x.amt FROM orders x "
+                    "WHERE x.uid=u.id) = 10")
+        assert '多行' in msg and '2 行' in msg, msg
+
+
+def test_join_scalar_subquery_multi_column_errors():
+    """验收⑥：JOIN 查询的标量子查询返回多列 → 显式报错（绝不取第一列）
+
+    WHERE 位置与投影位置都要报（原来一个是「暂不支持」、一个也是「暂不支持」，
+    现在统一走 `_scalar_from_rows` 的多列语义）。
+    """
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT u.id " + JOIN_SQ +
+                    " WHERE (SELECT x.uid, x.amt FROM orders x "
+                    "WHERE x.uid=u.id) = 1")
+        assert '多列' in msg and '2 列' in msg, msg
+
+
+def test_join_projection_scalar_subquery_multi_row_and_column_errors():
+    """验收⑥b：投影位置的同一套行数/列数语义（多行、多列都显式报错）"""
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT u.id, (SELECT x.amt FROM orders x "
+                    "WHERE x.uid=u.id) AS a " + JOIN_SQ)
+        assert '多行' in msg, msg
+        msg = e.err("SELECT u.id, (SELECT x.uid, x.amt FROM orders x "
+                    "WHERE x.uid=u.id) AS a " + JOIN_SQ)
+        assert '多列' in msg, msg
+
+
+def test_join_query_without_subquery_regression():
+    """验收⑦：不含子查询的 JOIN 查询回归（反向 ON / GROUP BY / ORDER BY /
+    DISTINCT / LIMIT+OFFSET / LEFT JOIN 全部保持正确）
+
+    反向 ON（`ON o.uid=u.id`）原来会把连接键解析丢 → 静默笛卡尔积
+    （3×3=9 行），GROUP BY / ORDER BY 全部跟着算错。
+    """
+    with _ScalarEnv() as e:
+        # 连接本身：3 行（不是 9 行）
+        _, rows = e.q("SELECT u.id " + JOIN_SQ)
+        assert rows == [(1,), (1,), (2,)], rows
+        # ORDER BY（限定列名）+ LIMIT + OFFSET
+        _, rows = e.q("SELECT u.id, o.amt " + JOIN_SQ +
+                      " ORDER BY o.amt DESC LIMIT 2 OFFSET 1")
+        assert rows == [(1, 20), (1, 10)], rows
+        # GROUP BY + ORDER BY + LIMIT
+        _, rows = e.q("SELECT u.city, COUNT(*) " + JOIN_SQ +
+                      " GROUP BY u.city ORDER BY u.city DESC LIMIT 1")
+        assert rows == [('BJ', 3)], rows
+        # LEFT JOIN
+        _, rows = e.q("SELECT u.id, o.amt FROM users u LEFT JOIN orders o "
+                      "ON o.uid=u.id ORDER BY u.id")
+        assert rows == [(1, 10), (1, 20), (2, 30), (3, None)], rows
+
+
+def test_join_correlated_exists_row_eval():
+    """附加：JOIN 查询里引用连接表的 EXISTS 子查询也逐连接行求值
+
+    原来计划执行器把子查询一次性执行（忽略外层 u.id），静默返回空集。
+    与标量子查询共用同一套折叠机制。
+    """
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT u.id " + JOIN_SQ +
+                      " WHERE EXISTS (SELECT 1 FROM orders x "
+                      "WHERE x.uid = u.id AND x.amt > 15) ORDER BY u.id")
+        assert rows == [(1,), (1,), (2,)], rows
+
+
+def test_join_having_scalar_subquery_non_group_key_errors():
+    """附加：HAVING 里的相关子查询引用了 GROUP BY 之后取不到的列 → 显式报错
+
+    不能静默保留所有分组（原实现 `_eval_condition` 见到没有左值的 subquery
+    节点直接 return True）。
+    """
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT u.city, COUNT(*) " + JOIN_SQ +
+                    " GROUP BY u.city HAVING (SELECT COUNT(*) FROM orders x "
+                    "WHERE x.uid=u.id) > 0")
+        assert 'GROUP BY' in msg, msg
+
+
+def test_join_scalar_subquery_residual_outer_ref_errors():
+    """附加：外层引用藏在聚合函数里（`MIN(u.id)`）→ 显式报错，绝不静默算错
+
+    `_is_correlated` 只识别「别名.列」的纯列引用，`MIN(u.id)` 这种形态识别
+    不到，会被当成非相关子查询一次性执行（内层解析不到该列 → 0 行 →
+    COUNT=0 → HAVING 判定为假），属于静默错答；这里显式报错。
+    """
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT u.city, COUNT(*) " + JOIN_SQ +
+                    " GROUP BY u.city HAVING (SELECT COUNT(*) FROM orders x "
+                    "WHERE x.uid=MIN(u.id)) > 0")
+        assert '无法安全折叠' in msg, msg
+
+
+def test_join_select_star_with_scalar_subquery():
+    """附加：`SELECT *` + WHERE 标量子查询（后置路径同样只给 3 个连接行）"""
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT * " + JOIN_SQ +
+                      " WHERE (SELECT COUNT(*) FROM orders) = 3")
+        assert len(rows) == 3, rows
+
+
+def test_join_ambiguous_bare_column_errors():
+    """附加：连接结果里的裸列名有歧义（`u.id` / `o.id` 并存）→ 显式报错
+
+    绝不能任取一侧，也不能静默把条件判成假（结果集会变成空集，用户分不清
+    「没有匹配行」与「列名有歧义」）。
+    """
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT u.city " + JOIN_SQ +
+                    " WHERE id = 1 AND (SELECT COUNT(*) FROM orders) = 3")
+        assert '歧义' in msg, msg
+
+
+def test_join_having_without_group_by_parses():
+    """附加：JOIN 查询的 HAVING（没有 GROUP BY）必须能解析
+
+    原来解析器切分 ON 子句时不认识 HAVING，`... JOIN o ON a.x=b.y HAVING ...`
+    会把 `HAVING ...` 整段当成 ON 条件 → SyntaxError（同一条查询不带 JOIN
+    时可以解析）。HAVING 里的标量子查询与 GROUP BY 形态走同一套逐分组求值。
+    """
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT COUNT(*) FROM users u JOIN orders o "
+                      "ON u.id=o.uid "
+                      "HAVING (SELECT COUNT(*) FROM orders) = 3")
+        assert rows == [(3,)], rows
 
