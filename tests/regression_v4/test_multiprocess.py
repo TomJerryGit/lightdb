@@ -10,6 +10,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 
+# 沙箱能力探测：多进程原语被禁用时 skip 而不是误报失败
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+import conftest as _conftest  # noqa: E402
+
 
 def _fake_worker_sleep(worker_id, config, shared_state):
     """测试用 Worker（必须模块级，spawn 无法 pickle 嵌套函数）"""
@@ -39,6 +44,9 @@ def test_worker_pool_restart():
     """测试：Worker 崩溃自动重启"""
     print("\n【Worker 池重启】")
     from lightdb.concurrency.multiprocess import WorkerPool
+
+    # 该用例起真实子进程，先探测环境能力（探测失败即 skip）
+    _conftest.require_mp_primitives()
 
     pool = WorkerPool(
         worker_func=_fake_worker_sleep,
@@ -73,6 +81,9 @@ def test_shared_counter():
     print("\n【共享计数器】")
     from lightdb.concurrency.shared_memory import (
         SharedMemoryManager, SharedCounter)
+
+    # 该用例跨 4 个子进程累加共享计数器，先探测环境能力
+    _conftest.require_mp_primitives()
 
     mgr = SharedMemoryManager(namespace='regtest')
     shm = mgr.create('counter', 1024)
@@ -148,6 +159,9 @@ def test_reuseport_multiple():
 def test_multiprocess_parallelism():
     """测试：多进程并行效率"""
     print("\n【多进程并行】")
+
+    # 该用例用 mp.Pool，先探测环境能力（探测失败即 skip）
+    _conftest.require_mp_primitives()
 
     # 4 进程 vs 串行
     t0 = time.perf_counter()

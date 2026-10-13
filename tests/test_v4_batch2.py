@@ -10,6 +10,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+# 沙箱能力探测：多进程原语（Queue/Pipe/Process/Pool）被禁用时 skip 而不是误报失败
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import conftest as _conftest  # noqa: E402
+
 
 def _cpu_work(n):
     """CPU 密集负载（必须模块级，spawn 下 mp.Pool.map 需要 pickle 它）"""
@@ -101,6 +105,9 @@ def test_shared_memory():
     from lightdb.concurrency.shared_memory import (
         SharedMemoryManager, SharedCounter, SharedLock)
 
+    # 该用例跨进程 + 共享内存，先探测环境能力（探测失败即 skip）
+    _conftest.require_mp_primitives()
+
     mgr = SharedMemoryManager(namespace='test')
 
     # 创建
@@ -143,6 +150,9 @@ def test_worker_pool():
     print("\n【测试4】Worker 池")
     from lightdb.concurrency.multiprocess import WorkerPool
 
+    # 该用例起真实子进程，先探测环境能力（探测失败即 skip）
+    _conftest.require_mp_primitives()
+
     # 注意：Windows 用 spawn 启动子进程，target 必须是模块级函数，
     # 局部的嵌套函数无法被 pickle（见文件顶部 _fake_worker_for_pool）
     pool = WorkerPool(
@@ -168,6 +178,9 @@ def test_shared_buffer_pool():
     """测试5: 共享 Buffer Pool"""
     print("\n【测试5】共享 Buffer Pool")
     from lightdb.cluster.shared_buffer import SharedBufferPool
+
+    # 该用例建立在共享内存段 + 进程间原语之上，先探测环境能力
+    _conftest.require_mp_primitives()
 
     pool = SharedBufferPool(
         name='test_bp', slot_count=100, create=True)
@@ -252,6 +265,9 @@ def test_stats_hub():
     print("\n【测试8】统计中心")
     from lightdb.cluster.stats_hub import StatsHub
 
+    # StatsHub 用 SharedMemoryManager + 进程间原语，先探测环境能力
+    _conftest.require_mp_primitives()
+
     hub = StatsHub(name='test_stats', worker_count=4,
                     create=True)
 
@@ -276,6 +292,9 @@ def test_multi_process_parallelism():
     print("\n【测试9】多进程真并行")
     import multiprocessing as mp
     import time
+
+    # 该用例用 mp.Pool，先探测环境能力（探测失败即 skip）
+    _conftest.require_mp_primitives()
 
     # 单进程跑 4 次
     t0 = time.perf_counter()

@@ -8,6 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+# 沙箱能力探测：多进程原语被禁用时 skip 而不是误报失败
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import conftest as _conftest  # noqa: E402
+
 
 def test_cprofile_analyzer():
     """测试1: cProfile 分析器"""
@@ -99,6 +103,10 @@ def test_gil_analyzer():
     print("\n【测试3】GIL 分析")
     from lightdb.profiling.gil_analyzer import GILAnalyzer
 
+    # 该用例的「进程效率」分支要起多进程，先探测环境能力（失败即 skip）；
+    # 剩下的 GIL 线程判定断言在探测通过后照原样执行
+    _conftest.require_mp_primitives()
+
     analyzer = GILAnalyzer()
 
     # 短时间快速测试
@@ -127,6 +135,9 @@ def test_multiprocess_experiment():
     print("\n【测试4】多进程实验")
     from lightdb.experiments.multiprocess_test import (
         MultiprocessExperiment)
+
+    # 该用例对比多进程/多线程并测 IPC，先探测环境能力（失败即 skip）
+    _conftest.require_mp_primitives()
 
     exp = MultiprocessExperiment()
 

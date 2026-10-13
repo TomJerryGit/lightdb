@@ -7,6 +7,10 @@ import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+# 沙箱能力探测：线程池/工作窃取类并行用例需要能新建线程
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import conftest as _conftest  # noqa: E402
+
 
 def test_fragment_splitter():
     """测试1: 分片器"""
@@ -155,6 +159,9 @@ def test_parallel_scan():
     from lightdb.columnar.column_store import ColumnStore
     from lightdb.parallel.executor import ParallelExecutor
 
+    # ParallelExecutor 依赖线程池，先探测环境能否新建线程（失败即 skip）
+    _conftest.require_thread_stacks()
+
     with tempfile.TemporaryDirectory() as tmp:
         cols = [
             {'name': 'id', 'type': 'INT'},
@@ -198,6 +205,9 @@ def test_parallel_aggregate():
     from lightdb.columnar.column_store import ColumnStore
     from lightdb.parallel.executor import ParallelExecutor
 
+    # 依赖线程池，先探测环境能否新建线程（失败即 skip）
+    _conftest.require_thread_stacks()
+
     with tempfile.TemporaryDirectory() as tmp:
         cols = [{'name': 'amount', 'type': 'INT'}]
         store = ColumnStore('t', cols, tmp)
@@ -238,6 +248,9 @@ def test_parallel_group_by():
     print("\n【测试7】并行分组")
     from lightdb.columnar.column_store import ColumnStore
     from lightdb.parallel.executor import ParallelExecutor
+
+    # 依赖线程池，先探测环境能否新建线程（失败即 skip）
+    _conftest.require_thread_stacks()
 
     with tempfile.TemporaryDirectory() as tmp:
         cols = [
@@ -320,6 +333,9 @@ def test_full_parallel_olap():
     from lightdb.columnar.column_store import ColumnStore
     from lightdb.olap.parallel_olap import ParallelOLAP
 
+    # 依赖线程池，先探测环境能否新建线程（失败即 skip）
+    _conftest.require_thread_stacks()
+
     with tempfile.TemporaryDirectory() as tmp:
         cols = [
             {'name': 'user_id', 'type': 'INT'},
@@ -373,6 +389,9 @@ def test_parallel_speedup():
     print("\n【测试10】并行加速比对比")
     from lightdb.columnar.column_store import ColumnStore
     from lightdb.parallel.executor import ParallelExecutor
+
+    # 依赖线程池，先探测环境能否新建线程（失败即 skip）
+    _conftest.require_thread_stacks()
 
     with tempfile.TemporaryDirectory() as tmp:
         cols = [{'name': 'value', 'type': 'INT'}]
