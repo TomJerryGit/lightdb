@@ -10,6 +10,7 @@
 - v4.0.1: CBO 参数可配置
 """
 import re
+from .parser import normalize_order_by
 from .plan import (
     SeqScan, IndexScan, Filter, Project, Sort, Limit,
     Aggregate, Explain, PlanNode,
@@ -155,10 +156,16 @@ class Optimizer:
             node = Distinct(node)
 
         # ---------- ORDER BY ----------
+        # 多键：`Sort` 节点仍按第一个键构造（`column` / `desc` 保持不变，
+        # EXPLAIN 输出与既有单键代码路径都不受影响），整串键挂在 `keys`
+        # 附加属性上，由 `plan_executor._exec_Sort` 逐键独立排序（稳定排序
+        # 从后往前做），方向逐键独立。
         if order_by:
-            col = order_by[0]
-            desc = bool(order_by[1]) if len(order_by) > 1 else False
-            node = Sort(node, col, desc)
+            order_keys = normalize_order_by(order_by)
+            if order_keys:
+                col, desc = order_keys[0]
+                node = Sort(node, col, desc)
+                node.keys = order_keys
 
         # ---------- LIMIT / OFFSET ----------
         # LIMIT 之前必须已经排好序（Sort 在上一步），OFFSET 也在这里裁剪，

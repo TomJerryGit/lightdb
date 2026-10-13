@@ -636,46 +636,84 @@ class PlanExecutor:
         return short_cols, out_rows
 
     def _exec_Sort(self, node):
+        """ORDER BY：**任意个键**、逐键独立 ASC/DESC
+
+        Sort 在计划里位于 Project / GroupBy **之上**，因此这里的 `cols` 是
+        投影之后的名字（`u.city` 被压成 `city`、聚合表达式压成 `COUNT(*)`
+        或 `AS 别名`）。逐键解析顺序：
+
+        ① 列序号（`ORDER BY 2`）→ 输出列下标；
+        ② 精确 / 末段 / `AS 别名` 匹配的列名（`_resolve_col` → `_resolve_loose`）；
+        ③ 标量表达式（`LENGTH(name)`、`o.amt * 2`）→ 逐行求值。
+
+        NULL 定义：**NULL 视为最大值** —— 升序排最后、降序排最前，逐键一致。
+        多键用「从最后一个键往前逐个稳定排序」实现字典序。
+
+        任何键都解析不到时**显式报错**（报出第几个键）：原实现是
+        `except: ValueError` 后**静默不排序**，`ORDER BY o.amt DESC` 会因为
+        Project 把 `o.amt` 压成 `amt` 而解析失败 → 返回一份顺序错误的结果。
+        """
         cols, rows = self.execute(node.children[0])
-        try:
-            ci = self._resolve_col(cols, node.column)
-        except ValueError:
-            # Sort 位于 Project **之上**，此时列名已被压成短名（`o.amt` 变成
-            # `amt`），而 ORDER BY 里通常还写着限定名。`_resolve_col` 的
-            # 后缀匹配方向是「cols 里的名字以 .name 结尾」，正好反了，于是
-            # `JOIN ... ORDER BY o.amt` 解析失败 → **静默不排序**（实测
-            # 反向 ON 修复后 `ORDER BY o.amt DESC LIMIT 2` 仍返回
-            # [(1,10),(1,20)]）。这里按「列名末段 / AS 别名」再解析一次。
-            ci = self._resolve_loose(cols, node.column)
-        if ci is not None:
-            rows = sorted(
-                rows,
-                key=lambda r: (r[ci] is None, r[ci] if r[ci] is not None else 0),
-                reverse=node.desc,
-            )
-            return cols, rows
-        # ORDER BY 是**表达式**（`ORDER BY LENGTH(name) DESC`）：按行算出排序键。
-        # 原行为是「解析不到就静默不排序」——`ORDER BY LENGTH(u.name) DESC`
-        # 返回的还是未排序结果，属于静默错答；这里算出排序键真正排序。
-        # 只用**非纯列名**的形态触发（`LENGTH(x)`、`x * 2`）：纯列名解析不到
-        # 时保持既有的「不排序」行为，避免影响 `IN (SELECT ... ORDER BY
-        # 未投影列)` 这类既有可用形态。
-        from .parser import parse_scalar_expr
-        snode = parse_scalar_expr(self._strip_select_alias(str(node.column)))
-        if snode is not None and snode.get('kind') != 'col':
+        keys = getattr(node, 'keys', None) or [(node.column, node.desc)]
+        specs = []
+        for pos, item in enumerate(keys):
+            text, desc = (item if isinstance(item, (list, tuple))
+                          else (item, getattr(node, 'desc', False)))
+            t = str(text).strip()
+            if re.match(r'^\d+$', t):
+                k = int(t)
+                if k < 1 or k > len(cols):
+                    raise ValueError(
+                        f"ORDER BY 第 {pos + 1} 个排序键是列序号 {k}，"
+                        f"超出输出列范围（1..{len(cols)}）")
+                specs.append(('idx', k - 1, bool(desc)))
+                continue
+            try:
+                ci = self._resolve_col(cols, t)
+            except ValueError:
+                # Sort 位于 Project **之上**，此时列名已被压成短名
+                # （`o.amt` 变成 `amt`），而 ORDER BY 里通常还写着限定名。
+                # `_resolve_col` 的后缀匹配方向是「cols 里的名字以 .name
+                # 结尾」，正好反了，于是 `JOIN ... ORDER BY o.amt` 解析失败
+                # → 曾**静默不排序**（实测 `ORDER BY o.amt DESC LIMIT 2` 仍
+                # 返回 [(1,10),(1,20)]）。这里按「列名末段 / AS 别名」再解析。
+                ci = self._resolve_loose(cols, t)
+            if ci is not None:
+                specs.append(('idx', ci, bool(desc)))
+                continue
+            # ORDER BY 是**表达式**（`ORDER BY LENGTH(name) DESC`）：按行算出
+            # 排序键。原行为是「解析不到就静默不排序」—— 静默错答。
+            from .parser import parse_scalar_expr
+            snode = parse_scalar_expr(self._strip_select_alias(t))
+            if snode is None or snode.get('kind') == 'col':
+                raise ValueError(
+                    f"ORDER BY 第 {pos + 1} 个排序键 '{t}' 无法解析："
+                    f"它既不是输出列名 / 投影别名 / 列序号，也不是可求值的"
+                    f"标量表达式（该键不会被静默忽略）")
             self._check_expr_functions(snode, 'ORDER BY')
-            keys = [self._eval_expr_in_row(
-                snode, cols, r, self._row_agg_values(cols, r), 'ORDER BY')
-                for r in rows]
-            order = sorted(
-                range(len(rows)),
-                key=lambda i: (keys[i] is None, keys[i]),
-                reverse=bool(node.desc))
-            rows = [rows[i] for i in order]
-        # 仍解析不到（例如 ORDER BY 引用没有出现在投影里的列）时保持既有行为：
-        # 不排序。已知限制，本次不改（改成报错会影响 `IN (SELECT ... ORDER BY
-        # 未投影列)` 这类既有可用形态）。
-        return cols, rows
+            specs.append(('expr', snode, bool(desc)))
+
+        if not specs:
+            return cols, rows
+
+        # 先算出每个键在每一行上的取值（'expr' 键逐行求值）
+        values = []
+        for kind, spec, desc in specs:
+            if kind == 'idx':
+                vals = [r[spec] if spec < len(r) else None for r in rows]
+            else:
+                vals = [self._eval_expr_in_row(
+                    spec, cols, r, self._row_agg_values(cols, r), 'ORDER BY')
+                    for r in rows]
+            values.append((vals, desc))
+
+        # 从最后一个键往前逐个稳定排序 → 字典序多键 + 逐键方向；
+        # `(值 is None, 值)` 把 NULL 当最大值（ASC 排最后、DESC 排最前）。
+        idx = list(range(len(rows)))
+        for vals, desc in reversed(values):
+            idx.sort(key=lambda i, v=vals: (v[i] is None, v[i]),
+                     reverse=desc)
+        return cols, [rows[i] for i in idx]
 
     def _exec_Limit(self, node):
         cols, rows = self.execute(node.children[0])

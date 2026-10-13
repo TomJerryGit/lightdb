@@ -2718,4 +2718,354 @@ def test_from_subquery_join_still_explicit_error():
         assert 'FROM 子查询暂不支持再 JOIN' in str(r.get('message')), r
 
 
+# ==========================================================================
+# 多键 ORDER BY（静默错答修复）
+#
+# 原来 `parsed['order_by']` 是**单个** `(列, desc)` 元组，`ORDER BY a, b`
+# 只保留第一个键 —— 第二键及之后被静默丢弃（结果看起来"有序"但排序规则
+# 是错的）。现在 parser 产出 `[(键文本, desc), ...]` 列表，执行器的统一
+# 排序路径 `_finish_select` 与计划路径 `_exec_Sort` 都按**从最后一个键
+# 往前逐个稳定排序**实现字典序多键排序，方向（ASC/DESC）逐键独立。
+#
+# 键的形态：普通列 / 限定列（`u.city`）/ 投影别名（`ORDER BY tot`）/
+# 标量表达式（`LENGTH(name)`、`salary * 2`）/ 聚合表达式 / 列序号
+# （`ORDER BY 2`，1 基）；**任何解析不到的键都显式报错**（报出第几个键），
+# 绝不静默丢弃。
+#
+# NULL 定义：**NULL 视为最大值**（与 PostgreSQL 默认一致）——ASC 排最后、
+# DESC 排最前，逐键一致、可预测。`NULLS FIRST/LAST` 语法仍不支持
+# （键文本会带进去 → 显式报错，不会当成列名静默排序）。
+# ==========================================================================
+
+
+def test_order_by_multi_key_lexicographic():
+    """验收 1 / 2 / 6：两键、隐式 ASC、三键都逐键生效
+
+    原实现 `ORDER BY dept ASC, salary DESC` 只按 dept 排（同部门内保持
+    插入顺序），第二键 salary DESC 被静默丢弃。
+    """
+    with _Env() as e:
+        # ① dept ASC, salary DESC
+        _, rows = e.q("SELECT name, dept, salary FROM emp "
+                      "ORDER BY dept ASC, salary DESC")
+        assert rows == [
+            ('Alice', 'Eng', 120), ('Bob', 'Eng', 100),
+            ('Carol', 'Eng', 100),
+            ('Frank', 'HR', 95), ('Grace', 'HR', 95), ('Henry', 'HR', 85),
+            ('Dave', 'Sales', 110), ('Eve', 'Sales', 90),
+        ], rows
+
+        # ② 隐式 ASC：dept 升序，同部门内 salary 升序
+        _, rows = e.q("SELECT name FROM emp ORDER BY dept, salary")
+        assert rows == [('Bob',), ('Carol',), ('Alice',),
+                        ('Henry',), ('Frank',), ('Grace',),
+                        ('Eve',), ('Dave',)], rows
+
+        # ③ 三键：dept ASC, salary DESC, name ASC
+        _, rows = e.q("SELECT name, dept, salary FROM emp "
+                      "ORDER BY dept ASC, salary DESC, name ASC")
+        assert rows == [
+            ('Alice', 'Eng', 120), ('Bob', 'Eng', 100),
+            ('Carol', 'Eng', 100),
+            ('Frank', 'HR', 95), ('Grace', 'HR', 95), ('Henry', 'HR', 85),
+            ('Dave', 'Sales', 110), ('Eve', 'Sales', 90),
+        ], rows
+
+        # ④ 第三键真的起作用：把第三键换成 name DESC，95/95 与 100/100
+        #    这两组同值行的顺序必须翻过来（否则说明第三键被丢弃）
+        _, rows = e.q("SELECT name, dept, salary FROM emp "
+                      "ORDER BY dept ASC, salary DESC, name DESC")
+        assert rows == [
+            ('Alice', 'Eng', 120), ('Carol', 'Eng', 100),
+            ('Bob', 'Eng', 100),
+            ('Grace', 'HR', 95), ('Frank', 'HR', 95), ('Henry', 'HR', 85),
+            ('Dave', 'Sales', 110), ('Eve', 'Sales', 90),
+        ], rows
+
+
+def test_order_by_direction_per_key_independent():
+    """验收 7：方向**逐键独立** —— 同一组数据两个方向对照
+
+    `dept ASC, salary ASC` 与 `dept ASC, salary DESC` 的分组顺序完全一致
+    （第一键都是 ASC），但每个分组内 salary 的序列正好相反。
+    """
+    with _Env() as e:
+        _, asc = e.q("SELECT name, dept, salary FROM emp "
+                     "ORDER BY dept ASC, salary ASC")
+        _, desc = e.q("SELECT name, dept, salary FROM emp "
+                      "ORDER BY dept ASC, salary DESC")
+        # 分组顺序由第一键（ASC）决定，两者必须一致
+        assert [r[1] for r in asc] == ['Eng'] * 3 + ['HR'] * 3 + ['Sales'] * 2
+        assert [r[1] for r in desc] == [r[1] for r in asc]
+        # Eng 组内序列对照：ASC = Bob, Carol, Alice；DESC = Alice, Bob, Carol
+        eng_asc = [(r[0], r[2]) for r in asc if r[1] == 'Eng']
+        eng_desc = [(r[0], r[2]) for r in desc if r[1] == 'Eng']
+        assert eng_asc == [('Bob', 100), ('Carol', 100), ('Alice', 120)]
+        assert eng_desc == [('Alice', 120), ('Bob', 100), ('Carol', 100)]
+        # 去掉并列（同 salary 的两行）后，两个方向的 salary 序列必须整体相反
+        for grp in ('Eng', 'HR', 'Sales'):
+            s_asc = [r[2] for r in asc if r[1] == grp]
+            s_desc = [r[2] for r in desc if r[1] == grp]
+            assert s_asc == list(reversed(s_desc)), (grp, s_asc, s_desc)
+
+        # 混合方向（第一键 DESC、第二键 ASC）：组内同 salary 时按名字升序
+        _, rows = e.q("SELECT name, dept, salary FROM emp "
+                      "ORDER BY dept DESC, salary ASC, name ASC")
+        assert [r[1] for r in rows] == ['Sales'] * 2 + ['HR'] * 3 + ['Eng'] * 3
+        assert [(r[0], r[2]) for r in rows if r[1] == 'HR'] == \
+            [('Henry', 85), ('Frank', 95), ('Grace', 95)], rows
+
+
+def test_order_by_expression_and_arithmetic_multi_key():
+    """验收 3：表达式键（`LENGTH(name)`）与普通键混排
+
+    原来 `ORDER BY LENGTH(name) DESC, name ASC` 只按 `LENGTH(name)` 排，
+    同长度的行顺序不确定（插入顺序）。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT name FROM emp "
+                      "ORDER BY LENGTH(name) DESC, name ASC")
+        assert rows == [('Alice',), ('Carol',), ('Frank',), ('Grace',),
+                        ('Henry',), ('Dave',), ('Bob',), ('Eve',)], rows
+
+        # 算术表达式 + 普通列：salary*2 DESC 等价 salary DESC，同值时 name ASC
+        _, rows = e.q("SELECT name, salary FROM emp "
+                      "ORDER BY salary * 2 DESC, name ASC")
+        assert rows == [('Alice', 120), ('Dave', 110), ('Bob', 100),
+                        ('Carol', 100), ('Frank', 95), ('Grace', 95),
+                        ('Eve', 90), ('Henry', 85)], rows
+
+        # 表达式键 + LIMIT/OFFSET 一起用：排序必须在裁剪之前生效
+        _, rows = e.q("SELECT name FROM emp "
+                      "ORDER BY LENGTH(name) ASC, name DESC LIMIT 2 OFFSET 1")
+        # LENGTH 升序：Bob/Eve(3) → Dave(4) → 5 个字母的一批；
+        # 长度为 3 的并列按 name DESC → Eve, Bob，OFFSET 1 跳过 Eve
+        assert rows == [('Bob',), ('Dave',)], rows
+
+
+def test_order_by_group_by_alias_and_aggregate_multi_key():
+    """验收 4：GROUP BY + 聚合别名 / 聚合表达式作为排序键"""
+    with _Env() as e:
+        # 聚合别名 tot 作为第一键，分组键作为第二键
+        _, rows = e.q("SELECT dept, SUM(salary) AS tot FROM emp "
+                      "GROUP BY dept ORDER BY tot DESC, dept ASC")
+        assert rows == [('Eng', 320), ('HR', 275), ('Sales', 200)], rows
+
+        # 别名同值（3/3/2）时第二键 dept ASC 决定顺序：Eng 在 HR 之前
+        _, rows = e.q("SELECT dept AS d, COUNT(*) AS n FROM emp "
+                      "GROUP BY dept ORDER BY n DESC, d ASC")
+        assert rows == [('Eng', 3), ('HR', 3), ('Sales', 2)], rows
+        # 第二键换成 DESC 必须整体反向（证明第二键真的生效）
+        _, rows = e.q("SELECT dept AS d, COUNT(*) AS n FROM emp "
+                      "GROUP BY dept ORDER BY n DESC, d DESC")
+        assert rows == [('HR', 3), ('Eng', 3), ('Sales', 2)], rows
+
+        # 没有别名、直接写聚合表达式作为排序键
+        _, rows = e.q("SELECT dept FROM emp GROUP BY dept "
+                      "ORDER BY SUM(salary) DESC, dept ASC")
+        assert rows == [('Eng',), ('HR',), ('Sales',)], rows
+
+
+def test_order_by_join_plan_and_materialized_path():
+    """验收 5：JOIN 查询的多键排序（计划路径 + 物化连接路径）
+
+    * `u.city` / `o.amt` 都在投影里 → 计划执行器 `_exec_Sort` 多键排序；
+    * 排序键引用**未投影**的列（`SELECT u.id ... ORDER BY o.amt`）→
+      计划路径解析不到（原来静默不排序），改走「先物化连接再由
+      `_finish_select` 统一排序」的路径，结果必须正确；
+    * 未知键 → 显式报错。
+    """
+    with _ScalarEnv() as e:      # users(id, city) / orders(id, uid, amt)
+        _, rows = e.q("SELECT u.city, o.amt FROM users u "
+                      "JOIN orders o ON o.uid=u.id "
+                      "ORDER BY u.city ASC, o.amt DESC")
+        assert rows == [('BJ', 30), ('BJ', 20), ('BJ', 10)], rows
+        # 第二键方向独立
+        _, rows = e.q("SELECT u.city, o.amt FROM users u "
+                      "JOIN orders o ON o.uid=u.id "
+                      "ORDER BY u.city ASC, o.amt ASC")
+        assert rows == [('BJ', 10), ('BJ', 20), ('BJ', 30)], rows
+        # 排序键引用未投影列：原实现静默不排序 → [(1,10),(1,20),(2,30)]
+        _, rows = e.q("SELECT u.id FROM users u "
+                      "JOIN orders o ON o.uid=u.id "
+                      "ORDER BY o.amt DESC, u.id ASC")
+        assert rows == [(2,), (1,), (1,)], rows
+        # JOIN + 表达式排序键
+        _, rows = e.q("SELECT u.city, o.amt FROM users u "
+                      "JOIN orders o ON o.uid=u.id "
+                      "ORDER BY LENGTH(u.city) DESC, o.amt ASC")
+        assert rows == [('BJ', 10), ('BJ', 20), ('BJ', 30)], rows
+        # JOIN + 未知键：显式报错
+        msg = e.err("SELECT u.id FROM users u JOIN orders o ON o.uid=u.id "
+                    "ORDER BY nosuchcol")
+        assert '第 1 个排序键' in msg and 'nosuchcol' in msg, msg
+
+    with _Env() as e:            # users(id, name, city) / orders(id, user_id, amount)
+        _, rows = e.q("SELECT u.city, o.amount FROM users u "
+                      "JOIN orders o ON o.user_id=u.id "
+                      "ORDER BY u.city ASC, o.amount DESC")
+        assert rows == [('BJ', 30), ('BJ', 20), ('BJ', 10)], rows
+        # JOIN + ORDER BY + LIMIT/OFFSET：排序先于裁剪
+        _, rows = e.q("SELECT u.city, o.amount FROM users u "
+                      "JOIN orders o ON o.user_id=u.id "
+                      "ORDER BY o.amount DESC, u.city ASC LIMIT 2 OFFSET 1")
+        assert rows == [('BJ', 20), ('BJ', 10)], rows
+
+
+def test_order_by_ordinal_and_projection_alias():
+    """序号（1 基）与投影别名都能作为排序键
+
+    `ORDER BY 2` 原来会被解析成 `{'column': '2'}` 交给存储层（静默不排序），
+    现在按输出列序号解析；越界时显式报错。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT dept, salary FROM emp "
+                      "ORDER BY 2 DESC, 1 ASC LIMIT 4")
+        assert rows == [('Eng', 120), ('Sales', 110),
+                        ('Eng', 100), ('Eng', 100)], rows
+        # 序号与别名混用（别名 salary2 指向 salary）
+        _, rows = e.q("SELECT name, salary AS salary2 FROM emp "
+                      "ORDER BY salary2 ASC, 1 ASC LIMIT 2")
+        assert rows == [('Henry', 85), ('Eve', 90)], rows
+        # 序号越界 → 显式报错
+        msg = _assert_err(e, "SELECT name, salary FROM emp ORDER BY 3")
+        assert '序号' in msg and '3' in msg, msg
+
+
+def test_order_by_unresolvable_key_explicit_error():
+    """验收 8：解析不到的排序键 → 显式报错（第几个键 + 原因）
+
+    原行为是「解析不到就静默不排序」：`ORDER BY nosuchcol` 返回未排序结果，
+    `SELECT name FROM emp ORDER BY salary`（salary 没被投影）同样静默不排序。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT name FROM emp ORDER BY nosuchcol")
+        assert '第 1 个排序键' in msg and 'nosuchcol' in msg, msg
+        assert 'ORDER BY' in msg, msg
+
+        msg = _assert_err(e, "SELECT name FROM emp ORDER BY 1 = 1")
+        assert '第 1 个排序键' in msg and '1 = 1' in msg, msg
+
+        # 坏在第二个键上 → 必须指出"第 2 个"
+        msg = _assert_err(e, "SELECT name FROM emp "
+                             "ORDER BY salary DESC, nosuchcol")
+        assert '第 2 个排序键' in msg and 'nosuchcol' in msg, msg
+
+        # 未投影的别名（cnt 既不是输出列也不是表列）
+        msg = _assert_err(e, "SELECT dept, SUM(salary) AS tot FROM emp "
+                             "GROUP BY dept ORDER BY tot DESC, cnt ASC")
+        assert '第 2 个排序键' in msg and 'cnt' in msg, msg
+
+        # 不支持的形态也不能被当成列名静默排序
+        msg = _assert_err(e, "SELECT name FROM emp ORDER BY salary NULLS LAST")
+        assert '第 1 个排序键' in msg and 'NULLS LAST' in msg, msg
+
+        # `SELECT *` 的未知列同样必须报错（存储层 out_cols 是表列；
+        # 原来 `except: pass` 会静默返回未排序结果）
+        msg = _assert_err(e, "SELECT * FROM emp ORDER BY nosuchcol")
+        assert '第 1 个排序键' in msg and 'nosuchcol' in msg, msg
+
+
+def test_order_by_uncorrelated_subquery_and_cte_multi_key():
+    """CTE / FROM 子查询 / 带子查询的查询里多键排序同样生效"""
+    with _Env() as e:
+        _, rows = e.q("WITH t AS (SELECT name, dept, salary FROM emp) "
+                      "SELECT name, dept FROM t "
+                      "ORDER BY dept ASC, salary DESC, name ASC")
+        assert rows == [('Alice', 'Eng'), ('Bob', 'Eng'), ('Carol', 'Eng'),
+                        ('Frank', 'HR'), ('Grace', 'HR'), ('Henry', 'HR'),
+                        ('Dave', 'Sales'), ('Eve', 'Sales')], rows
+
+        _, rows = e.q("SELECT d, s FROM (SELECT dept AS d, salary AS s "
+                      "FROM emp) x ORDER BY d ASC, s DESC")
+        assert rows == [('Eng', 120), ('Eng', 100), ('Eng', 100),
+                        ('HR', 95), ('HR', 95), ('HR', 85),
+                        ('Sales', 110), ('Sales', 90)], rows
+
+        _, rows = e.q("SELECT name, dept FROM emp WHERE id IN "
+                      "(SELECT id FROM emp WHERE salary >= 95) "
+                      "ORDER BY dept ASC, name DESC")
+        assert rows == [('Carol', 'Eng'), ('Bob', 'Eng'), ('Alice', 'Eng'),
+                        ('Grace', 'HR'), ('Frank', 'HR'),
+                        ('Dave', 'Sales')], rows
+
+
+def test_order_by_distinct_multi_key_keeps_sort_values_aligned():
+    """DISTINCT + 多键 ORDER BY：去重后排序键值必须跟着行一起重排
+
+    旧实现在 DISTINCT 之后按「源行下标」对齐的表达式排序值会整体错位
+    （长度不等时直接回退到按列名查找，查不到就静默不排序）。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT DISTINCT salary FROM emp "
+                      "ORDER BY salary DESC LIMIT 3 OFFSET 2")
+        assert rows == [(100,), (95,), (90,)], rows
+        _, rows = e.q("SELECT DISTINCT dept FROM emp "
+                      "ORDER BY LENGTH(dept) DESC, dept ASC")
+        # LENGTH: Sales(5) > Eng(3) > HR(2)
+        assert rows == [('Sales',), ('Eng',), ('HR',)], rows
+
+
+def test_order_by_multi_key_null_is_largest():
+    """NULL 排序定义：**NULL 视为最大值**（ASC 最后、DESC 最前），逐键一致"""
+    with _Env() as e:
+        e.ex.execute_sql("INSERT INTO emp VALUES (9,'Ivy','Eng',NULL)", {})
+        _, rows = e.q("SELECT name, salary FROM emp "
+                      "ORDER BY salary ASC, name ASC")
+        assert rows[-1] == ('Ivy', None), rows
+        _, rows = e.q("SELECT name, salary FROM emp "
+                      "ORDER BY salary DESC, name ASC")
+        assert rows[0] == ('Ivy', None), rows
+
+        # 多键时 NULL 只在**它所属的键**上体现：Eng 组内 salary 升序，
+        # Ivy 的 NULL 排在该组最后（但仍在 HR/Sales 之前，因为 dept 键优先）
+        _, rows = e.q("SELECT name, dept, salary FROM emp "
+                      "ORDER BY dept ASC, salary ASC, name ASC")
+        assert [r[0] for r in rows if r[1] == 'Eng'] == \
+            ['Bob', 'Carol', 'Alice', 'Ivy'], rows
+        assert [r[1] for r in rows] == ['Eng'] * 4 + ['HR'] * 3 + ['Sales'] * 2
+
+
+def test_order_by_single_key_and_window_regression():
+    """验收 9：单键 ORDER BY + LIMIT/OFFSET 与窗口内 OVER (ORDER BY ...) 不回归
+
+    窗口的 `OVER (ORDER BY ...)` 是**另一套逻辑**（`_compute_window`），
+    本次只改顶层 ORDER BY 的解析与排序，窗口结果必须逐字节不变。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT name FROM emp "
+                      "ORDER BY salary DESC LIMIT 3 OFFSET 2")
+        assert rows == [('Bob',), ('Carol',), ('Frank',)], rows
+        _, rows = e.q("SELECT name, salary FROM emp "
+                      "ORDER BY salary DESC LIMIT 1, 2")
+        assert rows == [('Dave', 110), ('Bob', 100)], rows
+        _, rows = e.q("SELECT name, salary FROM emp "
+                      "ORDER BY salary DESC LIMIT 2 OFFSET 6")
+        assert rows == [('Eve', 90), ('Henry', 85)], rows
+
+        # 窗口：窗口内部排序键原样（单键）。这里不写顶层 ORDER BY，
+        # 行的物理顺序就是插入顺序，因此按 rn 排序后再比对。
+        _, rows = e.q("SELECT name, ROW_NUMBER() OVER (ORDER BY salary DESC) "
+                      "AS rn FROM emp")
+        assert sorted((r[1], r[0]) for r in rows) == [
+            (1, 'Alice'), (2, 'Dave'), (3, 'Bob'), (4, 'Carol'),
+            (5, 'Frank'), (6, 'Grace'), (7, 'Eve'), (8, 'Henry')], rows
+        _, rows = e.q("SELECT name, DENSE_RANK() OVER (ORDER BY salary DESC) "
+                      "AS drk FROM emp ORDER BY drk ASC, name ASC")
+        assert rows == [('Alice', 1), ('Dave', 2), ('Bob', 3), ('Carol', 3),
+                        ('Frank', 4), ('Grace', 4), ('Eve', 5),
+                        ('Henry', 6)], rows
+
+        # 窗口内的多键排序键（另一套逻辑，走 window.py 的分区排序）
+        _, rows = e.q("SELECT name, dept, ROW_NUMBER() OVER "
+                      "(PARTITION BY dept ORDER BY salary DESC, name ASC) "
+                      "AS rn FROM emp ORDER BY dept ASC, rn ASC")
+        assert rows == [('Alice', 'Eng', 1), ('Bob', 'Eng', 2),
+                        ('Carol', 'Eng', 3),
+                        ('Frank', 'HR', 1), ('Grace', 'HR', 2),
+                        ('Henry', 'HR', 3),
+                        ('Dave', 'Sales', 1), ('Eve', 'Sales', 2)], rows
+
+
+
 

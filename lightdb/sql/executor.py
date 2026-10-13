@@ -27,6 +27,7 @@ from .parser import (
     expr_agg_texts as _expr_agg_texts,
     expr_pred_agg_texts as _expr_pred_agg_texts,
     unsupported_function_message,
+    normalize_order_by,
     AGGREGATE_FUNCTION_NAMES as _AGGREGATE_FUNCTION_NAMES,
     SCALAR_FUNCTION_NAMES as _SCALAR_FUNCTION_NAMES,
 )
@@ -412,11 +413,13 @@ class Executor:
         # GROUP BY / DISTINCT / 窗口函数 / 带限定列名的单表查询：
         # 都要在拿到行之后再加工
         # （原实现的 DISTINCT 只在解析器里记录，执行路径从未使用，属于静默错答）
+        # ORDER BY 是**多键**或键带限定名时，同样不能再交给存储层
+        # （存储层的 `db/table.py::select` 只认单个 `(列, desc)` 元组）。
+        ob_keys = normalize_order_by(p.get('order_by'))
         qualified = (
             any('.' in str(c) for c in (p.get('columns') or []))
             or self._where_has_qualified(p.get('where'))
-            or bool(p.get('order_by')
-                    and '.' in str(p['order_by'][0])))
+            or any('.' in key for key, _d in ob_keys))
         # 常量投影（`SELECT 1 FROM orders`）存储层认不了，必须走投影路径
         literal = any(self._literal_value(c)[0]
                       for c in (p.get('columns') or []) if c != '*')
@@ -461,10 +464,18 @@ class Executor:
         # 存储层只认 `column + op + value`，下推过去会 KeyError（报出
         # 与真实原因无关的「表不存在」），必须走统一求值路径
         expr_pred = self._where_has_expr_pred(where)
-        # ORDER BY 是表达式（`ORDER BY LENGTH(name) DESC`）：存储层与计划
-        # 执行器都只会去找同名列，找不到就**静默不排序**（DESC 也被丢掉），
-        # 必须由执行器按表达式算出排序键
-        order_expr = self._order_by_needs_eval(p.get('order_by'))
+        # ORDER BY 是表达式 / 序号 / 多键，或键引用了没被投影的列
+        # （`SELECT name FROM emp ORDER BY salary`）：存储层与计划执行器都
+        # 只会去找同名列，找不到就**静默不排序**（DESC 也可能被丢掉），
+        # 必须由执行器按表达式算出排序键；解析不到的键在统一路径显式报错。
+        # `SELECT *` 时把表列名传进去（存储层的输出列就是它们），这样
+        # `SELECT * FROM t ORDER BY 不存在的列` 也会显式报错而非静默不排序。
+        storage_cols = getattr(tbl, 'cols', None)
+        storage_cols = ([str(c.get('name')) for c in storage_cols
+                         if isinstance(c, dict)]
+                        if isinstance(storage_cols, list) else None)
+        order_expr = self._order_by_needs_eval(
+            p.get('order_by'), p.get('columns'), storage_cols)
         # 归一化后仍残留 negate 标记（LIKE 取反等存储层无法表达的形态）：
         # `_base_rows_and_cols` 会在取到行之后自己做三值过滤
         if self._where_has_negate(self._normalize_where(where)):
@@ -477,7 +488,9 @@ class Executor:
                 p, tbl, read_view=rv, where=where, session=s)
         cols, rows = tbl.select(
             p['columns'], where,
-            p.get('order_by'),
+            # 存储层只认单键 `(列, desc)`；走到这里时 `_order_by_needs_eval`
+            # 已经保证「最多一个键、且键就是投影输出列名」。
+            (ob_keys[0] if ob_keys else None),
             # 存储层只认 limit；OFFSET 靠多取 offset 行再切片实现
             (int(p['limit']) + int(p.get('offset') or 0))
             if p.get('limit') is not None else None,
@@ -1288,20 +1301,85 @@ class Executor:
         return False
 
     @classmethod
-    def _order_by_needs_eval(cls, order_by) -> bool:
-        """ORDER BY 的键是否是**需要执行器求值的表达式**
+    def _projection_output_names(cls, columns):
+        """投影列表对应的**输出列名**；无法确定（`*` / 空）时返回 None
 
-        纯列名 / 输出别名（`ORDER BY tot DESC`）走既有实现；函数或算术
-        （`ORDER BY LENGTH(name) DESC`）必须由 `_project_rows` /
-        `_apply_windows` 按源行算出排序键 —— 否则存储层找不到同名列会
-        `except: pass` 静默不排序（并且解析器原来还会把 DESC 一起丢掉）。
+        `SELECT name, salary AS v` → `['name', 'v']`（别名优先，其次去限定符
+        的表达式文本）。`*` 展开后列名取决于表结构，这里返回 None 表示
+        「任何普通列名都可能存在」，由调用方决定是否保守地走存储层。
         """
-        if not isinstance(order_by, (list, tuple)) or not order_by:
+        cols = [str(c) for c in (columns or [])]
+        if not cols or any(c.strip() == '*' or c.strip().endswith('.*')
+                           for c in cols):
+            return None
+        names = []
+        for c in cols:
+            expr, alias = cls._split_alias(c)
+            names.append(alias or cls._strip_qualifier(expr).strip())
+        return names
+
+    @classmethod
+    def _is_ordinal_order_key(cls, text) -> bool:
+        """`ORDER BY 2` 的序号形态（1 基，指向输出列）"""
+        return bool(re.match(r'^\d+$', str(text).strip()))
+
+    @staticmethod
+    def _order_key_error_message(pos, text, reason='') -> str:
+        """排序键无法解析时的统一报错文案（带**第几个键**与原因）"""
+        base = f"ORDER BY 第 {pos + 1} 个排序键 '{text}' 无法解析"
+        if reason:
+            return f"{base}：{reason}（ORDER BY 的键绝不会被静默忽略）"
+        return (f"{base}：它既不是输出列 / 投影别名 / 列序号，也不是可求值的"
+                f"标量表达式（ORDER BY 的键绝不会被静默忽略）")
+
+    @classmethod
+    def _order_by_needs_eval(cls, order_by, columns=None,
+                             table_cols=None) -> bool:
+        """ORDER BY 是否必须走执行器的**统一排序路径**（`_finish_select`）
+
+        下列任一成立就返回 True；否则可以继续交给存储层 `db/table.py::select`
+        按单键排序（那条路径只认 `(输出列名, desc)`）：
+
+        * **键数 > 1**（多键排序存储层不支持，`ORDER BY a, b` 原来只按 a 排）；
+        * 键是**序号**（`ORDER BY 2`，存储层不认识）；
+        * 键是需要求值的**表达式**（`LENGTH(name)` / `salary * 2` /
+          `SUM(salary)`），存储层找不到同名列会 `except: pass` 静默不排序；
+        * 键**不是投影输出列名**（`SELECT name FROM emp ORDER BY salary`：
+          存储层 out_cols 里没有 salary，同样静默不排序）；
+        * 键解析不出任何形态 —— 交给统一路径**显式报错**，绝不落存储层丢弃。
+
+        columns：投影列表（`SELECT *` 时无法从它推出输出列名）；
+        table_cols：`SELECT *` 时存储层实际会输出的列名（表列），由调用方
+        传入 —— 有了它，`SELECT * FROM t ORDER BY 不存在的列` 也能走统一
+        路径显式报错，而不是落进存储层的 `except: pass` 静默不排序。
+        """
+        keys = normalize_order_by(order_by)
+        if not keys:
             return False
-        text = str(order_by[0]).strip()
-        if not text or re.match(r'^[`"]?[\w.]+[`"]?$', text):
-            return False
-        return _parse_scalar_expr(text) is not None
+        if len(keys) > 1:
+            return True
+        out_names = (cls._projection_output_names(columns)
+                     if columns is not None else None)
+        if out_names is None:
+            # `SELECT *`：存储层的输出列就是表列
+            out_names = ([str(c) for c in table_cols]
+                         if table_cols is not None else None)
+        for text, _desc in keys:
+            t = str(text).strip()
+            if not t:
+                continue
+            if cls._is_ordinal_order_key(t):
+                return True
+            if re.match(r'^[`"]?[\w.]+[`"]?$', t):
+                # 纯列名 / 限定列名：投影里能直接找到才交给存储层
+                if out_names is None:
+                    return False
+                if t in out_names or t.strip('`"') in out_names:
+                    return False
+                return True
+            # 非纯列名：表达式（或认不出的形态）一律走统一路径
+            return True
+        return False
 
     @classmethod
     def _agg_needs_expr_eval(cls, text) -> bool:
@@ -1409,10 +1487,11 @@ class Executor:
         # 分组输出列里可能根本没有这一列。这里把它们当**隐藏列**补进
         # 分组结果（只供 `_order_by_sort_values` 取聚合值，不会出现在
         # SELECT 的输出列里，因为输出列由投影列表决定）。
+        # 多键 ORDER BY：**每个键**都要收集（原来只看第一个键，
+        # `ORDER BY dept, SUM(salary)` 里的聚合取不到值）。
         order_aggs = []
-        ob = p.get('order_by')
-        if ob:
-            node_ob = _parse_scalar_expr(str(ob[0]).strip())
+        for ob_text, _ob_desc in normalize_order_by(p.get('order_by')):
+            node_ob = _parse_scalar_expr(str(ob_text).strip())
             if node_ob is not None and _expr_has_agg(node_ob):
                 for t in self._expr_agg_texts_in_node(node_ob):
                     if t not in order_aggs and t not in eval_cols:
@@ -3674,70 +3753,146 @@ class Executor:
         return row_agg_values_map(base_cols, row)
 
     def _order_by_sort_values(self, p, out_cols, base_cols, rows):
-        """ORDER BY 是**表达式**时按源行算出排序键；否则返回 None
+        """按 ORDER BY 的**每一个键**预先算好排序值
 
-        返回 None 表示排序键是普通列名 / 输出别名（例如 `ORDER BY tot
-        DESC`），继续走 `_finish_select` 里按输出列名查找的既有实现。
+        返回值：与 `p['order_by']` 等长的列表（没有 ORDER BY 时为 None），
+        每个元素为：
 
-        为什么需要这条路径：`ORDER BY LENGTH(name) DESC` 里的
-        `LENGTH(name)` 在输出列里根本不存在，存储层与计划执行器的
-        `except: pass` 会**静默不排序**（而且解析器原来会把 DESC 一起丢掉），
+        * None —— 该键是**输出列**（普通列 / 限定列 / 投影别名）或**序号**，
+          由 `_finish_select` 直接从输出行取值；
+        * 值列表（与 rows 一一对应）—— 该键是需要按源行求值的表达式
+          （`LENGTH(name)`、`salary * 2`、`SUM(salary)`、`ROUND(AVG(v),1)`）。
+
+        为什么需要这条路径：这些键在输出列里根本不存在，存储层与计划执行器的
+        `except: pass` 会**静默不排序**（而且解析器原来还会把 DESC 一起丢掉），
         返回一份顺序错误的结果 —— 典型的静默错答。
+
+        **绝不静默丢弃**：认不出的键在这里显式报错，报出「第几个键 + 键文本」。
         """
-        order_by = p.get('order_by')
-        if not order_by:
+        keys = normalize_order_by(p.get('order_by'))
+        if not keys:
             return None
-        col = str(order_by[0]).strip()
-        if col in out_cols or self._strip_qualifier(col) in out_cols:
-            return None
-        node = _parse_scalar_expr(col)
-        if node is None:
-            return None
-        self._check_expr_functions(node, 'ORDER BY')
-        values = []
-        for r in rows:
-            values.append(self._eval_expr_in_row(
-                node, base_cols, r, self._row_agg_values(base_cols, r),
-                'ORDER BY'))
-        return values
+        out = []
+        for pos, (text, _desc) in enumerate(keys):
+            col = str(text).strip()
+            if self._is_ordinal_order_key(col):
+                out.append(None)
+                continue
+            if col in out_cols or self._strip_qualifier(col) in out_cols:
+                out.append(None)
+                continue
+            node = _parse_scalar_expr(col)
+            if node is None:
+                raise ValueError(self._order_key_error_message(pos, col))
+            self._check_expr_functions(node, 'ORDER BY')
+            if node.get('kind') == 'col':
+                # 纯列名形态：列必须在基础行里存在，否则显式报错
+                # （原来会静默不排序，或者取到 None 当成 NULL 值排序）
+                name = str(node.get('name') or col)
+                if self._col_index_of(base_cols, name) < 0:
+                    raise ValueError(self._order_key_error_message(
+                        pos, col,
+                        f"列 '{name}' 既不在输出列里，也不在可用列里"))
+            values = [
+                self._eval_expr_in_row(
+                    node, base_cols, r, self._row_agg_values(base_cols, r),
+                    'ORDER BY')
+                for r in rows
+            ]
+            out.append(values)
+        return out
+
+    @classmethod
+    def _order_output_values(cls, col, pos, out_cols, out_rows):
+        """从**输出行**里取出第 pos 个 ORDER BY 键的取值
+
+        解析顺序：列序号（`ORDER BY 2` → 2 号输出列）→ 精确列名 →
+        去限定符的列名；都取不到时**显式报错**（绝不静默不排序）。
+        """
+        n = len(out_cols)
+        if cls._is_ordinal_order_key(col):
+            k = int(col)
+            if k < 1 or k > n:
+                raise ValueError(
+                    f"ORDER BY 第 {pos + 1} 个排序键是列序号 {k}，"
+                    f"超出输出列范围（1..{n}）")
+            i = k - 1
+        else:
+            i = None
+            if col in out_cols:
+                i = out_cols.index(col)
+            elif cls._strip_qualifier(col) in out_cols:
+                i = out_cols.index(cls._strip_qualifier(col))
+            if i is None:
+                raise ValueError(cls._order_key_error_message(pos, col))
+        return [r[i] if i < len(r) else None for r in out_rows]
 
     def _finish_select(self, p, out_cols, out_rows, sort_values=None):
         """DISTINCT / ORDER BY / LIMIT（窗口计算之后才生效）
 
-        sort_values：ORDER BY 是表达式时，`_order_by_sort_values` 按源行
-        预先算好的排序键（与 out_rows 一一对应）；None 表示走按输出列名
-        查找的既有实现。
+        ORDER BY（本次改造为**真正的多键排序**）：
+
+        * 任意个键，**逐键独立** ASC / DESC；
+        * 实现方式：先按最后一个键、再倒数第二个 …… 最后第一个键，逐个做
+          **稳定排序**（Python 的 `list.sort` 是稳定排序）。后一个键相等的行
+          在前一个键的排序里保持原有相对顺序，因此整体等价于字典序多键排序，
+          且方向可以逐键不同；
+        * NULL 定义：**NULL 视为最大值**（与 PostgreSQL 默认一致）—— 升序时
+          排在最后、降序时排在最前，**逐键一致、可预测**。实现上用
+          `(值 is None, 值)` 作为排序键：NULL 的元组首元素为 True，比任何
+          非 NULL 的都大；`reverse=True`（DESC）时它排到最前。
+
+        sort_values：`_order_by_sort_values` 按 ORDER BY **逐键**预先算好的
+        排序值（与 out_rows 一一对应；元素为 None 表示该键从输出列取）。
         """
+        order_by = p.get('order_by')
+        keys = normalize_order_by(order_by)
+
         if p.get('distinct'):
             seen, deduped = set(), []
-            for r in out_rows:
+            # 排序键值必须与行**一起**去重：DISTINCT 之后行数变了，原来按
+            # 「源行下标」对齐的排序值列表会整体错位（长度不等时旧实现直接
+            # 回落到按列名查找，查不到就静默不排序）。
+            # 注意 `sort_values` 的外层是**键**、内层是行：这里要按「每个键
+            # 各自保留被去重保留下来的那些行的取值」重建，不能按行拼接。
+            kept_values = ([[] if sv is not None else None
+                            for sv in sort_values] if sort_values else None)
+            for i, r in enumerate(out_rows):
                 key = tuple(r)
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(r)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(r)
+                if kept_values is not None:
+                    for kpos, sv in enumerate(sort_values):
+                        if sv is not None:
+                            kept_values[kpos].append(
+                                sv[i] if i < len(sv) else None)
             out_rows = deduped
+            if kept_values is not None:
+                sort_values = kept_values
 
-        order_by = p.get('order_by')
-        if order_by:
-            col, desc = order_by
-            if sort_values is not None and len(sort_values) == len(out_rows):
-                # 表达式排序键：NULL 仍然排在最后（ASC）/ 最前（DESC），
-                # 与下面按列排序的 NULL 处理保持一致
-                order = sorted(
-                    range(len(out_rows)),
-                    key=lambda i: (sort_values[i] is None, sort_values[i]),
-                    reverse=bool(desc))
-                out_rows = [out_rows[i] for i in order]
-            else:
-                key = self._strip_qualifier(col)
-                i = None
-                if col in out_cols:
-                    i = out_cols.index(col)
-                elif key in out_cols:
-                    i = out_cols.index(key)
-                if i is not None:
-                    out_rows.sort(key=lambda r: (r[i] is None, r[i]),
-                                  reverse=bool(desc))
+        if keys:
+            # 逐键取排序值（None → 从输出行取；否则用预先算好的表达式值）
+            key_values = []
+            for pos, (text, desc) in enumerate(keys):
+                col = str(text).strip()
+                sv = (sort_values[pos]
+                      if (sort_values and pos < len(sort_values)) else None)
+                if sv is not None and len(sv) == len(out_rows):
+                    key_values.append((list(sv), bool(desc)))
+                else:
+                    key_values.append((
+                        self._order_output_values(
+                            col, pos, out_cols, out_rows),
+                        bool(desc)))
+            # 从最后一个键往前做稳定排序 → 字典序多键 + 逐键方向
+            idx = list(range(len(out_rows)))
+            for vals, desc in reversed(key_values):
+                idx.sort(
+                    key=lambda i, v=vals: (v[i] is None, v[i]),
+                    reverse=desc)
+            out_rows = [out_rows[i] for i in idx]
 
         # LIMIT / OFFSET：都在 ORDER BY 之后、对最终结果裁剪
         offset = int(p.get('offset') or 0)
@@ -3984,10 +4139,14 @@ class Executor:
            子查询时，整条查询交给优化器 + 计划执行器（Filter/Project/
            GroupBy/Sort/Limit 都在计划里）。
         2. **后置处理路径**：WHERE 里有标量子查询比较 / 引用连接表的子查询、
-           HAVING 里有子查询、或投影列表里有标量子查询时，计划执行器只负责
-           「FROM + JOIN（含 ON）」，产出带限定列名的连接结果；随后由执行器
-           逐连接行把子查询折叠求值（`_fold_and_run` + `_scalar_from_rows`，
-           与单表相关子查询完全同一套机制与缓存）。
+           HAVING 里有子查询、投影列表里有标量子查询，**或 ORDER BY 的键
+           是计划路径解析不了的形态**（引用了没被投影的列、是表达式 / 序号 /
+           聚合 / 非投影别名，见 `_join_order_needs_materialize`）时，计划
+           执行器只负责「FROM + JOIN（含 ON）」，产出带限定列名的连接结果；
+           随后由执行器逐连接行把子查询折叠求值（`_fold_and_run` +
+           `_scalar_from_rows`，与单表相关子查询完全同一套机制与缓存），
+          排序则由统一排序路径 `_finish_select` 完成（多键 / 逐键方向 /
+           别名 / 序号 / 表达式 / 聚合都支持）。
 
         为什么不让计划执行器只处理一半条件：`A OR (SELECT ...) > 1` 这种形态
         只摘掉子查询那一半会让真值表变错（要么全放行、要么丢太多行），
@@ -4007,7 +4166,8 @@ class Executor:
             return self._err(1105, "优化器未初始化")
 
         join_names = self._join_qualifiers(p)
-        if self._join_needs_row_eval(p, join_names):
+        if self._join_needs_row_eval(p, join_names) \
+                or self._join_order_needs_materialize(p):
             return self._exec_join_query_with_subqueries(
                 p, s, rv, join_names)
 
@@ -4066,6 +4226,68 @@ class Executor:
             self._projection_subquery_ast(self._split_alias(str(c))[0])[0]
             is not None
             for c in (p.get('columns') or []) if c != '*')
+
+    @staticmethod
+    def _proj_name_matches(name, key) -> bool:
+        """计划路径的输出列名 `name` 能否被排序键 `key` 命中
+
+        与 `plan_executor._resolve_loose` 同一套判定：按「列名末段」或
+        `AS 别名` 匹配（大小写不敏感）。
+        """
+        want = str(key).strip().strip('`"').rsplit('.', 1)[-1].lower()
+        if not want:
+            return False
+        text = str(name).strip().strip('`"')
+        m = re.search(r'\s+AS\s+[`"]?(\w+)[`"]?\s*$', text, re.IGNORECASE)
+        last = (m.group(1) if m else text.rsplit('.', 1)[-1]).lower()
+        return last == want
+
+    def _join_order_needs_materialize(self, p) -> bool:
+        """JOIN 计划路径**解析不了** ORDER BY 键时，改走物化连接路径
+
+        计划路径的 Sort 位于 Project / GroupBy 之上，只能看到**投影之后**
+        的列名（`u.city` 压成 `city`、聚合表达式压成 `COUNT(*)` / `AS 别名`）。
+        排序键引用了没被投影的列（`SELECT u.id ... ORDER BY o.amt DESC`）或
+        是表达式时，计划路径算不出排序键 —— 原实现静默不排序（顺序错误）。
+
+        这里判定为 True 时改走 `_exec_join_query_with_subqueries`：先把
+        `FROM ... JOIN ... ON ...` 物化成带限定列名的内存关系，再交给执行器
+        的统一排序路径（`_finish_select`），因此「非投影列 / 别名 / 序号 /
+        表达式 / 聚合 / 多键」全部由同一份实现处理，结果正确。
+        仍无法解析的键由统一路径**显式报错**（绝不静默丢弃）。
+        """
+        keys = normalize_order_by(p.get('order_by'))
+        if not keys:
+            return False
+        columns = [str(c) for c in (p.get('columns') or ['*'])]
+        if columns == ['*']:
+            return False        # 全部列都在，计划路径能解析任何列名
+        has_agg = any(re.match(r'^\w+\s*\(', c.strip()) for c in columns)
+        if p.get('group_by') or has_agg:
+            # GroupBy 的输出列名 = SELECT 列的**大写原文**（含 `AS 别名`）
+            out_names = [c.strip().upper() for c in columns]
+        else:
+            out_names = []
+            for c in columns:
+                expr, alias = self._split_alias(c)
+                out_names.append(
+                    alias or self._strip_qualifier(expr).strip())
+        for text, _desc in keys:
+            t = str(text).strip()
+            if not t:
+                continue
+            if self._is_ordinal_order_key(t):
+                k = int(t)
+                if k < 1 or k > len(columns):
+                    return True     # 序号越界：交给统一路径显式报错
+                continue
+            if re.match(r'^[`"]?[\w.]+[`"]?$', t):
+                if any(self._proj_name_matches(n, t) for n in out_names):
+                    continue
+                return True         # 非投影列：计划路径解析不到
+            # 表达式：引用的列未必都在投影里，交给统一路径按基础行求值
+            return True
+        return False
 
     def _exec_join_query_with_subqueries(self, p, s, rv, join_names):
         """JOIN 查询的后置处理路径：先算连接，再逐连接行处理子查询

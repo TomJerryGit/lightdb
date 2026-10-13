@@ -631,23 +631,41 @@ class Parser:
         if htext is not None:
             having = self._where(htext)
 
-        # ORDER BY：取**顶层** ORDER BY 正文（到 LIMIT 为止），再拆出
-        # 可选的 ASC / DESC。排序键允许是表达式（`ORDER BY LENGTH(name) DESC`）。
-        # 原来的 `ORDER BY\s+([\w.]+)(?:\s+(ASC|DESC))?` 只会取到
-        # `LENGTH`（把函数名当成列名），而且 `(name) DESC` 让 ASC/DESC
-        # 分组匹配不上 → DESC 被**静默丢掉**（升序返回），属于静默错答。
+        # ORDER BY：取**顶层** ORDER BY 正文（到 LIMIT 为止），按顶层逗号
+        # 拆成**任意个**排序键，每个键独立解析可选的 ASC / DESC。
+        #
+        # 数据结构：`order_by = [(键文本, desc), ...]`（列表，逐键独立方向）。
+        # 键文本原样保留（普通列 / 限定列 `u.city` / 投影别名 / 标量表达式
+        # `LENGTH(name)` / 聚合表达式 `SUM(salary)` / 序号 `2`），由执行器按
+        # 「输出列 → 表达式」的顺序解析；**任一个键解析不到都在执行期显式
+        # 报错**（报出第几个键与原因），绝不静默丢弃。
+        #
+        # 原实现是 `items[0]` 单键 + `([\w.]+)(?:\s+(ASC|DESC))?`，有两个
+        # 静默错答：① `ORDER BY a, b` 的第二键之后被直接丢掉，只按 a 排；
+        # ② `ORDER BY LENGTH(name) DESC` 只取到 `LENGTH`（函数名当列名），
+        # `(name) DESC` 让 ASC/DESC 分组匹配不上 → DESC 也被丢掉。
+        # 解析不出来的形态（`ORDER BY a NULLS LAST`）不在这里放过：键文本
+        # 会带着 `NULLS LAST` 落到执行器，由统一排序路径显式报错。
         otext = self._extract_clause(rest, 'ORDER', ('LIMIT',))
         if otext is not None:
-            items = self._split_top_level(otext)
-            key_text = items[0].strip() if items else ''
-            desc = False
-            dm = re.match(r'^(.*?)\s+(ASC|DESC)\s*$', key_text,
-                          re.IGNORECASE | re.DOTALL)
-            if dm:
-                key_text = dm.group(1).strip()
-                desc = dm.group(2).upper() == 'DESC'
-            if key_text:
-                order_by = (key_text, desc)
+            keys = []
+            for pos, raw in enumerate(self._split_top_level(otext)):
+                item = raw.strip()
+                if not item:
+                    continue
+                desc = False
+                dm = re.match(r'^(.*?)\s+(ASC|DESC)\s*$', item,
+                              re.IGNORECASE | re.DOTALL)
+                if dm:
+                    item = dm.group(1).strip()
+                    desc = dm.group(2).upper() == 'DESC'
+                if not item:
+                    raise SyntaxError(
+                        f"ORDER BY 第 {pos + 1} 个排序键为空"
+                        f"（只写了 ASC / DESC）")
+                keys.append((item, desc))
+            if keys:
+                order_by = keys
 
         # LIMIT：三种写法都要认
         #   LIMIT n                 -> limit=n
@@ -1581,6 +1599,32 @@ def _split_select_alias(text):
     return s, None
 
 
+def normalize_order_by(order_by) -> list:
+    """把 `parsed['order_by']` 规范化成 `[(键文本, desc_bool), ...]`
+
+    parser 现在的产出就是列表（`ORDER BY a DESC, b` → `[('a', True), ('b', False)]`），
+    这里额外兼容历史上的**单键元组** `(键文本, desc)`：执行器 / 优化器 /
+    计划执行器都通过本函数读取，因此单键与多键只有一套消费代码，
+    不会出现「有的消费点还按元组解包」的半改状态。
+
+    空 / None → `[]`（表示没有 ORDER BY）。
+    """
+    if not order_by:
+        return []
+    # 历史形态：单个 (键文本, desc) 元组
+    if isinstance(order_by, (list, tuple)) and len(order_by) == 2 \
+            and isinstance(order_by[0], str) \
+            and isinstance(order_by[1], bool):
+        return [(order_by[0], order_by[1])]
+    out = []
+    for item in order_by:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            out.append((str(item[0]), bool(item[1])))
+        else:
+            out.append((str(item), False))
+    return out
+
+
 def _norm_ident(text) -> str:
     """列标识符归一化：去引号、去表限定符、小写（`u.City` -> `city`）"""
     return str(text).strip().strip('`"').rsplit('.', 1)[-1].strip().lower()
@@ -1742,16 +1786,20 @@ def validate_group_by(parsed, strict=True):
     # 排序键可以是分组键本身、输出别名、聚合表达式，或**只引用分组键**的
     # 表达式（`ORDER BY LENGTH(dept)`，dept 是分组键 → 组内取值确定）。
     # 引用非分组键裸列的表达式仍然显式报错（绝不取组内第一行当排序键）。
+    # 多键 ORDER BY：**每个键**都要过同一份校验（原来只看 order[0]，
+    # `ORDER BY dept, name` 里第二键的非法性会被静默放过）。
     order = parsed.get('order_by')
-    if isinstance(order, (list, tuple)) and order:
-        col = str(order[0])
+    for order_pos, (col, _desc) in enumerate(normalize_order_by(order)):
         if not (_is_key(col) or _norm_ident(col) in out_aliases
                 or is_aggregate_expr(col)):
             node = parse_scalar_expr(_split_select_alias(col)[0])
             idents = expr_bare_columns(node) if node is not None else None
             if not (idents is not None
                     and all(_is_key(i) for i in idents)):
-                raise ValueError(group_by_violation_message(col, 'ORDER BY'))
+                # 报出「第几个排序键」，与执行器统一排序路径的文案风格一致
+                raise ValueError(
+                    f"ORDER BY 第 {order_pos + 1} 个排序键："
+                    + group_by_violation_message(col, 'ORDER BY'))
 
     # ---------- ④ 有 GROUP BY 时的窗口函数 ----------
     for w in (parsed.get('windows') or []):
