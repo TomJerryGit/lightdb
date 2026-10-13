@@ -13,6 +13,23 @@ from typing import Dict
 from ..logger import logger
 from ..db.information_schema import InformationSchema
 from ..db.table import Table as _StorageTable
+# 标量表达式（单行函数 + 算术）：解析 / 渲染 / 求值都在 parser 里，
+# 执行器与计划执行器共用同一份实现与同一套报错文案。
+# parser 不反向依赖 executor，因此这里可以模块级导入（见 sql/__init__ 的顺序）。
+from .parser import (
+    parse_scalar_expr as _parse_scalar_expr,
+    render_scalar_expr as _render_scalar_expr,
+    eval_expr_node as _eval_expr_node,
+    eval_expr_predicate as _eval_expr_predicate,
+    expr_has_agg as _expr_has_agg,
+    expr_has_func as _expr_has_func,
+    expr_columns_outside_agg as _expr_columns_outside_agg,
+    expr_agg_texts as _expr_agg_texts,
+    expr_pred_agg_texts as _expr_pred_agg_texts,
+    unsupported_function_message,
+    AGGREGATE_FUNCTION_NAMES as _AGGREGATE_FUNCTION_NAMES,
+    SCALAR_FUNCTION_NAMES as _SCALAR_FUNCTION_NAMES,
+)
 
 
 # 哨兵：区分"调用方没传 where"与"where 被改写成恒真(None)"
@@ -310,6 +327,13 @@ class Executor:
             # 的既有路径（与 CTE 同一条路径）
             sub = p.get('subquery')
             if isinstance(sub, dict) and sub.get('sql'):
+                # 任务 3（`FROM (子查询) x JOIN 表 ...`）：本可以交给 JOIN
+                # 计划路径（`_exec_join_query`，优化器的 SubqueryScan 原生
+                # 支持），实测结果正确；但既有回归
+                # `tests/test_v4_sql_features.py::test_from_subquery_alias` 第
+                # ⑧ 条**断言这里必须显式报错**，而本次任务的硬约束是
+                # 「不要改任何既有断言」，因此保持显式报错，不改行为。
+                # 详见 `_select_from_subquery` 的说明。
                 return self._select_from_subquery(p, s, sub)
             return self._err(1105, "暂不支持 FROM 子查询")
 
@@ -412,22 +436,43 @@ class Executor:
         # `\w+\s*\(` 判断"是否有聚合"，于是把标量函数也交给 _aggregate
         # —— 非聚合项取「第一行的值」，实测 `SELECT id, LOWER(name) FROM
         # users` 静默返回 1 行 (1, None)（NULL + 丢行），是同类错答。
-        # 这里强制走投影路径，由 `_projection_item_plan` 显式报「列不存在」
-        # （引擎没有标量函数求值能力），不再静默给出错答。
+        # 现在检查器里带函数调用的投影统一走投影路径，由
+        # `_projection_item_plan` 用表达式求值器逐行算（支持清单见
+        # parser.SCALAR_FUNCTION_NAMES；不支持的函数名在那里显式报错）。
+        # 另外 `SUM(salary * 2)` / `ROUND(AVG(v), 1)` 这类「聚合 + 表达式」
+        # 参数存储层也不认（`_aggregate` 的正则只吃单列），同样要接管。
         scalar_func = any(
             self._is_scalar_function_projection(c)
+            or self._agg_needs_expr_eval(c)
             for c in (p.get('columns') or []) if c != '*')
-        # WHERE 里的 NOT (...)：存储层 _match 只认 and/or/column+op+value，
+        # 投影项带 `AS 别名`（`SELECT salary AS v`）：存储层只认裸列名，
+        # 会把整段 `salary AS v` 当列名去查 → 报「列 salary AS v 不存在」
+        # （别名能力等于没有）。带别名的投影统一走投影路径，别名由
+        # `_projection_item_plan` 落实（输出列名 = 别名）。
+        aliased = any(
+            self._split_alias(str(c))[1] is not None
+            for c in (p.get('columns') or []) if c != '*')
+        # WHERE/HAVING 里的 NOT (...)：存储层 _match 只认 and/or/column+op+value，
         # 遇到 {'not': ...} 直接 KeyError，必须走统一求值路径
         has_not = self._where_has_not(p.get('where'))
         has_null = self._where_has_is_null(p.get('where'))
+        # WHERE/HAVING 里的**表达式谓词**（`WHERE salary * 2 > 230`、
+        # `WHERE LOWER(name) = 'alice'`、`HAVING SUM(v) * 2 > 100`）：
+        # 存储层只认 `column + op + value`，下推过去会 KeyError（报出
+        # 与真实原因无关的「表不存在」），必须走统一求值路径
+        expr_pred = self._where_has_expr_pred(where)
+        # ORDER BY 是表达式（`ORDER BY LENGTH(name) DESC`）：存储层与计划
+        # 执行器都只会去找同名列，找不到就**静默不排序**（DESC 也被丢掉），
+        # 必须由执行器按表达式算出排序键
+        order_expr = self._order_by_needs_eval(p.get('order_by'))
         # 归一化后仍残留 negate 标记（LIKE 取反等存储层无法表达的形态）：
         # `_base_rows_and_cols` 会在取到行之后自己做三值过滤
         if self._where_has_negate(self._normalize_where(where)):
             has_not = True
         if (p.get('windows') or p.get('group_by') or p.get('having')
                 or p.get('distinct') or qualified or literal or has_sub
-                or arith or proj_sub or scalar_func or has_not or has_null):
+                or arith or proj_sub or scalar_func or has_not or has_null
+                or expr_pred or order_expr or aliased):
             return self._select_advanced(
                 p, tbl, read_view=rv, where=where, session=s)
         cols, rows = tbl.select(
@@ -479,13 +524,22 @@ class Executor:
 
     @classmethod
     def _collect_agg_exprs(cls, having) -> list:
-        """收集 HAVING 里的聚合表达式（形如 COUNT(*) / SUM(amount)）"""
+        """收集 HAVING 里的聚合表达式（形如 COUNT(*) / SUM(amount)）
+
+        表达式谓词（`HAVING SUM(v) * 2 > 100`）里的聚合也要收集 —— 它们的
+        文本由 `render_scalar_expr` 规范渲染（`SUM(v)`、`SUM(v * 2)`），
+        与 `_eval_condition` 取聚合值时的查找键完全一致。
+        """
         found = []
         if isinstance(having, dict):
             if 'agg' in having:
                 a = str(having['agg']).strip()
                 if a and a not in found:
                     found.append(a)
+            if isinstance(having.get('expr_pred'), dict):
+                for a in cls._expr_agg_texts(having['expr_pred']):
+                    if a not in found:
+                        found.append(a)
             # NOT (...) 里也可能藏着聚合（`HAVING NOT (COUNT(*) > 1)`）
             inner = having.get('not')
             if isinstance(inner, dict):
@@ -498,6 +552,16 @@ class Executor:
                         if a not in found:
                             found.append(a)
         return found
+
+    @classmethod
+    def _expr_agg_texts(cls, pred) -> list:
+        """表达式谓词里的聚合函数文本（实现在 parser.expr_pred_agg_texts）"""
+        return _expr_pred_agg_texts(pred)
+
+    @classmethod
+    def _expr_agg_texts_in_node(cls, node) -> list:
+        """表达式节点里最外层聚合函数的规范文本（实现在 parser.expr_agg_texts）"""
+        return _expr_agg_texts(node)
 
     def _rewrite_subqueries(self, where, session, outer_table=None,
                             outer_alias=None, depth=0):
@@ -670,6 +734,14 @@ class Executor:
                 and not val.startswith(("'", '"'))
                 and re.match(r'^[\w.]+$', val)):
             out.append(val)
+        # 表达式谓词（`LOWER(u.name) = 'x'`）：列引用藏在表达式节点里，
+        # 不收集的话 `_is_correlated` 会漏判 → 相关子查询被当成非相关
+        # 一次性求值（静默错答）。聚合参数内部的引用不算（见
+        # `expr_columns_outside_agg`：由残留检查兜底显式报错）。
+        pred = where.get('expr_pred')
+        if isinstance(pred, dict):
+            for node in (pred.get('left'), pred.get('right')):
+                out.extend(_expr_columns_outside_agg(node))
         for key in ('and', 'or'):
             for c in (where.get(key) or []):
                 Executor._referenced_columns(c, out)
@@ -949,6 +1021,19 @@ class Executor:
                 if self._eval_condition(r, cols, target) is False:
                     kept.append(r)
             return cols, kept
+        # 表达式谓词（函数 / 算术，`WHERE LOWER(name) = 'alice'`、
+        # `WHERE salary * 2 > 230`）：存储层 `_match` 认不出这种节点
+        # （KeyError('column')），因此取全部行后用统一求值器逐行过滤。
+        # 三值逻辑：UNKNOWN（None）按「不通过」处理，与 SQL 的 WHERE 一致。
+        if isinstance(where, dict) and self._where_has_expr_pred(where):
+            if isinstance(src, _CTERelation):
+                cols = list(src.col_names)
+                rows = [list(r) for r in src.rows]
+            else:
+                cols, rows = src.select(['*'], None, None, None, read_view)
+                cols, rows = list(cols), [list(r) for r in rows]
+            return cols, [r for r in rows
+                          if self._eval_condition(r, cols, where)]
         if isinstance(src, _CTERelation):
             rows = [list(r) for r in src.rows]
             if where:
@@ -996,10 +1081,13 @@ class Executor:
         内存关系（CTE / FROM 子查询）路径原先直接按行投影，`SELECT
         COUNT(*) FROM (SELECT ...) x` 会输出「每行一个 NULL」——静默错答。
         这里识别出来交给 `_group_rows` 的「零分组键」形态：key=() 只产生
-        一个分组，再复用存储层 `_aggregate`。
+        一个分组，再算聚合值。
 
-        只认存储层支持的 5 个聚合函数，避免把标量函数
-        （`SELECT LOWER(name) FROM cte`）误当成聚合。
+        判定分两层：
+        * `名字(` 开头且名字是存储层支持的 5 个聚合（`COUNT(*)` / `SUM(x)`）；
+        * **表达式内部含聚合**（`ABS(SUM(v))`、`ROUND(AVG(v), 1)`）——
+          这类形态原先既不进分组路径、也不是标量函数，最后报「列不存在」。
+        标量函数（`SELECT LOWER(name) FROM cte`）不含聚合，仍然按行投影。
         """
         if p.get('group_by') or p.get('windows'):
             return False
@@ -1007,8 +1095,12 @@ class Executor:
             s = str(c).strip()
             if s == '*':
                 continue
-            m = re.match(r'^(\w+)\s*\(', cls._split_alias(s)[0].strip())
+            expr = cls._split_alias(s)[0].strip()
+            m = re.match(r'^(\w+)\s*\(', expr)
             if m and m.group(1).upper() in cls._AGG_FUNCS:
+                return True
+            node = _parse_scalar_expr(expr)
+            if node is not None and _expr_has_agg(node):
                 return True
         return False
 
@@ -1172,6 +1264,70 @@ class Executor:
         return False
 
     @classmethod
+    def _where_has_expr_pred(cls, where) -> bool:
+        """条件里是否含**表达式谓词**（`{'expr_pred': {...}}`）
+
+        表达式谓词 = 标量函数 / 算术参与比较（`WHERE salary * 2 > 230`、
+        `WHERE LOWER(name) = 'alice'`、`HAVING SUM(v) * 2 > 100`）。
+        存储层 `Table._match` 只认 `column + op + value`，遇到这种节点会
+        `KeyError('column')`（外层报成"表不存在"，与真实原因无关），
+        因此只要出现就必须走执行器的统一求值路径。
+        """
+        if not isinstance(where, dict):
+            return False
+        if isinstance(where.get('expr_pred'), dict):
+            return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._where_has_expr_pred(c):
+                    return True
+        for key in ('not', 'negate'):
+            inner = where.get(key)
+            if isinstance(inner, dict) and cls._where_has_expr_pred(inner):
+                return True
+        return False
+
+    @classmethod
+    def _order_by_needs_eval(cls, order_by) -> bool:
+        """ORDER BY 的键是否是**需要执行器求值的表达式**
+
+        纯列名 / 输出别名（`ORDER BY tot DESC`）走既有实现；函数或算术
+        （`ORDER BY LENGTH(name) DESC`）必须由 `_project_rows` /
+        `_apply_windows` 按源行算出排序键 —— 否则存储层找不到同名列会
+        `except: pass` 静默不排序（并且解析器原来还会把 DESC 一起丢掉）。
+        """
+        if not isinstance(order_by, (list, tuple)) or not order_by:
+            return False
+        text = str(order_by[0]).strip()
+        if not text or re.match(r'^[`"]?[\w.]+[`"]?$', text):
+            return False
+        return _parse_scalar_expr(text) is not None
+
+    @classmethod
+    def _agg_needs_expr_eval(cls, text) -> bool:
+        """投影项是否是「存储层聚合算不了、要执行器自己算」的形态
+
+        存储层 `Table._aggregate` 只认 `FN(单列)` / `FN(*)`，且只支持
+        COUNT/SUM/AVG/MIN/MAX；下列形态必须交给表达式聚合求值器
+        （`_eval_agg_expr_over_rows`）：
+
+        * 参数是表达式：`SUM(salary * 2)`、`COUNT(ABS(v))`；
+        * 函数名不在那 5 个之内：`ROUND(AVG(v), 1)`、`STDDEV(v)`、
+          `GROUP_CONCAT(name)`（存储层对未知聚合名**静默返回 NULL**，
+          这也是本次顺带修掉的静默错答）。
+        """
+        expr, _ = cls._split_alias(str(text))
+        e = expr.strip()
+        m = re.match(r'^(\w+)\s*\((.*)\)\s*$', e, re.DOTALL)
+        if not m:
+            return False
+        fn, arg = m.group(1).upper(), m.group(2).strip()
+        if fn in cls._AGG_FUNCS:
+            return not re.match(r'^(\*|[\w.]+)$', arg)
+        node = _parse_scalar_expr(e)
+        return bool(node is not None and _expr_has_agg(node))
+
+    @classmethod
     def _arith_projection_expr(cls, text):
         """投影项是否是算术表达式（可带 AS 别名），是则返回表达式文本
 
@@ -1213,9 +1369,19 @@ class Executor:
             p, strict=resolve_strict_group_by(self.strict_group_by))
 
         keys = [str(k).strip() for k in (p.get('group_by') or [])]
-        kidx = [self._col_index_of(base_cols, k) for k in keys]
-        if any(i < 0 for i in kidx):
-            raise KeyError(f"GROUP BY 列不存在: {keys}")
+        # 分组键可以是**表达式**（`GROUP BY UPPER(dept)`、`GROUP BY LENGTH(name)`）：
+        # 纯列名走原来的下标取法，表达式则逐行求值。两者都取不到时仍显式报错。
+        key_getters = []
+        for k in keys:
+            i = self._col_index_of(base_cols, k)
+            if i >= 0:
+                key_getters.append(('idx', i))
+                continue
+            node = _parse_scalar_expr(self._split_alias(k)[0])
+            if node is None or _expr_has_agg(node):
+                raise KeyError(f"GROUP BY 列不存在: {keys}")
+            self._check_expr_functions(node, 'GROUP BY')
+            key_getters.append(('expr', node))
 
         agg_cols = [str(c).strip() for c in (p.get('columns') or [])
                     if re.match(r'\w+\s*\(', str(c).strip())]
@@ -1224,8 +1390,8 @@ class Executor:
 
         having = p.get('having')
         # HAVING 里的聚合同样要归一化限定符：`HAVING SUM(o.amount) > 25`
-        # 里的 `SUM(o.amount)` 交给存储层 `_aggregate` 前必须变成
-        # `SUM(amount)`，否则报「列 SUM(o.amount) 不存在」。
+        # 里的 `SUM(o.amount)` 交给聚合求值器前必须变成 `SUM(amount)`，
+        # 否则报「列 SUM(o.amount) 不存在」。
         # 归一化前后用同一套键查 agg_vals：eval_cols 存归一化名，
         # having_aggs 保留原样，下面按归一化名建 extra 映射。
         having_aggs = self._collect_agg_exprs(having)
@@ -1239,9 +1405,29 @@ class Executor:
         having_has_sub = self._contains_subquery(having)
         having_cache = {}
 
+        # ORDER BY 表达式里用到的聚合（`ORDER BY ROUND(AVG(salary), 1)`）：
+        # 分组输出列里可能根本没有这一列。这里把它们当**隐藏列**补进
+        # 分组结果（只供 `_order_by_sort_values` 取聚合值，不会出现在
+        # SELECT 的输出列里，因为输出列由投影列表决定）。
+        order_aggs = []
+        ob = p.get('order_by')
+        if ob:
+            node_ob = _parse_scalar_expr(str(ob[0]).strip())
+            if node_ob is not None and _expr_has_agg(node_ob):
+                for t in self._expr_agg_texts_in_node(node_ob):
+                    if t not in order_aggs and t not in eval_cols:
+                        order_aggs.append(t)
+
         groups, order = {}, []
         for r in rows:
-            key = tuple(r[i] for i in kidx)
+            parts = []
+            for kind, spec in key_getters:
+                if kind == 'idx':
+                    parts.append(r[spec] if 0 <= spec < len(r) else None)
+                else:
+                    parts.append(self._eval_expr_in_row(
+                        spec, base_cols, r, None, 'GROUP BY'))
+            key = tuple(parts)
             if key not in groups:
                 groups[key] = []
                 order.append(key)
@@ -1251,13 +1437,17 @@ class Executor:
         for key in order:
             vals = list(key)
             agg_vals = {}
-            if eval_cols:
-                # 复用存储层的聚合实现（Table._aggregate）
-                agg_vals = dict(zip(
-                    eval_cols,
-                    list(_StorageTable._aggregate(
-                        src, groups[key], eval_cols))))
+            if eval_cols or order_aggs:
+                # 聚合求值：优先用表达式聚合求值器（支持 `SUM(salary * 2)`、
+                # `ROUND(AVG(v), 1)`、`STDDEV`、`GROUP_CONCAT` 等存储层算不了
+                # 的形态），存储层能算的 `FN(单列)` 也走同一条路（结果逐字
+                # 相同，见 `_eval_agg_expr_over_rows`）；真正解析不出聚合
+                # 形态的（`COUNT(DISTINCT x)`）才回落到存储层 `_aggregate`
+                # —— 那里会显式报错，绝不静默给 NULL。
+                agg_vals = self._compute_agg_values(
+                    eval_cols + order_aggs, src, base_cols, groups[key])
                 vals += list(agg_vals[a] for a in agg_eval)
+                vals += list(agg_vals[t] for t in order_aggs)
             if having:
                 # HAVING 的聚合值单独备好：可能不在 SELECT 列表里
                 # （`SELECT city FROM users GROUP BY city HAVING COUNT(*)>5`），
@@ -1277,7 +1467,53 @@ class Executor:
                 elif not self._eval_condition(vals, hcols, having, extra):
                     continue
             out_rows.append(vals)
-        return keys + agg_cols, out_rows
+        return keys + agg_cols + order_aggs, out_rows
+
+    # ==================== 聚合表达式求值（分组 / HAVING） ====================
+
+    def _compute_agg_values(self, exprs, src, base_cols, rows) -> dict:
+        """算出一组聚合表达式在**同一分组**上的取值 {表达式文本: 值}
+
+        表达式文本按 `_strip_qualifier` 归一化过（`SUM(o.amount)` →
+        `SUM(amount)`），输出键与调用方的 eval_cols 一致。
+        """
+        out = {}
+        fallback = []
+        for e in exprs:
+            node = _parse_scalar_expr(self._split_alias(str(e))[0])
+            if node is not None:
+                out[e] = self._eval_agg_expr_over_rows(
+                    node, base_cols, rows, 'GROUP BY/HAVING')
+                continue
+            fallback.append(e)
+        if fallback:
+            # 存储层兜底：只认 `FN(单列)` / `FN(*)`，认不出会显式报错
+            vals = list(_StorageTable._aggregate(src, rows, fallback))
+            out.update(dict(zip(fallback, vals)))
+        return out
+
+    def _eval_agg_expr_over_rows(self, node, cols, rows, position=''):
+        """在**分组行集合**上求值「含聚合函数的表达式」
+
+        实现放在 `parser.eval_agg_expr_over_rows`（与计划执行器共用同一份：
+        聚合语义、NULL 传播、除零 NULL、不支持函数报错、非分组键裸列报错
+        都只有一处实现）。这里只负责注入「按列名取当前行取值」的回调与
+        本实例的 GROUP BY 严格模式开关。
+        """
+        from .parser import eval_agg_expr_over_rows, resolve_strict_group_by
+        strict = resolve_strict_group_by(self.strict_group_by)
+        return eval_agg_expr_over_rows(
+            node, rows,
+            lambda r, name: self._expr_row_value(cols, r, name, position),
+            position, strict)
+
+    def _expr_row_value(self, cols, row, name, position=''):
+        """分组求值时的列取值（列必须存在于 base_cols 且在当前行范围内）"""
+        i = self._col_index_of(cols, name)
+        if i < 0 or i >= len(row):
+            raise ValueError(
+                f"{position} 里的列 '{name}' 不存在（分组表达式里的列引用）")
+        return row[i]
 
     def _eval_having_with_subquery(self, row, cols, where, agg_values, p,
                                    session, read_view, cache,
@@ -1382,6 +1618,18 @@ class Executor:
             return not self._eval_condition(
                 row, cols, where['not'], agg_values)
 
+        # `{'negate': ...}`：`_normalize_where` 对「存储层没有取反运算符」的
+        # 形态（例如 `NOT (name LIKE 'A%')`）打的标记。**必须在这里就地展开**：
+        # 只被顶层 `_base_rows_and_cols` 特殊处理是不够的 —— 嵌在 AND/OR 里的
+        # negate 走到这里会被当成「认不出的节点 → return True」而**静默丢掉**
+        # 整个 NOT 条件（例如 `WHERE NOT (name LIKE 'A%') AND LOWER(dept)='eng'`）。
+        # 三值逻辑：NOT UNKNOWN 仍是 UNKNOWN（None）。
+        if isinstance(where.get('negate'), dict):
+            inner = self._eval_condition(row, cols, where['negate'], agg_values)
+            if inner is None:
+                return None
+            return not inner
+
         if 'and' in where:
             return all(self._eval_condition(row, cols, c, agg_values)
                        for c in where['and'])
@@ -1391,6 +1639,19 @@ class Executor:
                 return False
             return any(self._eval_condition(row, cols, c, agg_values)
                        for c in parts)
+
+        # ---------- 表达式谓词（标量函数 / 算术）----------
+        # `WHERE LOWER(name) = 'alice'`、`WHERE salary * 2 + 10 > 50`、
+        # `HAVING SUM(v) * 2 > 100`。左右两侧都交给共用求值器
+        # `parser.eval_expr_predicate`；列解析走 `_col_index_of`
+        # （含 JOIN 结果的 `u.id` 限定名与末段唯一匹配），聚合值从
+        # agg_values（HAVING 语境）里按规范文本取。
+        # 任一侧是 NULL → UNKNOWN(None) → 行过滤时按「不通过」处理。
+        pred = where.get('expr_pred')
+        if isinstance(pred, dict):
+            pos = 'HAVING' if agg_values is not None else 'WHERE'
+            resolve = self._expr_resolver(cols, row, agg_values, pos)
+            return _eval_expr_predicate(pred, resolve, agg_values, pos)
 
         op = where.get('op')
         if 'agg' in where:
@@ -1518,6 +1779,62 @@ class Executor:
         if len(hits) > 1:
             raise ValueError(f"列 '{name}' 歧义，请加表名前缀")
 
+    # ==================== 标量表达式求值（统一路径） ====================
+
+    def _expr_resolver(self, cols, row, agg_values=None, position=''):
+        """构造表达式求值用的列解析回调 `resolve(name) -> 值`
+
+        解析不到列时**显式报错**（绝不静默给 NULL）：
+
+        * JOIN 结果的末段歧义沿用 `_raise_if_ambiguous_col` 的文案；
+        * HAVING 语境（agg_values 不为 None，即分组之后）说明
+          「GROUP BY 之后只保留分组键与聚合值」，避免报出令人费解的
+          「列不存在」—— 那正是本次要消除的误导性错误信息。
+        """
+        def resolve(name):
+            i = self._col_index_of(cols, name)
+            if i < 0:
+                self._raise_if_ambiguous_col(cols, name)
+                if agg_values is not None:
+                    raise ValueError(
+                        f"{position} 里的列 '{name}' 在分组结果里取不到："
+                        f"GROUP BY 之后只保留分组键与聚合值，请把该列加入"
+                        f"GROUP BY / SELECT，或改用聚合表达式")
+                raise ValueError(f"{position} 里的列 '{name}' 不存在")
+            if i >= len(row):
+                raise ValueError(
+                    f"{position} 里的列 '{name}' 在当前行里取不到值")
+            return row[i]
+        return resolve
+
+    def _eval_expr_in_row(self, node, cols, row, agg_values=None,
+                          position=''):
+        """在当前行上求值一个标量表达式节点（投影 / 排序键 / 分组键）"""
+        resolve = self._expr_resolver(cols, row, agg_values, position)
+        return _eval_expr_node(node, resolve, agg_values, position)
+
+    @staticmethod
+    def _check_expr_functions(node, position=''):
+        """静态校验表达式里的函数名（不支持的**显式报错并回列支持清单**）
+
+        这是「不支持的函数不得静默返回 NULL / 不得被当成列名」的落点：
+        `REVERSE(name)`、`NOW()` 这类名字在这里抛 ValueError，
+        文案由 `parser.unsupported_function_message` 统一给出。
+        """
+        if not isinstance(node, dict):
+            return
+        kind = node.get('kind')
+        if kind == 'func':
+            name = str(node.get('name') or '').upper()
+            if name not in _AGGREGATE_FUNCTION_NAMES \
+                    and name not in _SCALAR_FUNCTION_NAMES:
+                raise ValueError(unsupported_function_message(name))
+            for a in (node.get('args') or []):
+                Executor._check_expr_functions(a, position)
+        elif kind == 'arith':
+            Executor._check_expr_functions(node.get('left'), position)
+            Executor._check_expr_functions(node.get('right'), position)
+
     def _project_rows(self, p, base_cols, rows, session=None, read_view=None,
                       outer_name=None, outer_alias=None, extra_names=None):
         """把行按 SELECT 列表投影成输出列
@@ -1580,13 +1897,21 @@ class Executor:
                     item, r, base_cols, session, read_view,
                     outer_name, outer_alias, sub_cache, extra_names))
             out_rows.append(out)
-        return self._finish_select(p, out_cols, out_rows)
+        return self._finish_select(
+            p, out_cols, out_rows,
+            sort_values=self._order_by_sort_values(
+                p, out_cols, base_cols, rows))
 
     def _projection_item_plan(self, text, base_cols):
         """单个投影项 -> (kind, spec, 输出列名)
 
-        kind ∈ {'const','col','arith','sub'}。认不出来的形态抛 ValueError：
-        投影是用户直接看得到的结果，宁可变报错也不能安静地输出 NULL。
+        kind ∈ {'const','col','arith','expr','sub'}。认不出来的形态抛
+        ValueError：投影是用户直接看得到的结果，宁可变报错也不能安静地
+        输出 NULL。
+
+        'expr' 是本次新增的**标量表达式**（函数调用 / 含函数的算术）：
+        逐行用 `parser.eval_expr_node` 求值。函数名在规划期就校验，
+        不支持的函数（`REVERSE(name)`）在这里显式报错并回列支持清单。
         """
         expr, alias = self._split_alias(str(text))
         sub, bad = self._projection_subquery_ast(expr)
@@ -1616,6 +1941,23 @@ class Executor:
                     raise ValueError(
                         f"列 '{tok}' 不存在（算术表达式 {expr} 的列操作数）")
             return ('arith', arith, label)
+        # 标量函数 / 含函数的嵌套算术（`LOWER(name)`、`ROUND(AVG(v), 1)`
+        # 作为**列**已经在上面命中，这里只处理真正要逐行求值的形态）：
+        # 放在最后，保证既有形态（列 / 常量 / 二元算术 / 标量子查询）的
+        # 解析结果逐字不变。
+        node = _parse_scalar_expr(expr)
+        if node is not None and _expr_has_func(node):
+            self._check_expr_functions(node, '投影')
+            if _expr_has_agg(node):
+                raise ValueError(
+                    f"聚合表达式 {expr} 在投影里没有可用的分组上下文："
+                    f"请配合 GROUP BY 使用，或确认聚合列已被 SELECT 列表"
+                    f"显式列出（本项目 GROUP BY 语义按 ONLY_FULL_GROUP_BY 收紧）")
+            return ('expr', node, label)
+        if node is not None:
+            # 纯算术但没被 `_parse_arith` 认出来（三元以上嵌套，如
+            # `salary * 2 + 10`）：同样交给表达式求值器
+            return ('expr', node, label)
         raise ValueError(f"列 '{expr}' 不存在")
 
     def _eval_projection_item(self, item, row, base_cols, session, read_view,
@@ -1631,6 +1973,8 @@ class Executor:
             raise ValueError(f"投影列 '{label}' 在当前行里取不到值")
         if kind == 'arith':
             return self._eval_arith(spec, base_cols, row)
+        if kind == 'expr':
+            return self._eval_expr_in_row(spec, base_cols, row, None, '投影')
         return self._eval_projection_scalar(
             spec, row, base_cols, session, read_view,
             outer_name, outer_alias, sub_cache, extra_names)
@@ -2799,6 +3143,34 @@ class Executor:
                 return self._ast_literal(got)
             return v
 
+        def fold_expr(node):
+            """把表达式节点里的外层列引用换成**字面量节点**
+
+            表达式谓词（`{'expr_pred': ...}`）里的列引用不在 column / value
+            字段上，`fold_node` 的既有逻辑看不到它们；漏折叠的话折叠后的
+            子查询仍然引用外层列 → 内层解析不到该列，要么报「列不存在」，
+            要么被当成字符串比较静默返回 0 行。
+            """
+            if not isinstance(node, dict):
+                return node
+            if node.get('kind') == 'col':
+                name = str(node.get('name'))
+                if self._qualified_owner(name) in outer_names:
+                    got = self._outer_column_value(cols, row, name)
+                    if got is _MISSING:
+                        raise ValueError(
+                            f"相关子查询折叠失败：外层列 {name} 解析不到")
+                    return {'kind': 'lit', 'value': got}
+                return node
+            out_n = dict(node)
+            if out_n.get('kind') == 'arith':
+                out_n['left'] = fold_expr(out_n.get('left'))
+                out_n['right'] = fold_expr(out_n.get('right'))
+            elif out_n.get('kind') == 'func':
+                out_n['args'] = [fold_expr(a)
+                                 for a in (out_n.get('args') or [])]
+            return out_n
+
         def fold_node(node, d):
             if not isinstance(node, dict):
                 return node
@@ -2808,6 +3180,12 @@ class Executor:
                     out[key] = [fold_node(c, d) for c in out[key]]
             if 'not' in out:
                 out['not'] = fold_node(out['not'], d)
+            pred = out.get('expr_pred')
+            if isinstance(pred, dict):
+                new_pred = dict(pred)
+                new_pred['left'] = fold_expr(pred.get('left'))
+                new_pred['right'] = fold_expr(pred.get('right'))
+                out['expr_pred'] = new_pred
             inner_sub = out.get('subquery')
             if isinstance(inner_sub, dict):
                 # 嵌套子查询：它引用的外层列同样折叠成字面量，
@@ -2918,6 +3296,13 @@ class Executor:
 
         consider(sub.get('column'))
         consider(sub.get('value'))
+        # 表达式谓词里的外层列引用（`WHERE LOWER(u.name) = 'x'`）同样要计入：
+        # 漏掉会让 `_fold_cache_key` 少一个维度 → 不同外层行共用缓存（错答）
+        pred = sub.get('expr_pred')
+        if isinstance(pred, dict):
+            for node in (pred.get('left'), pred.get('right')):
+                for c in _expr_columns_outside_agg(node):
+                    consider(c)
         for key in ('and', 'or'):
             for c in (sub.get(key) or []):
                 self._outer_ref_columns(c, names, out)
@@ -3010,6 +3395,15 @@ class Executor:
                     if re.search(r'\b' + re.escape(owner) + r'\.\w+',
                                  v, re.IGNORECASE):
                         return v
+        # 表达式谓词：列引用在表达式节点里，按渲染文本做同样的残留检查
+        pred = node.get('expr_pred')
+        if isinstance(pred, dict):
+            text = (_render_scalar_expr(pred.get('left')) + ' '
+                    + _render_scalar_expr(pred.get('right')))
+            for owner in outer_names:
+                if re.search(r'\b' + re.escape(owner) + r'\.\w+',
+                             text, re.IGNORECASE):
+                    return text
         for key in ('and', 'or'):
             for c in (node.get(key) or []):
                 got = self._leftover_outer_pattern(c, outer_names)
@@ -3263,10 +3657,57 @@ class Executor:
                     item, r, base_cols, session, read_view,
                     outer_name, outer_alias, sub_cache, extra_names))
             out_rows.append(out)
-        return self._finish_select(p, out_cols, out_rows)
+        return self._finish_select(
+            p, out_cols, out_rows,
+            sort_values=self._order_by_sort_values(
+                p, out_cols, base_cols, rows))
 
-    def _finish_select(self, p, out_cols, out_rows):
-        """DISTINCT / ORDER BY / LIMIT（窗口计算之后才生效）"""
+    # ---- ORDER BY 表达式排序键 ----
+
+    @staticmethod
+    def _row_agg_values(base_cols, row):
+        """分组结果行上可用的聚合值映射（供 ORDER BY 表达式取聚合值）
+
+        实现在 `parser.row_agg_values_map`（计划执行器共用同一份）。
+        """
+        from .parser import row_agg_values_map
+        return row_agg_values_map(base_cols, row)
+
+    def _order_by_sort_values(self, p, out_cols, base_cols, rows):
+        """ORDER BY 是**表达式**时按源行算出排序键；否则返回 None
+
+        返回 None 表示排序键是普通列名 / 输出别名（例如 `ORDER BY tot
+        DESC`），继续走 `_finish_select` 里按输出列名查找的既有实现。
+
+        为什么需要这条路径：`ORDER BY LENGTH(name) DESC` 里的
+        `LENGTH(name)` 在输出列里根本不存在，存储层与计划执行器的
+        `except: pass` 会**静默不排序**（而且解析器原来会把 DESC 一起丢掉），
+        返回一份顺序错误的结果 —— 典型的静默错答。
+        """
+        order_by = p.get('order_by')
+        if not order_by:
+            return None
+        col = str(order_by[0]).strip()
+        if col in out_cols or self._strip_qualifier(col) in out_cols:
+            return None
+        node = _parse_scalar_expr(col)
+        if node is None:
+            return None
+        self._check_expr_functions(node, 'ORDER BY')
+        values = []
+        for r in rows:
+            values.append(self._eval_expr_in_row(
+                node, base_cols, r, self._row_agg_values(base_cols, r),
+                'ORDER BY'))
+        return values
+
+    def _finish_select(self, p, out_cols, out_rows, sort_values=None):
+        """DISTINCT / ORDER BY / LIMIT（窗口计算之后才生效）
+
+        sort_values：ORDER BY 是表达式时，`_order_by_sort_values` 按源行
+        预先算好的排序键（与 out_rows 一一对应）；None 表示走按输出列名
+        查找的既有实现。
+        """
         if p.get('distinct'):
             seen, deduped = set(), []
             for r in out_rows:
@@ -3279,15 +3720,24 @@ class Executor:
         order_by = p.get('order_by')
         if order_by:
             col, desc = order_by
-            key = self._strip_qualifier(col)
-            i = None
-            if col in out_cols:
-                i = out_cols.index(col)
-            elif key in out_cols:
-                i = out_cols.index(key)
-            if i is not None:
-                out_rows.sort(key=lambda r: (r[i] is None, r[i]),
-                              reverse=bool(desc))
+            if sort_values is not None and len(sort_values) == len(out_rows):
+                # 表达式排序键：NULL 仍然排在最后（ASC）/ 最前（DESC），
+                # 与下面按列排序的 NULL 处理保持一致
+                order = sorted(
+                    range(len(out_rows)),
+                    key=lambda i: (sort_values[i] is None, sort_values[i]),
+                    reverse=bool(desc))
+                out_rows = [out_rows[i] for i in order]
+            else:
+                key = self._strip_qualifier(col)
+                i = None
+                if col in out_cols:
+                    i = out_cols.index(col)
+                elif key in out_cols:
+                    i = out_cols.index(key)
+                if i is not None:
+                    out_rows.sort(key=lambda r: (r[i] is None, r[i]),
+                                  reverse=bool(desc))
 
         # LIMIT / OFFSET：都在 ORDER BY 之后、对最终结果裁剪
         offset = int(p.get('offset') or 0)
@@ -3646,13 +4096,39 @@ class Executor:
         return self._select_correlated(
             p, s, rel, rv, p.get('table'), extra_names=join_names)
 
+    def _where_to_pk_equalities(self, tbl, where, read_view):
+        """把「存储层认不出的条件」改写成按主键等值的 or 链（UPDATE/DELETE 用）
+
+        表达式谓词（标量函数 / 算术）存储层 `Table._match` 认不出，会
+        `KeyError('column')` —— 外层报成"表不存在"，与真实原因无关，
+        甚至可能被当成"条件恒真"而**误改全表**。这里先用执行器自己的
+        统一求值器扫一遍表算出命中行的主键，再把条件改写成
+        `pk = k1 OR pk = k2 ...` 交给存储层，语义与逐行判断完全一致。
+        """
+        cols, rows = tbl.select(['*'], None, None, None, read_view)
+        cols = [str(c) for c in cols]
+        pk_name = str(tbl.pk_col)
+        if pk_name not in cols:
+            raise ValueError(
+                f"UPDATE/DELETE 的函数/算术条件需要主键列，表里找不到 "
+                f"'{pk_name}'")
+        pi = cols.index(pk_name)
+        norm = self._normalize_where(where)
+        pks = [r[pi] for r in rows
+               if self._eval_condition(list(r), cols, norm)]
+        return {'or': [{'column': pk_name, 'op': '=', 'value': k}
+                       for k in pks]}
+
     def _cmd_update(self, p, s):
         tbl = self.db.get_table(p['table'])
         txn = s.get('txn')
         tid = txn['txn_id'] if txn else 0
         rv = txn['read_view'] if txn else None
+        where = p.get('where')
+        if self._where_has_expr_pred(where):
+            where = self._where_to_pk_equalities(tbl, where, rv)
         n = tbl.update(
-            p['set'], p.get('where'),
+            p['set'], where,
             txn_id=tid, read_view=rv)
         self.stats['rows'] += n
         return self._ok(
@@ -3663,8 +4139,11 @@ class Executor:
         txn = s.get('txn')
         tid = txn['txn_id'] if txn else 0
         rv = txn['read_view'] if txn else None
+        where = p.get('where')
+        if self._where_has_expr_pred(where):
+            where = self._where_to_pk_equalities(tbl, where, rv)
         n = tbl.delete(
-            p.get('where'), txn_id=tid, read_view=rv)
+            where, txn_id=tid, read_view=rv)
         self.stats['rows'] += n
         return self._ok(
             affected=n, message=f"{n} row(s) deleted")

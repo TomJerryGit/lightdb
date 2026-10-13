@@ -181,15 +181,30 @@ class Optimizer:
 
     @staticmethod
     def _is_agg_expr(expr):
+        """是否是聚合表达式
+
+        除了 `SUM(x)` 这种「名字(」开头的形态，还要识别**嵌套在表达式里**的
+        聚合（`ABS(SUM(v))`、`ROUND(AVG(v), 1)`）—— 漏判会让它们落进
+        Project 而不是 GroupBy，随后报「列不存在」（原本就是显式错误，
+        但用户看不出真实原因）。`TOTAL` / `GROUP_CONCAT` 也一并认。
+        判定前先剥掉 `AS 别名`（`ROUND(AVG(o.amount), 1) AS av`）。
+        """
         if not isinstance(expr, str):
             return False
-        e = expr.strip().upper()
-        return any(
-            e.startswith(fn + '(')
+        e = re.sub(r'\s+AS\s+[`"]?\w+[`"]?\s*$', '',
+                   expr.strip(), flags=re.IGNORECASE).strip()
+        up = e.upper()
+        if any(
+            up.startswith(fn + '(')
             for fn in ('COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
                        'STDDEV', 'STDDEV_POP', 'STDDEV_SAMP',
-                       'VARIANCE', 'VAR_POP', 'VAR_SAMP')
-        )
+                       'VARIANCE', 'VAR_POP', 'VAR_SAMP',
+                       'TOTAL', 'GROUP_CONCAT')
+        ):
+            return True
+        from .parser import parse_scalar_expr, expr_has_agg
+        node = parse_scalar_expr(e)
+        return bool(node is not None and expr_has_agg(node))
 
     # ==================== RBO ====================
 

@@ -631,13 +631,23 @@ class Parser:
         if htext is not None:
             having = self._where(htext)
 
-        om = re.search(
-            r'ORDER\s+BY\s+[`"]?([\w.]+)[`"]?(?:\s+(ASC|DESC))?',
-            rest, re.IGNORECASE)
-        if om:
-            order_by = (
-                om.group(1),
-                (om.group(2) or '').upper() == 'DESC')
+        # ORDER BY：取**顶层** ORDER BY 正文（到 LIMIT 为止），再拆出
+        # 可选的 ASC / DESC。排序键允许是表达式（`ORDER BY LENGTH(name) DESC`）。
+        # 原来的 `ORDER BY\s+([\w.]+)(?:\s+(ASC|DESC))?` 只会取到
+        # `LENGTH`（把函数名当成列名），而且 `(name) DESC` 让 ASC/DESC
+        # 分组匹配不上 → DESC 被**静默丢掉**（升序返回），属于静默错答。
+        otext = self._extract_clause(rest, 'ORDER', ('LIMIT',))
+        if otext is not None:
+            items = self._split_top_level(otext)
+            key_text = items[0].strip() if items else ''
+            desc = False
+            dm = re.match(r'^(.*?)\s+(ASC|DESC)\s*$', key_text,
+                          re.IGNORECASE | re.DOTALL)
+            if dm:
+                key_text = dm.group(1).strip()
+                desc = dm.group(2).upper() == 'DESC'
+            if key_text:
+                order_by = (key_text, desc)
 
         # LIMIT：三种写法都要认
         #   LIMIT n                 -> limit=n
@@ -835,10 +845,15 @@ class Parser:
         # 产出 {'agg': 'COUNT(*)', 'op': '>', 'value': 1}，聚合值由
         # GroupBy / 统一分组路径用 _eval_agg_expr 求出后再比较。
         # 聚合值上的 IS [NOT] NULL 同样编码成 op='=' / '!=' + value=None。
+        # 函数名必须是**聚合函数**才算聚合谓词。原来的正则对任意 `名字(...)`
+        # 都成立，于是 `WHERE LOWER(name) = 'alice'` / `WHERE ABS(v-20) < 5`
+        # 会被编成 `{'agg': 'LOWER(name)', ...}`（标量函数被当成聚合），
+        # 分组路径按聚合去算 → 报出与真实原因无关的错误。这里放行给下面的
+        # 表达式谓词分支（`_parse_expr_predicate`）处理。
         agm = re.match(
             r'\s*(\w+)\s*\(\s*(\*|[^()]*?)\s*\)\s+IS\s+(NOT\s+)?NULL\s*$',
             s, re.IGNORECASE)
-        if agm:
+        if agm and agm.group(1).upper() in _AGG_FUNC_NAMES:
             return {
                 'agg': f'{agm.group(1).upper()}({agm.group(2).strip()})',
                 'op': '!=' if agm.group(3) else '=',
@@ -848,7 +863,7 @@ class Parser:
             r'\s*(\w+)\s*\(\s*(\*|[^()]*?)\s*\)\s*'
             r'(=|!=|<>|<=|>=|<|>)\s*(.+?)\s*$',
             s, re.IGNORECASE)
-        if am:
+        if am and am.group(1).upper() in _AGG_FUNC_NAMES:
             op = am.group(3).upper()
             if op == '<>':
                 op = '!='
@@ -857,6 +872,16 @@ class Parser:
                 'op': op,
                 'value': am.group(4).strip().strip("'\""),
             }
+
+        # 表达式谓词（标量函数 / 算术，如 `LOWER(name) = 'alice'`、
+        # `salary * 2 + 10 > 50`、`ABS(v - 20) < 5`、`SUM(v) * 2 > 100`）：
+        # 左右两侧都由下面的标量表达式解析器解析，求值交给
+        # `eval_expr_predicate`（见文件末尾「标量表达式」一节）。
+        # **必须放在普通比较之前**：否则 `name = UPPER(x)` 会被普通比较
+        # 当成「name 等于字面量 'UPPER(x)'」静默给出错误行集。
+        expr_pred = self._parse_expr_predicate(s)
+        if expr_pred is not None:
+            return expr_pred
 
         # 普通比较
         m = re.match(
@@ -913,6 +938,74 @@ class Parser:
                 f"EXISTS (SELECT 1 FROM t WHERE x = a AND y = b)")
 
         raise SyntaxError(f"WHERE 条件错误: {s}")
+
+    # ============ 表达式谓词（标量函数 / 算术，任务 1、2） ============
+
+    # 单个操作数：裸列名（可带表限定符 / 反引号 / 双引号）
+    _PLAIN_OPERAND_RE = re.compile(r'^[`"]?[\w.]+[`"]?$')
+
+    @classmethod
+    def _split_top_level_comparison(cls, s: str):
+        """在顶层（括号 / 字符串字面量之外）找**第一个**比较运算符
+
+        返回 (左文本, op, 右文本)；找不到返回 None。op 归一到
+        `= != < > <= >=`（`<>` 写成 `!=`）。两字符运算符优先匹配，
+        因此 `a >= 1` 不会在 `>` 处断开。
+        """
+        ops = ('<=', '>=', '<>', '!=', '=', '<', '>')
+        depth = 0
+        for i, ch, quoted in cls._scan_quotes(s):
+            if quoted:
+                continue
+            if ch == '(':
+                depth += 1
+                continue
+            if ch == ')':
+                depth -= 1
+                continue
+            if depth != 0:
+                continue
+            for op in ops:
+                if s.startswith(op, i):
+                    left, right = s[:i].strip(), s[i + len(op):].strip()
+                    if not left or not right:
+                        return None
+                    return left, ('!=' if op == '<>' else op), right
+        return None
+
+    def _parse_expr_predicate(self, s: str):
+        """把 `表达式 比较 表达式` 解析成 `{'expr_pred': {...}}`
+
+        适用形态（任务 1 / 2）：
+        * 左值是标量函数 / 算术：`WHERE LOWER(name) = 'alice'`、
+          `WHERE LENGTH(name) > 3`、`WHERE salary * 2 + 10 > 50`；
+        * 右值是函数 / 算术：`WHERE name = UPPER(dept)`；
+        * 聚合参与运算：`HAVING SUM(v) * 2 > 100`（`sum` 由聚合求值器提供值）。
+
+        返回 None = 「不归本分支管」，交回既有比较分支：
+
+        * 两侧都是「普通列名 / 字面量」的比较（`id = 1`、`u.city = u2.city`）
+          **保持原有编码**（`{'column','op','value'}`）—— 相关子查询的外层
+          列折叠（`_fold_outer_literals` 处理 `value` 是列名的情况）依赖它；
+        * 左值是**裸聚合函数**（`SUM(v) > 100`）：保持既有 `{'agg': ...}`；
+        * 任一侧解析不出标量表达式（例如右侧是 `(SELECT ...)` 标量子查询）：
+          交回既有分支（标量子查询比较有自己的一套行数语义）。
+        """
+        split = self._split_top_level_comparison(s)
+        if split is None:
+            return None
+        left_text, op, right_text = split
+        left_plain = bool(self._PLAIN_OPERAND_RE.match(left_text))
+        right_plain = bool(self._PLAIN_OPERAND_RE.match(right_text))
+        if left_plain and (right_plain or is_literal_text(right_text)):
+            return None
+        left = parse_scalar_expr(left_text)
+        right = parse_scalar_expr(right_text)
+        if left is None or right is None:
+            return None
+        if left.get('kind') == 'func' and left.get('name') in _AGG_FUNC_NAMES:
+            return None
+        return {'expr_pred': {'left': left, 'op': op, 'right': right}}
 
     # ==================== DDL ====================
 
@@ -1646,12 +1739,19 @@ def validate_group_by(parsed, strict=True):
         raise ValueError(group_by_violation_message(col, 'HAVING'))
 
     # ---------- ③ ORDER BY ----------
+    # 排序键可以是分组键本身、输出别名、聚合表达式，或**只引用分组键**的
+    # 表达式（`ORDER BY LENGTH(dept)`，dept 是分组键 → 组内取值确定）。
+    # 引用非分组键裸列的表达式仍然显式报错（绝不取组内第一行当排序键）。
     order = parsed.get('order_by')
     if isinstance(order, (list, tuple)) and order:
         col = str(order[0])
         if not (_is_key(col) or _norm_ident(col) in out_aliases
                 or is_aggregate_expr(col)):
-            raise ValueError(group_by_violation_message(col, 'ORDER BY'))
+            node = parse_scalar_expr(_split_select_alias(col)[0])
+            idents = expr_bare_columns(node) if node is not None else None
+            if not (idents is not None
+                    and all(_is_key(i) for i in idents)):
+                raise ValueError(group_by_violation_message(col, 'ORDER BY'))
 
     # ---------- ④ 有 GROUP BY 时的窗口函数 ----------
     for w in (parsed.get('windows') or []):
@@ -1667,3 +1767,764 @@ def validate_group_by(parsed, strict=True):
             if not group_raw:
                 raise ValueError(group_by_violation_message(c, 'AGG'))
             raise ValueError(group_by_violation_message(c, 'WINDOW'))
+
+
+# ==========================================================================
+# 标量表达式（单行函数 + 算术）—— 解析 / 渲染 / 求值
+#
+# 背景：`SELECT LOWER(name) FROM t` 原先整条投影被下推给存储层，存储层只认
+# 列名 → 报「列 'LOWER(name)' 不存在」；`WHERE salary * 2 > 230` 连解析都
+# 过不去（SyntaxError）。本次给引擎补上一层**单行标量函数 + 算术**能力，
+# 覆盖 SELECT 投影 / WHERE / ORDER BY / GROUP BY / HAVING 五个位置。
+#
+# 实现方式（三层，本文件负责前两层）：
+#   ① 解析：`parse_scalar_expr(text)` 用递归下降把文本编成节点 dict
+#      （+ - * / 优先级、括号、一元负号、函数调用、字面量、列引用）；
+#   ② 渲染：`render_scalar_expr(node)` 还原成规范 SQL 文本 —— 聚合表达式
+#      （`SUM(v * 2)`）在 HAVING 里要按文本去 agg_values 里取值，必须有一份
+#      「同一节点 ↔ 同一文本」的规范写法；
+#   ③ 求值：`eval_expr_node` / `eval_expr_predicate` 是执行器（executor）与
+#      计划执行器（plan_executor）**共用**的求值器，列解析由调用方以
+#      `resolve(name)` 回调注入（单表 / JOIN 的列命名规则不同）。
+#
+# ★ 支持的标量函数清单（大小写不敏感，只此 7 个）：
+#       LOWER(x)  UPPER(x)  LENGTH(x)  TRIM(x)  ABS(x)
+#       ROUND(x[, n])      CONCAT(a, b, ...)   —— CONCAT 至少要 2 个参数
+#   其它函数名（REVERSE / NOW / SUBSTRING / ...）**一律显式报错并回列本清单**
+#   （见 `unsupported_function_message`），绝不静默返回 NULL，也绝不把函数名
+#   当成列名去查询。
+#
+# ★ NULL 语义（SQL 标准，三值逻辑）：
+#   * 任一参数为 NULL → 结果为 NULL（`LENGTH(NULL)`、`ABS(NULL)` 都是 NULL）；
+#   * `CONCAT` 采用**标准语义**：任一参数为 NULL → 整体 NULL
+#     （MySQL 的 CONCAT 也是这个语义；这里显式记录，避免与
+#      `CONCAT_WS`（跳过 NULL）混淆 —— 本引擎未支持 CONCAT_WS）；
+#   * 表达式谓词里任一侧是 NULL → 比较结果为 UNKNOWN（None），
+#     行过滤时按「不通过」处理（与 SQL 的 WHERE 语义一致）。
+#
+# ★ 算术与除零：
+#   * `+ - * /` 支持任意嵌套与括号；
+#   * **除零返回 NULL**（与既有 `Executor._eval_arith` 对
+#     `SELECT salary/0` 的行为一致，见 tests/test_v4_sql_features.py 的
+#     「除零：显式返回 NULL 而不是崩溃」）——不抛异常、不崩溃；
+#   * 类型不匹配（`'a' + 1`）**显式报错**，不静默给 NULL。
+#
+# ★ 已知限制：
+#   * 只支持单行标量函数，没有 CASE / CAST / 字符串拼接 `||`；
+#   * `COUNT(DISTINCT x)`、`SUM(x) FILTER (...)` 等形态解析不出表达式节点，
+#     交回既有路径处理（那里会显式报错）；
+#   * `LIKE` 不在表达式谓词里支持（`LOWER(name) LIKE 'a%'` 会显式
+#     SyntaxError）。
+# ==========================================================================
+
+# 支持的单行标量函数名（**唯一清单**，报错文案与参数校验都取自这里）
+SCALAR_FUNCTION_NAMES = ('LOWER', 'UPPER', 'LENGTH', 'TRIM', 'ABS',
+                         'ROUND', 'CONCAT')
+
+# 每个标量函数的参数个数：(最少, 最多)，None 表示不限
+SCALAR_FUNCTION_ARITY = {
+    'LOWER': (1, 1),
+    'UPPER': (1, 1),
+    'LENGTH': (1, 1),
+    'TRIM': (1, 1),
+    'ABS': (1, 1),
+    'ROUND': (1, 2),
+    'CONCAT': (2, None),
+}
+
+# 聚合函数名（与 executor._AGG_FUNCS / plan_executor._is_agg_expr 的超集一致）
+AGGREGATE_FUNCTION_NAMES = _AGG_FUNC_NAMES
+
+# 表达式词法：数字 / 字符串字面量 / 引号标识符 / 标识符 / 运算符
+_EXPR_TOKEN_RE = re.compile(r"""
+      (?P<ws>\s+)
+    | (?P<num>\d+\.\d+|\d+)
+    | (?P<str>'(?:[^']|'')*')
+    | (?P<qid>`[^`]*`|"[^"]*")
+    | (?P<ident>[A-Za-z_]\w*)
+    | (?P<op><=|>=|<>|!=|\+|-|\*|/|\(|\)|,|\.)
+""", re.VERBOSE)
+
+
+def is_literal_text(text) -> bool:
+    """文本是否是 SQL 字面量（数字 / 字符串 / NULL / TRUE / FALSE）"""
+    return bool(_LITERAL_RE.match(str(text or '').strip()))
+
+
+def _tokenize_expr(text):
+    """把表达式文本切成 token 列表；出现无法识别的字符时返回 None"""
+    tokens = []
+    i, n = 0, len(text)
+    while i < n:
+        m = _EXPR_TOKEN_RE.match(text, i)
+        if m is None:
+            return None
+        i = m.end()
+        if m.lastgroup == 'ws':
+            continue
+        tokens.append((m.lastgroup, m.group(0)))
+    return tokens
+
+
+class _ExprParser:
+    """标量表达式递归下降解析器
+
+    文法（只处理算术语义，比较运算由 `_split_top_level_comparison` 先切开）::
+
+        expr    := term (('+' | '-') term)*
+        term    := factor (('*' | '/') factor)*
+        factor  := ('-' | '+') factor | primary
+        primary := NUMBER | STRING | NULL | TRUE | FALSE
+                 | FUNC '(' [args] ')' | COLUMN | '(' expr ')'
+        args    := (expr | '*') (',' (expr | '*'))*
+    """
+
+    def __init__(self, tokens):
+        self.toks = tokens
+        self.pos = 0
+
+    def peek(self):
+        if self.pos < len(self.toks):
+            return self.toks[self.pos]
+        return (None, None)
+
+    def accept_op(self, *ops):
+        kind, val = self.peek()
+        if kind == 'op' and val in ops:
+            self.pos += 1
+            return val
+        return None
+
+    def parse(self):
+        node = self._expr()
+        if node is None or self.pos != len(self.toks):
+            return None
+        return node
+
+    def _expr(self):
+        left = self._term()
+        if left is None:
+            return None
+        while True:
+            op = self.accept_op('+', '-')
+            if op is None:
+                return left
+            right = self._term()
+            if right is None:
+                return None
+            left = {'kind': 'arith', 'op': op,
+                    'left': left, 'right': right}
+
+    def _term(self):
+        left = self._factor()
+        if left is None:
+            return None
+        while True:
+            op = self.accept_op('*', '/')
+            if op is None:
+                return left
+            right = self._factor()
+            if right is None:
+                return None
+            left = {'kind': 'arith', 'op': op,
+                    'left': left, 'right': right}
+
+    def _factor(self):
+        sign = self.accept_op('-', '+')
+        node = self._primary()
+        if node is None:
+            return None
+        if sign == '-':
+            if node.get('kind') == 'lit' \
+                    and isinstance(node.get('value'), (int, float)) \
+                    and not isinstance(node.get('value'), bool):
+                return {'kind': 'lit', 'value': -node['value']}
+            # 非字面量的负号：写成 `0 - x`，语义等价且求值器不必再处理
+            return {'kind': 'arith', 'op': '-',
+                    'left': {'kind': 'lit', 'value': 0}, 'right': node}
+        return node
+
+    def _primary(self):
+        kind, val = self.peek()
+        if kind == 'num':
+            self.pos += 1
+            return {'kind': 'lit',
+                    'value': float(val) if '.' in val else int(val)}
+        if kind == 'str':
+            self.pos += 1
+            return {'kind': 'lit', 'value': val[1:-1].replace("''", "'")}
+        if kind == 'qid':
+            self.pos += 1
+            return self._qualified(val[1:-1])
+        if kind == 'ident':
+            self.pos += 1
+            up = val.upper()
+            if self.peek() == ('op', '('):
+                self.pos += 1
+                args = self._args()
+                if args is None:
+                    return None
+                return {'kind': 'func', 'name': up, 'args': args}
+            if up == 'NULL':
+                return {'kind': 'lit', 'value': None}
+            if up == 'TRUE':
+                return {'kind': 'lit', 'value': True}
+            if up == 'FALSE':
+                return {'kind': 'lit', 'value': False}
+            return self._qualified(val)
+        if kind == 'op' and val == '(':
+            self.pos += 1
+            node = self._expr()
+            if node is None or self.accept_op(')') is None:
+                return None
+            return node
+        return None
+
+    def _qualified(self, name):
+        """`name` 或 `t.name`（点号 + 标识符）"""
+        parts = [name]
+        while self.peek() == ('op', '.'):
+            if self.pos + 1 >= len(self.toks):
+                return None
+            nxt_kind, nxt_val = self.toks[self.pos + 1]
+            if nxt_kind not in ('ident', 'qid'):
+                return None
+            parts.append(nxt_val.strip('`"'))
+            self.pos += 2
+        return {'kind': 'col', 'name': '.'.join(parts)}
+
+    def _args(self):
+        """函数参数列表（已吃掉左括号）；`*` 作为独立节点支持 `COUNT(*)`"""
+        args = []
+        if self.accept_op(')') is not None:
+            return args
+        while True:
+            kind, val = self.peek()
+            if kind == 'op' and val == '*':
+                self.pos += 1
+                args.append({'kind': 'star'})
+            else:
+                node = self._expr()
+                if node is None:
+                    return None
+                args.append(node)
+            if self.accept_op(',') is not None:
+                continue
+            if self.accept_op(')') is not None:
+                return args
+            return None
+
+
+def parse_scalar_expr(text):
+    """把文本解析成标量表达式节点；无法整体解析时返回 None
+
+    返回的节点是纯 dict（可安全放进 AST / 缓存 / 比较）::
+
+        {'kind': 'lit',   'value': 3}
+        {'kind': 'col',   'name': 'salary'}          # 可带限定符 `e.salary`
+        {'kind': 'star'}                              # 仅作为聚合参数 `*`
+        {'kind': 'arith', 'op': '*', 'left': ..., 'right': ...}
+        {'kind': 'func',  'name': 'LOWER', 'args': [...]}
+    """
+    t = str(text or '').strip()
+    if not t:
+        return None
+    tokens = _tokenize_expr(t)
+    if tokens is None:
+        return None
+    return _ExprParser(tokens).parse()
+
+
+def render_scalar_expr(node) -> str:
+    """把表达式节点还原成规范 SQL 文本（聚合取值键 / 报错文案用）
+
+    规范化约定：二元运算两侧各一个空格、函数参数用 `, ` 分隔、字符串用单
+    引号（内部单引号翻倍）。同一个节点渲染结果恒定，因此可以当字典键。
+    """
+    if not isinstance(node, dict):
+        return str(node)
+    kind = node.get('kind')
+    if kind == 'lit':
+        v = node.get('value')
+        if v is None:
+            return 'NULL'
+        if v is True:
+            return 'TRUE'
+        if v is False:
+            return 'FALSE'
+        if isinstance(v, str):
+            return "'" + v.replace("'", "''") + "'"
+        return repr(v)
+    if kind == 'col':
+        return str(node.get('name'))
+    if kind == 'star':
+        return '*'
+    if kind == 'arith':
+        return (f"{render_scalar_expr(node.get('left'))} "
+                f"{node.get('op')} "
+                f"{render_scalar_expr(node.get('right'))}")
+    if kind == 'func':
+        args = ', '.join(render_scalar_expr(a)
+                         for a in (node.get('args') or []))
+        return f"{node.get('name')}({args})"
+    return str(node)
+
+
+def expr_has_agg(node) -> bool:
+    """表达式里是否出现聚合函数（`SUM(v * 2)` / `ROUND(AVG(v), 1)`）"""
+    if not isinstance(node, dict):
+        return False
+    if node.get('kind') == 'func':
+        if node.get('name') in AGGREGATE_FUNCTION_NAMES:
+            return True
+        return any(expr_has_agg(a) for a in (node.get('args') or []))
+    if node.get('kind') == 'arith':
+        return expr_has_agg(node.get('left')) or expr_has_agg(node.get('right'))
+    return False
+
+
+def expr_has_func(node) -> bool:
+    """表达式里是否出现函数调用（标量或聚合）"""
+    if not isinstance(node, dict):
+        return False
+    if node.get('kind') == 'func':
+        return True
+    if node.get('kind') == 'arith':
+        return expr_has_func(node.get('left')) or expr_has_func(node.get('right'))
+    return False
+
+
+def expr_column_names(node, out=None) -> list:
+    """表达式里引用的列名（保持出现顺序、可重复）"""
+    if out is None:
+        out = []
+    if not isinstance(node, dict):
+        return out
+    kind = node.get('kind')
+    if kind == 'col':
+        out.append(str(node.get('name')))
+    elif kind == 'arith':
+        expr_column_names(node.get('left'), out)
+        expr_column_names(node.get('right'), out)
+    elif kind == 'func':
+        for a in (node.get('args') or []):
+            expr_column_names(a, out)
+    return out
+
+
+def expr_columns_outside_agg(node, out=None) -> list:
+    """表达式里**不在聚合函数内部**的列引用（相关性判定用）
+
+    与 `expr_bare_columns` 的区别：标量函数的参数**算**引用 ——
+    `LOWER(u.name)` 里的 `u.name` 是外层列引用，相关性判定必须看到它，
+    否则相关子查询会被当成非相关一次性求值（静默错答）。
+    聚合函数的参数**不算**：这与本引擎既有的 `{'agg': ...}` 编码一致
+    （聚合表达式文本本来就不参与相关性判定），藏在聚合里的外层引用由
+    `_leftover_outer_pattern` 的残留检查兜底并**显式报错**。
+    """
+    if out is None:
+        out = []
+    if not isinstance(node, dict):
+        return out
+    kind = node.get('kind')
+    if kind == 'col':
+        out.append(str(node.get('name')))
+    elif kind == 'arith':
+        expr_columns_outside_agg(node.get('left'), out)
+        expr_columns_outside_agg(node.get('right'), out)
+    elif kind == 'func':
+        if str(node.get('name') or '').upper() in AGGREGATE_FUNCTION_NAMES:
+            return out
+        for a in (node.get('args') or []):
+            expr_columns_outside_agg(a, out)
+    return out
+
+
+def expr_bare_columns(node, out=None) -> list:
+    """表达式里**不在聚合函数内部**的列引用（GROUP BY 校验用）
+
+    `ROUND(AVG(v), 1)` → []（v 在聚合里，聚合值只有一个，与分组无关）；
+    `LENGTH(dept)` → ['dept']（必须自己出现在 GROUP BY 里才合法）。
+    """
+    if out is None:
+        out = []
+    if not isinstance(node, dict):
+        return out
+    kind = node.get('kind')
+    if kind == 'col':
+        out.append(str(node.get('name')))
+    elif kind == 'arith':
+        expr_bare_columns(node.get('left'), out)
+        expr_bare_columns(node.get('right'), out)
+    elif kind == 'func':
+        if node.get('name') in AGGREGATE_FUNCTION_NAMES:
+            return out
+        for a in (node.get('args') or []):
+            expr_bare_columns(a, out)
+    return out
+
+
+def unsupported_function_message(name) -> str:
+    """不支持的函数名 → 显式报错文案（**必须回列支持清单**）"""
+    return (f"不支持的函数 '{name}'：本引擎支持的**单行标量函数**是 "
+            f"{' / '.join(SCALAR_FUNCTION_NAMES)}；聚合函数支持 "
+            f"COUNT / SUM / AVG / MIN / MAX / TOTAL / GROUP_CONCAT / "
+            f"STDDEV(_POP/_SAMP) / VARIANCE(VAR_POP/VAR_SAMP)。"
+            f"其它函数名不会静默返回 NULL，也不会被当成列名")
+
+
+def _norm_expr_key(text) -> str:
+    """聚合取值键的宽松归一化（去空白 + 小写），用于容错匹配"""
+    return re.sub(r'\s+', '', str(text or '')).lower()
+
+
+def lookup_agg_value(agg_values, node):
+    """按聚合成文本在 agg_values 里取值；取不到返回 _EXPR_MISSING"""
+    if not isinstance(agg_values, dict):
+        return _EXPR_MISSING
+    text = render_scalar_expr(node)
+    if text in agg_values:
+        return agg_values[text]
+    stripped = _strip_qualifiers_text(text)
+    if stripped in agg_values:
+        return agg_values[stripped]
+    want = _norm_expr_key(text)
+    for k, v in agg_values.items():
+        if _norm_expr_key(k) == want:
+            return v
+    return _EXPR_MISSING
+
+
+def _strip_qualifiers_text(text) -> str:
+    """去掉列引用上的表限定符：`SUM(o.amount)` -> `SUM(amount)`"""
+    return re.sub(r'\b\w+\.(\w+)', r'\1', str(text))
+
+
+def apply_arith_values(left, op, right):
+    """二元算术求值：NULL 传播 + 除零 NULL + 类型不匹配显式报错"""
+    if left is None or right is None:
+        return None
+    try:
+        if op == '+':
+            return left + right
+        if op == '-':
+            return left - right
+        if op == '*':
+            return left * right
+        if op == '/':
+            if right == 0:
+                # 除零 → NULL（与既有 `Executor._eval_arith` 的
+                # `SELECT salary/0` 行为一致；不抛异常、不崩溃）
+                return None
+            return left / right
+    except TypeError:
+        raise ValueError(
+            f"算术表达式类型不匹配: {left!r} {op} {right!r}")
+    raise ValueError(f"不支持的算术运算符: {op}")
+
+
+def apply_scalar_function(name, values):
+    """执行单个标量函数（参数已求值）；NULL 传播与参数个数检查在这里"""
+    name = str(name or '').upper()
+    if name not in SCALAR_FUNCTION_ARITY:
+        raise ValueError(unsupported_function_message(name))
+    lo, hi = SCALAR_FUNCTION_ARITY[name]
+    n = len(values)
+    if n < lo or (hi is not None and n > hi):
+        want = f"{lo}" if hi == lo else (
+            f"{lo} 或 {hi}" if hi is not None else f"至少 {lo}")
+        raise ValueError(
+            f"函数 {name} 的参数个数不对：需要 {want} 个，实际 {n} 个")
+    # ★ NULL 语义：任一参数为 NULL → 结果 NULL（CONCAT 也按标准返回 NULL）
+    if any(v is None for v in values):
+        return None
+    try:
+        if name == 'LOWER':
+            return str(values[0]).lower()
+        if name == 'UPPER':
+            return str(values[0]).upper()
+        if name == 'LENGTH':
+            # 字符个数（与 SQLite / 标准 SQL 的 LENGTH 一致；MySQL 的
+            # LENGTH 是字节数，中文场景会不同 —— 本引擎按字符数实现）
+            return len(str(values[0]))
+        if name == 'TRIM':
+            return str(values[0]).strip()
+        if name == 'ABS':
+            return abs(values[0])
+        if name == 'ROUND':
+            digits = 0
+            if len(values) == 2:
+                digits = int(values[1])
+            return _round_half_up(values[0], digits)
+        if name == 'CONCAT':
+            return ''.join(str(v) for v in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"函数 {name} 的参数不合法: {exc}")
+    raise ValueError(unsupported_function_message(name))
+
+
+def _round_half_up(x, digits):
+    """SQL 语义的 ROUND：四舍五入（**half away from zero**）
+
+    不能用 Python 内建 `round` —— 它是「银行家舍入」（round-half-even），
+    `round(2.5) == 2`、`round(0.125, 2) == 0.12`，与 SQL 的
+    `ROUND(2.5) == 3`、`ROUND(0.125, 2) == 0.13` 不一致，属于静默算错。
+    这里用 Decimal + ROUND_HALF_UP 保证与 SQL 一致。
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    d = Decimal(str(x))
+    # digits >= 0 → 量化到 10^-digits；digits < 0 → 量化到 10^|digits|
+    q = Decimal(1).scaleb(-int(digits))
+    out = d.quantize(q, rounding=ROUND_HALF_UP)
+    if digits <= 0:
+        return int(out)
+    return float(out)
+
+
+def _coerce_compare_pair(left, right):
+    """比较前的类型对齐：数字列 vs 字符串字面量（`LENGTH(name) > '3'`）"""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left, right
+    try:
+        if isinstance(left, (int, float)) and isinstance(right, str):
+            return left, float(right) if '.' in right else int(right)
+        if isinstance(right, (int, float)) and isinstance(left, str):
+            return (float(left) if '.' in left else int(left)), right
+    except (TypeError, ValueError):
+        pass
+    return left, right
+
+
+def compare_values(left, op, right):
+    """比较运算求值；任一侧 NULL → None（UNKNOWN，三值逻辑）"""
+    if left is None or right is None:
+        return None
+    left, right = _coerce_compare_pair(left, right)
+    try:
+        if op == '=':
+            return left == right
+        if op == '!=':
+            return left != right
+        if op == '<':
+            return left < right
+        if op == '>':
+            return left > right
+        if op == '<=':
+            return left <= right
+        if op == '>=':
+            return left >= right
+    except TypeError:
+        raise ValueError(f"无法比较 {left!r} {op} {right!r}：类型不兼容")
+    raise ValueError(f"不支持的比较运算符: {op}")
+
+
+# 表达式求值里「聚合值取不到」的哨兵
+_EXPR_MISSING = object()
+
+
+def eval_expr_node(node, resolve, agg_values=None, position=''):
+    """求值标量表达式节点
+
+    resolve: 列解析回调 `resolve(name) -> value`，解析不到时**必须抛
+             ValueError**（由调用方给出该路径下的准确措辞）。
+    agg_values: HAVING/分组语境下预先算好的聚合值
+             `{'SUM(v)': 320, ...}`；聚合节点按 `render_scalar_expr` 的
+             规范文本去查（并做去限定符 / 去空白的容错匹配）。
+    position: 报错前缀（'WHERE' / 'HAVING' / 'ORDER BY' / 'GROUP BY' /
+              '投影'），只影响错误文案。
+    """
+    if not isinstance(node, dict):
+        return node
+    pos = f"{position} " if position else ""
+    kind = node.get('kind')
+    if kind == 'lit':
+        return node.get('value')
+    if kind == 'star':
+        raise ValueError(
+            f"{pos}里的 '*' 只能用作 COUNT(*) 的参数，不能单独求值")
+    if kind == 'col':
+        return resolve(str(node.get('name')))
+    if kind == 'arith':
+        left = eval_expr_node(node.get('left'), resolve, agg_values, position)
+        right = eval_expr_node(node.get('right'), resolve, agg_values, position)
+        return apply_arith_values(left, node.get('op'), right)
+    if kind == 'func':
+        name = str(node.get('name') or '').upper()
+        if name in AGGREGATE_FUNCTION_NAMES:
+            got = lookup_agg_value(agg_values, node)
+            if got is _EXPR_MISSING:
+                raise ValueError(
+                    f"{pos}里的聚合函数 {render_scalar_expr(node)} 在这里"
+                    f"取不到值：聚合值只在分组语境（GROUP BY / 整表聚合的"
+                    f"SELECT 列表或 HAVING）里可用")
+            return got
+        values = [eval_expr_node(a, resolve, agg_values, position)
+                  for a in (node.get('args') or [])]
+        return apply_scalar_function(name, values)
+    raise ValueError(f"{pos}无法求值的表达式节点: {render_scalar_expr(node)}")
+
+
+def eval_expr_predicate(pred, resolve, agg_values=None, position=''):
+    """求值 `表达式 比较 表达式` 谓词，返回 True / False / None(UNKNOWN)"""
+    if not isinstance(pred, dict):
+        raise ValueError(f"{position} 里的表达式谓词形态不合法: {pred!r}")
+    left = eval_expr_node(pred.get('left'), resolve, agg_values, position)
+    right = eval_expr_node(pred.get('right'), resolve, agg_values, position)
+    return compare_values(left, pred.get('op'), right)
+
+
+def aggregate_values(name, vals):
+    """对**已求值并已剔除 NULL**的参数列表做聚合（两条执行路径共用）
+
+    `vals` 为空表示「空集或全 NULL」：SUM/AVG/MIN/MAX/STDDEV/VARIANCE 系列
+    都是 NULL（标准语义），`TOTAL` 按 SQLite 是 0.0。
+    """
+    name = str(name or '').upper()
+    if not vals:
+        return 0.0 if name == 'TOTAL' else None
+    try:
+        if name == 'SUM':
+            return sum(vals)
+        if name == 'TOTAL':
+            return float(sum(vals))
+        if name == 'AVG':
+            return sum(vals) / len(vals)
+        if name == 'MIN':
+            return min(vals)
+        if name == 'MAX':
+            return max(vals)
+        if name == 'GROUP_CONCAT':
+            return ','.join(str(v) for v in vals)
+        if name in ('STDDEV', 'STDDEV_POP', 'VARIANCE', 'VAR_POP'):
+            import math
+            mean = sum(vals) / len(vals)
+            var = sum((v - mean) ** 2 for v in vals) / len(vals)
+            return var if name in ('VARIANCE', 'VAR_POP') else math.sqrt(var)
+        if name in ('STDDEV_SAMP', 'VAR_SAMP'):
+            import math
+            if len(vals) < 2:
+                return None
+            mean = sum(vals) / len(vals)
+            var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+            return var if name == 'VAR_SAMP' else math.sqrt(var)
+    except TypeError as exc:
+        raise ValueError(f"聚合函数 {name} 的参数类型不匹配: {exc}")
+    raise ValueError(unsupported_function_message(name))
+
+
+def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True):
+    """在**行集合**上求值「含聚合函数的表达式」（两条执行路径共用）
+
+    * 聚合节点（`SUM(x)` / `COUNT(*)` / `GROUP_CONCAT(x)` / `ROUND(AVG(v),1)`
+      里的 AVG）→ 对集合求值；聚合**参数**逐行求值（所以
+      `SUM(salary * 2)`、`COUNT(ABS(v))` 都能算）；
+    * 标量函数 / 算术节点 → 递归后套用共用求值器（NULL 传播、除零 NULL、
+      不支持函数报错完全一致）；
+    * 裸列节点：组内取值必须唯一（等价于分组键），否则 `strict=True` 时
+      显式报错（`group_by_violation_message`），绝不取「组内第一行」。
+
+    resolve_row(row, name) -> 值；解析不到时**必须抛 ValueError**。
+    """
+    if not isinstance(node, dict):
+        return node
+    kind = node.get('kind')
+    if kind == 'lit':
+        return node.get('value')
+    if kind == 'star':
+        raise ValueError(
+            f"{position} 里的 '*' 只能用作 COUNT(*) 的参数")
+    if kind == 'col':
+        name = str(node.get('name'))
+        vals = [resolve_row(r, name) for r in rows]
+        first = vals[0] if vals else None
+        if all(v == first for v in vals) or not strict:
+            return first
+        raise ValueError(group_by_violation_message(name))
+    if kind == 'arith':
+        left = eval_agg_expr_over_rows(node.get('left'), rows, resolve_row,
+                                       position, strict)
+        right = eval_agg_expr_over_rows(node.get('right'), rows, resolve_row,
+                                        position, strict)
+        return apply_arith_values(left, node.get('op'), right)
+    if kind == 'func':
+        name = str(node.get('name') or '').upper()
+        args = node.get('args') or []
+        if name in AGGREGATE_FUNCTION_NAMES:
+            if not args:
+                raise ValueError(
+                    f"聚合函数 {name} 缺少参数（要写成 {name}(*) 或 "
+                    f"{name}(列)）")
+            star = args[0].get('kind') == 'star'
+
+            def arg_of(row):
+                return eval_expr_node(
+                    args[0], lambda n, _r=row: resolve_row(_r, n),
+                    None, position)
+
+            if name == 'COUNT':
+                return len(rows) if star \
+                    else sum(1 for r in rows if arg_of(r) is not None)
+            if star:
+                raise ValueError(f"聚合函数 {name} 不接受 `*` 参数")
+            return aggregate_values(
+                name, [v for v in (arg_of(r) for r in rows) if v is not None])
+        values = [eval_agg_expr_over_rows(a, rows, resolve_row, position,
+                                          strict)
+                  for a in args]
+        return apply_scalar_function(name, values)
+    raise ValueError(
+        f"{position} 里无法求值的表达式节点: {render_scalar_expr(node)}")
+
+
+def expr_agg_texts(node, out=None) -> list:
+    """表达式里**最外层**聚合函数的规范文本（HAVING 取值键用）
+
+    `SUM(v) * 2 > 100` → ['SUM(v)']；`ROUND(AVG(v), 1)` → ['AVG(v)']
+    （外层 ROUND 不是聚合，继续往里找）。
+    """
+    if out is None:
+        out = []
+    if not isinstance(node, dict):
+        return out
+    kind = node.get('kind')
+    if kind == 'func':
+        if str(node.get('name') or '').upper() in AGGREGATE_FUNCTION_NAMES:
+            out.append(render_scalar_expr(node))
+            return out
+        for a in (node.get('args') or []):
+            expr_agg_texts(a, out)
+    elif kind == 'arith':
+        expr_agg_texts(node.get('left'), out)
+        expr_agg_texts(node.get('right'), out)
+    return out
+
+
+def expr_pred_agg_texts(pred) -> list:
+    """表达式谓词里的聚合文本（`{'expr_pred': {...}}` → ['SUM(v)']）"""
+    if not isinstance(pred, dict):
+        return []
+    out = []
+    for node in (pred.get('left'), pred.get('right')):
+        expr_agg_texts(node, out)
+    return out
+
+
+def row_agg_values_map(cols, row):
+    """分组结果行上可用的聚合值映射 `{聚合成文本: 值}`
+
+    分组之后列名列表里本来就摆着聚合表达式文本（`SUM(salary)`），
+    这里把它们按 `render_scalar_expr` 的规范文本做成键，供
+    `eval_expr_node` 处理 `ORDER BY ROUND(AVG(v), 1)` 这类表达式时取聚合值。
+    """
+    out = {}
+    for i, c in enumerate(cols or []):
+        text = str(c)
+        if not re.match(r'^\w+\s*\(', text.strip()):
+            continue
+        node = parse_scalar_expr(_split_select_alias(text)[0])
+        if node is None or not expr_has_agg(node):
+            continue
+        val = row[i] if i < len(row) else None
+        out[render_scalar_expr(node)] = val
+        out[text] = val
+    return out

@@ -186,6 +186,20 @@ class PlanExecutor:
 
         op = where.get('op')
 
+        # ---------- 表达式谓词（标量函数 / 算术）----------
+        # `WHERE LOWER(u.name) = 'a'`、`WHERE o.amt * 2 > 100`、
+        # `HAVING SUM(v) * 2 > 100`：左右两侧交给 parser 的共用求值器，
+        # 列解析走本类的 `_resolve_col`（JOIN 结果的 `u.id` 限定名 / 歧义报错
+        # 都在那里）。**必须有这个分支**：否则 `{'expr_pred': ...}` 会落到
+        # 下面「col_name is None → return True」，把整个谓词静默丢掉，
+        # 返回全部连接行 —— 静默错答。
+        pred = where.get('expr_pred')
+        if isinstance(pred, dict):
+            from .parser import eval_expr_predicate
+            pos = 'HAVING' if agg_values is not None else 'WHERE'
+            return eval_expr_predicate(
+                pred, self._expr_resolver(cols, row, pos), agg_values, pos)
+
         # ---------- 聚合谓词（HAVING）----------
         if 'agg' in where:
             key = str(where.get('agg', '')).strip()
@@ -462,6 +476,82 @@ class PlanExecutor:
 
     # ==================== 中间算子 ====================
 
+    # ==================== 标量表达式（JOIN 计划路径） ====================
+
+    def _expr_resolver(self, cols, row, position=''):
+        """表达式求值用的列解析回调（复用 `_resolve_col` 的报错与歧义语义）
+
+        `_resolve_col` 的末段匹配方向是「列名以 .name 结尾」，而 Sort 位于
+        Project 之上时列名已被压成短名（`u.name` → `name`），限定名反向
+        解析不到；GROUP BY 的输出列名会带上 `AS 别名`（`U.CITY AS C`）。
+        这两种情况在这里补一层「末段 / 别名」匹配，**真歧义仍然显式报错**。
+        """
+        def resolve(name):
+            try:
+                i = self._resolve_col(cols, name)
+            except ValueError:
+                i = self._resolve_loose(cols, name)
+                if i is None:
+                    raise
+            if i >= len(row):
+                raise ValueError(
+                    f"{position} 里的列 '{name}' 在当前行里取不到值")
+            return row[i]
+        return resolve
+
+    @staticmethod
+    def _resolve_loose(cols, name):
+        """宽松列解析：按「末段」或「AS 别名」匹配；歧义返回 None 由调用方报错"""
+        want = str(name).strip().strip('`"').rsplit('.', 1)[-1].lower()
+        if not want:
+            return None
+        hits = []
+        for i, c in enumerate(cols):
+            text = str(c).strip().strip('`"')
+            m = re.search(r'\s+AS\s+[`"]?(\w+)[`"]?\s*$', text, re.IGNORECASE)
+            last = (m.group(1) if m else text.rsplit('.', 1)[-1]).lower()
+            if last == want:
+                hits.append(i)
+        if len(hits) > 1:
+            raise ValueError(f"列 '{name}' 歧义，请加表名前缀")
+        return hits[0] if hits else None
+
+    def _eval_expr_in_row(self, node, cols, row, agg_values=None,
+                          position=''):
+        from .parser import eval_expr_node
+        return eval_expr_node(node, self._expr_resolver(cols, row, position),
+                              agg_values, position)
+
+    @staticmethod
+    def _check_expr_functions(node, position=''):
+        """静态校验表达式里的函数名（不支持的**显式报错并回列支持清单**）
+
+        与 `Executor._check_expr_functions` 同一份语义：`REVERSE(name)` /
+        `NOW()` 这类名字在这里抛 ValueError（文案由 parser 统一给出），
+        绝不静默返回 NULL，也绝不把函数名当成列名。
+        """
+        from .parser import (AGGREGATE_FUNCTION_NAMES, SCALAR_FUNCTION_NAMES,
+                             unsupported_function_message)
+        if not isinstance(node, dict):
+            return
+        kind = node.get('kind')
+        if kind == 'func':
+            name = str(node.get('name') or '').upper()
+            if name not in AGGREGATE_FUNCTION_NAMES \
+                    and name not in SCALAR_FUNCTION_NAMES:
+                raise ValueError(unsupported_function_message(name))
+            for a in (node.get('args') or []):
+                PlanExecutor._check_expr_functions(a, position)
+        elif kind == 'arith':
+            PlanExecutor._check_expr_functions(node.get('left'), position)
+            PlanExecutor._check_expr_functions(node.get('right'), position)
+
+    @staticmethod
+    def _row_agg_values(cols, row):
+        """分组结果行上可用的聚合值映射（供 ORDER BY 表达式取聚合值）"""
+        from .parser import row_agg_values_map
+        return row_agg_values_map(cols, row)
+
     def _exec_Filter(self, node):
         cols, rows = self.execute(node.children[0])
         return cols, [r for r in rows
@@ -470,9 +560,13 @@ class PlanExecutor:
     def _exec_Project(self, node):
         cols, rows = self.execute(node.children[0])
 
+        from .parser import (parse_scalar_expr, expr_has_func,
+                             _split_select_alias)
+
         target_idx = []
         raw_cols = []
         consts = []
+        exprs = []
         for c in node.columns:
             c = c.strip()
             if c == '*':
@@ -494,7 +588,30 @@ class PlanExecutor:
                     raise ValueError(
                         "JOIN 查询的投影列表里暂不支持标量子查询"
                         f"（SELECT 列表）: {c}")
-                i = self._resolve_col(cols, c)
+                try:
+                    i = self._resolve_col(cols, c)
+                except ValueError:
+                    expr_text, alias = _split_select_alias(c)
+                    # `u.id AS uid`（纯列别名）：解析别名左侧的列
+                    if alias:
+                        try:
+                            i2 = self._resolve_col(cols, expr_text)
+                        except ValueError:
+                            i2 = None
+                        if i2 is not None:
+                            target_idx.append(i2)
+                            raw_cols.append(str(alias))
+                            continue
+                    # 标量函数 / 含函数或嵌套的算术（`LOWER(u.name)`、
+                    # `o.amt * 2 + 1`）：逐行用表达式求值器算
+                    fnode = parse_scalar_expr(expr_text)
+                    if fnode is None or not (expr_has_func(fnode) or alias):
+                        raise
+                    self._check_expr_functions(fnode, '投影')
+                    target_idx.append(-2)
+                    raw_cols.append(str(alias or expr_text))
+                    exprs.append((len(target_idx) - 1, fnode))
+                    continue
                 target_idx.append(i)
                 raw_cols.append(cols[i])
         # 输出短名（避免歧义时保留全名）
@@ -513,6 +630,8 @@ class PlanExecutor:
             out = [r[i] if i >= 0 else None for i in target_idx]
             for pos, val in consts:
                 out[pos] = val
+            for pos, node_e in exprs:
+                out[pos] = self._eval_expr_in_row(node_e, cols, r, None, '投影')
             out_rows.append(out)
         return short_cols, out_rows
 
@@ -526,21 +645,33 @@ class PlanExecutor:
             # 后缀匹配方向是「cols 里的名字以 .name 结尾」，正好反了，于是
             # `JOIN ... ORDER BY o.amt` 解析失败 → **静默不排序**（实测
             # 反向 ON 修复后 `ORDER BY o.amt DESC LIMIT 2` 仍返回
-            # [(1,10),(1,20)]）。这里按「列名末段」再解析一次。
-            ci = None
-            want = str(node.column).strip().strip('`"')
-            want = want.rsplit('.', 1)[-1].lower()
-            hits = [i for i, c in enumerate(cols)
-                    if str(c).strip().strip('`"')
-                    .rsplit('.', 1)[-1].lower() == want]
-            if len(hits) == 1:
-                ci = hits[0]
+            # [(1,10),(1,20)]）。这里按「列名末段 / AS 别名」再解析一次。
+            ci = self._resolve_loose(cols, node.column)
         if ci is not None:
             rows = sorted(
                 rows,
                 key=lambda r: (r[ci] is None, r[ci] if r[ci] is not None else 0),
                 reverse=node.desc,
             )
+            return cols, rows
+        # ORDER BY 是**表达式**（`ORDER BY LENGTH(name) DESC`）：按行算出排序键。
+        # 原行为是「解析不到就静默不排序」——`ORDER BY LENGTH(u.name) DESC`
+        # 返回的还是未排序结果，属于静默错答；这里算出排序键真正排序。
+        # 只用**非纯列名**的形态触发（`LENGTH(x)`、`x * 2`）：纯列名解析不到
+        # 时保持既有的「不排序」行为，避免影响 `IN (SELECT ... ORDER BY
+        # 未投影列)` 这类既有可用形态。
+        from .parser import parse_scalar_expr
+        snode = parse_scalar_expr(self._strip_select_alias(str(node.column)))
+        if snode is not None and snode.get('kind') != 'col':
+            self._check_expr_functions(snode, 'ORDER BY')
+            keys = [self._eval_expr_in_row(
+                snode, cols, r, self._row_agg_values(cols, r), 'ORDER BY')
+                for r in rows]
+            order = sorted(
+                range(len(rows)),
+                key=lambda i: (keys[i] is None, keys[i]),
+                reverse=bool(node.desc))
+            rows = [rows[i] for i in order]
         # 仍解析不到（例如 ORDER BY 引用没有出现在投影里的列）时保持既有行为：
         # 不排序。已知限制，本次不改（改成报错会影响 `IN (SELECT ... ORDER BY
         # 未投影列)` 这类既有可用形态）。
@@ -625,20 +756,40 @@ class PlanExecutor:
                 implicit=bool(getattr(node, 'implicit_group', False)),
                 having=node.having)
 
-        # 解析分组键
-        group_idx = []
+        # 解析分组键：纯列名走下标记；函数/算术表达式（`GROUP BY UPPER(dept)`）
+        # 逐行求值。原实现对解析不到的键**静默跳过**，group_idx 变空后
+        # 整表聚成一组（`GROUP BY UPPER(dept)` 静默返回 1 行）—— 静默错答。
+        from .parser import parse_scalar_expr, expr_has_agg
+        group_getters = []
         for gc in group_cols:
             try:
-                group_idx.append(self._resolve_col(cols, gc))
+                group_getters.append(('idx', self._resolve_col(cols, gc)))
+                continue
             except ValueError:
                 pass
+            gnode = parse_scalar_expr(self._strip_select_alias(gc))
+            if gnode is None or expr_has_agg(gnode):
+                raise ValueError(
+                    f"GROUP BY 列 '{gc}' 不存在，也无法解析成分组表达式")
+            self._check_expr_functions(gnode, 'GROUP BY')
+            group_getters.append(('expr', gnode))
+
+        def key_of(row):
+            parts = []
+            for kind, spec in group_getters:
+                if kind == 'idx':
+                    parts.append(self._hashable(row[spec]))
+                else:
+                    parts.append(self._hashable(
+                        self._eval_expr_in_row(spec, cols, row, None,
+                                               'GROUP BY')))
+            return tuple(parts)
 
         # 分组
-        if group_idx:
+        if group_getters:
             groups = defaultdict(list)
             for r in rows:
-                key = tuple(self._hashable(r[i]) for i in group_idx)
-                groups[key].append(r)
+                groups[key_of(r)].append(r)
         else:
             groups = {(): rows}
 
@@ -670,13 +821,22 @@ class PlanExecutor:
 
     @classmethod
     def _collect_having_aggs(cls, having) -> list:
-        """收集 HAVING 条件里出现的聚合表达式（保持出现顺序、去重）"""
+        """收集 HAVING 条件里出现的聚合表达式（保持出现顺序、去重）
+
+        含表达式谓词（`HAVING SUM(v) * 2 > 100`）里的聚合 —— 文本由
+        `render_scalar_expr` 规范渲染，与 `_eval_condition` 取值的查找键一致。
+        """
+        from .parser import expr_pred_agg_texts
         found = []
         if isinstance(having, dict):
             if 'agg' in having:
                 a = str(having['agg']).strip()
                 if a and a not in found:
                     found.append(a)
+            if isinstance(having.get('expr_pred'), dict):
+                for a in expr_pred_agg_texts(having['expr_pred']):
+                    if a not in found:
+                        found.append(a)
             # NOT (...) 里也可能藏着聚合（`HAVING NOT (COUNT(*) > 1)`）
             inner = having.get('not')
             if isinstance(inner, dict):
@@ -753,21 +913,52 @@ class PlanExecutor:
                 row.append(next(key_iter, None))
         return row
 
-    @staticmethod
-    def _is_agg_expr(expr):
+    @classmethod
+    def _is_agg_expr(cls, expr):
+        """是否是聚合表达式（含 `ABS(SUM(v))` / `ROUND(AVG(v), 1)` 这类嵌套）
+
+        先剥掉 `AS 别名` 再判定 —— `ROUND(AVG(o.amount), 1) AS av` 整段
+        解析不出表达式，不剥别名就会漏判成「非聚合」，落到 Project 上。
+        """
         if not isinstance(expr, str):
             return False
-        e = expr.strip().upper()
-        return any(
-            e.startswith(fn + '(')
+        e = cls._strip_select_alias(expr).strip()
+        up = e.upper()
+        if any(
+            up.startswith(fn + '(')
             for fn in ('COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
                        'STDDEV', 'STDDEV_POP', 'STDDEV_SAMP',
-                       'VARIANCE', 'VAR_POP', 'VAR_SAMP')
-        )
+                       'VARIANCE', 'VAR_POP', 'VAR_SAMP',
+                       'TOTAL', 'GROUP_CONCAT')
+        ):
+            return True
+        from .parser import parse_scalar_expr, expr_has_agg
+        node = parse_scalar_expr(e)
+        return bool(node is not None and expr_has_agg(node))
 
     def _eval_agg_expr(self, expr, cols, rows):
-        """求值单个聚合表达式"""
-        expr = expr.strip()
+        """求值单个聚合表达式
+
+        参数是**表达式**（`SUM(salary * 2)`、`COUNT(ABS(v))`）或函数名是
+        存储层不支持的聚合（`ROUND(AVG(v), 1)`、`STDDEV`、`GROUP_CONCAT`）时，
+        交给 `parser.eval_agg_expr_over_rows` 逐行求值后再聚合；
+        其余形态走下面的原有实现（结果完全相同）。
+        """
+        expr = str(expr).strip()
+        from .parser import (parse_scalar_expr, expr_has_agg,
+                             eval_agg_expr_over_rows)
+        node = parse_scalar_expr(self._strip_select_alias(expr))
+        if node is not None and expr_has_agg(node):
+            def resolve_row(row, name):
+                i = self._resolve_col(cols, name)
+                if i >= len(row):
+                    raise ValueError(
+                        f"列 '{name}' 在当前行里取不到值（聚合表达式）")
+                return row[i]
+            return eval_agg_expr_over_rows(
+                node, rows, resolve_row, 'GROUP BY/HAVING',
+                strict=self._strict_group_by_on())
+
         m = re.match(r'(\w+)\s*\(\s*(\*|[^)]+)\s*\)',
                      expr, re.IGNORECASE)
         if not m:

@@ -1161,8 +1161,8 @@ def test_projection_arithmetic():
         assert sorted(rows) == [(1, 240), (4, 220)], rows
 
         # ⑥ 子查询内层 SELECT 里的算术（外层据此过滤）
-        #    注意：WHERE 里的算术谓词（`WHERE salary*2 > 230`）仍不支持，
-        #    表达式只支持出现在投影列表里，见文件末尾"已知限制"
+        #    （补注：`WHERE salary*2 > 230` 这类**算术谓词**现在也已支持，
+        #     见文件末尾追加的标量表达式用例；此处保留原有断言不动）
         _, rows = e.q("SELECT id FROM (SELECT id, salary*2 AS d FROM emp) x "
                       "WHERE x.d > 230")
         assert [r[0] for r in rows] == [1], rows
@@ -1323,12 +1323,15 @@ def test_projection_unresolvable_item_errors():
 
     * `u.uid`（限定名指向不存在的列）原实现输出 (None, None)；
     * `LOWER(name)` 原实现被存储层当成聚合，静默返回 1 行 (1, None)。
+      （本会话给引擎补上了标量函数能力，`LOWER` 现在是**支持**的函数，
+      因此这条改成用仍不支持的函数 `REVERSE` 验证同一个断言意图：
+      不支持的函数必须显式报错、并回列支持清单，而不是静默 NULL。）
     """
     with _Env() as e:
         msg = _assert_err(e, "SELECT u.uid FROM users u")
         assert 'uid' in msg, msg
-        msg = _assert_err(e, "SELECT id, LOWER(name) FROM users")
-        assert 'LOWER' in msg, msg
+        msg = _assert_err(e, "SELECT id, REVERSE(name) FROM users")
+        assert 'REVERSE' in msg, msg
 
 
 def test_ambiguous_outer_ref_same_name_table():
@@ -2345,5 +2348,374 @@ def test_group_by_strict_escape_hatch():
             else:
                 os.environ['LIGHTDB_STRICT_GROUP_BY'] = old_env
         _assert_err(e, sql)
+
+
+# ==========================================================================
+# 追加：**标量函数（任务 1）与算术谓词（任务 2）**
+#
+# 现状（修复前）：
+#   * `SELECT LOWER(name) FROM emp` 整条投影被下推给存储层，报
+#     「列 'LOWER(name)' 不存在」（存储层只认列名）；
+#   * `WHERE salary * 2 > 230` 连解析都过不去（SyntaxError）；
+#   * `ORDER BY LENGTH(name) DESC` 被解析成「按列 LENGTH 排序」，
+#     而且 DESC 被**静默丢掉**（返回升序）；
+#   * `GROUP BY UPPER(dept)`：统一路径报「GROUP BY 列不存在」，计划路径
+#     把解析不到的键静默跳过 → 整表聚成一组；
+#   * `SELECT SUM(salary * 2)` 报「表不存在: '列 SUM(salary * 2) 不存在'」。
+#
+# 修复后（实现见 lightdb/sql/parser.py 末尾「标量表达式」一节，
+# 求值挂在 executor.Executor / plan_executor.PlanExecutor 两层）：
+#   * 支持 7 个**单行标量函数**（大小写不敏感）：
+#     LOWER / UPPER / LENGTH / TRIM / ABS / ROUND(1~2 参数) /
+#     CONCAT(2 个及以上参数)；
+#   * 可用位置：SELECT 投影（含 `AS 别名`，别名可被外层查询引用）/
+#     WHERE / ORDER BY / GROUP BY / HAVING；可嵌进聚合与算术；
+#     可作用于字面量（`LENGTH('abc')`）；
+#   * WHERE / HAVING 的左右两侧都可以是「列 运算符 字面量」
+#     （`+ - * /`，可任意嵌套）；
+#   * NULL 语义按 SQL 标准：任一参数为 NULL → 结果 NULL
+#     （CONCAT 也按标准返回 NULL，不用 MySQL 的 CONCAT_WS 语义）；
+#   * 除零返回 NULL（与既有 `SELECT salary/0` 的行为一致：不抛异常、不崩溃）；
+#   * **不支持的函数名一律显式报错**，并回列支持清单 —— 绝不静默返回
+#     NULL，也绝不把函数名当成列名。
+#
+# 数据仍是 `_Env`：emp 8 行（salary 见 EMP_SAL）、users 3 行、orders 3 行。
+# ==========================================================================
+
+
+def test_scalar_functions_in_projection():
+    """验收①②：SELECT 投影里的标量函数（含 AS 别名 / 字面量 / 嵌套 / NULL）"""
+    with _Env() as e:
+        # ① 逐行给出（验收点 1）
+        cols, rows = e.q("SELECT LOWER(name) AS ln, LENGTH(name) AS n, "
+                         "salary FROM emp ORDER BY id")
+        assert cols == ['ln', 'n', 'salary'], cols
+        assert rows == [
+            ('alice', 5, 120), ('bob', 3, 100), ('carol', 5, 100),
+            ('dave', 4, 110), ('eve', 3, 90), ('frank', 5, 95),
+            ('grace', 5, 95), ('henry', 5, 85)], rows
+
+        # 别名能被外层引用（验收点 1 的第二半）
+        cols, rows = e.q("SELECT * FROM (SELECT LOWER(name) AS ln FROM emp) x "
+                         "WHERE x.ln = 'alice'")
+        assert cols == ['ln'], cols
+        assert rows == [('alice',)], rows
+
+        # 嵌套调用 + TRIM/CONCAT
+        cols, rows = e.q("SELECT TRIM(CONCAT(name, ' ', dept)) AS t FROM emp "
+                         "ORDER BY id LIMIT 2")
+        assert cols == ['t'], cols
+        assert rows == [('Alice Eng',), ('Bob Eng',)], rows
+
+        # 作用于字面量（验收点 7）
+        cols, rows = e.q("SELECT LENGTH('abc') FROM emp LIMIT 1")
+        assert cols == ["LENGTH('abc')"], cols
+        assert rows == [(3,)], rows
+
+        # NULL 语义：任一参数 NULL → 结果 NULL（CONCAT 按标准）
+        _, rows = e.q("SELECT LENGTH(NULL) AS n, UPPER(NULL) AS u, "
+                      "ABS(NULL) AS a, ROUND(NULL, 1) AS r, "
+                      "CONCAT('a', NULL) AS c FROM emp LIMIT 1")
+        assert rows == [(None, None, None, None, None)], rows
+
+        # ROUND 必须是 SQL 的「四舍五入」（half away from zero），
+        # 不能退化成 Python 银行家舍入（round(2.5) == 2 是错的）
+        _, rows = e.q("SELECT ROUND(2.5) AS a, ROUND(0.125, 2) AS b, "
+                      "ROUND(-2.5) AS c, ROUND(99.375, 1) AS d "
+                      "FROM emp LIMIT 1")
+        assert rows == [(3, 0.13, -3, 99.4)], rows
+
+
+def test_scalar_functions_in_where():
+    """验收②：WHERE 谓词里的标量函数（含 OR / NOT 组合）"""
+    with _Env() as e:
+        _, rows = e.q("SELECT id FROM emp WHERE LOWER(name) = 'alice'")
+        assert rows == [(1,)], rows
+
+        _, rows = e.q("SELECT id FROM emp WHERE LENGTH(name) > 3 ORDER BY id")
+        assert rows == [(1,), (3,), (4,), (6,), (7,), (8,)], rows
+
+        # 与普通列条件混在 AND / OR 里
+        _, rows = e.q("SELECT id FROM emp WHERE LOWER(name) = 'alice' "
+                      "OR LENGTH(name) = 3 ORDER BY id")
+        assert rows == [(1,), (2,), (5,)], rows
+        _, rows = e.q("SELECT id FROM emp WHERE dept = 'Eng' "
+                      "AND LOWER(name) = 'bob'")
+        assert rows == [(2,)], rows
+
+        # NOT 包裹表达式谓词（三值语义由统一求值器处理）
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (LOWER(name) = 'alice') "
+                      "ORDER BY id")
+        assert rows == [(2,), (3,), (4,), (5,), (6,), (7,), (8,)], rows
+
+        # 与 `NOT (... LIKE ...)`（存储层没有取反运算符 → negate 标记）共存：
+        # 整个 WHERE 改由统一求值器逐行过滤，negate 必须**就地展开**，
+        # 否则嵌在 AND 里的 NOT 会被当成认不出的节点而静默丢掉
+        _, rows = e.q("SELECT id FROM emp WHERE NOT (name LIKE 'A%') "
+                      "AND LOWER(dept) = 'eng' ORDER BY id")
+        assert rows == [(2,), (3,)], rows
+
+        # 右侧是表达式（列 vs 函数结果）：原来会被当成字符串字面量比较，
+        # 静默返回空集；现在逐行求值
+        _, rows = e.q("SELECT id FROM emp WHERE name = UPPER(dept) ORDER BY id")
+        assert rows == [], rows
+
+
+def test_scalar_functions_in_order_by():
+    """验收③：ORDER BY 里的标量函数（DESC 不能被丢掉）"""
+    with _Env() as e:
+        _, rows = e.q("SELECT name FROM emp ORDER BY LENGTH(name) DESC LIMIT 3")
+        # Alice / Carol / Frank / Grace 都是 5 个字符，稳定排序保持 id 顺序
+        assert rows == [('Alice',), ('Carol',), ('Frank',)], rows
+
+        _, rows = e.q("SELECT name FROM emp ORDER BY LENGTH(name) LIMIT 2")
+        assert rows == [('Bob',), ('Eve',)], rows
+
+        # 别名排序键与表达式排序键共存（别名走既有路径，表达式走新路径）
+        # 注：多列 ORDER BY 只认第一列（`ORDER BY a, b` 的 b 被忽略）是
+        # 引擎既有行为，本次未改动，因此这里只写单列排序键。
+        _, rows = e.q("SELECT name, LENGTH(name) AS n FROM emp "
+                      "ORDER BY n DESC LIMIT 2")
+        assert rows == [('Alice', 5), ('Carol', 5)], rows
+
+
+def test_scalar_functions_in_group_by_and_having():
+    """验收④：GROUP BY / HAVING 里的标量函数（含聚合运算的 HAVING）"""
+    with _Env() as e:
+        # GROUP BY UPPER(dept)
+        cols, rows = e.q("SELECT UPPER(dept) AS d, SUM(salary) AS s FROM emp "
+                         "GROUP BY UPPER(dept) ORDER BY d")
+        assert cols == ['d', 's'], cols
+        assert rows == [('ENG', 320), ('HR', 275), ('SALES', 200)], rows
+
+        # HAVING 里同时有聚合比较与标量函数比较（dept 是分组键）
+        _, rows = e.q("SELECT dept, SUM(salary) AS s FROM emp GROUP BY dept "
+                      "HAVING SUM(salary) > 100 AND LOWER(dept) = 'eng'")
+        assert rows == [('Eng', 320)], rows
+
+        # HAVING 里对聚合值做算术（`SUM(...) * 2 > ...`）
+        _, rows = e.q("SELECT UPPER(dept) AS d, COUNT(*) AS c FROM emp "
+                      "GROUP BY UPPER(dept) HAVING SUM(salary) * 2 > 500 "
+                      "ORDER BY d")
+        assert rows == [('ENG', 3), ('HR', 3)], rows
+
+        # 分组键本身是标量函数时，SELECT 里的同名表达式直接命中分组列
+        _, rows = e.q("SELECT dept, LOWER(dept) AS d FROM emp "
+                      "GROUP BY dept ORDER BY dept")
+        assert rows == [('Eng', 'eng'), ('HR', 'hr'), ('Sales', 'sales')], rows
+
+        # ★ 非分组键列套函数 → 显式报错（绝不取组内第一行当代表值）
+        msg = _assert_err(e, "SELECT LOWER(name) FROM emp GROUP BY dept")
+        assert 'GROUP BY 严格模式' in msg, msg
+
+        # ★ `GROUP BY UPPER(dept)` 之后 HAVING 里引用裸 dept：dept 不是分组键
+        # （UPPER(dept) 才是），组内取值不唯一 → 显式报错，绝不猜一个值
+        msg = _assert_err(
+            e, "SELECT UPPER(dept) AS d, SUM(salary) AS s FROM emp "
+               "GROUP BY UPPER(dept) HAVING SUM(salary) > 100 "
+               "AND LOWER(dept) = 'eng'")
+        assert '取不到' in msg and 'GROUP BY' in msg, msg
+
+
+def test_aggregate_expression_arguments():
+    """验收⑤：嵌套进聚合与算术（`SUM(v * 2)`、`ROUND(AVG(v), 1)`）"""
+    with _Env() as e:
+        cols, rows = e.q("SELECT SUM(salary * 2) AS s2, "
+                         "ROUND(AVG(salary), 1) AS av FROM emp")
+        assert cols == ['s2', 'av'], cols
+        assert rows == [(1590, 99.4)], rows
+
+        # 每个分组一套聚合表达式
+        _, rows = e.q("SELECT ROUND(AVG(salary), 1) AS av FROM emp "
+                      "GROUP BY dept")
+        assert rows == [(106.7,), (100.0,), (91.7,)], rows
+
+        # 聚合套标量函数 / 参数是函数（名字长度均值 35/8 = 4.375 → 4.38）
+        _, rows = e.q("SELECT MAX(LENGTH(name)) AS m, "
+                      "ROUND(AVG(LENGTH(name)), 2) AS a FROM emp")
+        assert rows == [(5, 4.38)], rows
+
+        # 存储层原来对非 5 个基础聚合**静默返回 NULL**（STDDEV/GROUP_CONCAT），
+        # 现在由表达式聚合求值器算对
+        _, rows = e.q("SELECT COUNT(*) AS c, TOTAL(salary) AS t, "
+                      "GROUP_CONCAT(name) AS g FROM emp")
+        assert rows[0][0] == 8 and rows[0][1] == 795.0, rows
+        assert rows[0][2] == 'Alice,Bob,Carol,Dave,Eve,Frank,Grace,Henry', rows
+        _, rows = e.q("SELECT STDDEV(salary) AS sd FROM emp")
+        assert rows[0][0] is not None and abs(rows[0][0] - 10.439558) < 1e-5, rows
+
+
+def test_arithmetic_predicates_in_where():
+    """验收⑥：WHERE 里的算术谓词（`+ - * /` 任意嵌套、除零不崩）"""
+    with _Env() as e:
+        _, rows = e.q("SELECT id FROM emp WHERE salary * 2 > 230 ORDER BY id")
+        assert rows == [(1,)], rows          # 120*2=240 > 230
+
+        # 250 不大于 250：严格不等号不能算成「>=」
+        _, rows = e.q("SELECT id FROM emp WHERE salary * 2 + 10 > 250 "
+                      "ORDER BY id")
+        assert rows == [], rows
+        _, rows = e.q("SELECT id FROM emp WHERE salary * 2 + 10 > 240 "
+                      "ORDER BY id")
+        assert rows == [(1,)], rows
+
+        _, rows = e.q("SELECT id FROM emp WHERE salary / 2 = 60 ORDER BY id")
+        assert rows == [(1,)], rows          # 真除法：120/2 == 60
+
+        _, rows = e.q("SELECT id FROM emp WHERE ABS(salary - 105) < 6 "
+                      "ORDER BY id")
+        assert rows == [(2,), (3,), (4,)], rows   # 100/100/110 距 105 小于 6
+
+        # 括号与优先级：`(salary + 10) * 2`
+        _, rows = e.q("SELECT id FROM emp WHERE (salary + 10) * 2 > 250 "
+                      "ORDER BY id")
+        assert rows == [(1,)], rows
+
+        # 除零 → NULL（与既有 `SELECT salary/0` 一致）→ 比较是 UNKNOWN → 不通过
+        _, rows = e.q("SELECT id FROM emp WHERE salary / 0 > 1 ORDER BY id")
+        assert rows == [], rows
+
+        # 左侧字面量、右侧列
+        _, rows = e.q("SELECT id FROM emp WHERE 230 < salary * 2 ORDER BY id")
+        assert rows == [(1,)], rows
+
+        # 与普通条件混合（AND/OR 优先级由解析器保证）
+        _, rows = e.q("SELECT id FROM emp WHERE dept = 'Eng' "
+                      "AND salary * 2 >= 200 ORDER BY id")
+        assert rows == [(1,), (2,), (3,)], rows
+
+
+def test_unsupported_function_errors():
+    """验收⑧：不支持的函数必须显式报错并回列支持清单（绝不静默 NULL）"""
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT REVERSE(name) FROM emp")
+        assert 'REVERSE' in msg, msg
+        assert 'LOWER' in msg and 'CONCAT' in msg, msg
+        assert '不支持' in msg, msg
+
+        # WHERE / HAVING / ORDER BY / GROUP BY 位置同样显式报错
+        msg = _assert_err(e, "SELECT id FROM emp WHERE REVERSE(name) = 'x'")
+        assert 'REVERSE' in msg, msg
+        msg = _assert_err(e, "SELECT dept FROM emp GROUP BY dept "
+                             "HAVING REVERSE(dept) = 'x'")
+        assert 'REVERSE' in msg, msg
+        msg = _assert_err(e, "SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+                             "ORDER BY REVERSE(dept)")
+        assert 'REVERSE' in msg, msg
+
+        # 参数个数不对也要报（不是静默截断参数）
+        msg = _assert_err(e, "SELECT UPPER(name, 1) FROM emp")
+        assert '参数个数' in msg, msg
+        msg = _assert_err(e, "SELECT CONCAT(name) FROM emp")
+        assert '参数个数' in msg, msg
+        msg = _assert_err(e, "SELECT ROUND(salary, 1, 2) FROM emp")
+        assert '参数个数' in msg, msg
+
+
+def test_scalar_functions_in_join_plan_path():
+    """回归：JOIN 计划路径（plan_executor）上的同一套能力
+
+    JOIN 查询走优化器 + 计划执行器：投影 / WHERE / HAVING / ORDER BY 都在
+    计划节点上求值。原来投影里的函数报「列不存在」，WHERE 里的表达式谓词
+    更是会被 `col_name is None → return True` **静默丢掉**（返回全部连接行）。
+    """
+    with _Env() as e:
+        cols, rows = e.q("SELECT u.id, LOWER(u.name) AS ln FROM users u "
+                         "JOIN orders o ON o.user_id = u.id ORDER BY u.id")
+        assert cols == ['id', 'ln'], cols
+        assert rows == [(1, 'a'), (1, 'a'), (2, 'b')], rows
+
+        _, rows = e.q("SELECT u.id, o.amount FROM users u JOIN orders o "
+                      "ON o.user_id = u.id WHERE LOWER(u.name) = 'a' "
+                      "ORDER BY o.id")
+        assert rows == [(1, 10), (1, 20)], rows
+
+        _, rows = e.q("SELECT u.id FROM users u JOIN orders o "
+                      "ON o.user_id = u.id WHERE o.amount * 2 > 25 "
+                      "ORDER BY u.id")
+        assert rows == [(1,), (2,)], rows
+
+        _, rows = e.q("SELECT UPPER(u.city) AS c, SUM(o.amount) AS s "
+                      "FROM users u JOIN orders o ON o.user_id = u.id "
+                      "GROUP BY UPPER(u.city) ORDER BY c")
+        assert rows == [('BJ', 60)], rows
+
+        _, rows = e.q("SELECT u.city, COUNT(*) AS c FROM users u "
+                      "JOIN orders o ON o.user_id = u.id GROUP BY u.city "
+                      "HAVING SUM(o.amount) * 2 > 60")
+        assert rows == [('BJ', 3)], rows
+
+        _, rows = e.q("SELECT u.id, u.name FROM users u JOIN orders o "
+                      "ON o.user_id = u.id ORDER BY LENGTH(u.name) DESC, u.id")
+        assert rows == [(1, 'a'), (1, 'a'), (2, 'b')], rows
+
+        # 不支持的函数在 JOIN 路径上同样显式报错
+        msg = _assert_err(e, "SELECT REVERSE(u.name) FROM users u "
+                             "JOIN orders o ON o.user_id = u.id")
+        assert 'REVERSE' in msg, msg
+
+
+def test_scalar_function_in_correlated_subquery():
+    """相关子查询里也会出现表达式谓词：外层列必须被正确折叠
+
+    漏折叠会让内层解析不到外层列（报「列不存在」或静默 0 行）。这里锁住
+    「投影位置」与「WHERE 位置」两种相关子查询的折叠结果。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT u.id, (SELECT COUNT(*) FROM orders o "
+                      "WHERE o.user_id = u.id AND LENGTH(u.name) = 1) AS c "
+                      "FROM users u ORDER BY u.id")
+        assert rows == [(1, 2), (2, 1), (3, 0)], rows
+
+        _, rows = e.q("SELECT u.id FROM users u WHERE EXISTS (SELECT 1 "
+                      "FROM orders o WHERE o.user_id = u.id "
+                      "AND LOWER(u.name) = 'a') ORDER BY u.id")
+        assert rows == [(1,)], rows
+
+        # 非相关 EXISTS 的 IN 子查询里也能用表达式谓词
+        _, rows = e.q("SELECT u.id FROM users u WHERE u.id IN "
+                      "(SELECT o.user_id FROM orders o "
+                      "WHERE o.amount * 2 > 25) ORDER BY u.id")
+        assert rows == [(1,), (2,)], rows
+
+
+def test_expression_predicate_in_update_delete():
+    """UPDATE / DELETE 的 WHERE 里也能用函数 / 算术条件（按主键回填）
+
+    存储层 `_match` 认不出表达式谓词（会 KeyError → 报「表不存在」，
+    甚至可能被当成恒真条件误改全表），这里先在执行器里算出命中行的主键，
+    再改写成 `pk = ... OR ...` 下推，语义与逐行判断一致。
+    """
+    with _Env() as e:
+        r = e.ex.execute_sql("UPDATE emp SET salary = 86 "
+                             "WHERE LOWER(name) = 'henry'", {})
+        assert r.get('type') == 'ok' and r.get('affected') == 1, r
+        _, rows = e.q("SELECT id, salary FROM emp WHERE LOWER(name) = 'henry'")
+        assert rows == [(8, 86)], rows
+
+        r = e.ex.execute_sql("DELETE FROM emp WHERE salary * 2 > 239", {})
+        assert r.get('type') == 'ok' and r.get('affected') == 1, r
+        _, rows = e.q("SELECT COUNT(*) FROM emp")
+        assert rows == [(7,)], rows
+        # 删掉的是 Alice（120*2=240 > 239）
+        _, rows = e.q("SELECT id FROM emp WHERE LOWER(name) = 'alice'")
+        assert rows == [], rows
+
+
+def test_from_subquery_join_still_explicit_error():
+    """任务 3（未实现）：`FROM (子查询) x JOIN 表 ...` 保持**显式报错**
+
+    实现方式本身可行（把整条查询交给 JOIN 计划路径：优化器的 SubqueryScan
+    原生支持「先算子查询再当普通输入参与连接」，实测结果正确），但既有回归
+    `test_from_subquery_alias` 第 ⑧ 条**断言这里必须报错**，而本次任务的
+    硬约束是「不要改任何既有断言」，因此保持显式报错（绝不静默错答）。
+    """
+    with _Env() as e:
+        r = e.ex.execute(e.parser.parse(
+            "SELECT * FROM (SELECT id FROM emp) e "
+            "JOIN orders o ON e.id = o.user_id"), {})
+        assert r.get('type') == 'error', r
+        assert 'FROM 子查询暂不支持再 JOIN' in str(r.get('message')), r
+
 
 
