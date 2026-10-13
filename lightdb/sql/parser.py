@@ -6,6 +6,7 @@ SQL 解析器 - 正则驱动（修复版）
 - 移除重复的 _column_def（保留完整版）
 - 移除重复的 _select（保留完整版）
 """
+import os
 import re
 from typing import Optional, List, Dict, Any
 
@@ -1382,3 +1383,287 @@ class Parser:
 
 # 全局解析器实例
 parser = Parser()
+
+
+# ==========================================================================
+# GROUP BY 严格语义校验（等价 MySQL 的 ONLY_FULL_GROUP_BY）
+#
+# 背景（本次收紧的静默错答）：GROUP BY 之后引用**非分组键、且未被聚合**
+# 的裸列时，两条执行路径原来都会悄悄取「组内第一行」的值当代表：
+#   * 计划路径：`plan_executor._build_group_row` / `_eval_agg_expr`
+#     （`row.append(grows[0][ci] if grows else None)`）；
+#   * 统一路径：`executor._group_rows` 先把非分组键列从输出里丢掉，
+#     随后由 `_project_rows` 报「列不存在」——报错原文完全看不出是
+#     GROUP BY 的问题，用户改成 `MAX(name)` 之前根本猜不到原因。
+# MySQL 非严格模式也是任取一行，同一份 SQL 换台服务器就可能换一组答案。
+# 本项目「正确性优先」，因此改成与标准/MySQL 严格模式一致：**显式报错**。
+#
+# 实现方式（本函数是两条路径共用的**纯静态**校验，只吃解析后的 AST）：
+#   粒度 = 三种位置 × 三种允许形态
+#     位置：SELECT 投影列表 / HAVING / ORDER BY（外加 GROUP BY + 窗口函数）
+#     允许：① 分组键本身（含 `u.city` 限定名与别名形态）；
+#           ② 聚合函数作用于任意列；③ 与分组无关的常量/字面量。
+#   * 认不出的形态（标量子查询投影、标量函数、窗口函数体）**不在静态层拦**：
+#     引擎在运行时对它们本来就是显式报错（`_projection_item_plan` 的
+#     「列不存在」），静态层再拦一次只会给出更容易误导的列名。
+#   * 校验只在「聚合语境」下生效（有 GROUP BY / SELECT 里有聚合 / 有
+#     HAVING）；没有聚合的普通查询、纯 DISTINCT 查询完全不经过这里。
+#
+# 逃生口（兼容旧行为，默认必须是严格）：
+#   * 代码里：`Executor.strict_group_by = False`
+#             （计划路径同名开关：`PlanExecutor.strict_group_by = False`）
+#   * 环境变量：`LIGHTDB_STRICT_GROUP_BY=0`（false/off/no 同样关闭）
+#   详见 `resolve_strict_group_by`。
+#
+# 已知限制（仍可能静默的形态，逐条在测试里标注）：
+#   * `HAVING <聚合别名>`（`SELECT COUNT(*) AS c ... HAVING c > 1`）静态层
+#     视为合法（MySQL 也允许），但存储层 `_col_index_of` 认不出聚合别名，
+#     运行时会显式报「取不到」——不会静默，只是错误信息不如静态层精确。
+#   * 标量函数/窗口函数体：静态层放行，运行时由 `_projection_item_plan` /
+#     `_compute_window` 处理（前者显式报错；后者见 `validate_group_by`
+#     对 `windows` 的校验——有 GROUP BY 时窗口键必须是分组键）。
+# ==========================================================================
+
+# 严格模式默认值（逃生口见 resolve_strict_group_by）
+_STRICT_GROUP_BY_DEFAULT = True
+_STRICT_GROUP_BY_ENV = 'LIGHTDB_STRICT_GROUP_BY'
+
+# 聚合函数名（与 executor._AGG_FUNCS / optimizer._is_agg_expr 的超集保持一致）
+_AGG_FUNC_NAMES = frozenset((
+    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'TOTAL', 'GROUP_CONCAT',
+    'STDDEV', 'STDDEV_POP', 'STDDEV_SAMP',
+    'VARIANCE', 'VAR_POP', 'VAR_SAMP',
+))
+
+# `expr AS alias`（与 executor._split_alias 同一套写法）
+_SELECT_ALIAS_RE = re.compile(r'^(.+?)\s+AS\s+[`"]?(\w+)[`"]?$', re.IGNORECASE)
+# 整项就是一个常量
+_LITERAL_RE = re.compile(
+    r"^(?:-?\d+(?:\.\d+)?|'[^']*'|\"[^\"]*\"|NULL|TRUE|FALSE)$", re.IGNORECASE)
+# 函数调用头部（`COUNT(` / `LOWER(` / `COUNT (`）
+_FUNC_HEAD_RE = re.compile(r'^\s*(\w+)\s*\(')
+# 投影项以 `(SELECT` 开头 = 标量子查询
+_SCALAR_SUB_RE = re.compile(r'^\(\s*SELECT\b', re.IGNORECASE)
+# 表达式里的列标识符（可带表限定符）
+_IDENT_RE = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?')
+# 表达式里出现这些词不算列引用
+_SQL_WORDS = frozenset((
+    'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'BY', 'HAVING', 'LIMIT',
+    'AND', 'OR', 'NOT', 'NULL', 'TRUE', 'FALSE', 'AS', 'IN', 'IS', 'LIKE',
+    'DISTINCT', 'BETWEEN', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'OVER',
+    'PARTITION', 'ROWS', 'RANGE', 'UNION', 'ALL', 'JOIN', 'ON',
+))
+
+
+def resolve_strict_group_by(flag=None) -> bool:
+    """解析「GROUP BY 严格模式」开关（逃生口）
+
+    优先级（高 → 低）：
+    1. 显式传入的 flag —— `Executor.strict_group_by` /
+       `PlanExecutor.strict_group_by`（None 表示"没表态"，True/False 直接采用）；
+    2. 环境变量 `LIGHTDB_STRICT_GROUP_BY`（0 / false / off / no / 空 关闭）；
+    3. 默认**严格**（True）。
+    """
+    if flag is not None:
+        return bool(flag)
+    env = os.environ.get(_STRICT_GROUP_BY_ENV)
+    if env is None:
+        return _STRICT_GROUP_BY_DEFAULT
+    return env.strip().lower() not in ('0', 'false', 'off', 'no', '')
+
+
+def is_aggregate_expr(text) -> bool:
+    """`SUM(x)` / `COUNT(*)` / `COUNT ( x )` -> True（别名不影响判定）"""
+    expr, _ = _split_select_alias(text)
+    m = _FUNC_HEAD_RE.match(expr)
+    return bool(m) and m.group(1).upper() in _AGG_FUNC_NAMES
+
+
+def _split_select_alias(text):
+    """`SUM(x) AS t` -> ('SUM(x)', 't')；没有别名时返回 (原文, None)"""
+    s = str(text).strip()
+    m = _SELECT_ALIAS_RE.match(s)
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return s, None
+
+
+def _norm_ident(text) -> str:
+    """列标识符归一化：去引号、去表限定符、小写（`u.City` -> `city`）"""
+    return str(text).strip().strip('`"').rsplit('.', 1)[-1].strip().lower()
+
+
+def _is_literal_expr(text) -> bool:
+    return bool(_LITERAL_RE.match(_split_select_alias(text)[0]))
+
+
+def _expr_idents(text) -> list:
+    """取出表达式里真正被引用的列标识符（跳过函数名与 SQL 关键字）
+
+    用于 `salary*2` 这类算术投影：只要它引用的列全是分组键就合法。
+    """
+    s = str(text)
+    out = []
+    for m in _IDENT_RE.finditer(s):
+        if _FUNC_HEAD_RE.match(s[m.start():]):
+            continue  # 函数名，不是列引用
+        if m.group(0).upper() in _SQL_WORDS:
+            continue
+        out.append(m.group(0))
+    return out
+
+
+def group_by_violation_message(col, place='SELECT') -> str:
+    """构造「非分组键裸列」的统一报错文案（列名 + 修复办法）
+
+    两条执行路径（统一路径 / 计划路径）共用这一份文案，保证同一份 SQL
+    在不同路径下报出的错误逐字一致。place 取值：
+    'SELECT' / 'HAVING' / 'ORDER BY' / 'WINDOW' / 'AGG'。
+    """
+    if place == 'HAVING':
+        # 沿用既有实现（executor._eval_condition / plan_executor._eval_condition）
+        # 的「取不到」措辞，避免同一语义出现两套错误信息
+        return (f"HAVING 里的列 '{col}' 取不到：它不是 GROUP BY 的分组键，"
+                f"也没有被聚合函数包裹；GROUP BY 之后只保留分组键与聚合值。"
+                f"请把 {col} 加入 GROUP BY，或用聚合函数包裹"
+                f"（例如 MAX({col})）")
+    if place == 'ORDER BY':
+        return (f"ORDER BY 里的列 '{col}' 取不到：它不是 GROUP BY 的分组键，"
+                f"也没有被聚合函数包裹，GROUP BY 之后每一组里它的取值不唯一。"
+                f"请把 {col} 加入 GROUP BY，或用聚合函数包裹"
+                f"（例如 MAX({col})），或改成按分组键/聚合值排序")
+    if place == 'WINDOW':
+        return (f"GROUP BY 与窗口函数无法协同：窗口函数引用的列 '{col}' 既不是"
+                f"分组键也没有被聚合函数包裹，GROUP BY 之后取不到它的确定值。"
+                f"请把 {col} 加入 GROUP BY，或用聚合函数包裹"
+                f"（例如 MAX({col})）")
+    if place == 'AGG':
+        return (f"聚合查询里混用了非聚合列 '{col}'：没有 GROUP BY 时整张表聚成"
+                f"一组，只能输出聚合值。请把 {col} 加入 GROUP BY，或用聚合"
+                f"函数包裹（例如 MAX({col})）")
+    return (f"GROUP BY 严格模式（ONLY_FULL_GROUP_BY）：SELECT 列表里的列 "
+            f"'{col}' 取不到确定值 —— 它既不在 GROUP BY 里，也没有被聚合"
+            f"函数包裹。请把 {col} 加入 GROUP BY，或用聚合函数包裹"
+            f"（例如 MAX({col})）")
+
+
+def _having_bare_columns(having) -> list:
+    """收集 HAVING 条件树里直接引用的裸列（**不**钻进子查询）"""
+    out = []
+    if not isinstance(having, dict):
+        return out
+    col = having.get('column')
+    if isinstance(col, str) and col.strip():
+        out.append(col.strip())
+    inner = having.get('not')
+    if isinstance(inner, dict):
+        out.extend(_having_bare_columns(inner))
+    for key in ('and', 'or'):
+        for c in (having.get(key) or []):
+            out.extend(_having_bare_columns(c))
+    return out
+
+
+def validate_group_by(parsed, strict=True):
+    """GROUP BY 静态语义校验（SELECT 投影 / HAVING / ORDER BY / 窗口）
+
+    parsed: 解析器产出的 AST（也接受 plan_executor 用计划节点拼出的等价 dict）
+    strict: False 时直接返回（逃生口，见 resolve_strict_group_by）
+
+    不合法时抛 ValueError（执行器统一转成 SQL 错误返回），错误信息里带
+    **列名**与**修复办法**（加入 GROUP BY 或用聚合函数包裹）。
+    """
+    if not strict or not isinstance(parsed, dict):
+        return
+    if parsed.get('command') not in (None, 'SELECT'):
+        return
+
+    group_raw = [str(g).strip() for g in (parsed.get('group_by') or [])]
+    # 隐式分组：optimizer 对「无 GROUP BY 但有聚合」的查询会把裸列塞进
+    # group_cols（`SELECT dept, SUM(s) FROM emp` -> GROUP BY dept）。这类
+    # 分组键是执行器自己造的，不能算用户写的分组键，否则第 6 条验收
+    # （无 GROUP BY 混用）会在计划路径上被静默放行。
+    if parsed.get('implicit_group'):
+        group_raw = []
+    keys = {_norm_ident(g) for g in group_raw}
+
+    columns = [str(c) for c in (parsed.get('columns') or [])]
+    having = parsed.get('having')
+
+    aggs, bare = [], []
+    out_aliases = set()
+    for raw in columns:
+        expr, alias = _split_select_alias(raw)
+        if alias:
+            out_aliases.add(alias.strip().strip('`"').lower())
+        if is_aggregate_expr(expr):
+            aggs.append((expr, alias))
+        elif expr == '*':
+            bare.append((expr, alias))
+        elif _is_literal_expr(expr):
+            continue  # 常量投影与分组无关
+        elif _SCALAR_SUB_RE.match(expr):
+            continue  # 标量子查询投影：运行时单独校验（下同）
+        elif _FUNC_HEAD_RE.match(expr):
+            continue  # 标量/窗口函数体：运行时显式报错，静态层不猜
+        else:
+            bare.append((expr, alias))
+
+    agg_context = bool(group_raw) or bool(aggs) or (having is not None)
+    if not agg_context:
+        return
+
+    def _is_key(name) -> bool:
+        return _norm_ident(name) in keys
+
+    # ---------- ① SELECT 投影列表 ----------
+    for expr, _alias in bare:
+        if expr == '*':
+            raise ValueError(
+                "GROUP BY 严格模式（ONLY_FULL_GROUP_BY）：SELECT * 会展开出"
+                "非分组键的列，GROUP BY 之后它们的取值不唯一。请显式只选"
+                "分组键，或用聚合函数包裹其余列")
+        idents = _expr_idents(expr)
+        if idents:
+            for ident in idents:
+                if _is_key(ident):
+                    continue
+                # 无 GROUP BY（整表聚成一组）时任何裸列都不合法
+                if not group_raw:
+                    raise ValueError(
+                        group_by_violation_message(ident, 'AGG'))
+                raise ValueError(group_by_violation_message(ident))
+        elif not group_raw:
+            # 解析不出列引用的非字面量项：无 GROUP BY 时同样不合法
+            raise ValueError(group_by_violation_message(expr, 'AGG'))
+
+    # ---------- ② HAVING ----------
+    for col in _having_bare_columns(having):
+        n = _norm_ident(col)
+        # 允许：分组键 / 聚合别名 / 任意输出别名（MySQL 同样允许 HAVING 引用别名）
+        if _is_key(col) or n in out_aliases or n in keys:
+            continue
+        raise ValueError(group_by_violation_message(col, 'HAVING'))
+
+    # ---------- ③ ORDER BY ----------
+    order = parsed.get('order_by')
+    if isinstance(order, (list, tuple)) and order:
+        col = str(order[0])
+        if not (_is_key(col) or _norm_ident(col) in out_aliases
+                or is_aggregate_expr(col)):
+            raise ValueError(group_by_violation_message(col, 'ORDER BY'))
+
+    # ---------- ④ 有 GROUP BY 时的窗口函数 ----------
+    for w in (parsed.get('windows') or []):
+        if not isinstance(w, dict):
+            continue
+        order_cols = [c for c, _d in (w.get('order_by') or [])]
+        arg_cols = [a for a in (w.get('args') or []) if str(a).strip() != '*']
+        for c in (list(w.get('partition_by') or []) + order_cols + arg_cols):
+            if _is_literal_expr(c) or is_aggregate_expr(c):
+                continue
+            if _is_key(c) or _norm_ident(c) in out_aliases:
+                continue
+            if not group_raw:
+                raise ValueError(group_by_violation_message(c, 'AGG'))
+            raise ValueError(group_by_violation_message(c, 'WINDOW'))

@@ -19,6 +19,7 @@ from .plan import (
     Distinct, GroupBy, Union, SubqueryScan, ValueList,
     Window, CTEScan, CTEDefine, RecursiveCTE,
 )
+from .parser import group_by_violation_message
 
 
 # 常量投影的识别（`SELECT 1 FROM orders`）——用于无法用 None 表示的字面量
@@ -56,6 +57,32 @@ class PlanExecutor:
         # CTE 上下文（WITH 语句物化结果）
         self._cte_cache = {}
 
+    # ★ GROUP BY 严格模式开关（逃生口，与 executor.Executor.strict_group_by 同名同义）
+    #   None（默认）-> 环境变量 LIGHTDB_STRICT_GROUP_BY 决定，未设置即**严格**
+    #   False       -> 关闭严格模式：非分组键裸列恢复「组内第一行」的旧行为
+    strict_group_by = None
+
+    def _strict_group_by_on(self) -> bool:
+        """解析本执行器的严格模式开关（委托给 parser.resolve_strict_group_by）
+
+        用 **实例** 属性读开关：`Executor` 在创建计划执行器时会把
+        `Executor.strict_group_by` 原样赋到实例上（逃生口必须能传下来，
+        类属性读法会让实例级关闭失效）。
+        """
+        from .parser import resolve_strict_group_by
+        return resolve_strict_group_by(self.strict_group_by)
+
+    def _new_sub_executor(self):
+        """子查询用的执行器：**继承本实例的严格模式开关**
+
+        逃生口（`Executor.strict_group_by = False`）由调用方原样传到这里，
+        再传给子查询执行器；漏传的话子查询会退回默认的严格模式，
+        用户看到的现象是「关不掉」。
+        """
+        sub = PlanExecutor(self.db, read_view=self.read_view)
+        sub.strict_group_by = self.strict_group_by
+        return sub
+
     # ==================== 入口 ====================
 
     def execute(self, node):
@@ -70,6 +97,24 @@ class PlanExecutor:
         return method(node)
 
     # ==================== 列解析 ====================
+
+    @staticmethod
+    def _norm_ident(text) -> str:
+        """列标识符归一化：去引号/限定符、小写（`u.City` -> `city`）"""
+        return (str(text).strip().strip('`"')
+                .rsplit('.', 1)[-1].strip().lower())
+
+    @staticmethod
+    def _strip_select_alias(expr) -> str:
+        """`dept AS d` -> `dept`（与 executor._split_alias 同一形态）"""
+        return re.sub(r'\s+AS\s+[`"]?\w+[`"]?\s*$', '',
+                      str(expr).strip(), flags=re.IGNORECASE).strip()
+
+    @classmethod
+    def _is_group_key(cls, expr, group_cols) -> bool:
+        """`expr` 是否是分组键（别名 / 限定名 / 大小写都不影响判定）"""
+        want = cls._norm_ident(cls._strip_select_alias(expr))
+        return any(cls._norm_ident(g) == want for g in (group_cols or []))
 
     def _resolve_col(self, cols, name) -> int:
         """'t1.id' 或 'id' -> 列索引
@@ -346,7 +391,7 @@ class PlanExecutor:
             return [], set()
         opt = self._get_sub_optimizer()
         plan = opt.optimize(parsed)
-        sub_exec = PlanExecutor(self.db, read_view=self.read_view)
+        sub_exec = self._new_sub_executor()
         try:
             cols, rows = sub_exec.execute(plan)
         except Exception as e:
@@ -369,7 +414,7 @@ class PlanExecutor:
             return False
         opt = self._get_sub_optimizer()
         plan = opt.optimize(parsed)
-        sub_exec = PlanExecutor(self.db, read_view=self.read_view)
+        sub_exec = self._new_sub_executor()
         try:
             _, rows = sub_exec.execute(plan)
         except Exception as e:
@@ -531,18 +576,54 @@ class PlanExecutor:
     # ==================== 聚合 ====================
 
     def _exec_Aggregate(self, node):
-        """无 GROUP BY 的全表聚合"""
+        """无 GROUP BY 的全表聚合
+
+        ★ 严格模式：整表聚成一组时 SELECT 列表里只能有聚合函数与常量，
+        裸列（`SELECT dept, SUM(salary) FROM emp`）原来会静默取第一行。
+        """
         cols, rows = self.execute(node.children[0])
+        if self._strict_group_by_on():
+            self._check_group_by_columns(
+                node.columns, [], implicit=True)
         result = []
         for col_expr in node.columns:
             result.append(self._eval_agg_expr(col_expr, cols, rows))
         out_cols = [c.upper().strip() for c in node.columns]
         return out_cols, [result]
 
+    def _check_group_by_columns(self, columns, group_cols, implicit=False,
+                                having=None):
+        """严格模式下的 GROUP BY 校验（计划路径的**运行期兜底**）
+
+        与 `executor._check_strict_group_by` 共用 `parser.validate_group_by`
+        这一份实现（文案逐字一致）；计划路径可能由内部代码直接构造，
+        不经过 `_cmd_select`，所以这里必须再兜一次（SELECT 投影 /
+        HAVING / ORDER BY 三个位置都在同一份校验里）。
+
+        implicit=True 表示 group_cols 是优化器为了「无 GROUP BY 的聚合查询」
+        自动补出来的裸列（见 `optimizer.optimize` 的 `group_cols = non_agg`），
+        它**不是**用户写的分组键，否则第 6 条验收（无 GROUP BY 混用聚合与
+        非聚合列）会在计划路径上被静默放行。
+        """
+        from .parser import validate_group_by, resolve_strict_group_by
+        validate_group_by(
+            {'command': 'SELECT', 'columns': list(columns or []),
+             'group_by': list(group_cols or []) or None,
+             'having': having,
+             'implicit_group': bool(implicit)},
+            strict=resolve_strict_group_by(self.strict_group_by))
+
     def _exec_GroupBy(self, node):
         cols, rows = self.execute(node.children[0])
         group_cols = node.group_cols or []
         agg_cols = node.agg_cols or cols
+
+        # ★ 严格模式兜底（同一份静态校验，报错发生在构建任何分组行之前）
+        if self._strict_group_by_on():
+            self._check_group_by_columns(
+                agg_cols, group_cols,
+                implicit=bool(getattr(node, 'implicit_group', False)),
+                having=node.having)
 
         # 解析分组键
         group_idx = []
@@ -568,7 +649,8 @@ class PlanExecutor:
         # 分组时必须先把它们算出来，否则求值时拿不到
         having_aggs = self._collect_having_aggs(node.having)
         for gkey, grows in groups.items():
-            row = self._build_group_row(agg_cols, cols, gkey, grows)
+            row = self._build_group_row(
+                agg_cols, cols, gkey, grows, group_cols)
             out_rows.append(row)
 
         # HAVING
@@ -608,36 +690,67 @@ class PlanExecutor:
                             found.append(a)
         return found
 
-    def _build_group_row(self, agg_cols, src_cols, gkey, grows):
+    def _build_group_row(self, agg_cols, src_cols, gkey, grows,
+                         group_cols=None):
         """根据聚合表达式列表构建一行
 
-        已知限制（本次未改，仅显式记录）：非聚合列一律取「组内第一行」
-        的值作为代表。对**分组键**列这是安全的（组内取值恒等）；对
-        **非分组键**的裸列（`SELECT city, name, COUNT(*) ... GROUP BY city`）
-        则是任取一行——SQL 标准会直接拒绝，MySQL 会任取一行。
-        执行器的统一路径（executor._group_rows + _project_rows）在这种
-        形态下会显式报「列不存在」；JOIN/计划路径仍是任取第一行。
+        ★ 本次收紧（等价 MySQL ONLY_FULL_GROUP_BY）：非分组键、且未被聚合
+        的裸列**显式报错**，不再取「组内第一行」。
+
+        旧行为（记录在此，便于对照）：非聚合列一律用 `grows[0][ci]` 当代表
+        —— 对**分组键**列是安全的（组内取值恒等），对**非分组键**的裸列
+        （`SELECT city, name, COUNT(*) ... GROUP BY city`）则是任取一行；
+        同一份 SQL 换个子代理/换个物理顺序就可能换一组答案。
+
+        允许的三种形态：
+        ① 分组键本身（含 `u.city` 限定名与 `dept AS d` 别名形态）
+           —— 组内取值恒等，取第一行安全；
+        ② 聚合函数作用于任意列（`SUM(o.amount)`）；
+        ③ 与分组无关的常量/字面量（`SELECT 1 ... GROUP BY k`），直接输出常量。
+
+        逃生口：`PlanExecutor.strict_group_by = False`（或环境变量
+        LIGHTDB_STRICT_GROUP_BY=0）时保留旧行为。
         """
+        strict_on = self._strict_group_by_on()
         row = []
-        # 用 key 里可迭代出来的值填充非聚合列
+        # 用 key 里可迭代出来的值填充非聚合列（旧行为的兜底路径）
         key_iter = iter(gkey)
         for expr in agg_cols:
-            expr = expr.strip()
-            if self._is_agg_expr(expr):
-                row.append(self._eval_agg_expr(expr, src_cols, grows))
-            else:
-                # 分组列：从 key 里取（如果取不到，从第一行取）
+            text = str(expr).strip()
+            if self._is_agg_expr(text):
+                row.append(self._eval_agg_expr(text, src_cols, grows))
+                continue
+
+            # ③ 常量投影（`SELECT 1`）：与分组无关，直接输出常量
+            lit = _literal_of(self._strip_select_alias(text))
+            if lit is not _NOT_LITERAL:
+                row.append(lit)
+                continue
+
+            # ①② 分组键（别名/限定名归一化后按名字精确解析）
+            if self._is_group_key(text, group_cols):
                 try:
-                    ci = self._resolve_col(src_cols, expr)
-                    # 找 key 中对应的索引
-                    if gkey:
-                        # 因为 group_idx 与 group_cols 顺序一致
-                        # 我们用第一行的值作为代表
-                        row.append(grows[0][ci] if grows else None)
-                    else:
-                        row.append(next(key_iter, None))
-                except (ValueError, IndexError):
+                    ci = self._resolve_col(
+                        src_cols, self._strip_select_alias(text))
+                except ValueError:
+                    ci = None
+                if ci is not None and grows:
+                    row.append(grows[0][ci])
+                else:
                     row.append(next(key_iter, None))
+                continue
+
+            if strict_on:
+                # 非分组键裸列：显式报错（含列名与修复办法）
+                raise ValueError(group_by_violation_message(
+                    self._strip_select_alias(text)))
+            # 逃生口：旧行为（组内第一行）
+            try:
+                ci = self._resolve_col(
+                    src_cols, self._strip_select_alias(text))
+                row.append(grows[0][ci] if grows else None)
+            except (ValueError, IndexError):
+                row.append(next(key_iter, None))
         return row
 
     @staticmethod

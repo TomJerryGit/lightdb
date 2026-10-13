@@ -2094,3 +2094,256 @@ def test_join_having_qualified_column_not_silently_false():
                     " GROUP BY u.id HAVING u.id IN (SELECT uid, amt FROM orders)")
         assert _IN_MULTI_MSG in msg, msg
 
+
+# ==========================================================================
+# 追加（本会话）：GROUP BY 严格校验（等价 MySQL ONLY_FULL_GROUP_BY）
+#
+# 原来的静默错答：GROUP BY 之后引用**非分组键、且未被聚合**的裸列时，
+#   * 计划路径（`plan_executor._build_group_row`）取「组内第一行」的值；
+#   * 统一路径（`executor._group_rows`）把该列从输出里丢掉，再报
+#     「列不存在」——报错原文看不出是 GROUP BY 的问题。
+# 现在两条路径都改成**显式报错**，错误信息里带列名与修复办法
+# （「把 x 加入 GROUP BY 或用聚合函数包裹」）。
+#
+# 校验实现：`parser.validate_group_by`（静态，只吃 AST）——
+#   ① `executor._cmd_select` 最前面（覆盖单表 / JOIN / CTE / FROM 子查询 /
+#      UNION 所有分支，报错发生在取数之前）；
+#   ② 运行期兜底：`executor._group_rows`（统一路径）与
+#      `plan_executor._exec_GroupBy` / `_exec_Aggregate` / `_build_group_row`
+#      （计划路径），保证绕过 `_cmd_select` 的内部调用也拦得住。
+#
+# 逃生口（默认必须是严格）：`Executor.strict_group_by = False`
+# （计划路径同名开关 `PlanExecutor.strict_group_by`）或环境变量
+# `LIGHTDB_STRICT_GROUP_BY=0`。
+# ==========================================================================
+
+_GB_JOIN = ("FROM users u JOIN orders o ON u.id = o.user_id")
+
+
+def test_group_by_strict_select_bare_column_errors():
+    """验收①：SELECT 投影里的非分组键裸列 → 显式报错（含列名与修复办法）
+
+    `SELECT dept, name FROM emp GROUP BY dept` 原来在计划路径上取组内
+    第一行的 name（同一份 SQL 换台机器就可能换一组答案）。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT dept, name FROM emp GROUP BY dept")
+        assert 'name' in msg, msg
+        assert 'GROUP BY' in msg, msg
+        assert 'MAX(name)' in msg or '聚合函数' in msg, msg
+
+
+def test_group_by_strict_valid_forms_not_broken():
+    """验收②③④（正常侧）+ 不误伤：分组键 / 聚合 / HAVING / ORDER BY
+
+    * 分组键本身就是裸列（含 `dept, salary` 双键）；
+    * 聚合函数作用于任意列；
+    * HAVING 引用分组键或聚合值；
+    * ORDER BY 引用分组键或**聚合别名**（`tot`）。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT dept, COUNT(*) FROM emp GROUP BY dept")
+        assert len(rows) == 3 and sum(r[1] for r in rows) == 8, rows
+
+        cols, rows = e.q(
+            "SELECT dept, salary, COUNT(*) FROM emp GROUP BY dept, salary")
+        assert cols == ['dept', 'salary', 'COUNT(*)'], cols
+        assert sum(r[2] for r in rows) == 8, rows
+
+        _, rows = e.q("SELECT dept, SUM(salary) FROM emp GROUP BY dept "
+                      "HAVING SUM(salary) > 100")
+        assert sorted(rows) == [('Eng', 320), ('HR', 275), ('Sales', 200)], rows
+
+        _, rows = e.q("SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+                      "HAVING dept = 'HR'")
+        assert rows == [('HR', 3)], rows
+
+        _, rows = e.q("SELECT dept, SUM(salary) AS tot FROM emp GROUP BY dept "
+                      "ORDER BY tot DESC")
+        assert rows[0] == ('Eng', 320) and rows[-1] == ('Sales', 200), rows
+
+        _, rows = e.q("SELECT dept, SUM(salary) FROM emp GROUP BY dept "
+                      "ORDER BY dept")
+        assert len(rows) == 3, rows
+
+        # 无 GROUP BY 的纯聚合、无聚合的普通查询、DISTINCT 都不受影响
+        _, rows = e.q("SELECT COUNT(*) FROM emp")
+        assert rows == [(8,)], rows
+        _, rows = e.q("SELECT name FROM emp WHERE dept = 'HR'")
+        assert len(rows) == 3, rows
+        _, rows = e.q("SELECT DISTINCT dept FROM emp")
+        assert len(rows) == 3, rows
+
+        # 常量投影与分组键无关，必须继续可用
+        _, rows = e.q("SELECT 1 FROM emp GROUP BY dept")
+        assert rows == [(1,), (1,), (1,)], rows
+
+
+def test_group_by_strict_having_bare_column_errors():
+    """验收④（报错侧）：HAVING 引用非分组键裸列 → 显式报错
+
+    沿用既有实现的「取不到」措辞（`executor._eval_condition` /
+    `plan_executor._eval_condition` 对同一语义本来就报这个），
+    因此断言里同时锁住「取不到」与列名。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT dept, SUM(salary) FROM emp "
+                             "GROUP BY dept HAVING name = 'Alice'")
+        assert '取不到' in msg, msg
+        assert 'name' in msg, msg
+        assert 'GROUP BY' in msg, msg
+
+
+def test_group_by_strict_order_by_bare_column_errors():
+    """验收⑤：ORDER BY 引用非分组键裸列 → 显式报错（不静默不排序）
+
+    `_finish_select` 对解析不到的 ORDER BY 列是「静默不排序」，那同样是
+    错答（用户以为排好了），因此这里必须报错。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT dept, SUM(salary) FROM emp "
+                             "GROUP BY dept ORDER BY name")
+        assert 'ORDER BY' in msg and 'name' in msg, msg
+        assert 'GROUP BY' in msg, msg
+        # 同一个非分组键列：HAVING / ORDER BY 都要拦
+        msg = _assert_err(e, "SELECT dept, SUM(salary) FROM emp "
+                             "GROUP BY dept ORDER BY salary")
+        assert 'salary' in msg, msg
+
+
+def test_group_by_strict_without_group_by_mixed_errors():
+    """验收⑥：无 GROUP BY 却混用聚合与非聚合列 → 显式报错
+
+    `SELECT dept, SUM(salary) FROM emp` 原来被优化器静默改写成
+    `GROUP BY dept`（见 optimizer.optimize 的 `group_cols = non_agg`），
+    用户完全看不出语义被改了。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT dept, SUM(salary) FROM emp")
+        assert 'dept' in msg and 'GROUP BY' in msg, msg
+        assert '聚合' in msg, msg
+        # 纯聚合仍然正常
+        _, rows = e.q("SELECT SUM(salary) FROM emp")
+        assert rows == [(795,)], rows
+
+
+def test_group_by_strict_qualified_and_alias_forms():
+    """验收⑦：限定名与别名形态
+
+    `u.city` 是分组键（限定名两边写法一致）→ 正常；
+    `u.name` 不是 → 报错且错误信息里保留限定名。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT u.city, COUNT(*) FROM users u GROUP BY u.city")
+        assert sorted(rows) == [('BJ', 2), ('SH', 1)], rows
+        # 限定名与裸名混写（GROUP BY u.city，SELECT city）也要认成同一个键
+        _, rows = e.q("SELECT city, COUNT(*) FROM users u GROUP BY u.city")
+        assert sorted(rows) == [('BJ', 2), ('SH', 1)], rows
+        # 别名形态：ORDER BY 引用分组键的别名
+        _, rows = e.q("SELECT u.city AS c, COUNT(*) FROM users u "
+                      "GROUP BY u.city ORDER BY c")
+        assert sorted(rows) == [('BJ', 2), ('SH', 1)], rows
+
+        msg = _assert_err(e, "SELECT u.city, u.name FROM users u "
+                             "GROUP BY u.city")
+        assert 'u.name' in msg, msg
+        assert 'GROUP BY' in msg, msg
+
+
+def test_group_by_strict_join_plan_path():
+    """两条执行路径都覆盖：JOIN 查询走**计划路径**
+
+    `_cmd_select` 的静态校验与 `plan_executor._exec_GroupBy` 的运行期兜底
+    都会拦住；HAVING 位置的非分组键列同样拦。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT u.city, u.name, COUNT(*) " + _GB_JOIN +
+                             " GROUP BY u.city")
+        assert 'u.name' in msg and 'GROUP BY' in msg, msg
+
+        msg = _assert_err(e, "SELECT u.city, COUNT(*) " + _GB_JOIN +
+                             " GROUP BY u.city HAVING u.name = 'a'")
+        assert 'u.name' in msg and '取不到' in msg, msg
+
+        msg = _assert_err(e, "SELECT u.city, COUNT(*) " + _GB_JOIN +
+                             " GROUP BY u.city ORDER BY u.salary")
+        assert 'ORDER BY' in msg and 'u.salary' in msg, msg
+
+        # 合法形态不误伤：JOIN + GROUP BY（分组键 / 聚合）
+        _, rows = e.q("SELECT u.city, COUNT(*), SUM(o.amount) " + _GB_JOIN +
+                      " GROUP BY u.city")
+        assert rows == [('BJ', 3, 60)], rows
+
+
+def test_group_by_strict_window_with_group_by():
+    """有 GROUP BY 时的窗口函数：键是分组键 → 正常；否则显式报错
+
+    引擎在 GROUP BY 之后只剩「分组键 + 聚合值」，窗口函数引用别的列
+    取不到确定值（`_compute_window` 对解析不到的列会按 -1 索引静默取
+    最后一列 —— 典型的静默错答），因此这里显式报错而非静默降级。
+    """
+    with _Env() as e:
+        cols, rows = e.q(
+            "SELECT dept, COUNT(*) AS c, ROW_NUMBER() OVER (ORDER BY dept) "
+            "AS rn FROM emp GROUP BY dept")
+        assert cols == ['dept', 'c', 'rn'], cols
+        assert len(rows) == 3, rows
+
+        msg = _assert_err(e, "SELECT dept, ROW_NUMBER() OVER (ORDER BY salary) "
+                             "AS rn FROM emp GROUP BY dept")
+        assert 'salary' in msg and '窗口' in msg, msg
+
+
+def test_group_by_strict_escape_hatch():
+    """验收⑧：逃生口（默认严格，可关闭回旧行为）
+
+    三种关闭方式都验证：
+    ① 实例属性 `ex.strict_group_by = False`；
+    ② 类属性 `Executor.strict_group_by = False`；
+    ③ 环境变量 `LIGHTDB_STRICT_GROUP_BY=0`。
+    关闭后 JOIN 计划路径恢复「组内第一行」的旧行为（BJ 组第一行是 'a'）。
+    """
+    from lightdb.sql.executor import Executor
+    from lightdb.sql.plan_executor import PlanExecutor
+
+    sql = ("SELECT u.city, u.name, COUNT(*) " + _GB_JOIN +
+           " GROUP BY u.city")
+    with _Env() as e:
+        # 默认严格
+        _assert_err(e, sql)
+
+        # ① 实例属性
+        e.ex.strict_group_by = False
+        try:
+            _, rows = e.q(sql)
+            assert rows == [('BJ', 'a', 3)], rows
+        finally:
+            del e.ex.strict_group_by
+        _assert_err(e, sql)
+
+        # ② 类属性（计划路径同名开关必须跟着一起关掉，否则「关不掉」）
+        old_cls = Executor.strict_group_by
+        old_plan = PlanExecutor.strict_group_by
+        Executor.strict_group_by = False
+        try:
+            _, rows = e.q(sql)
+            assert rows == [('BJ', 'a', 3)], rows
+        finally:
+            Executor.strict_group_by = old_cls
+            PlanExecutor.strict_group_by = old_plan
+        _assert_err(e, sql)
+
+        # ③ 环境变量（Executor.strict_group_by 为 None 时生效）
+        old_env = os.environ.get('LIGHTDB_STRICT_GROUP_BY')
+        os.environ['LIGHTDB_STRICT_GROUP_BY'] = '0'
+        try:
+            _, rows = e.q(sql)
+            assert rows == [('BJ', 'a', 3)], rows
+        finally:
+            if old_env is None:
+                os.environ.pop('LIGHTDB_STRICT_GROUP_BY', None)
+            else:
+                os.environ['LIGHTDB_STRICT_GROUP_BY'] = old_env
+        _assert_err(e, sql)
+
+

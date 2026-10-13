@@ -105,6 +105,30 @@ class Executor:
 
     # ==================== 主入口 ====================
 
+    # ★ GROUP BY 严格模式开关（逃生口，与 MySQL 的 ONLY_FULL_GROUP_BY 等价）
+    #   None（默认）-> 由环境变量 LIGHTDB_STRICT_GROUP_BY 决定，未设置即**严格**
+    #   False       -> 关闭严格模式，恢复旧行为（非分组键裸列取「组内第一行」）
+    #   True        -> 强制严格
+    # 用法（类属性，对所有实例生效）：
+    #   from lightdb.sql.executor import Executor
+    #   Executor.strict_group_by = False        # 旧行为
+    # 或进程级：set LIGHTDB_STRICT_GROUP_BY=0
+    strict_group_by = None
+
+    def _check_strict_group_by(self, p):
+        """GROUP BY 严格校验（静态，见 `parser.validate_group_by`）
+
+        校验只吃解析后的 AST，不需要任何行数据，因此挂在 `_cmd_select`
+        的最前面：单表 / JOIN / CTE / FROM 子查询 / UNION 各分支都在那里
+        汇合，报错必然发生在真正取数之前（不会先算一半再失败）。
+
+        统一路径（`_group_rows`）与计划路径（`plan_executor._exec_GroupBy`）
+        还会各自再兜一次底，兜底用的是同一份实现，报错信息完全一致。
+        """
+        from .parser import validate_group_by, resolve_strict_group_by
+        validate_group_by(
+            p, strict=resolve_strict_group_by(self.strict_group_by))
+
     def execute(self, parsed: Dict, session: Dict) -> Dict:
         start = time.time()
         # 记录"当前会话"：投影列表里的标量子查询需要把折叠后的子查询
@@ -266,6 +290,8 @@ class Executor:
             affected=n, message=f"{n} row(s) inserted")
 
     def _cmd_select(self, p, s):
+        # ★ GROUP BY 严格校验放在最前面（静态判定，见 _check_strict_group_by）
+        self._check_strict_group_by(p)
         table = p['table']
 
         # WHERE 里的字面量 IN 列表（`id IN (1,2,NULL)`）解析出来是
@@ -1178,6 +1204,14 @@ class Executor:
         extra_names：JOIN 后置处理路径传入的连接表名/别名，供 HAVING 里的
         子查询折叠使用（见 `_eval_having_with_subquery`）。
         """
+        # ★ 严格模式运行期兜底：非分组键裸列在下面「分组后只剩 keys+聚合值」
+        # 的形态里会被静默丢掉（随后 `_project_rows` 报「列不存在」，完全
+        # 看不出是 GROUP BY 的问题）。这里先按同一份静态校验显式报错，
+        # 保证两条执行路径的报错信息逐字一致；逃生口见 strict_group_by。
+        from .parser import validate_group_by, resolve_strict_group_by
+        validate_group_by(
+            p, strict=resolve_strict_group_by(self.strict_group_by))
+
         keys = [str(k).strip() for k in (p.get('group_by') or [])]
         kidx = [self._col_index_of(base_cols, k) for k in keys]
         if any(i < 0 for i in kidx):
@@ -3531,6 +3565,12 @@ class Executor:
         self._last_plan = plan
 
         executor = PlanExecutor(self.db, read_view=rv)
+        # ★ 逃生口要能传到计划路径：本实例的严格模式开关原样传给计划执行器，
+        # 否则 `Executor.strict_group_by = False` 在 JOIN 查询上不生效。
+        # 只在显式表态（非 None）时传递，避免用 None 覆盖掉
+        # `PlanExecutor.strict_group_by` 的类属性设置。
+        if self.strict_group_by is not None:
+            executor.strict_group_by = self.strict_group_by
         cols, rows = executor.execute(plan)
         return self._rs(cols, rows)
 
@@ -3598,6 +3638,9 @@ class Executor:
         plan = self.optimizer.optimize(join_p)
         self._last_plan = plan
         executor = PlanExecutor(self.db, read_view=rv)
+        # ★ 同 _exec_join_query：严格模式开关随实例传递（逃生口）
+        if self.strict_group_by is not None:
+            executor.strict_group_by = self.strict_group_by
         cols, rows = executor.execute(plan)
         rel = _CTERelation('join', cols, rows)
         return self._select_correlated(
@@ -3703,6 +3746,9 @@ class Executor:
         if not inner or self.optimizer is None:
             return self._err(1105, "EXPLAIN 无法解析")
 
+        # ★ 与 _cmd_select 同一份静态校验：非法 SQL 在 EXPLAIN 阶段就报错，
+        # 不要等真正执行时才发现（MySQL 的 ONLY_FULL_GROUP_BY 同样如此）
+        self._check_strict_group_by(inner)
         plan = self.optimizer.optimize(inner)
         try:
             cols, rows, _ = self.optimizer.explain(plan)

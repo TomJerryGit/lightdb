@@ -138,6 +138,14 @@ class Optimizer:
             non_agg = [c for c in columns if not self._is_agg_expr(c)]
             group_cols = group_by or non_agg
             node = GroupBy(node, group_cols, columns, having=having)
+            # ★ 标记「分组键是优化器自动补的」：`SELECT dept, SUM(salary)
+            # FROM emp`（没写 GROUP BY）原来在这里被静默改写成
+            # `GROUP BY dept`，用户完全看不出自己的 SQL 被改了语义。
+            # 严格模式（ONLY_FULL_GROUP_BY）下这种混用必须显式报错，
+            # 因此把「是不是用户写的 GROUP BY」原样带到计划节点上，
+            # 由 plan_executor._exec_GroupBy 兜底校验（见
+            # parser.validate_group_by 的 implicit_group）。
+            node.implicit_group = not bool(group_by)
         else:
             if columns != ['*']:
                 node = Project(node, columns)
