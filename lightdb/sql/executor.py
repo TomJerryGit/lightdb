@@ -484,6 +484,8 @@ class Executor:
           —— 真 -> (None, True)，假 -> ({'or': []}, False)。
         * col IN (SELECT ...)：执行子查询取第一列的值集合 v，改写成
           `col = v1 OR col = v2 OR ...`；空集合时 IN 恒假 → {'or': []}。
+          子查询返回**多于 1 列**时显式报错（行值 IN 不支持，绝不只认
+          第一列 —— 见 `_guard_in_subquery_width`）。
         * col NOT IN (SELECT ...)：同样取集合后改写成
           `col != v1 AND col != v2 AND ...`；空集合时 NOT IN 恒真 → None。
 
@@ -559,10 +561,19 @@ class Executor:
             if op in ('IN', 'NOT IN'):
                 column = where.get('column')
                 if not isinstance(column, str) or not column:
-                    raise ValueError("IN 子查询缺少左值列")
-                # IN 是**集合语义**（允许多行），只取每行第一列做候选值；
-                # 已知限制：`c IN (SELECT a, b ...)` 的行值 IN 不支持，
-                # 多出来的列被忽略（不报错）。IN 不在标量语义的收紧范围内。
+                    # 左值不是单列（行值 IN `(a,b) IN (...)` 之类）：
+                    # 本引擎不支持行值比较，显式报错，绝不猜一个左值。
+                    raise ValueError(
+                        "IN / NOT IN 的左侧必须是单列：本引擎不支持行值"
+                        "（多列）比较，无法安全推断出参与比较的列")
+                # 集合上下文同样只允许**一列**：多列一律显式报错（静态
+                # 列数 + 实际列数双判定，空结果集也拦得住），绝不静默
+                # 只取每行第一列 —— 见 `_guard_in_subquery_width`。
+                self._guard_in_subquery_width(
+                    sub, 'WHERE/HAVING 里的', res_cols=res.get('columns'),
+                    rows=rows)
+                # IN 是**集合语义**（允许多行），每行取唯一一列做候选值；
+                # 多列形态已在上一行被显式拒绝（行值 IN 不支持）。
                 values, seen = [], set()
                 for r in rows:
                     if not r:
@@ -1376,6 +1387,46 @@ class Executor:
             if op == '>=': return l >= r
             return False
 
+        # ---------- IN / NOT IN（集合上下文）----------
+        # 字面量列表 `c IN (1,2,NULL)`：按三值语义求值。
+        # **原实现没有这个分支**，条件会掉进下面「r = where.get('value')
+        # → None → return op == '!='」的普通比较逻辑；op 是 'IN' 于是恒返回
+        # False —— 实测 `... GROUP BY uid HAVING uid IN (1,2)` 静默返回 0 个
+        # 分组（WHERE 里的字面量列表在 `_cmd_select` / `_select_from_relation`
+        # 已被 `_rewrite_in_lists` 改写成 and/or 链，因此只有 HAVING 位置
+        # 暴露了这个静默错答）。
+        # 子查询形态（`{'subquery': ...}`）不该走到这里：WHERE 由
+        # `_rewrite_subqueries` / `_eval_outer_where` 处理，HAVING 由
+        # `_eval_having_with_subquery` 处理。真走到这里说明路由有缺口，
+        # 显式报错，绝不静默判假（否则会变成「查不到行」这种错误答案）。
+        if op in ('IN', 'NOT IN'):
+            if isinstance(where.get('subquery'), dict):
+                raise ValueError(
+                    "IN / NOT IN 的子查询谓词没有走子查询求值路径："
+                    "该条件在此处无法安全求值，绝不静默判假")
+            if 'values' not in where:
+                raise ValueError(
+                    "IN / NOT IN 谓词缺少值列表（也没带子查询）：无法求值")
+            if not isinstance(where.get('column'), str) \
+                    or not where.get('column'):
+                raise ValueError(
+                    "IN / NOT IN 的左值必须是单列：本引擎不支持行值"
+                    "（多列）比较，无法安全推断出参与比较的列")
+            ci = self._col_index_of(cols, where['column'])
+            if ci < 0:
+                # 末段歧义（JOIN 结果里 `u.id` / `o.id` 并存）→ 显式报错
+                self._raise_if_ambiguous_col(cols, where['column'])
+                if agg_values is not None:
+                    raise ValueError(
+                        f"HAVING 里的列 '{where['column']}' 在分组结果里"
+                        f"取不到：GROUP BY 之后只保留分组键与聚合值，"
+                        f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
+                return False
+            lv = row[ci] if ci < len(row) else None
+            vals = [None if (v is None or str(v).upper() == 'NULL') else v
+                    for v in (where.get('values') or [])]
+            return bool(self._in_predicate(lv, vals, neg=(op == 'NOT IN')))
+
         col = where.get('column')
         if not isinstance(col, str):
             return True
@@ -1385,6 +1436,16 @@ class Executor:
             # 显式报错：静默返回"条件为假"会把整个结果集变成空集，用户看不出
             # 是「没有匹配行」还是「列名有歧义」。
             self._raise_if_ambiguous_col(cols, col)
+            # HAVING 语境（agg_values is not None）取不到列时显式报错：
+            # GROUP BY 之后行里只有分组键 + 聚合值，`HAVING <裸列> ...`
+            # （例如 `SELECT id, COUNT(*) ... GROUP BY id HAVING city IN ('BJ')`）
+            # 原来静默判假、整个分组被丢掉；正确做法是要求用户把该列放进
+            # GROUP BY/SELECT 或改用聚合表达式。
+            if agg_values is not None:
+                raise ValueError(
+                    f"HAVING 里的列 '{col}' 在分组结果里取不到："
+                    f"GROUP BY 之后只保留分组键与聚合值，"
+                    f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
             return False
         l = row[i] if i < len(row) else None
         r = where.get('value')
@@ -1613,6 +1674,55 @@ class Executor:
             return None
         return len(items)
 
+    @staticmethod
+    def _in_subquery_arity_error(pos_text, n):
+        """IN / NOT IN 子查询多列时的报错文本（静态/动态判定共用同一份措辞）"""
+        pos = str(pos_text or '').strip()
+        head = f"{pos} " if pos else ""
+        return (
+            f"{head}IN / NOT IN 的子查询只能返回一列，"
+            f"当前返回了 {n} 列："
+            f"多列子查询的 IN 在 SQL 标准里是**行值（tuple）比较**，"
+            f"本引擎不支持行值比较，因此显式报错"
+            f"（绝不只取第一列参与比较，那会给出看似正确、实际错误的行）")
+
+    @staticmethod
+    def _guard_in_subquery_width(sub, pos_text="", res_cols=None, rows=None):
+        """IN / NOT IN（集合上下文）的子查询列数守卫：多于 1 列一律报错
+
+        背景：`c IN (SELECT a, b FROM t)` 在 SQL 标准里等价于行值比较
+        `c IN ((a1,b1),(a2,b2),...)`，左值必须是行值；左值是单列时它本身
+        就是语义错误。原实现在集合上下文里对每行 `r[0]` 取值，把
+        `id IN (SELECT uid, amt FROM orders)` 静默算成
+        `id IN (SELECT uid FROM orders)` —— 返回的是**看起来对**的行集，
+        属于最典型的静默错答。标量上下文（`_scalar_from_rows`）上一轮已经
+        收紧为「多列报错」，这里把集合上下文对齐到同一纪律。
+
+        静态 + 动态双保险（缺一不可）：
+        * **静态**：解析期就能数出投影项数（`_scalar_static_width`），
+          因此**结果集为空**也拦得住（`IN (SELECT a, b ... WHERE ...)`
+          命中 0 行时不能让多列悄悄通过）；
+        * **动态**：拿到结果后再按实际列数（结果列名个数，其次首行长度）
+          判一次，兜住静态判不出的形态（`SELECT *`）。
+
+        pos_text：出错位置前缀（如 'WHERE 里的'），拼进报错信息。
+        res_cols：结果集列名列表（`res['columns']`），可为 None。
+        rows：结果行列表，可为 None。
+        """
+        static_w = Executor._scalar_static_width(sub)
+        if static_w is not None and static_w > 1:
+            raise ValueError(
+                Executor._in_subquery_arity_error(pos_text, static_w))
+        if res_cols is not None:
+            n = len(res_cols)
+        elif rows:
+            n = len(rows[0]) if rows[0] else 0
+        else:
+            n = 0
+        if n > 1:
+            raise ValueError(
+                Executor._in_subquery_arity_error(pos_text, n))
+
     def _eval_projection_scalar(self, sub, row, cols, session, read_view,
                                 outer_name, outer_alias, cache,
                                 extra_names=None):
@@ -1653,9 +1763,12 @@ class Executor:
             key = ('psub', id(sub), self._fold_cache_key(
                 sub, row, cols, outer_name, outer_alias, extra_names))
             if key not in cache:
-                cache[key] = self._fold_and_run(
+                # `_fold_and_run` 现在返回 (列名, 行)；投影是标量上下文，
+                # 列数语义仍统一由 `_scalar_from_rows` 收敛
+                _res_cols, folded_rows = self._fold_and_run(
                     sub, row, cols, session, outer_name, outer_alias,
                     read_view, extra_names)
+                cache[key] = folded_rows
             rows = cache[key]
         else:
             # 疑似非相关：确认里面没有「藏在表达式里的外层引用」，
@@ -2261,17 +2374,27 @@ class Executor:
             if not isinstance(res, dict) or res.get('type') == 'error':
                 raise ValueError(
                     f"子查询执行失败: {(res or {}).get('message', '')}")
-            cache[key] = [tuple(r) for r in (res.get('rows') or [])]
-        rows = cache[key]
+            cache[key] = (list(res.get('columns') or []),
+                          [tuple(r) for r in (res.get('rows') or [])])
+        res_cols, rows = cache[key]
 
         if op == 'EXISTS':
             return len(rows) > 0
         if op == 'NOT EXISTS':
             return len(rows) == 0
-        # IN / NOT IN 是**集合语义**（允许多行），只取每行的第一列做候选值
-        # ——这是 IN(SELECT) 的标准形态，不属于标量降级，故保持原样；
-        # 已知限制：`c IN (SELECT a, b ...)` 这种「行值 IN」本引擎不支持，
-        # 多出来的列会被忽略（不会报错）。此处刻意不动 IN 的语义。
+        # IN / NOT IN 是**集合语义**（允许多行），但只允许**一列**：
+        # 多列子查询在 SQL 标准里是行值（tuple）比较，本引擎不支持，
+        # 因此显式报错 —— 原实现对每行取 r[0]，把
+        # `id IN (SELECT uid, amt ...)` 静默算成 `id IN (SELECT uid ...)`，
+        # 返回看似正确、实际错误的行集（本会话消灭的静默错答）。
+        # 静态列数（解析期）+ 实际列数（结果列名/首行长度）双判定，
+        # 空结果集也拦得住，见 `_guard_in_subquery_width`。
+        self._guard_in_subquery_width(
+            sub, 'WHERE/HAVING 里的', res_cols=res_cols, rows=rows)
+        if not isinstance(where.get('column'), str) or not where.get('column'):
+            raise ValueError(
+                "IN / NOT IN 的左侧必须是单列：本引擎不支持行值"
+                "（多列）比较，无法安全推断出参与比较的列")
         vals = [r[0] for r in rows if r]
         lv = self._scoped_value(where.get('column'), row, cols, None)
         return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
@@ -2305,12 +2428,12 @@ class Executor:
         cache_key = ('corr', id(sub), self._fold_cache_key(
             sub, row, cols, outer_name, outer_alias, extra_names))
         if cache_key in cache:
-            rows = cache[cache_key]
+            res_cols, rows = cache[cache_key]
         else:
-            rows = self._fold_and_run(sub, row, cols, s,
-                                      outer_name, outer_alias, read_view,
-                                      extra_names)
-            cache[cache_key] = rows
+            res_cols, rows = self._fold_and_run(
+                sub, row, cols, s, outer_name, outer_alias, read_view,
+                extra_names)
+            cache[cache_key] = (res_cols, rows)
 
         if op == 'EXISTS':
             return len(rows) > 0
@@ -2318,10 +2441,19 @@ class Executor:
             return len(rows) == 0
 
         if op in ('IN', 'NOT IN'):
-            # IN / NOT IN（子查询形态）：集合语义，允许多行，取第一列作为
-            # 候选集合（与 _eval_plain_subquery_predicate 一致）。
-            # 已知限制：多列子查询在 IN 里只认第一列（行值 IN 不支持），
-            # 这是 IN 的既有语义，刻意不改。
+            # IN / NOT IN（子查询形态）：集合语义，允许多行，但只允许
+            # **一列**。多列在 SQL 标准里是行值比较，本引擎不支持 →
+            # 显式报错。原实现取 r[0]，把多列子查询静默截断成第一列
+            # （`id IN (SELECT uid, amt ...)` 算成 `id IN (SELECT uid ...)`），
+            # 是典型静默错答，这里按 `_guard_in_subquery_width` 收紧
+            # （静态列数 + 实际列数双判定，空结果集同样报错）。
+            self._guard_in_subquery_width(
+                sub, 'WHERE/HAVING 里的', res_cols=res_cols, rows=rows)
+            if not isinstance(where.get('column'), str) \
+                    or not where.get('column'):
+                raise ValueError(
+                    "IN / NOT IN 的左侧必须是单列：本引擎不支持行值"
+                    "（多列）比较，无法安全推断出参与比较的列")
             vals = [r[0] for r in rows if r]
             lv = self._scoped_value(where.get('column'), row, cols, None)
             return self._in_predicate(lv, vals, neg=(op == 'NOT IN'))
@@ -2798,7 +2930,12 @@ class Executor:
 
     def _fold_and_run(self, sub, row, cols, s, outer_name, outer_alias,
                       read_view, extra_names=None):
-        """折叠外层列 → 正常执行 → 返回结果行列表"""
+        """折叠外层列 → 正常执行 → 返回 (结果列名, 结果行列表)
+
+        结果列名一并返回，是为了让 IN / NOT IN 的集合上下文能按**实际
+        列数**判定多列子查询（空结果集也要拦得住：`SELECT *` 这类静态
+        判不出列数的形态只能靠结果列名）。
+        """
         names = self._fold_outer_names(sub, outer_name, outer_alias,
                                        extra_names)
         if not names:
@@ -2825,7 +2962,8 @@ class Executor:
         if not isinstance(res, dict) or res.get('type') == 'error':
             raise ValueError(
                 f"相关子查询执行失败: {(res or {}).get('message', '未知错误')}")
-        return [tuple(r) for r in (res.get('rows') or [])]
+        return (list(res.get('columns') or []),
+                [tuple(r) for r in (res.get('rows') or [])])
 
     def _leftover_outer_pattern(self, node, outer_names):
         """折叠后的 AST 里是否还残留 `外层名.列` 文本（返回该文本或 None）"""

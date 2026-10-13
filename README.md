@@ -88,9 +88,9 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**：**290 通过 / 82 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值（均**显式报错**，不静默）、`IN (SELECT a,b)` 行值 IN（只认第一列）、WHERE 里的算术谓词、投影标量函数、OLAP 向量化路径受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。注意失败数会因环境性用例（`test_dashboard_generation`、`test_row_format_performance`、`test_federated_governance`、`test_where_after_join`、`test_react_agent`）逐次抖动 ±2，**判据是改动领域零失败 + 干净 HEAD 副本对照**。
+**测试套件**：**299 通过 / 83 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：行值 `(a,b) IN (SELECT x,y ...)`（现**显式报错**并提示改写成 `EXISTS`）、HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、WHERE 里的算术谓词、投影标量函数、OLAP 向量化路径受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。注意失败数会因环境性用例（`test_dashboard_generation`、`test_row_format_performance`、`test_federated_governance`、`test_where_after_join`、`test_react_agent`）逐次抖动 ±2，**判据是改动领域零失败 + 干净 HEAD 副本对照**。
 
-**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值、`IN (SELECT a,b)` 行值 IN 只认第一列、WHERE 里的算术谓词、投影标量函数、`FROM (子查询)` 之后直接 `JOIN` —— 以上均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；存储侧 `Database.vacuum()` 只释放槽位、不做页内紧凑，且旧 `.dat` 行头布局不兼容（需重建库）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
+**仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；行值 `(a,b) IN (SELECT x,y ...)` 与行值比较 `(a,b) = (1,2)`（现**显式报错**并给出 `EXISTS` 改写建议）、HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值、WHERE 里的算术谓词、投影标量函数、`FROM (子查询)` 之后直接 `JOIN` —— 以上均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；存储侧 `Database.vacuum()` 只释放槽位、不做页内紧凑，且旧 `.dat` 行头布局不兼容（需重建库）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 
 > 更正记录：`tests/test_batch7.py::test_union_all` 曾长期失败（`assert 24 == 8`），一度被误判为「重复行 / 测试隔离」缺陷。实际是**该用例的期望值算错**：`setup()` 的城市列表 `['Beijing','Shanghai','Beijing','Beijing','Shenzhen']` 里有三处 'Beijing'，因此 `i % 5 ∈ {2,3,4}` 都是 Beijing（12 行），正确期望是 `12 × 2 = 24`；原断言只按 `i % 5 == 2` 算成 4 行。实测索引 20 条、堆 20 行、`_find_pks` 返回 12 个**互不重复**的 pk —— 存储层无缺陷。期望值现已改为从同一份 `cities` 列表推导，`test_batch7.py` 9/9 全绿。
 

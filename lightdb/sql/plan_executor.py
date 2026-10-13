@@ -72,7 +72,18 @@ class PlanExecutor:
     # ==================== 列解析 ====================
 
     def _resolve_col(self, cols, name) -> int:
-        """'t1.id' 或 'id' -> 列索引"""
+        """'t1.id' 或 'id' -> 列索引
+
+        标识符按 SQL 惯例**不区分大小写**匹配（原实现区分大小写）：
+        GROUP BY 的输出列名会被统一成大写
+        （`_exec_GroupBy` 的 `out_cols = [c.upper() ...]`），而 HAVING 里
+        写的是用户原来的 `u.id`；区分大小写时 `_resolve_col` 抛
+        ValueError，又会被 `_eval_condition` 的
+        `except ValueError: return False` 吞掉 —— 实测
+        `... GROUP BY u.id HAVING u.id = 1` 与 `HAVING u.id IN (1)`
+        都静默返回 0 行（正确结果是 [(1, 2)]），是 JOIN 计划路径上的
+        静默错答。大小写不敏感后两者都算对；真歧义仍显式报错。
+        """
         if not isinstance(name, str):
             raise ValueError(f"列名必须是字符串: {name!r}")
         name = name.strip().strip('`"')
@@ -80,11 +91,12 @@ class PlanExecutor:
         if name in cols:
             return cols.index(name)
 
-        # 尝试按 '.' 拆最后一段匹配
-        suffix = '.' + name
+        # 按 '.' 拆最后一段匹配（大小写不敏感）
+        low = name.lower()
         matches = [
             i for i, c in enumerate(cols)
-            if c == name or c.endswith(suffix)
+            if isinstance(c, str)
+            and (c.lower() == low or c.lower().endswith('.' + low))
         ]
         if len(matches) == 1:
             return matches[0]
@@ -162,9 +174,26 @@ class PlanExecutor:
             try:
                 ci = self._resolve_col(cols, where['column'])
             except ValueError:
+                if agg_values is not None:
+                    raise ValueError(
+                        f"HAVING 里的列 '{where.get('column')}' 在分组结果里"
+                        f"取不到：GROUP BY 之后只保留分组键与聚合值，"
+                        f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
                 return False
             val = row[ci]
-            values = self._exec_subquery_values(where['subquery'])
+            sub = where['subquery']
+            # 集合上下文只允许**一列**：多列在 SQL 标准里是行值（tuple）
+            # 比较，本引擎不支持 → 显式报错。原实现 `_exec_subquery_values`
+            # 用 `{row[0] for row in rows}` 只保留第一列，把
+            # `u.id IN (SELECT uid, amt ...)` 静默算成
+            # `u.id IN (SELECT uid ...)`，JOIN 路径上返回看似正确的错行集。
+            # 判定分两层：静态投影宽度（解析期，空结果集也拦得住）+
+            # 子查询结果的实际列数（兜住 `SELECT *` 这类静态判不出的形态）。
+            from .executor import Executor
+            Executor._guard_in_subquery_width(sub, 'JOIN 查询里的')
+            res_cols, values = self._exec_subquery_values(sub)
+            Executor._guard_in_subquery_width(
+                sub, 'JOIN 查询里的', res_cols=res_cols)
             return self._in_semantics(val, values, neg=(op == 'NOT IN'))
 
         # ---------- IN (v1, v2, ...) ----------
@@ -172,6 +201,13 @@ class PlanExecutor:
             try:
                 ci = self._resolve_col(cols, where['column'])
             except ValueError:
+                # HAVING 语境里列取不到 → 显式报错（原来静默判假，
+                # `HAVING <未投影的列> IN (...)` 会整组被丢掉）
+                if agg_values is not None:
+                    raise ValueError(
+                        f"HAVING 里的列 '{where.get('column')}' 在分组结果里"
+                        f"取不到：GROUP BY 之后只保留分组键与聚合值，"
+                        f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
                 return False
             val = row[ci]
             # 字面量列表里的 NULL 同样走三值语义
@@ -198,6 +234,16 @@ class PlanExecutor:
         try:
             ci = self._resolve_col(cols, col_name)
         except ValueError:
+            # HAVING 语境（agg_values is not None，见 `_exec_GroupBy`）里
+            # 解析不到列时显式报错：GROUP BY 的输出行只有分组键 + 聚合值，
+            # `HAVING <未投影的裸列> ...`（例如
+            # `SELECT u.id, COUNT(*) ... GROUP BY u.id HAVING u.city IN ('BJ')`）
+            # 原来静默判假、整个分组被丢掉 —— 用户看到的是「没有分组」。
+            if agg_values is not None:
+                raise ValueError(
+                    f"HAVING 里的列 '{col_name}' 在分组结果里取不到："
+                    f"GROUP BY 之后只保留分组键与聚合值，"
+                    f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
             return False
 
         l = row[ci]
@@ -286,22 +332,38 @@ class PlanExecutor:
         return self._sub_optimizer
 
     def _exec_subquery_values(self, parsed):
-        """执行子查询，返回第一列的值的集合"""
+        """执行子查询，返回 (结果列名, 第一列的值的集合)
+
+        原来只返回第一列的集合（`{row[0] for row in rows}`），列数信息在
+        这里被丢弃，调用方无法判断「多列子查询」——这正是 IN 在 JOIN 路径
+        上静默截断成第一列的根源。现在把结果列名一并返回，由调用方用
+        `Executor._guard_in_subquery_width` 判定多列并显式报错。
+        注意：执行失败不再吞成空集合（`return set()` 会让 `c IN (...)` 变成
+        恒假、`c NOT IN (...)` 变成恒真，是另一种静默错答），改为向上抛出，
+        由 `Executor.execute` 统一转成错误结果。
+        """
         if parsed is None:
-            return set()
+            return [], set()
         opt = self._get_sub_optimizer()
         plan = opt.optimize(parsed)
         sub_exec = PlanExecutor(self.db, read_view=self.read_view)
         try:
             cols, rows = sub_exec.execute(plan)
-        except Exception:
-            return set()
-        return {row[0] for row in rows if row}
+        except Exception as e:
+            raise ValueError(f"子查询执行失败: {e}")
+        return (list(cols or []),
+                {row[0] for row in rows if row})
 
     def _eval_subquery_exists(self, parsed) -> bool:
         """EXISTS 子查询（当前简化：不关联外层列）
 
         TODO: 支持相关子查询时，需要把外层行注入子执行器
+
+        注意：子查询**执行失败**不再吞成 False。原实现
+        `except Exception: return False` 会把「子查询算不出来」静默变成
+        「EXISTS 为假」，于是 `WHERE EXISTS (...)` 返回 0 行、
+        `NOT EXISTS` 返回全部行 —— 两者都是看似正常的错答案（同类静默
+        降级）。改为向上抛出，由 `Executor.execute` 转成显式错误结果。
         """
         if parsed is None:
             return False
@@ -310,8 +372,8 @@ class PlanExecutor:
         sub_exec = PlanExecutor(self.db, read_view=self.read_view)
         try:
             _, rows = sub_exec.execute(plan)
-        except Exception:
-            return False
+        except Exception as e:
+            raise ValueError(f"EXISTS 子查询执行失败: {e}")
         return len(rows) > 0
 
     # ==================== 扫描 ====================

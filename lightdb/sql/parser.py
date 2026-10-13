@@ -877,6 +877,40 @@ class Parser:
                 'column': m.group(1), 'op': op, 'value': val,
             }
 
+        # 行值（tuple）比较：`(a, b) IN (SELECT x, y FROM u)` /
+        # `(a, b) = (1, 2)`。
+        #
+        # 本引擎的存储层 `_match` 与各条求值路径都只支持**单列**比较，
+        # 没有元组匹配能力。这种形态原先落到下面兜底的
+        # 「WHERE 条件错误: ...」——虽然也是显式失败（不会静默错答），
+        # 但看不出原因。这里显式说明「不支持行值比较」。
+        #
+        # **红线**：绝不静默降级成「行值只比第一列」——那会给出一份
+        # 看起来正确、实际错误的行集（本会话消灭的正是这类静默错答）。
+        #
+        # 已知限制：如需支持行值 IN，需要 ① 解析层产出
+        # `{'columns': ['a','b'], 'op': 'IN', 'subquery': ...}`；
+        # ② 在四条求值路径上实现行值匹配——`_rewrite_subqueries`
+        # （单表下推）、`_eval_plain_subquery_predicate`（逐行非相关）、
+        # `_eval_correlated_predicate`（相关）、
+        # `plan_executor._eval_condition`（JOIN 纯计划路径）；
+        # ③ 行值比较的 NULL 语义：任一列含 NULL → 该行比较结果为
+        # UNKNOWN（IN 不命中；NOT IN 遇到含 NULL 的候选行整体为 UNKNOWN）。
+        # 这是一次跨解析/执行/计划三层的语义扩展，本次不做，故显式拒绝。
+        tup = re.match(
+            r'\s*\(\s*[\w`".]+\s*(?:,\s*[\w`".]+\s*)+\)\s*'
+            r'(?:NOT\s+)?(?:IN\b|=|!=|<>|<=|>=|<|>)',
+            s, re.IGNORECASE)
+        if tup:
+            raise SyntaxError(
+                f"不支持行值（多列）比较 / 行值 IN: {s} —— "
+                f"本引擎的 IN 与比较运算只支持单列左值，行值形态需要多个列"
+                f"同时参与比较（任一列含 NULL 时整体为 UNKNOWN），"
+                f"无法安全降级为「只比第一列」；"
+                f"请改用单列条件组合，例如 "
+                f"(a, b) IN (SELECT x, y FROM t) 可改写为 "
+                f"EXISTS (SELECT 1 FROM t WHERE x = a AND y = b)")
+
         raise SyntaxError(f"WHERE 条件错误: {s}")
 
     # ==================== DDL ====================

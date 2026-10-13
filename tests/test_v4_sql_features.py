@@ -1847,3 +1847,250 @@ def test_join_having_without_group_by_parses():
                       "HAVING (SELECT COUNT(*) FROM orders) = 3")
         assert rows == [(3,)], rows
 
+
+# ==========================================================================
+# 追加（本会话）：`IN` / `NOT IN` 子查询的多列「静默截断」
+#
+# 原实现：`id IN (SELECT uid, amt FROM orders)` 对子查询结果的每一行取
+# `r[0]`，**静默只用第一列**参与比较，于是返回一份「看起来对」的行集
+# （等价于 `id IN (SELECT uid FROM orders)`）。SQL 标准里多列 IN 是
+# **行值（tuple）比较**：左右两侧都必须看成行值，本引擎不支持行值比较，
+# 因此现在一律**显式报错**——要么算对，要么报错，绝不静默给出可能错误的
+# 结果（与上一轮标量上下文 `_scalar_from_rows` 的纪律对齐）。
+#
+# 覆盖：单表 `_rewrite_subqueries` 路径、逐行非相关路径
+# （`_eval_plain_subquery_predicate`）、相关路径
+# （`_eval_correlated_predicate`）、HAVING 路径、JOIN 纯计划路径
+# （`plan_executor._eval_condition` + `_exec_subquery_values`）。
+# 列数判定是「静态 + 动态」双保险：静态看解析期的投影项数
+# （空结果集也拦得住），动态看结果列名/结果列数（兜住 `SELECT *`）。
+#
+# 数据同 _ScalarEnv：users(id, city) = (1,'BJ') (2,'BJ') (3,'SH')；
+#                  orders(id, uid, amt) = (1,1,10) (2,1,20) (3,2,30)。
+# ==========================================================================
+
+_IN_MULTI_MSG = '只能返回一列'
+
+
+def test_in_subquery_multi_column_errors():
+    """验收①②：`IN` / `NOT IN` 的子查询返回 2 列 → 显式报错
+
+    原实现 `id IN (SELECT uid, amt FROM orders)` 静默只用 uid 一列，
+    返回 [(1,), (2,)]（NOT IN 返回 [(3,)]）——看似正确、实际错误。
+    """
+    with _ScalarEnv() as e:
+        for sql in (
+            "SELECT id FROM users "
+            "WHERE id IN (SELECT uid, amt FROM orders)",
+            "SELECT id FROM users "
+            "WHERE id NOT IN (SELECT uid, amt FROM orders)",
+        ):
+            msg = e.err(sql)
+            assert _IN_MULTI_MSG in msg, msg
+            assert '2 列' in msg, msg
+            assert '行值' in msg, msg
+
+
+def test_in_subquery_multi_column_empty_result_errors():
+    """验收③：子查询**命中 0 行**但静态列数 > 1 → 同样显式报错
+
+    空集不能让多列子查询悄悄通过（否则 `NOT IN` 会恒真、`IN` 会恒假，
+    用户看到的是「没有匹配行」这种错误答案）。
+    `WHERE uid=99` 是必然空集（该表没有 uid=99）；
+    `SELECT *` 形态静态判不出列数，由「结果列名个数」兜住。
+    """
+    with _ScalarEnv() as e:
+        for sql in (
+            "SELECT id FROM users "
+            "WHERE id IN (SELECT uid, amt FROM orders WHERE uid=99)",
+            "SELECT id FROM users "
+            "WHERE id NOT IN (SELECT uid, amt FROM orders WHERE uid=99)",
+            "SELECT id FROM users WHERE id IN (SELECT * FROM orders)",
+            "SELECT id FROM users WHERE id NOT IN (SELECT * FROM orders)",
+        ):
+            msg = e.err(sql)
+            assert _IN_MULTI_MSG in msg, msg
+
+
+def test_in_subquery_single_column_unchanged():
+    """验收④：单列子查询行为不变（IN → [(1,),(2,)]，NOT IN → [(3,)]）
+
+    同时锁住字面量列表 `IN (1,2,3)` 不受影响。
+    """
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE id IN (SELECT uid FROM orders)")
+        assert rows == [(1,), (2,)], rows
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE id NOT IN (SELECT uid FROM orders)")
+        assert rows == [(3,)], rows
+        _, rows = e.q("SELECT id FROM users WHERE id IN (1,2,3)")
+        assert rows == [(1,), (2,), (3,)], rows
+        _, rows = e.q("SELECT id FROM users WHERE id NOT IN (1,2,3)")
+        assert rows == [], rows
+
+
+def test_in_subquery_null_three_valued_unchanged():
+    """验收⑤：`IN` 的 NULL 三值语义不变（候选集含 NULL 时 NOT IN 不通过）
+
+    orders 里插入一行 uid=NULL 后：
+    * `NOT IN (SELECT uid ...)` → 候选集含 NULL → 整体 UNKNOWN → []；
+    * `IN (SELECT uid ...)` → NULL 匹配不了任何值 → 仍只剩 [(1,), (2,)]；
+    * 字面量列表 `NOT IN (1,2,NULL)` 同样 → []。
+    """
+    with _ScalarEnv() as e:
+        r = e.ex.execute_sql("INSERT INTO orders VALUES (4,NULL,40)", {})
+        assert r.get('type') == 'ok', r
+        _, rows = e.q("SELECT uid FROM orders")
+        assert rows == [(1,), (1,), (2,), (None,)], rows
+
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE id NOT IN (SELECT uid FROM orders)")
+        assert rows == [], rows
+        _, rows = e.q("SELECT id FROM users "
+                      "WHERE id IN (SELECT uid FROM orders)")
+        assert rows == [(1,), (2,)], rows
+        _, rows = e.q("SELECT id FROM users WHERE id NOT IN (1,2,NULL)")
+        assert rows == [], rows
+
+
+def test_in_subquery_correlated_multi_column_errors():
+    """相关子查询路径（`_eval_correlated_predicate`）同样拦多列"""
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT u.id FROM users u WHERE u.id IN "
+                    "(SELECT o.uid, o.amt FROM orders o WHERE o.uid=u.id)")
+        assert _IN_MULTI_MSG in msg, msg
+        assert '2 列' in msg, msg
+        # 单列相关 IN 行为不变
+        _, rows = e.q("SELECT u.id FROM users u WHERE u.id IN "
+                      "(SELECT o.uid FROM orders o WHERE o.uid=u.id)")
+        assert rows == [(1,), (2,)], rows
+
+
+def test_having_in_subquery_multi_column_errors():
+    """验收③（HAVING）：`HAVING <col> IN (多列子查询)` 同样显式报错
+
+    HAVING 的子查询在分组之后逐分组求值（`_eval_having_with_subquery`
+    → `_eval_outer_where` → `_eval_plain_subquery_predicate`），这条路径
+    原来也取 `r[0]`，必须一起收紧。
+    """
+    with _ScalarEnv() as e:
+        msg = e.err("SELECT uid, COUNT(*) FROM orders GROUP BY uid "
+                    "HAVING uid IN (SELECT uid, amt FROM orders)")
+        assert _IN_MULTI_MSG in msg, msg
+        # 单列 HAVING IN 行为不变：uid=1 有 2 行 → 命中
+        _, rows = e.q("SELECT uid, COUNT(*) FROM orders GROUP BY uid "
+                      "HAVING uid IN (SELECT uid FROM orders)")
+        assert (1, 2) in rows and (2, 1) in rows, rows
+
+
+def test_join_in_subquery_multi_column_errors():
+    """验收⑦：JOIN 路径的 `IN` 多列子查询 → 显式报错（不能只比第一列）
+
+    纯计划路径（`plan_executor._eval_condition` → `_exec_subquery_values`）
+    原来返回 `{row[0] ...}`，把 `u.id IN (SELECT uid, amt ...)` 静默算成
+    `u.id IN (SELECT uid ...)`，JOIN 结果 [(1,), (1,), (2,)] 看似正确、实际错误。
+    """
+    with _ScalarEnv() as e:
+        for sql in (
+            "SELECT u.id " + JOIN_SQ +
+            " WHERE u.id IN (SELECT uid, amt FROM orders)",
+            "SELECT u.id " + JOIN_SQ +
+            " WHERE u.id NOT IN (SELECT uid, amt FROM orders)",
+            # 空结果集 + 多列同样要报错
+            "SELECT u.id " + JOIN_SQ +
+            " WHERE u.id IN (SELECT uid, amt FROM orders WHERE uid=99)",
+            # 静态判不出列数（SELECT *）→ 由结果列数兜住
+            "SELECT u.id " + JOIN_SQ +
+            " WHERE u.id IN (SELECT * FROM orders)",
+        ):
+            msg = e.err(sql)
+            assert _IN_MULTI_MSG in msg, msg
+        # 回归：单列子查询在 JOIN 路径上行为不变
+        _, rows = e.q("SELECT u.id " + JOIN_SQ +
+                      " WHERE u.id IN (SELECT uid FROM orders)")
+        assert rows == [(1,), (1,), (2,)], rows
+
+
+def test_row_value_in_and_comparison_explicitly_rejected():
+    """验收⑥：行值（多列）`IN` 与行值比较 → 显式报错（明确「不支持」）
+
+    本引擎的存储层 `_match` 与四条求值路径都只支持单列比较，没有元组匹配
+    能力，因此选择「显式报错」而不是「只比第一列」（后者是静默错答）。
+    原先这两种形态落到兜底的 `WHERE 条件错误`（也是失败，但看不出原因），
+    现在给出说明并给出 EXISTS 改写建议。
+    """
+    with _ScalarEnv() as e:
+        for sql in (
+            "SELECT id FROM users "
+            "WHERE (id, id) IN (SELECT uid, uid FROM orders)",
+            "SELECT id FROM users "
+            "WHERE (id, id) IN (SELECT uid, amt FROM orders)",
+            "SELECT id FROM users WHERE (id, id) = (1, 2)",
+            "SELECT id FROM users WHERE (id, city) IN (SELECT uid, uid FROM orders)",
+        ):
+            try:
+                e.parser.parse(sql)
+            except SyntaxError as ex:
+                assert '不支持行值' in str(ex), str(ex)
+            else:
+                raise AssertionError(f'行值形态应当显式报错: {sql}')
+
+
+def test_having_in_list_is_evaluated_not_silently_false():
+    """任务③附带：HAVING 里的**字面量** `IN` 列表不再静默判假
+
+    执行器的统一求值器 `_eval_condition` 原先**没有 IN 分支**，字面量列表
+    会掉进普通比较逻辑（`r = value` 取不到 → None → `op == '!='` → False），
+    实测 `... GROUP BY uid HAVING uid IN (1,2)` 静默返回 0 个分组
+    （WHERE 里的字面量列表在 `_cmd_select` 已被 `_rewrite_in_lists` 改写，
+    所以只有 HAVING 暴露）。现在按三值语义求值；HAVING 里引用**取不到的
+    列**（GROUP BY 后只剩分组键与聚合值）改为显式报错，不静默丢分组。
+    """
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT uid, COUNT(*) FROM orders GROUP BY uid "
+                      "HAVING uid IN (1,2)")
+        assert sorted(rows) == [(1, 2), (2, 1)], rows
+        _, rows = e.q("SELECT uid, COUNT(*) FROM orders GROUP BY uid "
+                      "HAVING uid NOT IN (1)")
+        assert rows == [(2, 1)], rows
+        # 三值语义：列表含 NULL → NOT IN 整体 UNKNOWN → 无分组通过
+        _, rows = e.q("SELECT uid, COUNT(*) FROM orders GROUP BY uid "
+                      "HAVING uid NOT IN (1,2,NULL)")
+        assert rows == [], rows
+        _, rows = e.q("SELECT city, COUNT(*) FROM users GROUP BY city "
+                      "HAVING city IN ('BJ')")
+        assert rows == [('BJ', 2)], rows
+        # 取不到的列 → 显式报错（原来静默判假、整个分组被丢掉）
+        msg = e.err("SELECT id, COUNT(*) FROM users GROUP BY id "
+                    "HAVING city IN ('BJ')")
+        assert '取不到' in msg, msg
+
+
+def test_join_having_qualified_column_not_silently_false():
+    """任务③附带：JOIN 计划路径的 `HAVING <限定列>` 不再静默判假
+
+    `_exec_GroupBy` 把输出列名统一成大写（`U.ID`），而 `_resolve_col` 原先
+    区分大小写，于是 `HAVING u.id = 1` / `HAVING u.id IN (1)` 都解析不到列，
+    被 `except ValueError: return False` 吞掉 → 静默返回 0 行
+    （正确结果是 [(1, 2)]）。标识符按 SQL 惯例改成大小写不敏感后算对；
+    HAVING 引用未投影的列仍显式报错。
+    """
+    with _ScalarEnv() as e:
+        _, rows = e.q("SELECT u.id, COUNT(*) " + JOIN_SQ +
+                      " GROUP BY u.id HAVING u.id IN (1)")
+        assert rows == [(1, 2)], rows
+        _, rows = e.q("SELECT u.id, COUNT(*) " + JOIN_SQ +
+                      " GROUP BY u.id HAVING u.id = 1")
+        assert rows == [(1, 2)], rows
+        _, rows = e.q("SELECT u.id, COUNT(*) " + JOIN_SQ +
+                      " GROUP BY u.id, u.city HAVING u.id IN (1,2)")
+        assert sorted(rows) == [(1, 2), (2, 1)], rows
+        msg = e.err("SELECT u.id, COUNT(*) " + JOIN_SQ +
+                    " GROUP BY u.id HAVING u.city IN ('BJ')")
+        assert '取不到' in msg, msg
+        # 多列子查询在 HAVING + JOIN 组合下同样显式报错
+        msg = e.err("SELECT u.id, COUNT(*) " + JOIN_SQ +
+                    " GROUP BY u.id HAVING u.id IN (SELECT uid, amt FROM orders)")
+        assert _IN_MULTI_MSG in msg, msg
+
