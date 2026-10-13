@@ -122,12 +122,31 @@ class Optimizer:
                 continue
             right = SeqScan(jtbl, None, j.get('alias'))
 
+            # ★ ON 在 SQL 标准里是**连接后的过滤条件**。这里把 ON 的条件树
+            # 原样挂到连接节点上（`on_filter` / `on_text`），由计划执行器在
+            # 「等值连接键解析不出来」时按标准语义逐候选行求值。
+            # 原来 `_resolve_join_keys` 解析失败会返回 (None, None)、
+            # `_exec_HashJoin` 直接吐笛卡尔积并把 ON **整个丢掉**：
+            # 恒真的 `ON o.id = o.id` 只是碰巧算对，而 `ON o.uid = 1` /
+            # `ON u.id = u.city` 这类非恒真形态会静默给出错误的行集。
+            on_filter = on.get('filter') if isinstance(on, dict) else None
+            on_text = on.get('text') if isinstance(on, dict) else None
+
             if jtype == 'CROSS':
                 node = CrossJoin(node, right)
+                node.on_filter = on_filter
+                node.on_text = on_text
             elif on and 'left' in on and 'right' in on:
                 node = HashJoin(node, right, on['left'], on['right'], jtype)
+                node.on_filter = on_filter
+                node.on_text = on_text
             else:
+                # 没有可用等值键（无 ON / 常量 ON / 只引用单侧 / 非等值）：
+                # 嵌套循环 + ON 连接后过滤
                 node = NestedLoopJoin(node, right, None, None, jtype)
+                node.on_filter = on_filter
+                node.on_text = on_text
+
 
         # ---------- WHERE ----------
         if where:

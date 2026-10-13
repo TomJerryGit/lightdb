@@ -847,14 +847,25 @@ class Parser:
             r'[`"]?([\w.]+)[`"]?\s+(NOT\s+)?IN\s*\(\s*(.+?)\s*\)\s*$',
             s, re.IGNORECASE | re.DOTALL)
         if im2:
-            values = self._split_top_level(im2.group(3))
-            return {
+            raw_items = self._split_top_level(im2.group(3))
+            # 未加引号且是标识符形态的项 = **列引用**（`o.user_id IN (u.id)`）：
+            # 记下标，供 `_rewrite_in_lists` / 求值器按列取值。
+            # 引号包起来的（`IN ('id')`）返回 None → 保持字符串字面量语义。
+            col_refs = {}
+            for idx, raw in enumerate(raw_items):
+                ref = _column_ref_text(raw)
+                if ref is not None:
+                    col_refs[idx] = ref
+            node = {
                 'column': im2.group(1),
                 'op': 'NOT IN' if im2.group(2) else 'IN',
                 'values': [
-                    v.strip().strip("'\"") for v in values
+                    v.strip().strip("'\"") for v in raw_items
                 ],
             }
+            if col_refs:
+                node['value_columns'] = col_refs
+            return node
 
         # 聚合谓词（HAVING 的常见形式）：
         #   COUNT(*) > 1 / SUM(amount) >= 100 / COUNT(id) < 3
@@ -917,9 +928,26 @@ class Parser:
             if self._has_top_level_break(raw_val):
                 raise SyntaxError(f"WHERE 条件错误（缺少 AND/OR？）: {s}")
             val = raw_val.strip("'\"")
-            return {
+            node = {
                 'column': m.group(1), 'op': op, 'value': val,
             }
+            # ★ 右侧是**列引用**（`WHERE o.user_id = u.id`）而不是字面量时
+            # 打上 `value_column` 标记。
+            #
+            # 为什么必须区分：原来的编码把右侧文本一律当字面量
+            # （`val = raw_val.strip("'\"")`），求值器于是执行
+            # `row[o.user_id] == 'u.id'` —— 与字符串比较永远不成立，
+            # **静默返回空集**。跨表 WHERE（`o.user_id = u.id`）、
+            # JOIN ON 回退成连接后过滤条件、单表 `WHERE user_id = id`
+            # 全部命中这条路（实测都返回 0 行且不报错，是静默错答）。
+            #
+            # 只认「无引号 / 反引号」的标识符形态：`= 'id'`（字符串字面量）
+            # 不加标记，因此 `WHERE city = 'name'` 仍然是字面量比较。
+            col_ref = _column_ref_text(raw_val)
+            if col_ref is not None:
+                node['value'] = col_ref
+                node['value_column'] = True
+            return node
 
         # 行值（tuple）比较：`(a, b) IN (SELECT x, y FROM u)` /
         # `(a, b) = (1, 2)`。
@@ -1313,21 +1341,55 @@ class Parser:
         return {'command': 'SHOW COLUMNS', 'table': m.group(1)}
 
     def _join_condition(self, s: str) -> Optional[Dict]:
-        """解析 JOIN ON 条件
+        """解析 JOIN ON 条件（标准语义：ON = 连接后的过滤条件）
 
-        当前只支持单个等值连接（`a.x = b.y`）。**不认识的形态一律抛
-        SyntaxError**，不能返回 None —— 返回 None 会让 JOIN 静默退化成
-        交叉连接（`ON a.x=b.x AND b.y=1` 会丢掉后半段、结果行数翻倍），
-        属于典型的静默错答。
+        产出两个字段：
+
+        * `left` / `right`：**仅当** ON 恰好是「两个列引用的单个等值比较」
+          （`a.x = b.y`）时给出 —— 它是可用作等值连接键的形态，优化器据此
+          构造 HashJoin（快路径，性能不变）；
+        * `filter`：ON 的通用条件树（与 WHERE 同一套编码，右侧列引用带
+          `value_column` 标记）。当等值键在连接结果里**解析不出来**时
+          （自比较 `ON o.id = o.id`、只引用单侧、常量 `ON 1 = 1`、
+          `ON o.uid = 1`、非等值 `ON o.amt > 0`），计划执行器按 SQL 标准
+          把它当**连接后过滤条件**逐候选行求值（笛卡尔积 + ON 过滤）。
+
+        **绝不返回 None**：返回 None 会让 JOIN 静默退化成无条件的交叉连接
+        （`ON a.x=b.x AND b.y=1` 会丢掉后半段、结果行数翻倍），属于典型的
+        静默错答。原来非等值形态直接抛 SyntaxError（显式失败、不静默），
+        现在按标准语义算对；`_where` 认不出的形态仍抛 SyntaxError。
         """
         text = s.strip()
+        out = {'filter': self._join_filter(text), 'text': text}
         m = re.match(
             r'[`"]?([\w.]+)[`"]?\s*=\s*[`"]?([\w.]+)[`"]?\s*$',
             text)
         if m:
-            return {'left': m.group(1), 'right': m.group(2)}
-        raise SyntaxError(
-            f"JOIN ON 条件只支持单个等值连接（形如 a.x = b.y）: {text}")
+            left, right = m.group(1), m.group(2)
+            # 两侧都得是**列引用**：`ON 1 = 1`（常量）、`ON o.id = 3`
+            # （右侧是数字）都不是等值连接键，不能拿去构造 HashJoin
+            # （`_resolve_col` 解析不到时会静默退化成笛卡尔积）。
+            if _column_ref_text(left) and _column_ref_text(right):
+                out['left'] = left
+                out['right'] = right
+        return out
+
+    def _join_filter(self, text: str) -> Dict:
+        """ON 文本 -> 条件树
+
+        常量比较（`1 = 1`、`'a' = 'a'`）必须走**表达式求值器**：普通比较
+        分支会把 `1 = 1` 编成 `{'column': '1', ...}`（把数字当列名），
+        求值时再报「列 '1' 不存在」—— 恒真的 ON 反而变成显式错误。
+        """
+        split = self._split_top_level_comparison(text)
+        if split is not None:
+            left, op, right = split
+            if is_literal_text(left) and is_literal_text(right):
+                ln = parse_scalar_expr(left)
+                rn = parse_scalar_expr(right)
+                if ln is not None and rn is not None:
+                    return {'expr_pred': {'left': ln, 'op': op, 'right': rn}}
+        return self._where(text)
 
     def _split_top_level(self, s: str) -> List[str]:
         """按顶层逗号分割"""
@@ -1557,6 +1619,32 @@ _FUNC_HEAD_RE = re.compile(r'^\s*(\w+)\s*\(')
 _SCALAR_SUB_RE = re.compile(r'^\(\s*SELECT\b', re.IGNORECASE)
 # 表达式里的列标识符（可带表限定符）
 _IDENT_RE = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?')
+# 比较右侧的「列引用」文本：裸标识符或反引号包裹的标识符（可带限定符）。
+# 单/双引号包裹的一律视为**字符串字面量**（本引擎把双引号也当字符串），
+# 数字 / NULL / TRUE / FALSE 同样排除。
+_COL_REF_TEXT_RE = re.compile(
+    r'^`?([A-Za-z_]\w*)`?(?:\.`?([A-Za-z_]\w*)`?)?$')
+
+
+def _column_ref_text(raw_val):
+    """比较右侧的原始文本是「列引用」时返回归一化列名，否则返回 None
+
+    用于区分 `WHERE o.user_id = u.id`（右侧是列）与 `WHERE city = 'SH'`
+    / `WHERE n = 5`（右侧是字面量）。后者不能加列解析标记，否则字符串
+    常量会被拿去当列名解析。
+    """
+    t = str(raw_val or '').strip()
+    if not t:
+        return None
+    up = t.upper()
+    if up in ('NULL', 'TRUE', 'FALSE'):
+        return None
+    m = _COL_REF_TEXT_RE.match(t)
+    if not m:
+        return None
+    return f"{m.group(1)}.{m.group(2)}" if m.group(2) else m.group(1)
+
+
 # 表达式里出现这些词不算列引用
 _SQL_WORDS = frozenset((
     'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'BY', 'HAVING', 'LIMIT',

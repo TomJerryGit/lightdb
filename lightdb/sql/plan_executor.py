@@ -151,7 +151,8 @@ class PlanExecutor:
 
     # ==================== 条件求值（唯一定义） ====================
 
-    def _eval_condition(self, row, cols, where, agg_values=None):
+    def _eval_condition(self, row, cols, where, agg_values=None,
+                        strict=False):
         """求值 WHERE/HAVING 条件
 
         ★ 只保留这一份实现（原代码中重复定义两次）
@@ -159,6 +160,13 @@ class PlanExecutor:
         agg_values: HAVING 语境下预先算好的聚合值 {'COUNT(*)': 3, ...}。
         GROUP BY 之后行里只剩输出列，HAVING 引用的聚合表达式可能不在
         SELECT 列表里，因此在分组时统一算好再传进来。
+
+        strict: **连接后过滤（JOIN ON 回退路径）**用。此时条件里的列名
+        必须全部解析得到：`_resolve_col` 失败不能再 `return False`
+        （那会把「列写错」静默变成"条件为假"→ 空集），必须显式报错。
+        无论 strict 与否，**带限定符**的列（`u.nosuch`）解析不到都报错
+        （见 `_missing_col_result`）；只有裸列名保留既有的「判假」语义，
+        因为本引擎允许 `WHERE name = Alice` 这种不写引号的字面量写法。
         """
         if where is None:
             return True
@@ -168,20 +176,22 @@ class PlanExecutor:
         # NOT (...)：整体取反（三值语义下 UNKNOWN 取反仍是 UNKNOWN）
         if isinstance(where.get('not'), dict):
             inner = self._eval_condition(
-                row, cols, where['not'], agg_values)
+                row, cols, where['not'], agg_values, strict=strict)
             if inner is None:
                 return None
             return not inner
 
         if 'and' in where:
-            return all(self._eval_condition(row, cols, c, agg_values)
+            return all(self._eval_condition(row, cols, c, agg_values,
+                                            strict=strict)
                        for c in where['and'])
         if 'or' in where:
             parts = where['or']
             # 空 OR 列表 = 常量假（执行器改写子查询时用这个表示）
             if not parts:
                 return False
-            return any(self._eval_condition(row, cols, c, agg_values)
+            return any(self._eval_condition(row, cols, c, agg_values,
+                                            strict=strict)
                        for c in parts)
 
         op = where.get('op')
@@ -233,12 +243,8 @@ class PlanExecutor:
             try:
                 ci = self._resolve_col(cols, where['column'])
             except ValueError:
-                if agg_values is not None:
-                    raise ValueError(
-                        f"HAVING 里的列 '{where.get('column')}' 在分组结果里"
-                        f"取不到：GROUP BY 之后只保留分组键与聚合值，"
-                        f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
-                return False
+                return self._missing_col_result(
+                    where.get('column'), agg_values, strict, 'WHERE')
             val = row[ci]
             sub = where['subquery']
             # 集合上下文只允许**一列**：多列在 SQL 标准里是行值（tuple）
@@ -260,18 +266,12 @@ class PlanExecutor:
             try:
                 ci = self._resolve_col(cols, where['column'])
             except ValueError:
-                # HAVING 语境里列取不到 → 显式报错（原来静默判假，
-                # `HAVING <未投影的列> IN (...)` 会整组被丢掉）
-                if agg_values is not None:
-                    raise ValueError(
-                        f"HAVING 里的列 '{where.get('column')}' 在分组结果里"
-                        f"取不到：GROUP BY 之后只保留分组键与聚合值，"
-                        f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
-                return False
+                # HAVING 语境 / JOIN ON / 限定名解析不到 → 显式报错
+                return self._missing_col_result(
+                    where.get('column'), agg_values, strict, 'WHERE')
             val = row[ci]
-            # 字面量列表里的 NULL 同样走三值语义
-            vals = [None if str(v).upper() == 'NULL' else v
-                    for v in where['values']]
+            # 字面量列表里的 NULL 同样走三值语义；带限定名的项是列引用
+            vals = self._resolve_in_values(where['values'], row, cols)
             return self._in_semantics(val, vals, neg=(op == 'NOT IN'))
 
         # ---------- 普通比较 ----------
@@ -298,15 +298,12 @@ class PlanExecutor:
             # `HAVING <未投影的裸列> ...`（例如
             # `SELECT u.id, COUNT(*) ... GROUP BY u.id HAVING u.city IN ('BJ')`）
             # 原来静默判假、整个分组被丢掉 —— 用户看到的是「没有分组」。
-            if agg_values is not None:
-                raise ValueError(
-                    f"HAVING 里的列 '{col_name}' 在分组结果里取不到："
-                    f"GROUP BY 之后只保留分组键与聚合值，"
-                    f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
-            return False
+            return self._missing_col_result(col_name, agg_values, strict,
+                                            'WHERE')
 
         l = row[ci]
         r = where.get('value')
+        r = self._comparison_rhs(r, where, row, cols, strict)
 
         if l is None:
             return op == '=' and r is None
@@ -358,6 +355,81 @@ class PlanExecutor:
         except (ValueError, TypeError):
             pass
         return str(a) == str(b)
+
+    def _missing_col_result(self, col_name, agg_values, strict, context):
+        """条件里的列在当前行解析不到时的统一处理（**绝不静默给空集**）
+
+        原来三处都是 `return False`（"条件为假"）—— 用户看到的是「查不到
+        任何行」，分不清是「确实没有匹配」还是「列名写错了 / 忘了加表前缀」。
+
+        * HAVING 语境（GROUP BY 之后只剩分组键与聚合值）→ 报错并说明；
+        * JOIN ON 回退路径（strict）→ 报错（ON 里引用不存在的列）；
+        * **带限定符**的列（`u.nosuch` / `x.id`，绝不可能是字符串字面量）
+          → 报错，指出表名/别名或列不在这个查询里；
+        * 其余（裸列名解析不到）保持既有「判假」行为：本引擎允许
+          `WHERE name = Alice` 这种不写引号的字面量写法，收紧会改坏它。
+        """
+        if agg_values is not None:
+            raise ValueError(
+                f"HAVING 里的列 '{col_name}' 在分组结果里取不到："
+                f"GROUP BY 之后只保留分组键与聚合值，"
+                f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
+        if strict:
+            raise ValueError(
+                f"JOIN ON 条件里的列 '{col_name}' 在连接结果里解析不到"
+                f"（列不存在或需要表名前缀）")
+        if isinstance(col_name, str) and '.' in col_name.strip().strip('`"'):
+            raise ValueError(
+                f"JOIN 查询的 {context} 里列 '{col_name}' 在连接结果里"
+                f"解析不到：列不存在，或该表名/别名不在这个查询里")
+        return False
+
+    def _comparison_rhs(self, r, where, row, cols, strict=False):
+        """比较右侧取值：`value_column` 标记的**列引用**在本行取列值
+
+        `WHERE o.user_id = u.id` 的右侧是列引用，但 AST 里它的编码与字面量
+        一样（`{'column','op','value'}`）。求值器原来无条件把 `value` 当
+        字面量 → 执行 `row[o.user_id] == 'u.id'` → 恒不成立 →
+        **静默返回空集**（本次报告的主症状）。
+
+        * 带 `value_column` 且能在本行解析到列 → 取该列的值比较；
+        * 解析不到且**带限定符**（`u.nosuch`）或 `strict`（JOIN ON 回退
+          路径）→ 显式报错，绝不静默判假；
+        * 其余（裸标识符解析不到）→ 保持历史行为当字符串字面量
+          （`WHERE name = Alice` 这种不写引号的写法在既有测试里存在）。
+        """
+        if not where.get('value_column') or not isinstance(r, str):
+            return r
+        try:
+            rj = self._resolve_col(cols, r)
+        except ValueError:
+            if strict or '.' in r.strip().strip('`"'):
+                raise ValueError(
+                    f"列 '{r}' 在连接结果里解析不到"
+                    f"（列不存在或需要表名前缀）")
+            return r
+        return row[rj] if rj < len(row) else None
+
+    def _resolve_in_values(self, values, row, cols):
+        """IN 列表求值：带限定名的项是**列引用**，取该行对应列的值
+
+        `WHERE o.user_id IN (u.id)` 原来被当成字面量集合 {'u.id'} →
+        恒不命中 → 静默空集（与 `a = b` 同一类吞错）。带点的项只可能是
+        列引用：解析不到就显式报错；裸标识符 / 字面量保持原样。
+        """
+        out = []
+        for v in (values or []):
+            if isinstance(v, str) and '.' in v.strip().strip('`"'):
+                try:
+                    vi = self._resolve_col(cols, v)
+                except ValueError:
+                    raise ValueError(
+                        f"IN 列表里的列 '{v}' 在连接结果里解析不到"
+                        f"（列不存在或需要表名前缀）")
+                out.append(row[vi] if vi < len(row) else None)
+                continue
+            out.append(None if str(v).upper() == 'NULL' else v)
+        return out
 
     @staticmethod
     def _coerce_pair(l, r, op):
@@ -1080,8 +1152,10 @@ class PlanExecutor:
         ON o.uid=u.id` 返回 3×3=9 行，其上的 WHERE / GROUP BY / 子查询
         全部跟着算错）。
 
-        这里按「原顺序 → 交换一次」两轮解析；两轮都失败才返回 (None, None)，
-        保持既有的「无等值键 → 笛卡尔积」行为（CROSS JOIN / 无 ON 场景）。
+        这里按「原顺序 → 交换一次」两轮解析；两轮都失败才返回 (None, None)。
+        调用方**不能**把 (None, None) 当成「没有 ON」：那会把 ON 丢掉，
+        必须改走 `_exec_join_with_on_filter`（笛卡尔积 + ON 连接后过滤）
+        或显式报错。
         """
         for lk, rk in ((lkey, rkey), (rkey, lkey)):
             if not lk or not rk:
@@ -1093,6 +1167,57 @@ class PlanExecutor:
                 continue
         return None, None
 
+    # ==================== JOIN（ON 连接后过滤） ====================
+
+    def _join_on_filter(self, node):
+        """连接节点上挂的 ON 条件树（没有则 None）"""
+        f = getattr(node, 'on_filter', None)
+        return f if isinstance(f, dict) else None
+
+    def _exec_join_with_on_filter(self, node, lcols, lrows, rcols, rrows):
+        """ON 不能用作等值连接键时的**标准语义**执行：笛卡尔积 + ON 过滤
+
+        SQL 标准里 `ON` 就是连接后的过滤条件（笛卡尔积再按 ON 过滤），
+        所以「ON 不可用作等值键」不该丢掉 ON，而应该退化成
+        「嵌套循环 + 逐候选行求值 ON」：
+
+        * 自比较 / 只引用单侧 / 常量 / 非等值 ON 全部走这里；
+        * 没有 ON（真正的 CROSS JOIN 或 `JOIN t` 无 ON）时等价于笛卡尔积；
+        * ON 引用了连接结果里不存在的列 → `strict=True` **显式报错**
+          （原来会被 `except ValueError: return False` 吞成"条件为假"，
+          整个结果静默变成空集）；
+        * `LEFT/RIGHT JOIN` 未匹配时按 SQL 语义补 NULL（ON 是连接条件、
+          不是外层 WHERE，未匹配的左侧行必须保留）。
+
+        这就是本次修复的核心：原实现在 `_resolve_join_keys` 返回
+        (None, None) 时直接产出笛卡尔积并**把 ON 丢掉**。
+        """
+        out_cols = lcols + rcols
+        on_filter = self._join_on_filter(node)
+        jt = (node.join_type or 'INNER').upper()
+        out_rows = []
+        matched_right = [False] * len(rrows)
+
+        for lrow in lrows:
+            matched = False
+            for j, rrow in enumerate(rrows):
+                cand = lrow + rrow
+                if on_filter is not None and not self._eval_condition(
+                        cand, out_cols, on_filter, strict=True):
+                    continue
+                out_rows.append(cand)
+                matched = True
+                matched_right[j] = True
+            if not matched and jt in ('LEFT', 'LEFT OUTER'):
+                out_rows.append(lrow + [None] * len(rcols))
+
+        if jt in ('RIGHT', 'RIGHT OUTER'):
+            for j, rrow in enumerate(rrows):
+                if not matched_right[j]:
+                    out_rows.append([None] * len(lcols) + rrow)
+
+        return out_cols, out_rows
+
     def _exec_HashJoin(self, node):
         lcols, lrows = self.execute(node.left)
         rcols, rrows = self.execute(node.right)
@@ -1100,15 +1225,13 @@ class PlanExecutor:
         li, ri = self._resolve_join_keys(
             lcols, rcols, node.left_key, node.right_key)
 
-        out_cols = lcols + rcols
-
-        # 无等值键 -> 笛卡尔积
+        # 等值键解析失败 -> **不能丢 ON**：按标准语义笛卡尔积 + ON 过滤
+        # （原来这里直接吐笛卡尔积，ON 被静默丢弃）
         if li is None or ri is None:
-            out_rows = []
-            for lr in lrows:
-                for rr in rrows:
-                    out_rows.append(lr + rr)
-            return out_cols, out_rows
+            return self._exec_join_with_on_filter(
+                node, lcols, lrows, rcols, rrows)
+
+        out_cols = lcols + rcols
 
         # 构建哈希表
         hash_table = defaultdict(list)
@@ -1147,6 +1270,12 @@ class PlanExecutor:
             li, ri = self._resolve_join_keys(
                 lcols, rcols, node.left_key, node.right_key)
 
+        # 没有可用的等值键（无 ON / 常量 ON / 只引用单侧 / 非等值 ON）：
+        # 交给统一的「ON 连接后过滤」实现（含 LEFT/RIGHT 补 NULL）
+        if li is None or ri is None:
+            return self._exec_join_with_on_filter(
+                node, lcols, lrows, rcols, rrows)
+
         jt = (node.join_type or 'INNER').upper()
         out_rows = []
         matched_right = [False] * len(rrows)
@@ -1154,9 +1283,8 @@ class PlanExecutor:
         for lrow in lrows:
             matched = False
             for j, rrow in enumerate(rrows):
-                if li is not None and ri is not None:
-                    if lrow[li] != rrow[ri]:
-                        continue
+                if lrow[li] != rrow[ri]:
+                    continue
                 out_rows.append(lrow + rrow)
                 matched = True
                 matched_right[j] = True
@@ -1173,6 +1301,12 @@ class PlanExecutor:
     def _exec_CrossJoin(self, node):
         lcols, lrows = self.execute(node.left)
         rcols, rrows = self.execute(node.right)
+        on_filter = self._join_on_filter(node)
+        # `CROSS JOIN` 本身没有 ON；带 ON 的形态（`JOIN t ON ...` 无可用
+        # 等值键）也复用同一条「ON 连接后过滤」路径
+        if on_filter is not None:
+            return self._exec_join_with_on_filter(
+                node, lcols, lrows, rcols, rrows)
         out_rows = [lr + rr for lr in lrows for rr in rrows]
         return lcols + rcols, out_rows
 

@@ -3067,5 +3067,202 @@ def test_order_by_single_key_and_window_regression():
                         ('Dave', 'Sales', 1), ('Eve', 'Sales', 2)], rows
 
 
+# ==========================================================================
+# 验收：JOIN 的 ON 不是「左右两表各一列」的可用等值连接键时，
+#       按 SQL 标准回退成「笛卡尔积 + ON 作为连接后过滤条件」
+#
+# 根因（两处互相叠加的静默吞错）：
+#   ① `plan_executor._resolve_join_keys` 两轮解析都失败时返回 (None, None)，
+#      `_exec_HashJoin` 直接把 ON **整个丢掉**、吐笛卡尔积（恒真的
+#      `ON o.id = o.id` 只是碰巧算对；`ON o.uid = 1`、`ON u.id = u.city`
+#      这类非恒真形态会静默给出错误行集）；
+#   ② 比较右侧的**列引用**被解析器当成字符串字面量
+#      （`WHERE o.user_id = u.id` → `row[o.user_id] == 'u.id'`），恒不成立 →
+#      静默返回空集。这才是「ON 写不出等值键 → 跨表 WHERE 算出 0 行」的直接原因，
+#      单表 `WHERE user_id = id` 同样返回 0（同一类吞错）。
+#
+# 修法：`{'value_column': True}` 标记 + 求值器按列取值；ON 不可用作等值键时
+# 由 `_exec_join_with_on_filter` 逐候选行求值 ON（含 LEFT/RIGHT 补 NULL），
+# ON / WHERE 里引用不存在的列**显式报错**，绝不静默给空集。
+# ==========================================================================
+
+_ON_TAUTOLOGY = "FROM users u JOIN orders o ON o.id = o.id"
+_ON_SELF_LEFT = "FROM users u JOIN orders o ON u.id = u.id"
+_ON_EQUI = "FROM users u JOIN orders o ON o.user_id = u.id"
+
+
+def test_join_on_self_compare_where_cross_table():
+    """验收 1-3：ON 是自比较（不可用作等值键）时，跨表 WHERE 必须算对
+
+    `ON o.id = o.id` / `ON u.id = u.id` 都不是连接键：标准语义下 ON 退化成
+    连接后过滤（恒真 → 笛卡尔积 9 行），其上的 `WHERE o.user_id = u.id`
+    按**列引用**比较 → 3 行。修复前这里返回 0 行且不报错（静默错答）。
+    """
+    with _Env() as e:
+        # ③ 单独的 ON（恒真）仍是 9 行（笛卡尔积）
+        _, rows = e.q("SELECT COUNT(*) " + _ON_TAUTOLOGY)
+        assert rows == [(9,)], rows
+        _, rows = e.q("SELECT COUNT(*) " + _ON_SELF_LEFT)
+        assert rows == [(9,)], rows
+        # ① ON o.id = o.id + 跨表 WHERE：3（修复前 0，且不报错）
+        _, rows = e.q("SELECT COUNT(*) " + _ON_TAUTOLOGY +
+                      " WHERE o.user_id = u.id")
+        assert rows == [(3,)], rows
+        # ② ON u.id = u.id + 跨表 WHERE：3（ON 在左表内部自比较）
+        _, rows = e.q("SELECT COUNT(*) " + _ON_SELF_LEFT +
+                      " WHERE o.user_id = u.id")
+        assert rows == [(3,)], rows
+        # WHERE 求值必须发生在**连接之后**：(u1,o2) 与 (u2,o3) 满足
+        # `o.amount > u.id * 10`，(u1,o1) 的 10 > 10 不成立 → 2 行
+        _, rows = e.q("SELECT COUNT(*) " + _ON_TAUTOLOGY +
+                      " WHERE o.user_id = u.id AND o.amount > u.id * 10")
+        assert rows == [(2,)], rows
+
+
+def test_join_on_fallback_regression_equi_left_group_by():
+    """验收 4-5：正常等值连接 / GROUP BY / LEFT JOIN 补 NULL 不回归
+
+    正常等值 ON 仍走 HashJoin 快路径（性能不变），LEFT JOIN 的 ON 是连接
+    条件（不是外层 WHERE），未匹配的左侧行必须补 NULL。
+    """
+    with _Env() as e:
+        # ④ 正常等值连接 + GROUP BY
+        cols, rows = e.q("SELECT u.city, COUNT(*) " + _ON_EQUI +
+                         " GROUP BY u.city")
+        assert rows == [('BJ', 3)], rows
+        # 正常等值连接的行数
+        _, rows = e.q("SELECT COUNT(*) " + _ON_EQUI)
+        assert rows == [(3,)], rows
+        # 反方向 ON（JOIN 进来的表写在左边）同样 3 行
+        _, rows = e.q("SELECT COUNT(*) "
+                      "FROM users u JOIN orders o ON o.id = o.user_id")
+        assert rows == [(3,)], rows
+        # ⑤ LEFT JOIN + 不可用作键的 ON（恒真）→ 9 行（右侧恒匹配，无补 NULL）
+        _, rows = e.q("SELECT COUNT(*) FROM users u LEFT JOIN orders o "
+                      "ON o.id = o.id")
+        assert rows == [(9,)], rows
+        # LEFT JOIN + 该 ON + 跨表 WHERE → 3 行
+        _, rows = e.q("SELECT COUNT(*) FROM users u LEFT JOIN orders o "
+                      "ON o.id = o.id WHERE o.user_id = u.id")
+        assert rows == [(3,)], rows
+        # LEFT JOIN 未匹配补 NULL：users 3 行 + 1 个用户没订单
+        _, rows = e.q("SELECT u.id, o.amount FROM users u LEFT JOIN orders o "
+                      "ON o.user_id = u.id ORDER BY u.id, o.amount")
+        assert rows == [(1, 10), (1, 20), (2, 30), (3, None)], rows
+
+
+def test_join_on_constant_and_non_equi_conditions():
+    """验收 6：常量 ON / 非等值 ON 按标准语义当连接后过滤条件求值
+
+    `ON 1 = 1`（恒真）→ 9 行；`ON o.amount > 15` → 2 笔订单 × 3 个用户 = 6 行；
+    `ON u.id = 5` → 没有任何连接行（过滤后 0 行）。
+    `ON o.uid > 0` 这类非等值形态修复前是解析期 SyntaxError，现在按标准
+    算对（仍是显式失败 → 算对的**改进**，不会静默）。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT COUNT(*) " + _ON_TAUTOLOGY.replace(
+            "o.id = o.id", "1 = 1"))
+        assert rows == [(9,)], rows
+        _, rows = e.q("SELECT COUNT(*) FROM users u JOIN orders o "
+                      "ON o.amount > 15")
+        assert rows == [(6,)], rows
+        _, rows = e.q("SELECT COUNT(*) FROM users u JOIN orders o "
+                      "ON u.id = 5")
+        assert rows == [(0,)], rows
+        # 非等值 ON 的 LEFT JOIN：右侧全不匹配 → 每行左侧补 NULL（3 行）
+        _, rows = e.q("SELECT COUNT(*) FROM users u LEFT JOIN orders o "
+                      "ON o.amount > 1000")
+        assert rows == [(3,)], rows
+        # 非等值 ON + LEFT JOIN（有匹配）：9 行，无补 NULL
+        _, rows = e.q("SELECT COUNT(*) FROM users u LEFT JOIN orders o "
+                      "ON o.amount > 0")
+        assert rows == [(9,)], rows
+
+
+def test_join_on_unknown_column_errors():
+    """ON / WHERE 里引用不存在的列 → **显式报错**，绝不静默给空集
+
+    修复前 `_exec_HashJoin` 解析不到键就丢 ON，`_eval_condition` 解析不到列
+    就 `return False`，两种都会静默返回空集；这里全部收紧成显式错误。
+    """
+    with _Env() as e:
+        msg = _assert_err(e, "SELECT COUNT(*) FROM users u JOIN orders o "
+                             "ON o.nosuch = u.id")
+        assert 'nosuch' in msg, msg
+        msg = _assert_err(e, "SELECT COUNT(*) FROM users u JOIN orders o "
+                             "ON o.id = u.nosuch")
+        assert 'nosuch' in msg, msg
+        # 裸列名在连接结果里解析不到（不是字面量比较）→ 报错
+        msg = _assert_err(e, "SELECT COUNT(*) FROM users u JOIN orders o "
+                             "ON nosuch = 1")
+        assert 'nosuch' in msg, msg
+        # WHERE 里带限定符的未知列 → 报错（原来静默 0 行）
+        msg = _assert_err(e, "SELECT COUNT(*) FROM users u JOIN orders o "
+                             "ON o.user_id = u.id WHERE o.nosuch = u.id")
+        assert 'nosuch' in msg, msg
+
+
+def test_join_where_column_reference_comparison():
+    """附加：WHERE 的**列引用**比较（`a = b` / `IN (b)` / `NOT (a = b)`）算对
+
+    单表 `WHERE user_id = id` 修复前同样返回 0 行（同一类吞错）。
+    """
+    with _Env() as e:
+        # 单表：orders(id, user_id) → user_id = id 只有第 1 行
+        _, rows = e.q("SELECT COUNT(*) FROM orders WHERE user_id = id")
+        assert rows == [(1,)], rows
+        _, rows = e.q("SELECT COUNT(*) FROM orders WHERE id IN (user_id)")
+        assert rows == [(1,)], rows
+        _, rows = e.q("SELECT COUNT(*) FROM orders WHERE id = user_id")
+        assert rows == [(1,)], rows
+        # 连接后逐行比较：o.user_id 与 u.id 相等的连接行 3 行
+        _, rows = e.q("SELECT COUNT(*) " + _ON_EQUI +
+                      " WHERE o.user_id = u.id")
+        assert rows == [(3,)], rows
+        _, rows = e.q("SELECT COUNT(*) " + _ON_EQUI +
+                      " WHERE o.user_id IN (u.id)")
+        assert rows == [(3,)], rows
+        _, rows = e.q("SELECT COUNT(*) " + _ON_EQUI +
+                      " WHERE NOT (o.user_id = u.id)")
+        assert rows == [(0,)], rows
+        # 右侧带引号仍是字符串字面量（不是列引用）
+        _, rows = e.q("SELECT COUNT(*) FROM users WHERE city = 'SH'")
+        assert rows == [(1,)], rows
+        # 单表自比较（恒真）→ 3 行
+        _, rows = e.q("SELECT COUNT(*) FROM users WHERE city = city")
+        assert rows == [(3,)], rows
+        # UPDATE / DELETE 的条件里带列引用同样不能静默改 0 行
+        # （orders 的 (1,1) 与新增的 (4,4) 满足 user_id = id → 2 行）
+        e.ex.execute_sql("INSERT INTO orders VALUES (4,4,40)", {})
+        r = e.ex.execute_sql("UPDATE orders SET amount = 0 "
+                             "WHERE user_id = id", {})
+        assert r.get('affected') == 2, r
+        r = e.ex.execute_sql("DELETE FROM orders WHERE user_id = id", {})
+        assert r.get('affected') == 2, r
+
+
+def test_join_order_by_qualified_columns_multi_key():
+    """验收 7：JOIN + 限定列名多键 ORDER BY + LIMIT（顺序正确）
+
+    投影 `SELECT u.id, o.id` 的输出列名都被压成裸名 `id`，计划路径的 Sort
+    只看得到 `['id','id']`：两个排序键都会落到第一列（第二键静默算错），
+    限定名 `u.id` 还会被判成歧义 → 报错。这里改走「物化连接 + 统一排序」，
+    按连接结果的限定列名逐键求值。
+    """
+    with _Env() as e:
+        _, rows = e.q("SELECT u.id, o.id " + _ON_TAUTOLOGY +
+                      " WHERE o.user_id = u.id ORDER BY u.id, o.id LIMIT 3")
+        assert rows == [(1, 1), (1, 2), (2, 3)], rows
+        # 第二键方向独立：o.id DESC
+        _, rows = e.q("SELECT u.id, o.id " + _ON_TAUTOLOGY +
+                      " WHERE o.user_id = u.id ORDER BY u.id ASC, o.id DESC")
+        assert rows == [(1, 2), (1, 1), (2, 3)], rows
+        # 计划路径（等值 ON，投影里没有重名）仍然正确
+        _, rows = e.q("SELECT u.id, o.amount " + _ON_EQUI +
+                      " ORDER BY o.amount DESC, u.id ASC LIMIT 2")
+        assert rows == [(2, 30), (1, 20)], rows
+
+
+
 
 

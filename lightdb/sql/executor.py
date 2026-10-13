@@ -464,6 +464,12 @@ class Executor:
         # 存储层只认 `column + op + value`，下推过去会 KeyError（报出
         # 与真实原因无关的「表不存在」），必须走统一求值路径
         expr_pred = self._where_has_expr_pred(where)
+        # WHERE/HAVING 里**右侧是列引用**的比较（`WHERE user_id = id`、
+        # `WHERE o.user_id = u.id`）：存储层 `_match` 会把右侧当字符串
+        # 字面量（`1 == 'id'` 恒假）→ 静默返回空集，必须走统一求值路径
+        # 由 `_eval_condition` 按列取值比较。
+        col_rhs = self._where_has_column_rhs(where) \
+            or self._where_has_column_rhs(p.get('having'))
         # ORDER BY 是表达式 / 序号 / 多键，或键引用了没被投影的列
         # （`SELECT name FROM emp ORDER BY salary`）：存储层与计划执行器都
         # 只会去找同名列，找不到就**静默不排序**（DESC 也可能被丢掉），
@@ -483,7 +489,7 @@ class Executor:
         if (p.get('windows') or p.get('group_by') or p.get('having')
                 or p.get('distinct') or qualified or literal or has_sub
                 or arith or proj_sub or scalar_func or has_not or has_null
-                or expr_pred or order_expr or aliased):
+                or expr_pred or col_rhs or order_expr or aliased):
             return self._select_advanced(
                 p, tbl, read_view=rv, where=where, session=s)
         cols, rows = tbl.select(
@@ -1038,7 +1044,11 @@ class Executor:
         # `WHERE salary * 2 > 230`）：存储层 `_match` 认不出这种节点
         # （KeyError('column')），因此取全部行后用统一求值器逐行过滤。
         # 三值逻辑：UNKNOWN（None）按「不通过」处理，与 SQL 的 WHERE 一致。
-        if isinstance(where, dict) and self._where_has_expr_pred(where):
+        # 「右侧是列引用」的比较（`WHERE user_id = id`）同样：存储层会把
+        # 右侧当字符串字面量（恒假 → 静默空集），必须在这里按列取值求值。
+        if isinstance(where, dict) and (
+                self._where_has_expr_pred(where)
+                or self._where_has_column_rhs(where)):
             if isinstance(src, _CTERelation):
                 cols = list(src.col_names)
                 rows = [list(r) for r in src.rows]
@@ -1187,7 +1197,8 @@ class Executor:
             # 只翻转运算符（=' -> '!=、'!=' -> '='），NULL 语义自动对齐
             return {'column': where.get('column'),
                     'op': cls._NOT_OP[op],
-                    'value': val}
+                    'value': val,
+                    'value_column': where.get('value_column', False)}
         if 'agg' in where and op in cls._NOT_OP:
             return {'agg': where.get('agg'), 'op': cls._NOT_OP[op],
                     'value': val}
@@ -1297,6 +1308,34 @@ class Executor:
         for key in ('not', 'negate'):
             inner = where.get(key)
             if isinstance(inner, dict) and cls._where_has_expr_pred(inner):
+                return True
+        return False
+
+    @classmethod
+    def _where_has_column_rhs(cls, where) -> bool:
+        """条件里是否有**右侧是列引用**的比较（`{'value_column': True}`）
+
+        这种节点存储层 `Table._match` 只当字面量比较（`a == 'b'` 恒假），
+        必须走执行器的统一求值路径由 `_eval_condition` 按列取值比较，
+        否则单表 `WHERE user_id = id` 会静默返回空集。
+        """
+        if not isinstance(where, dict):
+            return False
+        if where.get('value_column'):
+            return True
+        if where.get('op') in ('IN', 'NOT IN') \
+                and isinstance(where.get('values'), list):
+            # `IN (t.col)`：带限定名的候选项是列引用，存储层会当字面量
+            if any(isinstance(v, str) and '.' in v.strip().strip('`"')
+                   for v in where['values']):
+                return True
+        for key in ('and', 'or'):
+            for c in (where.get(key) or []):
+                if cls._where_has_column_rhs(c):
+                    return True
+        for key in ('not', 'negate'):
+            inner = where.get(key)
+            if isinstance(inner, dict) and cls._where_has_column_rhs(inner):
                 return True
         return False
 
@@ -1797,8 +1836,11 @@ class Executor:
                         f"请把该列加入 GROUP BY / SELECT，或改用聚合表达式")
                 return False
             lv = row[ci] if ci < len(row) else None
-            vals = [None if (v is None or str(v).upper() == 'NULL') else v
-                    for v in (where.get('values') or [])]
+            # `IN (u.id)` 这类「右侧是列引用」的形态：带限定名的项按列取值
+            # （原来是字面量集合 → 恒不命中 → 静默空集）；字面量 NULL 同样
+            # 走三值语义（在 `_resolve_in_values` 里统一处理）。
+            vals = self._resolve_in_values(
+                where.get('values') or [], row, cols)
             return bool(self._in_predicate(lv, vals, neg=(op == 'NOT IN')))
 
         col = where.get('column')
@@ -1823,6 +1865,18 @@ class Executor:
             return False
         l = row[i] if i < len(row) else None
         r = where.get('value')
+        # ★ 右侧是**列引用**（`WHERE o.user_id = u.id`）：按列取值比较。
+        # 原来把 `u.id` 当字符串字面量 → `1 == 'u.id'` 恒假 → 静默空集
+        # （跨表 WHERE / JOIN ON 回退路径的主症状）。
+        if where.get('value_column') and isinstance(r, str):
+            j = self._col_index_of(cols, r)
+            if j < 0:
+                # 带限定符却解析不到 = 列名写错：显式报错，绝不静默判假
+                if '.' in r.strip().strip('`"'):
+                    self._raise_if_ambiguous_col(cols, r)
+                    raise ValueError(f"列 '{r}' 不存在（WHERE 里的列引用）")
+            else:
+                r = row[j] if j < len(row) else None
         if l is None:
             return op == '=' and r is None
         if r is None:
@@ -2470,7 +2524,10 @@ class Executor:
         * `c IN (v1, v2, NULL)`：NULL 匹配不了任何值（连 NULL 左值也不行，
           SQL 里 `NULL IN (...)` 是 UNKNOWN），所以直接丢掉 NULL 项；
         * `c NOT IN (..., NULL)`：SQL 标准下整体为 UNKNOWN → 恒不通过；
-        * 空列表：IN 恒假、NOT IN 恒真（保持既有行为）。
+        * 空列表：IN 恒假、NOT IN 恒真（保持既有行为）；
+        * `c IN (u.id)`（候选项是**列引用**，解析期记在 `value_columns` 里）：
+          展开出的比较必须带上 `value_column` 标记，否则会退化成与字符串
+          `'u.id'` 比较 → 恒不命中 → 静默空集。
         """
         if not isinstance(where, dict):
             return where
@@ -2485,23 +2542,34 @@ class Executor:
         neg = where.get('op') == 'NOT IN'
         raw = list(where.get('values') or [])
         has_null = any(v is None or str(v).upper() == 'NULL' for v in raw)
-        values = [v for v in raw
-                  if not (v is None or str(v).upper() == 'NULL')]
+        # (原始下标, 去掉引号的文本)；NULL 项在 SQL 语义下不参与匹配
+        kept = [(idx, v) for idx, v in enumerate(raw)
+                if not (v is None or str(v).upper() == 'NULL')]
+        # ★ 解析期标出的「列引用项」（`IN (u.id)`）：展开成比较时必须把
+        # `value_column` 标记带过去，否则展开后的 `= 'u.id'` 会被当字符串
+        # 字面量比较 → 恒不命中 → 静默空集（本次修复的同一类吞错）。
+        col_refs = where.get('value_columns') or {}
+
+        def mk(idx, v, op):
+            node = {'column': col, 'op': op, 'value': v}
+            if idx in col_refs:
+                node['value'] = col_refs[idx]
+                node['value_column'] = True
+            return node
 
         if neg:
             if has_null:
                 return cls._ALWAYS_FALSE
-            if not values:
+            if not kept:
                 return None
-            if len(values) == 1:
-                return {'column': col, 'op': '!=', 'value': values[0]}
-            return {'and': [{'column': col, 'op': '!=', 'value': v}
-                            for v in values]}
-        if not values:
+            if len(kept) == 1:
+                return mk(kept[0][0], kept[0][1], '!=')
+            return {'and': [mk(i, v, '!=') for i, v in kept]}
+        if not kept:
             return cls._ALWAYS_FALSE
-        if len(values) == 1:
-            return {'column': col, 'op': '=', 'value': values[0]}
-        return cls._eq_conditions(col, values)
+        if len(kept) == 1:
+            return mk(kept[0][0], kept[0][1], '=')
+        return {'or': [mk(i, v, '=') for i, v in kept]}
 
     # ==================== 相关子查询（逐外层行求值） ====================
 
@@ -3265,6 +3333,10 @@ class Executor:
                 new_pred['left'] = fold_expr(pred.get('left'))
                 new_pred['right'] = fold_expr(pred.get('right'))
                 out['expr_pred'] = new_pred
+            # JOIN ON 的条件树（`on_filter`）：ON 里的外层列引用同样要折叠，
+            # 否则折叠后的子查询仍引用外层列 → 内层解析不到 → 静默错答
+            if isinstance(out.get('filter'), dict):
+                out['filter'] = fold_node(out['filter'], d)
             inner_sub = out.get('subquery')
             if isinstance(inner_sub, dict):
                 # 嵌套子查询：它引用的外层列同样折叠成字面量，
@@ -3281,7 +3353,12 @@ class Executor:
                 # 折叠后没有任何比较能留在这一层，直接给常量真
                 return None
             if 'value' in out:
-                out['value'] = fold_value(out['value'])
+                folded_v = fold_value(out['value'])
+                if folded_v is not out['value']:
+                    # 已折叠成字面量：右侧不再是列引用，标记必须清掉
+                    # （否则求值器会拿字面量去当列名解析）
+                    out.pop('value_column', None)
+                out['value'] = folded_v
             return out
 
         out = dict(sub)
@@ -3648,6 +3725,28 @@ class Executor:
                 return outer['row'][j]
         return _MISSING
 
+    def _resolve_in_values(self, values, row, cols):
+        """IN 候选列表求值：带限定名的项是**列引用**，取本行对应列的值
+
+        `WHERE o.user_id IN (u.id)` 原来被当成字面量集合 {'u.id'} → 恒不命中
+        → 静默空集（与 `a = b` 同一类吞错）。带点的项只可能是列引用：
+        解析不到就显式报错；裸标识符 / 字面量保持原样，字面量 NULL 归一到
+        None（三值语义由 `_in_predicate` 负责）。
+        """
+        out = []
+        for v in (values or []):
+            if isinstance(v, str) and '.' in v.strip().strip('`"'):
+                j = self._col_index_of(cols, v)
+                if j < 0:
+                    # 末段歧义（JOIN 结果里 `u.id` / `o.id` 并存）显式报错
+                    self._raise_if_ambiguous_col(cols, v)
+                    raise ValueError(
+                        f"IN 列表里的列 '{v}' 解析不到（列不存在）")
+                out.append(row[j] if j < len(row) else None)
+                continue
+            out.append(None if (v is None or str(v).upper() == 'NULL') else v)
+        return out
+
     @staticmethod
     def _in_predicate(value, values, neg=False):
         """IN / NOT IN 的三值语义（简化为真/假）
@@ -3778,9 +3877,21 @@ class Executor:
             if self._is_ordinal_order_key(col):
                 out.append(None)
                 continue
-            if col in out_cols or self._strip_qualifier(col) in out_cols:
+            if col in out_cols:
                 out.append(None)
                 continue
+            stripped = self._strip_qualifier(col)
+            if stripped in out_cols:
+                if out_cols.count(stripped) == 1:
+                    out.append(None)
+                    continue
+                # ★ 去限定符后**重名**（`SELECT u.id, o.id` → ['id','id']）：
+                # `_finish_select` 从输出行取值时只认裸名，两个键都会落到
+                # 第一列上（第二键静默算错）。这时改按**基础行**的限定名
+                # 求值（`u.id` / `o.id` 在连接结果的列名里是精确唯一的）。
+                if self._col_index_of(base_cols, col) < 0:
+                    out.append(None)
+                    continue
             node = _parse_scalar_expr(col)
             if node is None:
                 raise ValueError(self._order_key_error_message(pos, col))
@@ -4173,6 +4284,13 @@ class Executor:
 
         plan = self.optimizer.optimize(p)
         self._last_plan = plan
+        # ★ 计划构建失败（optimize 返回 None）必须显式报错：
+        # `PlanExecutor.execute(None)` 会返回 `[], []`，JOIN 查询会**静默**
+        # 变成一个 0 列 0 行的结果集（用户以为「没有匹配行」）。
+        if plan is None:
+            return self._err(
+                1105, "JOIN 查询无法生成执行计划（FROM/JOIN 形态不支持）"
+                      "：绝不静默返回空集")
 
         executor = PlanExecutor(self.db, read_view=rv)
         # ★ 逃生口要能传到计划路径：本实例的严格模式开关原样传给计划执行器，
@@ -4282,9 +4400,15 @@ class Executor:
                     return True     # 序号越界：交给统一路径显式报错
                 continue
             if re.match(r'^[`"]?[\w.]+[`"]?$', t):
-                if any(self._proj_name_matches(n, t) for n in out_names):
+                hits = sum(1 for n in out_names
+                           if self._proj_name_matches(n, t))
+                if hits == 1:
                     continue
-                return True         # 非投影列：计划路径解析不到
+                # hits == 0：非投影列；hits > 1：去限定符后重名
+                # （`SELECT u.id, o.id ... ORDER BY u.id` → 计划 Sort 只看得到
+                # 投影后的裸列名 'id'，两个键都落第一列 → 静默算错第二键）。
+                # 两种情况都改走物化连接路径，由统一排序路径按限定名求值。
+                return True
             # 表达式：引用的列未必都在投影里，交给统一路径按基础行求值
             return True
         return False
@@ -4309,6 +4433,10 @@ class Executor:
         })
         plan = self.optimizer.optimize(join_p)
         self._last_plan = plan
+        if plan is None:
+            return self._err(
+                1105, "JOIN 查询无法生成执行计划（FROM/JOIN 形态不支持）"
+                      "：绝不静默返回空集")
         executor = PlanExecutor(self.db, read_view=rv)
         # ★ 同 _exec_join_query：严格模式开关随实例传递（逃生口）
         if self.strict_group_by is not None:
@@ -4347,7 +4475,8 @@ class Executor:
         tid = txn['txn_id'] if txn else 0
         rv = txn['read_view'] if txn else None
         where = p.get('where')
-        if self._where_has_expr_pred(where):
+        if self._where_has_expr_pred(where) \
+                or self._where_has_column_rhs(where):
             where = self._where_to_pk_equalities(tbl, where, rv)
         n = tbl.update(
             p['set'], where,
@@ -4362,7 +4491,8 @@ class Executor:
         tid = txn['txn_id'] if txn else 0
         rv = txn['read_view'] if txn else None
         where = p.get('where')
-        if self._where_has_expr_pred(where):
+        if self._where_has_expr_pred(where) \
+                or self._where_has_column_rhs(where):
             where = self._where_to_pk_equalities(tbl, where, rv)
         n = tbl.delete(
             where, txn_id=tid, read_view=rv)
