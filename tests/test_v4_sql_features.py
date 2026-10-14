@@ -3758,7 +3758,270 @@ def test_show_slave_status_reflects_registered_replicator():
         assert vals['Slave_IO_Running'] == 'No'
 
 
+# ==========================================================================
+# 存储函数（CREATE FUNCTION / DROP FUNCTION / SHOW FUNCTIONS）—— 追加
+# ==========================================================================
+#
+# 覆盖：简式 `RETURN <expr>` / 复合式 `BEGIN ... END`（DECLARE + IF/ELSE +
+# SET）、投影 / WHERE / HAVING / ORDER BY 四个调用位置、函数调用函数、
+# 函数体内用标量函数、重启（关闭 Database 后重新打开同一目录）后仍可调用、
+# 参数个数不匹配与调用不存在的函数的**显式报错**。
+#
+# 断言只依赖真实执行结果（不 mock）；这份回归一旦失败就说明存储函数真的
+# 坏了，而不是"某条消息文案变了"。
+
+STORED_FN_DIR = os.path.join(ROOT, 'data_sql_features_fn_test')
 
 
+class _FnEnv:
+    """独立数据目录的环境：`reopen()` 用于验证**持久化**"""
 
+    def __enter__(self):
+        from lightdb.db.database import Database
+        from lightdb.sql.executor import Executor
+        from lightdb.sql.parser import parser
+
+        shutil.rmtree(STORED_FN_DIR, ignore_errors=True)
+        self.db = Database(STORED_FN_DIR)
+        self.ex = Executor(self.db)
+        self.parser = parser
+        self.ex.execute_sql(
+            "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20), a INT)", {})
+        for i, (n, a) in enumerate(
+                [('Alice', 1), ('bob', 4), ('Carol', 3), ('dave', 8)], start=1):
+            self.ex.execute_sql(
+                "INSERT INTO t VALUES (%d,'%s',%d)" % (i, n, a), {})
+        return self
+
+    def reopen(self):
+        """关闭 Database 再用**同一目录**打开（持久化验证）"""
+        from lightdb.db.database import Database
+        from lightdb.sql.executor import Executor
+
+        self.db.shutdown()
+        self.db = Database(STORED_FN_DIR)
+        self.ex = Executor(self.db)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self.db is not None:
+                self.db.shutdown()
+        except Exception:
+            pass
+        shutil.rmtree(STORED_FN_DIR, ignore_errors=True)
+        return False
+
+    def run(self, sql):
+        return self.ex.execute_sql(sql, {})
+
+    def ok(self, sql):
+        r = self.run(sql)
+        assert r.get('type') == 'ok', \
+            f'语句应成功: {sql} -> {r.get("message")}'
+        return r
+
+    def err(self, sql):
+        r = self.run(sql)
+        assert r.get('type') == 'error', \
+            f'语句应显式报错（绝不静默返回 NULL/0）: {sql} -> {r}'
+        return str(r.get('message') or '')
+
+    def q(self, sql):
+        r = self.run(sql)
+        assert r.get('type') == 'resultset', \
+            f'查询失败: {sql} -> {r.get("message")}'
+        return r['columns'], [tuple(x) for x in r['rows']]
+
+
+def test_stored_function_simple_form():
+    """简式 `CREATE FUNCTION f(x INT) RETURNS INT RETURN <expr>`"""
+    with _FnEnv() as e:
+        r = e.ok("CREATE FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
+        assert 'double_it' in r['message']
+        # 投影
+        cols, rows = e.q("SELECT id, double_it(a) AS d FROM t")
+        assert cols == ['id', 'd']
+        assert rows == [(1, 2), (2, 8), (3, 6), (4, 16)]
+        # WHERE（表达式谓词位置）
+        assert e.q("SELECT id FROM t WHERE double_it(a) = 6")[1] == [(3,)]
+        # ORDER BY
+        assert e.q("SELECT id FROM t ORDER BY double_it(a) DESC")[1] == \
+            [(4,), (2,), (3,), (1,)]
+        # 函数名不区分大小写（MySQL 语义）
+        assert e.q("SELECT DOUBLE_IT(a) FROM t ORDER BY id")[1] == \
+            [(2,), (8,), (6,), (16,)]
+
+
+def test_stored_function_compound_form():
+    """复合式 `BEGIN DECLARE/IF/ELSE/SET ... RETURN ... END`"""
+    with _FnEnv() as e:
+        e.ok("""CREATE FUNCTION grade(a INT) RETURNS VARCHAR(10)
+        BEGIN
+            DECLARE g VARCHAR(10) DEFAULT 'low';
+            IF a >= 5 THEN
+                SET g = 'high';
+            ELSE
+                SET g = 'low';
+            END IF;
+            RETURN g;
+        END""")
+        assert e.q("SELECT id, grade(a) AS g FROM t")[1] == \
+            [(1, 'low'), (2, 'low'), (3, 'low'), (4, 'high')]
+        # 复合式函数同样能在 WHERE 里用
+        assert e.q("SELECT id FROM t WHERE grade(a) = 'high'")[1] == [(4,)]
+        # HAVING（函数套聚合）：真过滤，真命中
+        e.ok("CREATE FUNCTION times3(n INT) RETURNS INT RETURN n * 3")
+        assert e.q("SELECT a FROM t GROUP BY a HAVING times3(COUNT(*)) >= 3"
+                   )[1] == [(1,), (4,), (3,), (8,)]
+        assert e.q("SELECT a FROM t GROUP BY a HAVING times3(COUNT(*)) > 3"
+                   )[1] == []
+        e.ok("INSERT INTO t VALUES (5, 'eve', 1)")
+        assert e.q("SELECT a, COUNT(*) FROM t GROUP BY a "
+                   "HAVING times3(COUNT(*)) >= 6")[1] == [(1, 2)]
+
+
+def test_stored_function_nested_and_scalar():
+    """函数调用另一个函数；函数体内用已实现的标量函数"""
+    with _FnEnv() as e:
+        e.ok("CREATE FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
+        e.ok("CREATE FUNCTION quad(x INT) RETURNS INT "
+             "RETURN double_it(double_it(x))")
+        assert e.q("SELECT id, quad(a) AS q FROM t")[1] == \
+            [(1, 4), (2, 16), (3, 12), (4, 32)]
+        # 存储函数套标量函数 + 标量函数套存储函数（双向都通）
+        assert e.q("SELECT id, CONCAT(double_it(a), '|', LOWER(name)) AS c "
+                   "FROM t ORDER BY id")[1] == \
+            [(1, '2|alice'), (2, '8|bob'), (3, '6|carol'), (4, '16|dave')]
+        # 函数体内部用标量函数
+        e.ok("""CREATE FUNCTION shout(x VARCHAR(20)) RETURNS VARCHAR(40)
+        BEGIN
+            DECLARE s VARCHAR(40);
+            SET s = CONCAT(LOWER(x), '-', UPPER(x));
+            RETURN s;
+        END""")
+        assert e.q("SELECT shout(name) FROM t ORDER BY id")[1] == \
+            [('alice-ALICE',), ('bob-BOB',), ('carol-CAROL',), ('dave-DAVE',)]
+
+
+def test_stored_function_in_join_query():
+    """JOIN 查询（计划执行器路径）的投影/WHERE/HAVING 也能调用存储函数"""
+    with _FnEnv() as e:
+        e.ok("CREATE TABLE jo (id INT PRIMARY KEY, uid INT, amt INT)")
+        for i, (uid, amt) in enumerate([(1, 5), (1, 7), (2, 3)], start=1):
+            e.ok("INSERT INTO jo VALUES (%d,%d,%d)" % (i, uid, amt))
+        e.ok("CREATE FUNCTION dbl(x INT) RETURNS INT RETURN x * 2")
+        # 投影（计划执行器的逐行表达式求值路径）
+        assert e.q("SELECT t.id, dbl(jo.amt) AS d FROM t "
+                   "JOIN jo ON t.id = jo.uid ORDER BY t.id, d")[1] == \
+            [(1, 10), (1, 14), (2, 6)]
+        # WHERE
+        assert e.q("SELECT t.id FROM t JOIN jo ON t.id = jo.uid "
+                   "WHERE dbl(jo.amt) > 10")[1] == [(1,)]
+        # GROUP BY + 聚合 + HAVING
+        assert e.q("SELECT t.id, SUM(dbl(jo.amt)) AS s FROM t "
+                   "JOIN jo ON t.id = jo.uid GROUP BY t.id ORDER BY t.id"
+                   )[1] == [(1, 24), (2, 6)]
+
+
+def test_stored_function_persists_after_reopen():
+    """函数定义随元数据持久化：关闭 Database、重开同一目录后仍可调用"""
+    with _FnEnv() as e:
+        e.ok("CREATE FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
+        e.ok("CREATE FUNCTION grade(a INT) RETURNS VARCHAR(10) "
+             "BEGIN DECLARE g VARCHAR(10) DEFAULT 'x'; "
+             "IF a >= 5 THEN SET g = 'high'; END IF; RETURN g; END")
+        e.reopen()
+        assert e.q("SELECT id, double_it(a) AS d, grade(a) AS g FROM t")[1] == \
+            [(1, 2, 'x'), (2, 8, 'x'), (3, 6, 'x'), (4, 16, 'high')]
+        assert e.q("SELECT id FROM t WHERE double_it(a) >= 8 ORDER BY id"
+                   )[1] == [(2,), (4,)]
+        names = [r[0] for r in e.q("SHOW FUNCTIONS")[1]]
+        assert 'double_it' in names and 'grade' in names
+
+
+def test_stored_function_errors_are_explicit():
+    """函数相关错误全部显式：参数个数 / 不存在 / 函数体不支持 / 类型 / OUT"""
+    with _FnEnv() as e:
+        e.ok("CREATE FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
+
+        # 1) 参数个数不匹配
+        msg = e.err("SELECT double_it(1, 2) FROM t")
+        assert '参数个数' in msg and '需要 1' in msg and '实际给了 2' in msg
+
+        # 2) 调用不存在的函数（不被当成列名、不返回 NULL）
+        msg = e.err("SELECT nope_fn(a) FROM t")
+        assert '不支持的函数' in msg and 'NOPE_FN' in msg
+
+        # 3) 函数体含不支持的语句：游标
+        msg = e.err("""CREATE FUNCTION bad_cur() RETURNS INT
+        BEGIN
+            DECLARE cur CURSOR FOR SELECT id FROM t;
+            RETURN 1;
+        END""")
+        assert '函数体' in msg and 'bad_cur' in msg
+        # 3b) 循环
+        msg = e.err("""CREATE FUNCTION bad_loop(x INT) RETURNS INT
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            WHILE i < x DO
+                SET i = i + 1;
+            END WHILE;
+            RETURN i;
+        END""")
+        assert 'WHILE' in msg
+        # 3c) 改数据的 SQL
+        msg = e.err("""CREATE FUNCTION bad_ins(x INT) RETURNS INT
+        BEGIN
+            INSERT INTO t VALUES (99, 'x', x);
+            RETURN x;
+        END""")
+        assert 'INSERT' in msg
+        # 三个坏函数都没被注册
+        names = [r[0] for r in e.q("SHOW FUNCTIONS")[1]]
+        for bad in ('bad_cur', 'bad_loop', 'bad_ins'):
+            assert bad not in names, names
+
+        # 4) 不支持的 RETURNS 类型
+        msg = e.err("CREATE FUNCTION bad_rt() RETURNS CURSOR RETURN 1")
+        assert "RETURNS" in msg and 'CURSOR' in msg
+
+        # 5) OUT/INOUT 参数显式拒绝（不是静默按 IN 处理）
+        msg = e.err("CREATE FUNCTION bad_out(OUT x INT) RETURNS INT RETURN x")
+        assert 'OUT' in msg and 'IN' in msg
+
+        # 6) 递归过深（显式报错，不是栈溢出/静默 NULL）
+        e.ok("CREATE FUNCTION rec(x INT) RETURNS INT RETURN rec(x + 1)")
+        msg = e.err("SELECT rec(a) FROM t")
+        assert '递归过深' in msg
+
+
+def test_drop_function_and_if_exists():
+    """`DROP FUNCTION` 与 `DROP FUNCTION IF EXISTS`"""
+    with _FnEnv() as e:
+        e.ok("CREATE FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
+        e.ok("DROP FUNCTION double_it")
+        assert 'double_it' not in [r[0] for r in e.q("SHOW FUNCTIONS")[1]]
+        # 已删除后调用 → 显式报错（不是 NULL）
+        assert '不支持的函数' in e.err("SELECT double_it(a) FROM t")
+        # IF EXISTS：不存在也算成功
+        e.ok("DROP FUNCTION IF EXISTS double_it")
+        # 不带 IF EXISTS：不存在 → 显式报错
+        msg = e.err("DROP FUNCTION double_it")
+        assert 'does not exist' in msg or '不存在' in msg
+        # IF NOT EXISTS 语义（MySQL 位置：CREATE FUNCTION IF NOT EXISTS ...）：
+        # 已存在时不覆盖原定义
+        e.ok("CREATE FUNCTION keep(x INT) RETURNS INT RETURN x + 1")
+        r = e.run("CREATE FUNCTION IF NOT EXISTS keep(x INT) RETURNS INT "
+                  "RETURN x + 100")
+        assert r.get('type') == 'ok' and 'already exists' in r['message'], r
+        assert e.q("SELECT keep(1) FROM t LIMIT 1")[1] == [(2,)]
+        # 把 IF NOT EXISTS 写到 FUNCTION 之后是错误的语法 → 显式报语法错误
+        try:
+            e.parser.parse("CREATE FUNCTION keep IF NOT EXISTS (x INT) "
+                           "RETURNS INT RETURN 1")
+        except SyntaxError:
+            pass
+        else:
+            raise AssertionError('IF NOT EXISTS 位置错误应显式报语法错误')
 

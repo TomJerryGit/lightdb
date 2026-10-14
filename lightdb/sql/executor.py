@@ -282,13 +282,29 @@ class Executor:
             logger.warn(f"初始化 IP 白名单失败: {e}")
             self.ip_whitelist = None
 
-        # 存储过程 / 触发器（SQL 层 DDL 的落地位置）
+        # 存储过程 / 触发器 / 存储函数（SQL 层 DDL 的落地位置）
         try:
             from .stored import StoredManager
             self._stored = StoredManager(str(db.data_dir))
         except Exception as e:                   # pragma: no cover
             logger.warn(f"初始化存储过程管理器失败: {e}")
             self._stored = None
+        # 公开别名：`tests/test_batch12.py::test_function` 直接读
+        # `ex.stored_mgr.functions`（存储函数与过程共用同一个管理器，
+        # 定义一起落在 `<data_dir>/_stored.json`）。
+        self.stored_mgr = self._stored
+        # ★ JOIN 查询由 `plan_executor.PlanExecutor` 执行，它的静态函数名
+        # 校验（`PlanExecutor._check_expr_functions`）看不到本执行器的
+        # StoredManager（那个文件不在本次可改范围内）。这里把「名字是不是
+        # 存储函数」的查询按数据目录登记到 parser 的注册表，两边用同一份
+        # 答案：JOIN 的投影/WHERE 里调用存储函数不会被误判成"不支持的函数"。
+        try:
+            from .parser import register_stored_function_lookup
+            register_stored_function_lookup(
+                str(db.data_dir), self._has_stored_function,
+                self._call_stored_function)
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"登记存储函数查询钩子失败: {e}")
         try:
             from .trigger import TriggerManager
             self._trigger_mgr = TriggerManager(str(db.data_dir))
@@ -927,6 +943,11 @@ class Executor:
         表达式谓词（`HAVING SUM(v) * 2 > 100`）里的聚合也要收集 —— 它们的
         文本由 `render_scalar_expr` 规范渲染（`SUM(v)`、`SUM(v * 2)`），
         与 `_eval_condition` 取聚合值时的查找键完全一致。
+
+        **聚合嵌在函数调用里**（`HAVING double_it(COUNT(*)) > 1`）同样要
+        收集：否则 `avg` 求值时 `COUNT(*)` 的聚合值取不到 → 整条 HAVING
+        被静默丢掉（实测 `HAVING double_it(COUNT(*)) > 1` 返回了全部
+        分组，属于静默错答）。
         """
         found = []
         if isinstance(having, dict):
@@ -935,7 +956,7 @@ class Executor:
                 if a and a not in found:
                     found.append(a)
             if isinstance(having.get('expr_pred'), dict):
-                for a in cls._expr_agg_texts(having['expr_pred']):
+                for a in cls._all_agg_texts_in_pred(having['expr_pred']):
                     if a not in found:
                         found.append(a)
             # NOT (...) 里也可能藏着聚合（`HAVING NOT (COUNT(*) > 1)`）
@@ -950,6 +971,46 @@ class Executor:
                         if a not in found:
                             found.append(a)
         return found
+
+    @classmethod
+    def _all_agg_texts_in_pred(cls, pred) -> list:
+        """表达式谓词里**任意深度**的聚合文本（含 `F(COUNT(*))` 这种嵌法）"""
+        out = []
+        # parser.expr_pred_agg_texts 处理「谓词最外层的聚合」
+        # （`HAVING SUM(v) * 2 > 100`）；这里再补「聚合嵌在函数调用里」
+        # （`HAVING double_it(COUNT(*)) > 1`）—— 两条合起来才完整。
+        for a in cls._expr_agg_texts(pred):
+            if a not in out:
+                out.append(a)
+        for node in (pred.get('left'), pred.get('right')):
+            cls._all_agg_texts_in_node(node, out)
+        return out
+
+    @classmethod
+    def _all_agg_texts_in_node(cls, node, out) -> list:
+        """表达式节点里**任意深度**的聚合文本（`F(COUNT(*))` 也要挖出来）
+
+        文本用 `render_scalar_expr` 规范渲染，与 `lookup_agg_value` 的
+        查找键一致（`COUNT(*)` / `SUM(v * 2)` 都逐字相同）。
+        """
+        if not isinstance(node, dict):
+            return out
+        kind = node.get('kind')
+        if kind == 'arith':
+            cls._all_agg_texts_in_node(node.get('left'), out)
+            cls._all_agg_texts_in_node(node.get('right'), out)
+            return out
+        if kind != 'func':
+            return out
+        name = str(node.get('name') or '').upper()
+        if name in _AGGREGATE_FUNCTION_NAMES:
+            text = _render_scalar_expr(node)
+            if text not in out:
+                out.append(text)
+            return out
+        for arg in (node.get('args') or []):
+            cls._all_agg_texts_in_node(arg, out)
+        return out
 
     @classmethod
     def _expr_agg_texts(cls, pred) -> list:
@@ -1973,14 +2034,33 @@ class Executor:
 
         表达式文本按 `_strip_qualifier` 归一化过（`SUM(o.amount)` →
         `SUM(amount)`），输出键与调用方的 eval_cols 一致。
+
+        两趟：
+        1. **纯聚合**（`COUNT(*)` / `SUM(v)`）先算出来，放进 `agg_ctx`；
+        2. 其余表达式（`SUM(v * 2)`、`ROUND(AVG(v), 1)`、
+           `f(COUNT(*))`）求值时，内层聚合直接从 `agg_ctx` 取值。
+
+        分两趟是必须的：`f(COUNT(*))` 这种「聚合嵌在函数调用里」的形态，
+        `eval_agg_expr_over_rows` 会把 `COUNT(*)` 当**逐行**表达式再求一遍
+        （`COUNT` 是聚合名，逐行求值取不到值 → 显式报错）。有了 agg_ctx，
+        内层聚合按第一趟的真实值代入，HAVING 才真的起到过滤作用。
         """
         out = {}
+        agg_ctx = {}
+        for e in exprs:
+            node = _parse_scalar_expr(self._split_alias(str(e))[0])
+            if node is not None and _expr_has_agg(node):
+                agg_ctx[e] = self._eval_agg_expr_over_rows(
+                    node, base_cols, rows, 'GROUP BY/HAVING')
         fallback = []
         for e in exprs:
+            if e in agg_ctx:
+                out[e] = agg_ctx[e]
+                continue
             node = _parse_scalar_expr(self._split_alias(str(e))[0])
             if node is not None:
                 out[e] = self._eval_agg_expr_over_rows(
-                    node, base_cols, rows, 'GROUP BY/HAVING')
+                    node, base_cols, rows, 'GROUP BY/HAVING', agg_ctx)
                 continue
             fallback.append(e)
         if fallback:
@@ -1989,20 +2069,41 @@ class Executor:
             out.update(dict(zip(fallback, vals)))
         return out
 
-    def _eval_agg_expr_over_rows(self, node, cols, rows, position=''):
+    def _eval_agg_expr_over_rows(self, node, cols, rows, position='',
+                                 agg_ctx=None):
         """在**分组行集合**上求值「含聚合函数的表达式」
 
         实现放在 `parser.eval_agg_expr_over_rows`（与计划执行器共用同一份：
         聚合语义、NULL 传播、除零 NULL、不支持函数报错、非分组键裸列报错
-        都只有一处实现）。这里只负责注入「按列名取当前行取值」的回调与
-        本实例的 GROUP BY 严格模式开关。
+        都只有一处实现）。这里只负责注入「按列名取当前行取值」的回调、
+        本实例的 GROUP BY 严格模式开关，以及 `agg_ctx`（已经按分组算好的
+        聚合值 + `F(COUNT(*))` 这类嵌套聚合的求值方式）。
         """
         from .parser import eval_agg_expr_over_rows, resolve_strict_group_by
         strict = resolve_strict_group_by(self.strict_group_by)
         return eval_agg_expr_over_rows(
             node, rows,
             lambda r, name: self._expr_row_value(cols, r, name, position),
-            position, strict)
+            position, strict, self._stored_function_resolver(position),
+            agg_ctx or {},
+            lambda n: self._eval_agg_ctx_node(n, agg_ctx or {}, cols, rows,
+                                              position))
+
+    def _eval_agg_ctx_node(self, node, agg_ctx, cols, rows, position=''):
+        """求值一个**内层聚合**节点：先查 agg_ctx，取不到就现算
+
+        `F(COUNT(*))` 里的 `COUNT(*)` 走这里：查第一趟算好的值；查不到
+        （例如聚合只出现在 HAVING 且没被收集到）就地在同一个分组行集合上
+        真算一次 —— 绝不静默返回 NULL 或让外层拿到一个"没过滤"的条件。
+        """
+        text = _render_scalar_expr(node)
+        if text in agg_ctx:
+            return agg_ctx[text]
+        stripped = self._strip_qualifier(text)
+        if stripped in agg_ctx:
+            return agg_ctx[stripped]
+        return self._eval_agg_expr_over_rows(
+            node, cols, rows, position or 'GROUP BY/HAVING', agg_ctx)
 
     def _expr_row_value(self, cols, row, name, position=''):
         """分组求值时的列取值（列必须存在于 base_cols 且在当前行范围内）"""
@@ -2148,7 +2249,8 @@ class Executor:
         if isinstance(pred, dict):
             pos = 'HAVING' if agg_values is not None else 'WHERE'
             resolve = self._expr_resolver(cols, row, agg_values, pos)
-            return _eval_expr_predicate(pred, resolve, agg_values, pos)
+            return _eval_expr_predicate(pred, resolve, agg_values, pos,
+                                        self._stored_function_resolver(pos))
 
         op = where.get('op')
         if 'agg' in where:
@@ -2323,15 +2425,126 @@ class Executor:
                           position=''):
         """在当前行上求值一个标量表达式节点（投影 / 排序键 / 分组键）"""
         resolve = self._expr_resolver(cols, row, agg_values, position)
-        return _eval_expr_node(node, resolve, agg_values, position)
+        return _eval_expr_node(node, resolve, agg_values, position,
+                               funcs=self._stored_function_resolver(position))
 
-    @staticmethod
-    def _check_expr_functions(node, position=''):
+    # ==================== 存储函数调用（表达式里） ====================
+
+    #: 存储函数最大嵌套调用深度（含间接递归）——超过即显式报错，
+    #: 不会让进程栈溢出成 RecursionError。
+    _FUNCTION_MAX_DEPTH = 32
+
+    def _stored_function_resolver(self, position=''):
+        """给 `parser.eval_expr_node` / `pl.eval_expr` 用的存储函数解析回调
+
+        契约（三条求值路径共用）：
+
+        * `resolver.has_function(名字) -> bool` —— 是不是已注册的存储函数；
+        * `resolver(名字, [实参值]) -> 返回值` —— 真正调用；出错（参数个数
+          不对、函数体出错、递归过深）**直接抛异常**。
+
+        绝不返回任何"看起来像值"的替代对象：那种对象会被当成表达式结果
+        写进结果集（实测就是「函数对象被静默当成返回值」这种静默错答）。
+        """
+        def resolve(fname, args):
+            return self._call_stored_function(fname, args, position)
+        resolve.has_function = self._has_stored_function
+        return resolve
+
+    def _has_stored_function(self, name):
+        return self._lookup_stored_function(name) is not None
+
+    def _lookup_stored_function(self, name):
+        mgr = self._stored
+        if mgr is None:
+            return None
+        try:
+            return mgr.get_function(name)
+        except Exception:                        # pragma: no cover
+            return None
+
+    def _call_stored_function(self, name, args, position='', depth=1):
+        """在表达式里调用已注册的存储函数（返回值）
+
+        嵌套调用（函数体里调用另一个函数）走同一条路径，共享一个深度计数
+        `_FUNCTION_ACTIVE`：超过 `_FUNCTION_MAX_DEPTH` 显式报错。
+        """
+        fn = self._lookup_stored_function(name)
+        if fn is None:
+            raise RuntimeError(f"存储函数 '{name}' 不存在")
+        params = fn.params or []
+        n_args = len(args)
+        n_par = len(params)
+        if n_args != n_par:
+            raise RuntimeError(
+                f"函数 {name} 的参数个数不对：需要 {n_par} 个"
+                f"（{', '.join(p.get('name', '') for p in params)}），"
+                f"实际给了 {n_args} 个")
+        active = getattr(self, '_FUNCTION_ACTIVE', None)
+        if active is None:
+            active = self._FUNCTION_ACTIVE = []
+        # depth 参数只用于日志/兼容；真正的深度来自当前线程的调用栈
+        # （active 列表）：嵌套调用（含间接递归）每次都重新走
+        # `_stored_function_resolver`，靠参数层层传会丢失深度信息。
+        if len(active) + 1 > self._FUNCTION_MAX_DEPTH:
+            chain = ' -> '.join(active + [str(name)])
+            raise RuntimeError(
+                f"存储函数递归过深（超过 {self._FUNCTION_MAX_DEPTH} 层）："
+                f"{chain}。请检查函数是否直接或间接调用了自己")
+        bind_sql, bind_val = {}, {}
+        for i, prm in enumerate(params):
+            v = args[i]
+            bind_val[str(prm['name'])] = v
+            bind_sql[str(prm['name'])] = self._sql_literal(v)
+        active.append(str(name))
+        session = self._active_session if isinstance(
+            getattr(self, '_active_session', None), dict) else {}
+        try:
+            return self._exec_function_body(fn, bind_sql, bind_val, session,
+                                            depth)
+        finally:
+            active.pop()
+
+    def _exec_function_body(self, fn, bind_sql, bind_val, session, depth):
+        """执行函数体并返回 RETURN 的值
+
+        复用过程体那套：`PLParser` 切语句 + 引号感知的变量字面量替换
+        （`Executor._substitute_words`），因此函数体里的 `IF` / `DECLARE` /
+        `SET` 与过程体行为一致；区别只有两处：
+        * 函数体的 RETURN 必须有值（无 RETURN 显式报错，不静默返回 NULL）；
+        * 不允许改数据的 SQL（创建期已校验，这里兜底）。
+        """
+        body = self._substitute_words(fn.body, bind_sql)
+        from .pl import PLParser, PLContext, ExprParser, eval_expr
+        ctx = PLContext(self, session, self.db)
+        ctx.function_name = getattr(fn, 'name', '?')
+        for k, v in (bind_val or {}).items():
+            ctx.variables[k] = v
+        text = self._strip_begin_end(body)
+        try:
+            stmts = PLParser(text).parse_program()
+        except SyntaxError as e:
+            raise RuntimeError(f"函数体语法错误: {e}")
+        if not stmts:
+            raise RuntimeError("函数体为空（本引擎要求 RETURN <表达式>）")
+        returned = self._run_pl_statements(
+            stmts, ctx, ExprParser, eval_expr, funcs_depth=depth + 1)
+        if not ctx.return_hit:
+            raise RuntimeError(
+                "函数体执行结束都没有遇到 RETURN：存储函数必须有返回值，"
+                "本引擎不会静默返回 NULL")
+        return returned
+
+    def _check_expr_functions(self, node, position=''):
         """静态校验表达式里的函数名（不支持的**显式报错并回列支持清单**）
 
         这是「不支持的函数不得静默返回 NULL / 不得被当成列名」的落点：
         `REVERSE(name)`、`NOW()` 这类名字在这里抛 ValueError，
         文案由 `parser.unsupported_function_message` 统一给出。
+
+        **已注册的存储函数名**（`CREATE FUNCTION f(...)`）同样合法：名字
+        对得上就放行，由 `_stored_function_resolver` 在求值时真正调用；
+        注册表里没有的名字仍然按「不支持的函数」报错。
         """
         if not isinstance(node, dict):
             return
@@ -2339,13 +2552,14 @@ class Executor:
         if kind == 'func':
             name = str(node.get('name') or '').upper()
             if name not in _AGGREGATE_FUNCTION_NAMES \
-                    and name not in _SCALAR_FUNCTION_NAMES:
+                    and name not in _SCALAR_FUNCTION_NAMES \
+                    and self._lookup_stored_function(node.get('name')) is None:
                 raise ValueError(unsupported_function_message(name))
             for a in (node.get('args') or []):
-                Executor._check_expr_functions(a, position)
+                self._check_expr_functions(a, position)
         elif kind == 'arith':
-            Executor._check_expr_functions(node.get('left'), position)
-            Executor._check_expr_functions(node.get('right'), position)
+            self._check_expr_functions(node.get('left'), position)
+            self._check_expr_functions(node.get('right'), position)
 
     def _project_rows(self, p, base_cols, rows, session=None, read_view=None,
                       outer_name=None, outer_alias=None, extra_names=None):
@@ -5706,6 +5920,176 @@ class Executor:
         self._stored.create_procedure(p['name'], params, p['body'])
         return self._ok(message=f"Procedure '{p['name']}' created")
 
+    # ---------- 存储函数 ----------
+
+    _FUNCTION_BODY_HINT = (
+        "函数体只支持 `RETURN <表达式>` 或 "
+        "`BEGIN [DECLARE ...;] [SET ...;] [IF ... THEN ... END IF;] "
+        "RETURN <表达式>; END`")
+
+    def _cmd_create_function(self, p, s):
+        """`CREATE FUNCTION ...` —— 解析 → 校验 → 落 `_stored.json`
+
+        三条**创建期**校验（都在真正保存之前）：
+        1. 参数只支持 IN（OUT/INOUT 没有回填机制 → 显式拒绝，不静默按 IN 处理）；
+        2. `RETURNS 类型` 必须在本引擎的类型清单里（CURSOR/ROW/TABLE 这类
+           没有标量值语义的类型显式报错）；
+        3. 函数体交给 `PLParser` 解析并逐个语句校验（游标 / 循环 / handler /
+           事务 / 改数据的 SQL 全部显式报错）—— 校验通过才注册。
+        """
+        if self._stored is None:
+            return self._err(1105, "存储函数管理器不可用")
+        name = p['name']
+        if p.get('if_not_exists') and self._lookup_stored_function(name) is not None:
+            return self._ok(message=f"Function '{name}' already exists")
+
+        from .stored import parse_params
+        params = parse_params(', '.join(p.get('params') or []))
+        bad_mode = [prm['name'] for prm in params
+                    if str(prm.get('mode', 'IN')).upper() in ('OUT', 'INOUT')]
+        if bad_mode:
+            return self._err(
+                1105, f"CREATE FUNCTION {name}: 参数 "
+                      f"{', '.join(bad_mode)} 用了 OUT/INOUT —— 函数参数只"
+                      f"支持 IN（本引擎没有用户变量回填机制，按 IN 静默处理"
+                      f"会让调用方拿到错误的返回值），显式拒绝")
+
+        ret_type = str(p.get('return_type') or '').strip()
+        try:
+            ret_upper = self._check_function_return_type(name, ret_type)
+        except ValueError as e:
+            return self._err(1235, str(e))
+
+        try:
+            self._validate_function_body(name, p['body'], params)
+        except SyntaxError as e:
+            return self._err(1064, f"CREATE FUNCTION {name} 函数体语法错误: {e}")
+        except ValueError as e:
+            return self._err(1105, str(e))
+
+        self._stored.create_function(name, params, ret_upper, p['body'])
+        return self._ok(message=f"Function '{name}' created")
+
+    #: 本引擎支持的 `RETURNS` 类型（规范化形式）。没有标量值语义的类型
+    #: （CURSOR / ROW / TABLE / SET / ENUM）一律显式报错。
+    _FUNCTION_RETURN_TYPES = (
+        'TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'INTEGER', 'BIGINT',
+        'DECIMAL', 'NUMERIC', 'FLOAT', 'DOUBLE', 'REAL',
+        'CHAR', 'VARCHAR', 'TEXT', 'TINYTEXT', 'MEDIUMTEXT', 'LONGTEXT',
+        'BOOL', 'BOOLEAN', 'BIT',
+        'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR', 'JSON', 'BLOB',
+    )
+
+    def _check_function_return_type(self, name, ret_type):
+        """校验 `RETURNS 类型`；返回规范化（大写、去长度）的类型名
+
+        `VARCHAR(20)` → `VARCHAR`；`INT` → `INT`；`CURSOR` 等显式报错。
+        """
+        t = str(ret_type or '').strip()
+        if not t:
+            raise ValueError(f"CREATE FUNCTION {name}: RETURNS 缺少返回类型")
+        if not re.match(r'^[A-Za-z_]\w*(\s*\(\s*[\w, ]+\s*\))?$', t):
+            raise ValueError(
+                f"CREATE FUNCTION {name}: 无法识别的 RETURNS 类型 {t!r}")
+        base = re.match(r'^([A-Za-z_]\w*)', t).group(1).upper()
+        if base not in self._FUNCTION_RETURN_TYPES:
+            raise ValueError(
+                f"CREATE FUNCTION {name}: 不支持的 RETURNS 类型 '{t}' —— "
+                f"本引擎的标量函数只能返回单个标量值，支持的类型是 "
+                f"{' / '.join(self._FUNCTION_RETURN_TYPES)}；"
+                f"CURSOR / ROW / TABLE / SET / ENUM 这类没有标量值语义的"
+                f"类型不会静默降级成 INT 或 NULL")
+        return base
+
+    def _validate_function_body(self, name, body, params):
+        """解析并静态校验函数体（不执行）
+
+        复用的是过程体那套 `PLParser`（同一个词法/语法实现），只在**语句
+        种类**上收紧：函数体里出现游标 / 循环 / handler / 事务 / 改数据的
+        SQL 都显式报错（MySQL 的存储函数同样禁止改数据的语句）。
+        """
+        from .pl import PLParser
+        text = self._strip_begin_end(str(body or ''))
+        if not text:
+            raise ValueError(
+                f"CREATE FUNCTION {name} 函数体为空（{self._FUNCTION_BODY_HINT}）")
+        try:
+            stmts = PLParser(text).parse_program()
+        except SyntaxError as e:
+            raise SyntaxError(f"{e}（{self._FUNCTION_BODY_HINT}）")
+        if not stmts:
+            raise ValueError(
+                f"CREATE FUNCTION {name} 函数体为空（{self._FUNCTION_BODY_HINT}）")
+        self._check_function_stmts(name, stmts, bool(params))
+
+    #: 函数体允许的 PL 语句种类（其余显式报错）
+    _FUNCTION_ALLOWED_STMTS = ('DECLARE', 'SET', 'IF', 'RETURN')
+
+    def _check_function_stmts(self, name, stmts, has_params):
+        """递归校验函数体里的每条语句（越界一律显式报错）"""
+        for stmt in stmts:
+            if not isinstance(stmt, tuple) or not stmt:
+                raise ValueError(
+                    f"CREATE FUNCTION {name}: 函数体里有无法识别的语句 "
+                    f"{stmt!r}")
+            op = stmt[0]
+            if op == 'SQL':
+                raise ValueError(
+                    f"CREATE FUNCTION {name}: 函数体里的 SQL 语句不受支持: "
+                    f"{stmt[1][:80]} —— 存储函数是纯计算，不能执行 "
+                    f"INSERT / UPDATE / DELETE / SELECT ... INTO / CALL / "
+                    f"OPEN / FETCH / CLOSE 等语句（本引擎显式拒绝，不静默"
+                    f"跳过）。{self._FUNCTION_BODY_HINT}")
+            if op not in self._FUNCTION_ALLOWED_STMTS:
+                raise ValueError(
+                    f"CREATE FUNCTION {name}: 函数体里暂不支持的语句类型 "
+                    f"{op}（只支持 {' / '.join(self._FUNCTION_ALLOWED_STMTS)}"
+                    f"）。{self._FUNCTION_BODY_HINT}")
+            if op == 'IF':
+                _, branches, else_body = stmt
+                for _cond, block in branches:
+                    self._check_function_stmts(name, block, has_params)
+                if else_body:
+                    self._check_function_stmts(name, else_body, has_params)
+
+    def _cmd_drop_function(self, p, s):
+        if self._stored is None:
+            return self._err(1105, "存储函数管理器不可用")
+        name = p['name']
+        if self._lookup_stored_function(name) is None:
+            if p.get('if_exists'):
+                return self._ok(message=f"Unknown function '{name}'")
+            return self._err(1305, f"FUNCTION {name} does not exist")
+        self._stored.drop_function(name)
+        return self._ok(message=f"Function '{name}' dropped")
+
+    def _show_functions(self, p, s):
+        """`SHOW FUNCTIONS` / `SHOW FUNCTION STATUS` —— 真实注册表快照
+
+        列名沿用 MySQL `SHOW FUNCTION STATUS`（首列是 Name，这样
+        `lightdb_studio` 的 `[r[0] for r in rows]` 拿到的是函数名）。
+        """
+        mgr = self._stored
+        funcs = (getattr(mgr, 'functions', {}) if mgr is not None else {})
+        cols = ['Name', 'Db', 'Type', 'Return_type', 'Parameters',
+                'Definer', 'Modified', 'Created', 'Security_type', 'Comment',
+                'character_set_client', 'collation_connection',
+                'Database Collation']
+        rows = []
+        for fname in sorted(funcs):
+            fn = funcs[fname]
+            params = ', '.join(
+                f"{prm.get('name')} {prm.get('type')}"
+                for prm in (fn.params or []))
+            created = time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                time.localtime(getattr(fn, 'created_at', time.time())))
+            rows.append((fname, 'default', 'FUNCTION', fn.return_type,
+                         params, 'root@localhost', created, created,
+                         'DEFINER', '', 'utf8mb4', 'utf8mb4_general_ci',
+                         'utf8mb4_general_ci'))
+        return self._rs(cols, rows)
+
     def _cmd_create_trigger(self, p, s):
         if self._trigger_mgr is None:
             return self._err(1105, "触发器管理器不可用")
@@ -5771,31 +6155,56 @@ class Executor:
         引号内（字符串字面量 / 反引号标识符）一律不动 —— 否则
         `INSERT INTO t VALUES (1, 'x marks')` 里的 `x` 会被参数值替换成
         静默错误值，这正是要避免的。
+
+        **函数调用名不替换**（存储函数那一轮补的边界）：标识符后面紧跟
+        `(` 时它是函数名，不是变量 —— 否则 `CREATE FUNCTION quad(x INT)
+        RETURNS INT RETURN double_it(double_it(x))` 里的函数名会被参数
+        值顶掉，变成 `2(2)` 这种无法解析的文本，或者更糟：静默算成别的
+        东西。带点的限定名（`t.a` / `NEW.age`）同样整段匹配，只有整段
+        命中 mapping 才替换（因此 `t.a` 不会因为变量 `a` 而被改写）。
         """
         if not mapping:
             return text
         upper = {str(k).upper(): v for k, v in mapping.items()}
-        out, i, n = [], 0, len(text)
-        in_str = None
-        word_re = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*')
+        s = str(text)
+        out = []
+        i, n = 0, len(s)
         while i < n:
-            ch = text[i]
-            if in_str:
-                out.append(ch)
-                if ch == in_str:
-                    in_str = None
-                i += 1
-                continue
+            ch = s[i]
             if ch in ("'", '"', '`'):
-                in_str = ch
-                out.append(ch)
-                i += 1
+                j = i + 1
+                while j < n:
+                    if s[j] == ch:
+                        # SQL 的 '' 是转义的单引号，继续留在字符串里
+                        if ch == "'" and j + 1 < n and s[j + 1] == "'":
+                            j += 2
+                            continue
+                        break
+                    j += 1
+                out.append(s[i:j + 1])
+                i = j + 1
                 continue
-            m = word_re.match(text, i)
-            if m:
-                word = m.group(0)
+            if ch.isalpha() or ch == '_':
+                j = i
+                while j < n and (s[j].isalnum() or s[j] == '_'):
+                    j += 1
+                k = j
+                while k < n and s[k] == '.':
+                    k += 1
+                    if k < n and (s[k].isalpha() or s[k] == '_'):
+                        while k < n and (s[k].isalnum() or s[k] == '_'):
+                            k += 1
+                    else:
+                        k = j
+                        break
+                # 后面紧跟 `(` → 函数调用名，不替换
+                if k < n and s[k] == '(':
+                    out.append(s[i:k])
+                    i = k
+                    continue
+                word = s[i:k]
                 out.append(upper.get(word.upper(), word))
-                i = m.end()
+                i = k
                 continue
             out.append(ch)
             i += 1
@@ -5864,37 +6273,65 @@ class Executor:
         return ctx
 
     def _run_pl_statements(self, stmts, ctx, ExprParser, eval_expr,
-                           cond_tokens=None):
-        """逐条执行 PL 语句（自实现，见 _exec_pl_body 的说明）"""
+                           cond_tokens=None, funcs_depth=None):
+        """逐条执行 PL 语句（自实现，见 _exec_pl_body 的说明）
+
+        funcs_depth 不为 None 时进入**函数体模式**：
+        * 表达式求值带上存储函数解析回调（函数体里可以调用别的函数，
+          并且共享同一个递归深度计数）；
+        * 出现 SQL / 循环 / SELECT INTO 时显式报错（创建期已拦，这里是
+          兜底：即使有人绕过 `CREATE FUNCTION` 校验写进 `_stored.json`，
+          调用时也一定报错而不是静默执行）。
+        过程体模式（funcs_depth is None）行为与原来逐字一致。
+        """
         from .parser import parser as _p
         if cond_tokens is not None:
             if not eval_expr(ExprParser(cond_tokens).parse(), ctx):
                 return None
+
+        def _funcs():
+            if funcs_depth is None:
+                return None
+            return self._stored_function_resolver('函数体')
+
+        if funcs_depth is not None:
+            self._check_function_stmts(
+                getattr(ctx, 'function_name', '?'), stmts, True)
         for stmt in stmts:
             op = stmt[0]
             if op == 'DECLARE':
                 _, name, _types, default_toks = stmt
                 value = None
                 if default_toks:
-                    value = eval_expr(ExprParser(default_toks).parse(), ctx)
+                    value = eval_expr(ExprParser(default_toks).parse(), ctx,
+                                      funcs=_funcs())
                 ctx.variables[name] = value
             elif op == 'SET':
                 _, name, expr_toks = stmt
                 ctx.variables[name] = eval_expr(
-                    ExprParser(expr_toks).parse(), ctx)
+                    ExprParser(expr_toks).parse(), ctx, funcs=_funcs())
             elif op == 'IF':
                 _, branches, else_body = stmt
                 taken = False
                 for cond_toks, block in branches:
-                    if eval_expr(ExprParser(cond_toks).parse(), ctx):
+                    if eval_expr(ExprParser(cond_toks).parse(), ctx,
+                                 funcs=_funcs()):
                         self._run_pl_statements(
-                            block, ctx, ExprParser, eval_expr)
+                            block, ctx, ExprParser, eval_expr,
+                            funcs_depth=funcs_depth)
                         taken = True
                         break
                 if not taken and else_body:
                     self._run_pl_statements(
-                        else_body, ctx, ExprParser, eval_expr)
+                        else_body, ctx, ExprParser, eval_expr,
+                        funcs_depth=funcs_depth)
+                if ctx.return_hit:
+                    return ctx.return_value
             elif op == 'WHILE':
+                if funcs_depth is not None:
+                    raise RuntimeError(
+                        "函数体里暂不支持 WHILE 循环（本引擎的存储函数"
+                        "只支持 DECLARE / SET / IF / RETURN）")
                 _, cond_toks, block = stmt
                 guard = 0
                 while eval_expr(ExprParser(cond_toks).parse(), ctx):
@@ -5904,6 +6341,10 @@ class Executor:
                     self._run_pl_statements(
                         block, ctx, ExprParser, eval_expr)
             elif op == 'SELECT_INTO':
+                if funcs_depth is not None:
+                    raise RuntimeError(
+                        "函数体里暂不支持 SELECT ... INTO（存储函数是纯"
+                        "计算，不能读表写变量）")
                 _, toks, into_pos = stmt
                 from .pl import PLParser
                 rest = toks[into_pos + 1:]
@@ -5928,12 +6369,18 @@ class Executor:
                         if i < len(names):
                             ctx.variables[names[i]] = v
             elif op == 'RETURN':
+                ctx.return_hit = True
                 ctx.return_value = None
                 if stmt[1]:
                     ctx.return_value = eval_expr(
-                        ExprParser(stmt[1]).parse(), ctx)
+                        ExprParser(stmt[1]).parse(), ctx, funcs=_funcs())
                 return ctx.return_value
             elif op == 'SQL':
+                if funcs_depth is not None:
+                    raise RuntimeError(
+                        f"函数体里暂不支持 SQL 语句: {stmt[1][:80]}"
+                        f"（存储函数是纯计算，不能执行 INSERT / UPDATE / "
+                        f"DELETE / SELECT ... INTO / CALL）")
                 sql = stmt[1]
                 if sql.strip().upper().startswith('CALL '):
                     from .stored import call_procedure

@@ -296,10 +296,30 @@ class Parser:
                 opts[kv.group(1).lower()] = kv.group(2).strip().strip("'\"")
             return {'command': 'SET PASSWORD POLICY', 'options': opts}
 
-        # ---- 存储过程 / 触发器 / 全文索引 ----
+        # ---- 存储过程 / 触发器 / 全文索引 / 存储函数 ----
         if re.match(r'CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\b',
                     sql, re.IGNORECASE):
             return self._create_procedure(sql)
+        if re.match(r'CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b',
+                    sql, re.IGNORECASE):
+            # `CREATE OR REPLACE FUNCTION` 没有"替换语义"就无法保证不静默
+            # 复用一个同名旧函数体，因此显式拒绝（不是静默按 CREATE 处理）。
+            if re.match(r'CREATE\s+OR\s+REPLACE\s+FUNCTION\b',
+                        sql, re.IGNORECASE):
+                raise SyntaxError(
+                    "暂不支持 CREATE OR REPLACE FUNCTION：请先 "
+                    "DROP FUNCTION 再创建同名函数")
+            return self._create_function(sql)
+        dfm = re.match(
+            r'DROP\s+FUNCTION\s+(IF\s+EXISTS\s+)?([`"]?\w+[`"]?)\s*$',
+            sql, re.IGNORECASE)
+        if dfm:
+            return {'command': 'DROP FUNCTION',
+                    'name': dfm.group(2).strip('`"'),
+                    'if_exists': bool(dfm.group(1))}
+        if upper in ('SHOW FUNCTIONS', 'SHOW FUNCTION STATUS') \
+                or re.match(r'SHOW\s+FUNCTION\s+STATUS\b', sql, re.IGNORECASE):
+            return self._show_result('FUNCTIONS')
         cm = re.match(r'CALL\s+[`"]?(\w+)[`"]?\s*\((.*)\)\s*$',
                       sql, re.IGNORECASE | re.DOTALL)
         if cm:
@@ -361,6 +381,52 @@ class Parser:
             raise SyntaxError(f"CREATE USER 缺少账号: {sql}")
         return {'command': 'CREATE USER', 'accounts': accounts,
                 'if_not_exists': if_not_exists}
+
+    def _create_function(self, sql: str) -> Dict:
+        """`CREATE FUNCTION [IF NOT EXISTS] name(p TYPE, ...) RETURNS type
+        [DETERMINISTIC | READS SQL DATA | ...] RETURN <expr> | BEGIN ... END`
+
+        `IF NOT EXISTS` 必须写在 **FUNCTION 之后**（MySQL 5.7/8.0 手册
+        13.1.12「CREATE FUNCTION Statement」：`CREATE FUNCTION [IF NOT
+        EXISTS] func_name(...)`）；写成 `CREATE FUNCTION name IF NOT EXISTS
+        (...)` 会显式报语法错误，不会被当成表名/列名静默吞掉。
+
+        函数体只做**文本切分**（不去解析 PL 结构）：结构由执行器交给
+        `PLParser` 校验/执行（见 `Executor._exec_function_body`），这样
+        `CREATE FUNCTION` 的报错（比如函数体里有游标）与调用期报错用的是
+        同一份实现。
+        """
+        m = re.match(
+            r'CREATE\s+FUNCTION\s+(IF\s+NOT\s+EXISTS\s+)?'
+            r'[`"]?(\w+)[`"]?\s*\(', sql, re.IGNORECASE)
+        if not m:
+            raise SyntaxError(
+                "CREATE FUNCTION 语法错误（需要 CREATE FUNCTION [IF NOT "
+                "EXISTS] 名(参数...) RETURNS 类型 <函数体>）")
+        if_not_exists = bool(m.group(1))
+        name = m.group(2)
+        open_idx = sql.index('(', m.end() - 1)
+        end = self._matching_paren(sql, open_idx)
+        params = [p.strip() for p in
+                  self._split_top_level(sql[open_idx + 1:end]) if p.strip()]
+        rest = sql[end + 1:].strip()
+
+        rm = re.match(r'RETURNS\s+(.+)$', rest, re.IGNORECASE | re.DOTALL)
+        if not rm:
+            raise SyntaxError(
+                f"CREATE FUNCTION {name} 缺少 RETURNS 子句"
+                f"（{_FUNCTION_BODY_MSG}）")
+        ret_type, chspec, body = _split_function_returns(rm.group(1), name)
+        if not body.strip():
+            raise SyntaxError(
+                f"CREATE FUNCTION {name} 缺少函数体"
+                f"（{_FUNCTION_BODY_MSG}）")
+        return {
+            'command': 'CREATE FUNCTION', 'name': name,
+            'params': params, 'return_type': ret_type,
+            'characteristics': chspec, 'body': body.strip(),
+            'if_not_exists': if_not_exists,
+        }
 
     def _create_procedure(self, sql: str) -> Dict:
         m = re.match(
@@ -2865,6 +2931,85 @@ def expr_bare_columns(node, out=None) -> list:
     return out
 
 
+#: 存储函数名的**进程内查询钩子**：`{数据目录: has_function(名字)->bool}`
+#:
+#: 为什么放在 parser：报错文案 `unsupported_function_message` 在这里，静态
+#: 校验分两处（`executor.Executor._check_expr_functions` 与
+#: `plan_executor.PlanExecutor._check_expr_functions`）。前者手里有
+#: StoredManager，后者（**本次不可改**）没有 —— 而 JOIN 查询走的是后者，
+#: 于是 JOIN 的投影/WHERE 里调用存储函数会被误判成"不支持的函数"。
+#: 执行器构造时把自己登记的查询函数放进这个字典，两边就都能识别。
+#: 未登记的进程（`parser` 单独使用，例如只做解析的用例）行为与以前完全
+#: 一致：未知函数名照旧显式报错。
+_STORED_FUNCTION_LOOKUPS = {}
+
+#: **按数据目录登记的执行器调用钩子**：
+#: `{数据目录: caller(名字, [实参值]) -> 返回值}`（不认识的名字由前面的
+#: `_STORED_FUNCTION_LOOKUPS` 判定，不会走到 caller）。
+#:
+#: 为什么需要它：`plan_executor._eval_expr_in_row`（JOIN 的投影 / 排序逐行
+#: 求值）调 `parser.eval_expr_node` 时**不传 funcs**，而那个文件不在本次
+#: 可改范围内。有它之后，JOIN 的投影里调用存储函数会真正走执行器的
+#: `_call_stored_function`（参数个数校验、递归深度、函数体执行全都一致）。
+_STORED_FUNCTION_CALLERS = {}
+
+
+def register_stored_function_lookup(data_dir, lookup, caller=None):
+    """登记某个数据目录的「存储函数名查询」（以及可选的调用钩子）"""
+    try:
+        key = os.path.abspath(str(data_dir))
+    except Exception:                            # pragma: no cover
+        key = str(data_dir)
+    _STORED_FUNCTION_LOOKUPS[key] = lookup
+    if caller is not None:
+        # 按目录一起存：进程里同时开着多个 Database 时（测试里常见），
+        # 兜底调用要按「那个目录有没有这个函数」分派，不能只看最后构造的
+        # 执行器 —— 否则先开的库里的函数会突然"不支持"。
+        _STORED_FUNCTION_CALLERS[key] = caller
+
+
+def stored_function_call(name, args):
+    """没显式传 funcs 的求值路径（plan_executor）用的兜底调用
+
+    返回**真实返回值**；名字不是任何已注册目录里的存储函数 → 返回
+    `_EXPR_MISSING` 哨兵（调用方按既有逻辑报「不支持的函数」）；
+    调用出错直接抛异常（绝不返回"看起来像值"的替代对象）。
+    """
+    if not name:
+        return _EXPR_MISSING
+    for key, lookup in list(_STORED_FUNCTION_LOOKUPS.items()):
+        try:
+            if not lookup(name):
+                continue
+        except Exception:                        # pragma: no cover
+            continue
+        caller = _STORED_FUNCTION_CALLERS.get(key)
+        if caller is not None:
+            return caller(name, args)
+    return _EXPR_MISSING
+
+
+def is_stored_function_name(name) -> bool:
+    """`name` 是否是**合法的函数名**（内建标量/聚合 + 已注册的存储函数）
+
+    只用于「该不该报『不支持的函数』」的静态校验；真正调用走
+    `Executor._stored_function_resolver`（那里查的是当前执行器的注册表，
+    不会串到别的数据目录）。大小写不敏感。
+    """
+    if not name:
+        return False
+    upper = str(name).upper()
+    if upper in SCALAR_FUNCTION_ARITY or upper in AGGREGATE_FUNCTION_NAMES:
+        return True
+    for lookup in list(_STORED_FUNCTION_LOOKUPS.values()):
+        try:
+            if lookup(name):
+                return True
+        except Exception:                        # pragma: no cover
+            continue
+    return False
+
+
 def unsupported_function_message(name) -> str:
     """不支持的函数名 → 显式报错文案（**必须回列支持清单**）"""
     return (f"不支持的函数 '{name}'：本引擎支持的**单行标量函数**是 "
@@ -3041,7 +3186,7 @@ def compare_values(left, op, right):
 _EXPR_MISSING = object()
 
 
-def eval_expr_node(node, resolve, agg_values=None, position=''):
+def eval_expr_node(node, resolve, agg_values=None, position='', funcs=None):
     """求值标量表达式节点
 
     resolve: 列解析回调 `resolve(name) -> value`，解析不到时**必须抛
@@ -3051,6 +3196,11 @@ def eval_expr_node(node, resolve, agg_values=None, position=''):
              规范文本去查（并做去限定符 / 去空白的容错匹配）。
     position: 报错前缀（'WHERE' / 'HAVING' / 'ORDER BY' / 'GROUP BY' /
               '投影'），只影响错误文案。
+    funcs: **存储函数解析回调**
+             `funcs.has_function(名字) -> bool`  +  `funcs(名字, [实参值])
+             -> 返回值`（出错**必须抛异常**，绝不返回"看起来像值"的替代
+             对象）；不是已注册的存储函数则回落到 `apply_scalar_function`
+             （它在函数名不认识时显式报错并回列支持清单）。
     """
     if not isinstance(node, dict):
         return node
@@ -3064,8 +3214,10 @@ def eval_expr_node(node, resolve, agg_values=None, position=''):
     if kind == 'col':
         return resolve(str(node.get('name')))
     if kind == 'arith':
-        left = eval_expr_node(node.get('left'), resolve, agg_values, position)
-        right = eval_expr_node(node.get('right'), resolve, agg_values, position)
+        left = eval_expr_node(node.get('left'), resolve, agg_values, position,
+                              funcs)
+        right = eval_expr_node(node.get('right'), resolve, agg_values, position,
+                               funcs)
         return apply_arith_values(left, node.get('op'), right)
     if kind == 'func':
         name = str(node.get('name') or '').upper()
@@ -3077,18 +3229,35 @@ def eval_expr_node(node, resolve, agg_values=None, position=''):
                     f"取不到值：聚合值只在分组语境（GROUP BY / 整表聚合的"
                     f"SELECT 列表或 HAVING）里可用")
             return got
-        values = [eval_expr_node(a, resolve, agg_values, position)
+        values = [eval_expr_node(a, resolve, agg_values, position, funcs)
                   for a in (node.get('args') or [])]
+        if name not in SCALAR_FUNCTION_ARITY:
+            if funcs is not None:
+                has = getattr(funcs, 'has_function', None)
+                if has is not None and has(node.get('name')):
+                    return funcs(node.get('name'), values)
+            elif is_stored_function_name(node.get('name')):
+                # 没传 funcs（plan_executor 的 JOIN 逐行求值路径）→ 走
+                # 进程内兜底钩子（见 `_STORED_FUNCTION_CALLER` 的说明）
+                got = stored_function_call(node.get('name'), values)
+                if got is not _EXPR_MISSING:
+                    return got
         return apply_scalar_function(name, values)
     raise ValueError(f"{pos}无法求值的表达式节点: {render_scalar_expr(node)}")
 
 
-def eval_expr_predicate(pred, resolve, agg_values=None, position=''):
-    """求值 `表达式 比较 表达式` 谓词，返回 True / False / None(UNKNOWN)"""
+def eval_expr_predicate(pred, resolve, agg_values=None, position='',
+                        funcs=None):
+    """求值 `表达式 比较 表达式` 谓词，返回 True / False / None(UNKNOWN)
+
+    funcs：存储函数解析回调（契约见 `eval_expr_node`）。
+    """
     if not isinstance(pred, dict):
         raise ValueError(f"{position} 里的表达式谓词形态不合法: {pred!r}")
-    left = eval_expr_node(pred.get('left'), resolve, agg_values, position)
-    right = eval_expr_node(pred.get('right'), resolve, agg_values, position)
+    left = eval_expr_node(pred.get('left'), resolve, agg_values, position,
+                          funcs)
+    right = eval_expr_node(pred.get('right'), resolve, agg_values, position,
+                           funcs)
     return compare_values(left, pred.get('op'), right)
 
 
@@ -3131,7 +3300,8 @@ def aggregate_values(name, vals):
     raise ValueError(unsupported_function_message(name))
 
 
-def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True):
+def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True,
+                            funcs=None, agg_ctx=None, agg_eval=None):
     """在**行集合**上求值「含聚合函数的表达式」（两条执行路径共用）
 
     * 聚合节点（`SUM(x)` / `COUNT(*)` / `GROUP_CONCAT(x)` / `ROUND(AVG(v),1)`
@@ -3141,6 +3311,13 @@ def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True):
       不支持函数报错完全一致）；
     * 裸列节点：组内取值必须唯一（等价于分组键），否则 `strict=True` 时
       显式报错（`group_by_violation_message`），绝不取「组内第一行」。
+
+    funcs：存储函数解析回调（见 `eval_expr_node`）。
+    agg_ctx / agg_eval：**内层聚合**（聚合嵌在函数调用或外层函数参数里，
+      如 `f(COUNT(*))`）的求值方式。`agg_ctx` 是同一分组上已经算好的
+      `{聚合成文本: 值}`；命中就直接取值，没命中则调 `agg_eval(节点)`
+      就地真算一次。两者缺省时保持原行为（在函数参数里遇到聚合会直接
+      求值 → 显式报错），绝不静默填 NULL。
 
     resolve_row(row, name) -> 值；解析不到时**必须抛 ValueError**。
     """
@@ -3161,13 +3338,25 @@ def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True):
         raise ValueError(group_by_violation_message(name))
     if kind == 'arith':
         left = eval_agg_expr_over_rows(node.get('left'), rows, resolve_row,
-                                       position, strict)
+                                       position, strict, funcs, agg_ctx,
+                                       agg_eval)
         right = eval_agg_expr_over_rows(node.get('right'), rows, resolve_row,
-                                        position, strict)
+                                        position, strict, funcs, agg_ctx,
+                                        agg_eval)
         return apply_arith_values(left, node.get('op'), right)
     if kind == 'func':
         name = str(node.get('name') or '').upper()
         args = node.get('args') or []
+        if name not in AGGREGATE_FUNCTION_NAMES \
+                and name not in SCALAR_FUNCTION_ARITY \
+                and agg_eval is not None \
+                and (funcs is None
+                     or not getattr(funcs, 'has_function', lambda _n: False)(
+                         node.get('name'))):
+            # 参数里嵌了聚合（`f(COUNT(*))`）：交给调用方按 agg_ctx 取真实
+            # 聚合值，而不是把聚合逐行求值（那会取不到值 → 误报错误）
+            if expr_has_agg(node):
+                return agg_eval(node)
         if name in AGGREGATE_FUNCTION_NAMES:
             if not args:
                 raise ValueError(
@@ -3177,8 +3366,9 @@ def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True):
 
             def arg_of(row):
                 return eval_expr_node(
-                    args[0], lambda n, _r=row: resolve_row(_r, n),
-                    None, position)
+                    args[0],
+                    lambda n, _r=row: resolve_row(_r, n),
+                    None, position, funcs)
 
             if name == 'COUNT':
                 return len(rows) if star \
@@ -3188,8 +3378,17 @@ def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True):
             return aggregate_values(
                 name, [v for v in (arg_of(r) for r in rows) if v is not None])
         values = [eval_agg_expr_over_rows(a, rows, resolve_row, position,
-                                          strict)
+                                          strict, funcs, agg_ctx, agg_eval)
                   for a in args]
+        if name not in SCALAR_FUNCTION_ARITY:
+            if funcs is not None:
+                has = getattr(funcs, 'has_function', None)
+                if has is not None and has(node.get('name')):
+                    return funcs(node.get('name'), values)
+            elif is_stored_function_name(node.get('name')):
+                got = stored_function_call(node.get('name'), values)
+                if got is not _EXPR_MISSING:
+                    return got
         return apply_scalar_function(name, values)
     raise ValueError(
         f"{position} 里无法求值的表达式节点: {render_scalar_expr(node)}")
@@ -3247,3 +3446,65 @@ def row_agg_values_map(cols, row):
         out[render_scalar_expr(node)] = val
         out[text] = val
     return out
+
+
+# ==========================================================================
+# 存储函数（CREATE FUNCTION）的解析辅助
+# ==========================================================================
+#
+# 这一节只做**文本切分**（参数表 / RETURNS 类型 / 特征子句 / 函数体原文），
+# 结构校验与执行都在执行器侧（复用 `pl.py::PLParser`，与存储过程/触发器
+# 同一套实现），因此这里不重复实现任何 PL 语义。
+
+#: `RETURNS` 与函数体之间的特征子句（全部匹配后再剥掉，不匹配则报错）
+_FUNCTION_CHARACTERISTIC_RE = re.compile(
+    r'^(?:\s*(?:'
+    r'DETERMINISTIC|NOT\s+DETERMINISTIC|'
+    r'NO\s+SQL|CONTAINS\s+SQL|READS\s+SQL\s+DATA|MODIFIES\s+SQL\s+DATA|'
+    r'LANGUAGE\s+SQL|SQL\s+SECURITY\s+(?:DEFINER|INVOKER)|'
+    r'COMMENT\s+\'(?:[^\']|\'\')*\'|'
+    r'RETURNS\s+NULL\s+ON\s+NULL\s+INPUT'
+    r'))+',
+    re.IGNORECASE)
+
+_FUNCTION_BODY_MSG = (
+    "函数体只支持 `RETURN <表达式>`（简式）或 `BEGIN ... RETURN "
+    "<表达式>; ... END`（复合式）")
+
+
+def _split_function_returns(rest, name):
+    """把 `RETURNS` 之后的文本切成 (返回类型, 特征子句, 函数体原文)
+
+    例：`INT DETERMINISTIC RETURN x*2` → ('INT', 'DETERMINISTIC', 'RETURN x*2')
+        `VARCHAR(20) BEGIN RETURN a; END` → ('VARCHAR(20)', '',
+                                             'BEGIN RETURN a; END')
+
+    找不到 `RETURN` / `BEGIN` 关键词 → 显式报错（绝不把整段当函数体存起来
+    等调用期再报一个看不懂的错）。
+    """
+    text = str(rest or '').strip()
+    m = re.search(r'(?<![\w$])(RETURN|BEGIN)[\s(]', text, re.IGNORECASE)
+    if not m:
+        raise SyntaxError(
+            f"CREATE FUNCTION {name} 找不到函数体（{_FUNCTION_BODY_MSG}）: "
+            f"{text[:120]}")
+    head = text[:m.start()].strip()
+    body = text[m.start():].strip()
+    tm = re.match(r'^([A-Za-z_]\w*(?:\s*\([^)]*\))?)\s*(.*)$',
+                  head, re.DOTALL)
+    if not tm:
+        raise SyntaxError(
+            f"CREATE FUNCTION {name} 的 RETURNS 类型无法识别: {head[:60]!r}")
+    ret_type = tm.group(1).strip()
+    chspec = tm.group(2).strip()
+    if chspec:
+        cm = _FUNCTION_CHARACTERISTIC_RE.match(' ' + chspec)
+        leftover = chspec[cm.end() - 1:].strip() if cm else chspec
+        if not cm or leftover:
+            raise SyntaxError(
+                f"CREATE FUNCTION {name}: 不支持的函数特征子句 "
+                f"{leftover or chspec!r}（只支持 DETERMINISTIC / NOT "
+                f"DETERMINISTIC / NO SQL / CONTAINS SQL / READS SQL DATA / "
+                f"MODIFIES SQL DATA / LANGUAGE SQL / SQL SECURITY "
+                f"DEFINER|INVOKER / COMMENT '...'）")
+    return ret_type, chspec, body

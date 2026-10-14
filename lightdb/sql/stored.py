@@ -73,6 +73,19 @@ class StoredManager:
         except Exception:
             pass
 
+    def _case_index(self, table):
+        """`大小写无关的名字 -> 注册表里的真实键`
+
+        MySQL 的函数/过程名大小写不敏感（`Double_It(x)` 与
+        `double_it(x)` 是同一个函数），而注册表要保留用户写的原始大小写
+        （`SHOW FUNCTION STATUS` 要如实回显）。因此查名字时统一走这个索引，
+        找不到就返回 None（调用方按"不存在"显式报错，绝不静默）。
+        """
+        idx = {}
+        for key in table:
+            idx.setdefault(str(key).lower(), key)
+        return idx
+
     def save(self):
         data = {
             'procedures': {n: p.to_dict() for n, p in self.procedures.items()},
@@ -96,7 +109,8 @@ class StoredManager:
             self.save()
 
     def get_procedure(self, name):
-        return self.procedures.get(name)
+        key = self._case_index(self.procedures).get(str(name or '').lower())
+        return self.procedures.get(key) if key is not None else None
 
     def list_procedures(self):
         return list(self.procedures.keys())
@@ -114,7 +128,8 @@ class StoredManager:
             self.save()
 
     def get_function(self, name):
-        return self.functions.get(name)
+        key = self._case_index(self.functions).get(str(name or '').lower())
+        return self.functions.get(key) if key is not None else None
 
     def list_functions(self):
         return list(self.functions.keys())

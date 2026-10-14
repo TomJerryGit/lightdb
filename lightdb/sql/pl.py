@@ -546,8 +546,15 @@ class ExprParser:
         raise SyntaxError(f"意外的 token: {t}")
 
 
-def eval_expr(node, ctx):
-    """求值表达式"""
+def eval_expr(node, ctx, funcs=None):
+    """求值表达式
+
+    funcs：**存储函数解析回调**（可选，函数体模式用）。契约：
+    `funcs.has_function(名字) -> bool` 判断是不是已注册的存储函数；
+    `funcs(名字, [实参值]) -> 返回值` 真正调用，出错就**抛异常**
+    （绝不返回"看起来像值"的替代对象 —— 那会静默算出错误结果）。
+    名字不是存储函数时回落到 `call_builtin`（未知函数在那里显式报错）。
+    """
     op = node[0]
 
     if op == 'lit':
@@ -571,8 +578,8 @@ def eval_expr(node, ctx):
         raise NameError(f"变量 '{name}' 未定义")
 
     if op == 'binop':
-        a = eval_expr(node[2], ctx)
-        b = eval_expr(node[3], ctx)
+        a = eval_expr(node[2], ctx, funcs)
+        b = eval_expr(node[3], ctx, funcs)
         o = node[1]
         if a is None or b is None:
             return None
@@ -583,18 +590,20 @@ def eval_expr(node, ctx):
         if o == '%': return a % b if b != 0 else None
 
     if op == 'neg':
-        return -eval_expr(node[1], ctx)
+        return -eval_expr(node[1], ctx, funcs)
 
     if op == 'and':
-        return bool(eval_expr(node[1], ctx)) and bool(eval_expr(node[2], ctx))
+        return bool(eval_expr(node[1], ctx, funcs)) \
+            and bool(eval_expr(node[2], ctx, funcs))
     if op == 'or':
-        return bool(eval_expr(node[1], ctx)) or bool(eval_expr(node[2], ctx))
+        return bool(eval_expr(node[1], ctx, funcs)) \
+            or bool(eval_expr(node[2], ctx, funcs))
     if op == 'not':
-        return not bool(eval_expr(node[1], ctx))
+        return not bool(eval_expr(node[1], ctx, funcs))
 
     if op == 'cmp':
-        a = eval_expr(node[2], ctx)
-        b = eval_expr(node[3], ctx)
+        a = eval_expr(node[2], ctx, funcs)
+        b = eval_expr(node[3], ctx, funcs)
         o = node[1]
         if a is None or b is None:
             return False
@@ -613,24 +622,28 @@ def eval_expr(node, ctx):
         if o == '>=': return a >= b
 
     if op == 'isnull':
-        return eval_expr(node[1], ctx) is None
+        return eval_expr(node[1], ctx, funcs) is None
     if op == 'notnull':
-        return eval_expr(node[1], ctx) is not None
+        return eval_expr(node[1], ctx, funcs) is not None
 
     if op == 'like':
-        a = eval_expr(node[1], ctx)
-        pat = eval_expr(node[2], ctx)
+        a = eval_expr(node[1], ctx, funcs)
+        pat = eval_expr(node[2], ctx, funcs)
         if a is None or pat is None:
             return False
         pat = str(pat).replace('%', '.*').replace('_', '.')
         return bool(re.match('^' + pat + '$', str(a)))
 
     if op == 'in':
-        a = eval_expr(node[1], ctx)
-        return a in [eval_expr(n, ctx) for n in node[2]]
+        a = eval_expr(node[1], ctx, funcs)
+        return a in [eval_expr(n, ctx, funcs) for n in node[2]]
 
     if op == 'func':
-        args = [eval_expr(a, ctx) for a in node[2]]
+        args = [eval_expr(a, ctx, funcs) for a in node[2]]
+        if funcs is not None:
+            has = getattr(funcs, 'has_function', None)
+            if has is not None and has(node[1]):
+                return funcs(node[1], args)
         return call_builtin(node[1], args)
 
     raise NotImplementedError(f"表达式类型: {op}")
@@ -680,6 +693,9 @@ class PLContext:
         self.new_row = None       # 触发器 NEW（dict）
         self.old_row = None       # 触发器 OLD（dict）
         self.return_value = None
+        # 是否真的执行到过 RETURN（存储函数必须有返回值：执行器在
+        # `_exec_function_body` 里据此显式报错，而不是静默返回 NULL）
+        self.return_hit = False
         self.out_params = {}      # OUT 参数回填
         self.leave_flag = None    # LEAVE 标记
         self.iterate_flag = None  # ITERATE 标记

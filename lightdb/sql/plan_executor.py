@@ -601,16 +601,20 @@ class PlanExecutor:
         与 `Executor._check_expr_functions` 同一份语义：`REVERSE(name)` /
         `NOW()` 这类名字在这里抛 ValueError（文案由 parser 统一给出），
         绝不静默返回 NULL，也绝不把函数名当成列名。
+
+        **已注册的存储函数名**（`CREATE FUNCTION f(...)`）同样合法：
+        查询走 `parser.is_stored_function_name`（执行器构造时登记的钩子），
+        JOIN 查询的投影/WHERE 里调用存储函数因此不会被误判；真正的调用由
+        计划执行器的 `_eval_expr_in_row` 走 `Executor` 那条求值路径完成。
         """
-        from .parser import (AGGREGATE_FUNCTION_NAMES, SCALAR_FUNCTION_NAMES,
+        from .parser import (is_stored_function_name,
                              unsupported_function_message)
         if not isinstance(node, dict):
             return
         kind = node.get('kind')
         if kind == 'func':
-            name = str(node.get('name') or '').upper()
-            if name not in AGGREGATE_FUNCTION_NAMES \
-                    and name not in SCALAR_FUNCTION_NAMES:
+            name = node.get('name')
+            if not is_stored_function_name(name):
                 raise ValueError(unsupported_function_message(name))
             for a in (node.get('args') or []):
                 PlanExecutor._check_expr_functions(a, position)
