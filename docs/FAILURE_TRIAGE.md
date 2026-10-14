@@ -287,3 +287,173 @@
 - 2 条 Errno 13 写权限项（工作区外 HOME、`dashboards/`）在沙箱下无法本地判定，仍需补 ACL 或让工具尊重 `--output-dir`。
 - 4 条纯计时/吞吐断言（C 类）在共享机器上无判别力，结论仍同第 7 节。
 - **仍未修的 A 类 61 条**：本次只改测试清理，`lightdb/**` 一字未动，故 8.4 里的缺陷全部**待修**；其中 `test_batch15::test_security_via_sql`（CREATE USER 全不支持 → 负向断言假阳性）、`test_batch9::test_prepared_statement`（查询结果多前导空格）、`test_batch8::test_logical_backup`（恢复未建表）属于结果正确性，优先级应高于纯语法缺口。
+
+## 9. 第二次全量失败分诊（2026-10-14）
+
+本轮**只更新本文件**：未改 `tests/**`、未改 `lightdb/**`、未 commit、未 pip install；临时脚本与根目录探针已删除（`_t2_*.py` / `_t2_*_test.py` 均已删，仅保留原始运行输出 `_t2_*.txt`）。
+
+### 9.1 运行条件与 3 次汇总
+
+- 环境：Windows 10/11 + Python 3.11.9（`D:\Program Files\Python311\python.exe`）、DSH 沙箱 workspace-write（工作区内可写、禁写工作区外、禁多进程原语、GBK 控制台）。11 条 skip 仍全是 `tests/conftest.py` 的多进程原语探测（`WinError 5`），**不是失败**。
+- 命令：`python -m pytest tests -q -rs -rf -p no:cacheprovider`，串行 3 次，输出落盘 `_t2_run1.txt`/`_t2_run2.txt`/`_t2_run3.txt`。
+
+| 运行 | 汇总行 | 耗时 |
+|---|---|---|
+| run1 | **37 failed, 412 passed, 11 skipped, 4 warnings** | 251.9s |
+| run2 | **38 failed, 411 passed, 11 skipped, 4 warnings** | 229.1s |
+| run3 | **39 failed, 410 passed, 11 skipped, 4 warnings** | 222.7s |
+
+失败**并集 = 39 条**（= run3 清单；run1 ⊂ run2 ⊂ run3）。抖动只来自 2 条：run1 少 `tests/test_v2_batch6.py::test_federated_governance`，run1/run2 少 `tests/test_v3_batch2.py::test_row_format_performance`。
+
+隔离证据：并集 39 条**逐条**跑 `python -m pytest <id> -q --tb=line -p no:cacheprovider` 全部 `exit=1`（汇总 `_t2_line.txt`，逐条原始输出 `_t2_line1..39.txt` 体积较大已删）→ 不存在"仅全量失败"的用例；2 条抖动项 + 4 条计时/吞吐项 + `test_memory_analyzer_structure`、`test_concurrent_load` 各**单独连跑 5 次**（`_t2_iso.txt`）；"单跑 vs 同文件连跑"另跑 `pytest tests/test_v2_batch6.py`（2 failed / 3 passed）与 `pytest tests/test_v3_batch2.py`（2 failed / 7 passed），与单跑结果**一致**，故本轮无一例由共享数据目录/执行顺序造成。
+
+### 9.2 类别计数（基准 = 39 条并集）
+
+| 类别 | 条数 | 判定依据 |
+|---|---|---|
+| A 真实实现缺陷 | **24** | 逐条隔离稳定复现（exit=1），与沙箱/Windows 无关 |
+| B 平台/环境限制 | **3** | 写工作区外 1 + 工作区内目录 ACL 1 + Windows 无 `readline` 1 |
+| C flaky（有翻转） | **2** | 3 次全量翻转（P F F / P F P），5 次隔离亦翻转 |
+| D 需进一步定位 | **0** | 每条根因都能从贴出的输出推出 |
+| E 测试期望/测试自身写错 | **10** | 断言、桩或测试内联逻辑与本引擎既有行为/MySQL 语义矛盾 |
+| 合计 | **39** | = §9.3 主表行数 = 失败并集 |
+
+### 9.3 主表（39 条，逐条对应并集）
+
+| # | 测试 ID | 类 | 错误类型 | 根因（一行） | 失败栈 file:line | 处置建议 | P |
+|---|---|---|---|---|---|---|---|
+| 1 | tests/regression/test_performance.py::test_row_format_performance | A | TypeError: cannot convert 'float' object to bytes | DECIMAL 列按字符串类型处理，float 值走 `bytes(v)` | lightdb/storage/row_format.py:89 | T_STRING 分支支持 float/Decimal（或给 DECIMAL 独立类型） | P1 |
+| 2 | tests/regression/test_sql_compat.py::test_ddl | A | AssertionError: 解析失败 ALTER TABLE t1 ADD COLUMN age INT | `parser.parse('ALTER TABLE t1 ADD COLUMN age INT')` 返回 None | tests/regression/test_sql_compat.py:29 | 补 ALTER TABLE ADD COLUMN 解析 | P1 |
+| 3 | tests/regression/test_sql_compat.py::test_variables | A | AssertionError: 失败 SET @@autocommit = 1 | `parser.parse('SET @@autocommit = 1')` 返回 None | tests/regression/test_sql_compat.py:148 | 支持 `@@` 系统变量 SET（与 #30/#32 同族，一并修） | P1 |
+| 4 | tests/regression_v4/test_columnar.py::test_encoder_compression | A | assert 2.776615357277715 > 3 | 4 万值字典编码仅 2.78x（索引 4B、未 bitpack）；5 次隔离同值 | tests/regression_v4/test_columnar.py:62 | 提升字典索引压缩，或复核 3x 门槛依据 | P3 |
+| 5 | tests/regression_v4/test_columnar.py::test_olap_groupby | A | assert 0 == 100000 | 列存 GROUP BY 返回 0 行 | tests/regression_v4/test_columnar.py:146 | 修列存分组扫描 | P1 |
+| 6 | tests/regression_v4/test_performance_v4.py::test_olap_aggregate_performance | A | assert 11.68M~16.73M > 20000000 | 聚合吞吐未达 `PERF_TARGETS`（隔离 5/5 不达标） | tests/regression_v4/test_performance_v4.py:124 | 移出门禁或做 benchmark 记录 | P3 |
+| 7 | tests/regression_v4/test_performance_v4.py::test_parallel_speedup | A | AssertionError: 并行加速不足 0.56x（隔离 0.56~0.89x） | `ParallelExecutor` 用 `ThreadPoolExecutor`，GIL 下纯 Python 聚合无加速 | tests/regression_v4/test_performance_v4.py:163 | 改多进程/向量化，或改判据；别再调阈值 | P3 |
+| 8 | tests/test_batch10.py::test_concurrent_load | A | AttributeError: 'MySQLServer' object has no attribute 'query_cache' | 服务端无 `query_cache` 属性（实例属性探测为 False） | tests/test_batch10.py:208 | 补 query_cache 或改用例引用真实缓存 API | P2 |
+| 9 | tests/test_batch13.py::test_check_constraint | A | assert False（用例自打印"CHECK 未生效！"） | CHECK 约束既不保存也不校验：SQL 路径与 `Table.insert` 直写都放行 price=-5 | tests/test_batch13.py:269 | 建表保存 CHECK 表达式并在写入路径强制校验 | P1 |
+| 10 | tests/test_batch14.py::test_semi_sync_sql | A | pymysql 1064 near '__SEMI_SYNC_REGISTER__ slave_test' | 服务端未实现半同步注册魔法语句 | pymysql/err.py:154 | 实现该命令或改走正式 SQL 接口 | P2 |
+| 11 | tests/test_batch3.py::test_er_relations | E | assert False | 测试内联启发式（test_batch3.py:164-176）只认 `{表名}_id`，不认 `user_id↔users`；引擎 ER 代码未参与 | tests/test_batch3.py:181 | 改启发式/断言（单复数归一） | P2 |
+| 12 | tests/test_batch3.py::test_query_builder_sql | E | assert 'age > 20' in "…WHERE \`age\` > 20…" | 断言用不带反引号的子串，而生成串按 MySQL 规范给标识符加反引号 | tests/test_batch3.py:233 | 断言改为 `` `age` > 20 `` | P3 |
+| 13 | tests/test_batch6.py::test_explain_join | E | TypeError: argument of type 'int' is not iterable | 把 EXPLAIN 结果第 0 列（`id`，int）当文本计划树逐字搜索 | tests/test_batch6.py:159 | 改判据：查 Extra 列或 FORMAT=TREE（见 §9.7） | P2 |
+| 14 | tests/test_batch9.py::test_cli_tool | B | assert 1 == 0（子进程 `ModuleNotFoundError: No module named 'readline'`） | `lightdb/tools/cli.py` 顶层 `import readline`，Windows CPython 无此模块 | tests/test_batch9.py:242 | 改 try/except 导入或换 pyreadline | P2 |
+| 15 | tests/test_batch9.py::test_grant_via_sql | A | pymysql 1064 near 'GRANT SELECT, INSERT ON *.* TO 'bob'' | GRANT 语法未实现 | pymysql/err.py:154 | 实现 GRANT/REVOKE | P1 |
+| 16 | tests/test_batch9.py::test_privilege_enforcement | A | pymysql 1819 密码长度至少 6 位（`CREATE USER 'readonly' IDENTIFIED BY ''`） | `_check_password_policy` 只豁免 `None`，`''` 被当弱口令，与其自身文档"空密码不校验"矛盾 | pymysql/err.py:154（lightdb/sql/executor.py:5734） | `if not password: return True`；修后仍会卡在 GRANT（#15） | P1 |
+| 17 | tests/test_v2_batch1.py::test_catalog_basic | E | assert 'restricted' == 'confidential' | 断言 salary=机密，而引擎常量表自首次提交起把 salary 与 credit_card 同归受限 | tests/test_v2_batch1.py:42 | 先定口径，再改断言或改常量表 | P2 |
+| 18 | tests/test_v2_batch1.py::test_lineage_enhanced | A | assert 0 >= 1（`[] = edges`） | `INSERT…SELECT` 未产生列级血缘边 | tests/test_v2_batch1.py:182 | 修列级血缘解析 | P2 |
+| 19 | tests/test_v2_batch4.py::test_data_api | A | assert 0 == 2 | `params={'city':'Beijing'}` 未下推，过滤后 0 行 | tests/test_v2_batch4.py:432 | 修 API 参数下推 | P1 |
+| 20 | tests/test_v2_batch4.py::test_federation | A | assert 'c.city_name' in ['u.id','u.name','u.city_id'] | 联邦 JOIN 只输出左表列 | tests/test_v2_batch4.py:167 | 合并跨库投影列 | P1 |
+| 21 | tests/test_v2_batch4.py::test_virtualization | A | assert 3 == 2（WHERE age>26 仍 3 行） | 虚拟表 WHERE 未下推 | tests/test_v2_batch4.py:96 | 修虚拟表过滤下推 | P1 |
+| 22 | tests/test_v2_batch5.py::test_recommender | A | assert False（related 里无 orders） | `learn_from_sql` 的 JOIN 关联未落库/未查出 | tests/test_v2_batch5.py:86 | 修关联学习与查询 | P2 |
+| 23 | tests/test_v2_batch6.py::test_federated_governance | C | assert not True（DROP 被放行） | `policy_id=毫秒时间戳%1e6` 同刻度撞号 → dict 覆盖 → DROP 拒绝策略静默丢失 | tests/test_v2_batch6.py:178 | 改 uuid4/自增 id（断言本身正确，勿改）；见 §9.6 | P1 |
+| 24 | tests/test_v2_batch6.py::test_react_agent | E | KeyError: 'tables' | 测试桩 `FakeConn` 缺 `get_tables`（工具与全仓 20 处都按此接口调用） | tests/test_v2_batch6.py:276 | 给桩补 `get_tables` | P2 |
+| 25 | tests/test_v2_batch7.py::test_digital_twin | A | AttributeError: 'NoneType' object has no attribute 'snapshot_id' | 创建快照返回 None | tests/test_v2_batch7.py:385 | 修孪生快照创建 | P1 |
+| 26 | tests/test_v3_batch1.py::test_full_pipeline_dry_run | B | PermissionError [Errno 13] …\.lightdb_studio\reports\benchmark_dry_run_*.md | 默认报告目录取 HOME（工作区外，沙箱按设计拒写） | lightdb/benchmark/report.py:112 | 尊重调用方 `--output-dir` 或默认落到工作区 | P2 |
+| 27 | tests/test_v3_batch1.py::test_memory_analyzer_structure | E | assert 'watch' == 'stable' | 样本 100→101.5MB/60s=+1.5MB/min，超引擎 `>1=watch` 门槛，引擎判定正确 | tests/test_v3_batch1.py:241 | 改样本（如 100.0/100.05/100.1）或改断言为 'watch' | P3 |
+| 28 | tests/test_v3_batch2.py::test_batch_executor | A | assert 50000 == 16317 | 向量化过滤批间条件失效，返回全量 50000 行 | tests/test_v3_batch2.py:235 | 修 VectorizedFilter 条件传递 | P1 |
+| 29 | tests/test_v3_batch2.py::test_row_format_performance | C | AssertionError: 计时未达标（bin 23.27ms > json 17.80ms） | 无 warmup 的墙钟对比，两法同量级 | tests/test_v3_batch2.py:95 | 移出门禁或 warmup+中位数+放宽；见 §9.6 | P3 |
+| 30 | tests/test_v3_batch4.py::test_parser_v3b4 | A | TypeError: 'NoneType' object is not subscriptable | `ParserV3B4.parse_set("SET @@autocommit = 0")` 返回 None 后仍取下标 | tests/test_v3_batch4.py:319 | 补 `@@` 变量解析（与 #3/#32 同族） | P1 |
+| 31 | tests/test_v3_batch4.py::test_registry | E | assert 132 >= 150 | 注册表确有 132 个函数，但"150"这个目标全仓库（含 docs）无任何出处 | tests/test_v3_batch4.py:155 | 改阈值/删目标，或先定 150 的产品口径 | P3 |
+| 32 | tests/test_v3_batch4.py::test_variable_executor | A | TypeError: 'NoneType' object is not subscriptable | 变量语句解析返回 None 后被下标访问 | lightdb/sql/parser_v3b4.py:110 | 同 #30 | P1 |
+| 33 | tests/test_v3_batch5.py::test_dashboard_generation | B | PermissionError [Errno 13] D:\lightdb_project\dashboards\lightdb_overview.json | 该目录缺沙箱 SID 的 ACL（errno=13 而非 winerror=32） | lightdb/tools/dashboard.py:271 | 补目录 ACL，或让工具回退到可写目录 | P2 |
+| 34 | tests/test_v4_batch1.py::test_decision_doc | E | assert 'Cython' in … | 文档已被有意截断（44 行，含"原文档在此处截断，后续章节缺失"），断言仍要求完整章节 | tests/test_v4_batch1.py:237 | 改断言（存在性+可信度声明），或先补文档再保留断言 | P3 |
+| 35 | tests/test_v4_batch1.py::test_end_to_end_diagnosis | E | NameError: name 'subprocess' is not defined | `import subprocess` 只写在另一个用例内部（函数局部），本用例未导入 | tests/test_v4_batch1.py:267 | 文件顶层 import subprocess | P1 |
+| 36 | tests/test_v4_batch1.py::test_route_comparison | E | IndexError: list index out of range | 按名字含"混合"筛路线，引擎名为"多进程+Cython（推荐）" | tests/test_v4_batch1.py:211 | 按 key(\'hybrid\') 或实际名匹配 | P3 |
+| 37 | tests/test_v4_batch4.py::test_encoder_auto_select | A | assert False（返回 DeltaEncoder） | 常量 INT 列被判给 Delta（增量恒 0，压缩率≈1），而 RLE 可达 ~100x | tests/test_v4_batch4.py:105 | 修 `EncoderRegistry.select` 判定顺序 | P2 |
+| 38 | tests/test_v4_batch4.py::test_performance_vs_python | A | assert 499999500000 == 1783293664.0 | 向量化 SUM 溢出（整数被塞进 float32/int32 累加）返回错值 | tests/test_v4_batch4.py:462 | 用 int64/整数累加 | P1 |
+| 39 | tests/test_v4_batch4.py::test_vectorized_aggregate | A | assert 704982704.0 == 4999950000 | 同上；运行时警告定位 `overflow encountered in scalar add` | tests/test_v4_batch4.py:247（lightdb/olap/vectorized_engine.py:201） | 同上 | P1 |
+
+### 9.4 A 类：最小复现与实测输出（24 条）
+
+统一复现命令（隔离，逐条 exit=1）：`python -m pytest <上表 ID> -q --tb=line -p no:cacheprovider`；下表"实测输出"即该命令输出的末行原文。
+
+| # | 实测输出（--tb=line，原文） | 栈顶 file:line |
+|---|---|---|
+| 1 | `TypeError: cannot convert 'float' object to bytes` | lightdb/storage/row_format.py:89 |
+| 2 | `AssertionError: 解析失败: ALTER TABLE t1 ADD COLUMN age INT` | tests/regression/test_sql_compat.py:29 |
+| 3 | `AssertionError: 失败: SET @@autocommit = 1` | tests/regression/test_sql_compat.py:148 |
+| 4 | `assert 2.776615357277715 > 3` | tests/regression_v4/test_columnar.py:62 |
+| 5 | `assert 0 == 100000` | tests/regression_v4/test_columnar.py:146 |
+| 6 | `assert 11685451.028994024 > 20000000`（全量 run3 为 16730493.5） | tests/regression_v4/test_performance_v4.py:124 |
+| 7 | `AssertionError: 并行加速不足: 0.56x`（全量 run3 为 0.894x） | tests/regression_v4/test_performance_v4.py:163 |
+| 8 | `AttributeError: 'MySQLServer' object has no attribute 'query_cache'` | tests/test_batch10.py:208 |
+| 9 | `assert False`（前一行打印"CHECK 未生效！"） | tests/test_batch13.py:269 |
+| 10 | `pymysql.err.ProgrammingError: (1064, "You have an error in your SQL syntax near '__SEMI_SYNC_REGISTER__ slave_test'")` | pymysql/err.py:154 |
+| 15 | `(1064, "… near 'GRANT SELECT, INSERT ON *.* TO 'bob''")` | pymysql/err.py:154 |
+| 16 | `(1819, "Your password does not satisfy the current policy requirements…密码长度至少 6 位")` | pymysql/err.py:154 |
+| 18 | `assert 0 >= 1`（`where [] = EnhancedLineageStore.edges`） | tests/test_v2_batch1.py:182 |
+| 19 | `assert 0 == 2` | tests/test_v2_batch4.py:432 |
+| 20 | `AssertionError: assert 'c.city_name' in ['u.id', 'u.name', 'u.city_id']` | tests/test_v2_batch4.py:167 |
+| 21 | `AssertionError: assert 3 == 2`（`where 3 = len([(1,'Alice',30),(2,'Bob',25),(3,'Carol',28)])`） | tests/test_v2_batch4.py:96 |
+| 22 | `assert False`（related_tables 输出为空） | tests/test_v2_batch5.py:86 |
+| 25 | `AttributeError: 'NoneType' object has no attribute 'snapshot_id'` | tests/test_v2_batch7.py:385 |
+| 28 | `AssertionError: assert 50000 == 16317` | tests/test_v3_batch2.py:235 |
+| 30 | `TypeError: 'NoneType' object is not subscriptable` | tests/test_v3_batch4.py:319 |
+| 32 | `TypeError: 'NoneType' object is not subscriptable` | lightdb/sql/parser_v3b4.py:110 |
+| 37 | `assert False`（`isinstance(DeltaEncoder(...), RLEEncoder)` 为 False） | tests/test_v4_batch4.py:105 |
+| 38 | `assert 499999500000 == 1783293664.0` | tests/test_v4_batch4.py:462 |
+| 39 | `assert 704982704.0 == 4999950000` | tests/test_v4_batch4.py:247 |
+
+裸 Python（不经 pytest、无沙箱依赖）实测片段（`_t2_evidence_out.txt`、`_t2_repro_*_out.txt`）：
+
+| 片段 | 实测输出 | 覆盖 |
+|---|---|---|
+| `BinaryRowFormat([INT,VARCHAR,DECIMAL]).encode([0,'u0',0.0])` | `TypeError: cannot convert 'float' object to bytes` | #1 |
+| `Parser().parse('ALTER TABLE t1 ADD COLUMN age INT')` / `parse('SET @@autocommit = 1')` | `(None, None)` | #2 #3 |
+| `CREATE TABLE products(price INT CHECK(price>0))` → `INSERT …(1,100,10)` → `INSERT …(2,-5,10)` → `Table.insert([3,-5,10])` | `create=ok`；SQL 合法 INSERT=ok；**SQL 非法 INSERT 也 = ok（行数 2）**；`Table.insert` 直写非法值**未拦截**（最终 3 行） | #9 |
+| `VectorizedAggregate(VectorizedScan(10 万行),'value','SUM').execute()` | `got=704982704.0 expect=4999950000` + `RuntimeWarning: overflow encountered in scalar add @ vectorized_engine.py:201` | #38 #39 |
+| `EncoderRegistry.select('INT',[100]*1000)` / `Dict 压缩率` | `('DeltaEncoder', 2.7766)` | #37 #4 |
+| `'query_cache' in dir(MySQLServer)` | `False` | #8 |
+| `ParserV3B4.parse_set("SET @@autocommit = 0")` | `None`（调用方随即下标 → TypeError） | #30 #32 |
+| `EXPLAIN SELECT * FROM users JOIN orders …` 的列名 | `['id','select_type','table','type','key','rows','Extra']`，行如 `(1,'SIMPLE','users','ALL',None,0,None)` | #13（见 §9.7） |
+
+### 9.5 B 类：判别证据与"何时变成真实缺陷"
+
+1. **`tests/test_batch9.py::test_cli_tool`（readline）**：用例子进程 stderr 原文 `File "lightdb\tools\cli.py", line …, in <module>\n    import readline` → `ModuleNotFoundError: No module named 'readline'`；裸 `python -c "import readline"` 同样失败。判别：不是沙箱限制，是 **CPython on Windows 从不提供 readline**。→ 在任何 Windows（含 CI）上都是必须修的移植性缺陷（顶层 import → try/except），在 Linux 上会自动通过。
+2. **`tests/test_v3_batch1.py::test_full_pipeline_dry_run`**：`PermissionError [Errno 13] 'C:\Users\Administrator\.lightdb_studio\reports\benchmark_dry_run_1791964126.md'`；裸 `open(该目录/…)` 同样 `errno=13, winerror=None`（非 32，排除占用）。判别：目标在工作区外，沙箱按设计拒绝。→ 若目标是只读 HOME（容器/CI），它变成真实缺陷：工具应尊重调用方 `--output-dir`（本用例已传 `--output-dir`）。
+3. **`tests/test_v3_batch5.py::test_dashboard_generation`**：`PermissionError [Errno 13] 'D:\lightdb_project\dashboards\lightdb_overview.json'`；裸 `open('dashboards/_t2_acl_probe.tmp','w')` 同样 `errno=13`（第 4 节已核：该目录无沙箱 SID `S-1-4-…` 的 ACE，根目录与 `data/` 有）。→ 补 ACL 后即可验证；若工具把输出目录写死在工作区内不可写位置，则在只读仓库挂载下是真实缺陷。
+
+### 9.6 C 类 flaky 清单（2 条，含 5 次序列与触发条件）
+
+| 测试 ID | 3 次全量 | 隔离序列 | 触发条件（已定位） | 建议处置 |
+|---|---|---|---|---|
+| tests/test_v2_batch6.py::test_federated_governance | `P F F` | 首轮 5 次 `F F F F F`；再补 10 次 `F F P F F P F F F F`（合计 2P/13F） | **系统时钟刻度竞态**：`Policy.policy_id = f"p_{int(now*1000)%1000000}"`（federated_gov.py:39），本机 `time.time()` 刻度 15.6ms；两次 `add_policy` 落在同一刻度即同 id，`self.policies[id]=p`（:133）把"禁止 DROP"策略覆盖掉。探针实测（同代码路径，`-s`）：`gap=0.000ms collided=True policies=1 allowed=True` 与 `gap=14.4/15.6ms collided=False policies=2 allowed=False` 交替出现。**与数据目录/执行顺序无关**（单跑与整文件连跑都失败，用例已用 `tempfile` + `finally` 还原）。 | 改 `policy_id` 生成为 uuid4/自增（正确性修复，P1）；断言本身正确，**不要改断言** |
+| tests/test_v3_batch2.py::test_row_format_performance | `P F P` | `F F P P P` | 纯墙钟对比：`assert bin_enc < json_enc`（`encode_many` vs `json.dumps`），无 warmup，两者同量级（run3：bin 23.27ms / json 17.80ms，隔离末次亦 23.27>17.80） | 移出功能门禁/标 benchmark，或 warmup + 取中位数 + 放宽为 `bin_enc < json_enc*1.3` |
+
+### 9.7 E 类（10 条）：错在哪、正确行为、建议断言
+
+| # | 测试 ID | 错在哪 | 引擎/MySQL 正确行为（依据） | 建议断言 |
+|---|---|---|---|---|
+| 11 | tests/test_batch3.py::test_er_relations | 失败断言由**测试内联循环**（164-176 行）产生：只匹配 `{表名}_id`，用例建的是 users/orders/payments、列是 `user_id`/`order_id`（单数），故 relations 恒空；引擎 ER 代码未参与 | 外键命名惯例是"单数表名_id"（orders.user_id→users），检测必须做单复数归一 | 循环里同时比较 `on.rstrip('s')+'_id'`，或直接改调引擎 ER 接口 |
+| 12 | tests/test_batch3.py::test_query_builder_sql | 断言 `'age > 20' in sql`，而生成串是 `` …WHERE `age` > 20 … ``（build_sql 就在用例内） | MySQL 用反引号引用标识符是合法且推荐的写法；生成的 SQL 本身正确 | ``assert "`age` > 20" in sql``（及 LIKE 那行同样把反引号写进断言） |
+| 13 | tests/test_batch6.py::test_explain_join | 把 `row[0]`（EXPLAIN 的 `id` 列，int）当文本计划树搜索 `'HashJoin'` → TypeError | MySQL 的 `EXPLAIN` 返回表格结果集（列 `id/select_type/table/type/key/rows/Extra`，本引擎实测列名一致）；连接算法信息在 `Extra`（MySQL 8.0.18+ 会写 `Using join buffer (hash join)`）或 `FORMAT=TREE` | `any('hash' in (row[6] or '').lower() for row in r['rows'])`，或实现并断言 `EXPLAIN FORMAT=TREE` |
+| 17 | tests/test_v2_batch1.py::test_catalog_basic | 断言 `salary=='confidential'` | 引擎常量表 `SENSITIVE_COL_PATTERNS` 自首次提交（a63b6a3）起就把 `salary` 与 `credit_card/bank_card` 同列 `restricted`（catalog.py:35-38），`_infer_sensitivity`（:184-190）按该表返回 restricted —— 断言与引擎既有行为矛盾 | 先定产品口径：若沿用引擎表则断言 `'restricted'`；若产品要求"机密"则改常量表（那就回到 A） |
+| 24 | tests/test_v2_batch6.py::test_react_agent | 测试桩 `FakeConn`（test_v2_batch6.py:12-57）实现了 query/get_columns/execute，**漏了 `get_tables`**；工具 `_tool_list_tables` 调 `conn.get_tables()`（agent_react.py:256）与项目 `DBConnection.get_tables`（lightdb_studio/db/connection.py:129）及全仓 20 处一致 → 工具返回 `{'error': …}`，断言 KeyError | 连接接口的既有契约包含 `get_tables()`；桩不完整属测试资产缺陷 | 给 `FakeConn` 加 `get_tables()`（返回 `list(self.tables)`） |
+| 27 | tests/test_v3_batch1.py::test_memory_analyzer_structure | 断言 `status=='stable'`，但样本 100→101.0→101.5MB/60s 即 **+1.5MB/min** | 引擎状态梯子（memory_analyzer.py:176-181）：`>5 → leak_suspected`、`>1 → watch`、否则 `stable`；+1.5MB/min 判 watch 是设计内正确输出（≈2.16GB/天） | 样本改平缓（100.0/100.05/100.1 ≈ +0.1MB/min）再断言 `stable`，或直接断言 `'watch'` |
+| 31 | tests/test_v3_batch4.py::test_registry | 断言 `total >= 150`；注册表实测 132，且"150"在仓库任何文档/源码里都无出处（`git log -S ">= 150"` 只指向首次快照；`grep` 全仓 150 均与函数数无关） | 断言把无来源的数字当门禁，测量本身正确（`reg.count()==132`） | 改为 `>= 132`（或按分类计数断言），或先补"150 函数"的产品目标再保留 |
+| 34 | tests/test_v4_batch1.py::test_decision_doc | 断言文档含 `Cython`；`docs/V4_DECISION.md` 现为 44 行，顶部写明"数据可信度声明"、末尾写明"原文档在此处截断，后续章节缺失"（有意截断以移除不可核实数据） | 这是**仓库既有（有意）状态**，不是引擎缺陷；断言未跟随该变更 | 断言存在性 + `数据可信度声明`；若要保留 `Cython/多进程` 检查，须先补回被截断章节 |
+| 35 | tests/test_v4_batch1.py::test_end_to_end_diagnosis | `NameError: name 'subprocess' is not defined` | 纯测试缺陷：`import subprocess` 只出现在 `test_diagnose_cli` 函数内部（第 247 行），对本用例不可见 | 文件顶层 `import subprocess` |
+| 36 | tests/test_v4_batch1.py::test_route_comparison | `[r for r in routes if '混合' in r.name][0]` → IndexError | 引擎路线名就是 `多进程+Cython（推荐）`（comparison.py:148，key=`hybrid`；只有模块 docstring 与报告结论用"混合方案"一词） | 用 key 匹配（`next(r for r in routes if r.name.startswith('多进程+Cython'))`） |
+
+### 9.8 与上一轮（§4/§8）的对比
+
+- 规模：§4 基线 73 → §8（teardown 修复后）68 → **本轮 39**（−29）。并集 39 条**全部**是 §4 基线里就存在的用例，**本轮无任何新增失败**（集合差为空）。
+- 已修复：相对 §4 基线修好 34 条；§8.4 登记的 19 条"新显形缺陷"中 **18 条已修**（备份恢复建表、SHOW MASTER/SLAVE STATUS、prepared_statement 前导空格、CHECK TABLE/OPTIMIZE、CREATE USER 弱口令假阳性、JSON 路径、SHOW ENGINE/AUDIT LOG、admin/dump `-h` 冲突、benchmark 结果键、CREATE FUNCTION、生成列、全文索引 API、分区元数据、并行统计等），仅 `test_batch9.py::test_cli_tool` 仍在失败（已改判 B 类，见 §9.5）。
+- 一直没动：39 条全部属于"每轮都失败"（A 24 / B 3 / C 2 / E 10）；其中 A 类 24 条是本轮真正待修的实现缺陷，E 类 10 条是此前从未识别的测试侧问题（§8 的 E 类为 0）。
+- 类别迁移（§8 → §9，逐项可对账）：A 61→**24**（净 −37 = 修好 29 条 − 10 条重新定性为 E − 1 条重新定性为 B + 3 条由 C 归入 A）；B 2→**3**（+`test_cli_tool`，按"仅因 Windows 缺 readline"重判）；C 5→**2**（`test_columnar::test_encoder_compression`、`test_olap_aggregate_performance`、`test_parallel_speedup` 隔离 5/5 全失败 → 移出 C 入 A；保留 2 条真抖动）；D 0→0；E 0→**10**（这 10 条在上轮都是 A 类用例，本轮按"断言/桩与引擎既有行为矛盾"重新定性）。
+- 上一轮点名的 3 类假阳性/契约错误（`test_union_all` 算术、严格 GROUP BY 旧契约、"函数体含 WHILE/游标必须报错"）**本轮均不再失败**，无新增同族问题；但发现了新的同族问题（§9.7 的 #11/#12/#13/#24/#27/#31/#34/#36）。
+
+### 9.9 建议下一步 top 5 与不该再投入的项
+
+1. `tests/test_v4_batch4.py::test_vectorized_aggregate`（连带 `test_performance_vs_python`）：SUM 溢出返回**错值**（704982704 ≠ 4999950000），错误结果会静默流给用户，正确性最高。
+2. `tests/test_batch13.py::test_check_constraint`：CHECK 完全不生效——SQL 路径与 `Table.insert` 直写都放行 `price=-5`，非法数据可入库，属数据完整性。
+3. `tests/test_v3_batch2.py::test_batch_executor`：向量化过滤把 16317 行变 50000 行（WHERE 在大批量路径失效），同属静默错值。
+4. `tests/test_v2_batch6.py::test_federated_governance`（C，根因 A）：`policy_id` 毫秒撞号导致治理策略被静默覆盖（连"禁止生产 DROP"都会消失）；改 uuid4 即可同时消除本轮唯一非计时类抖动。
+5. `tests/test_batch9.py::test_privilege_enforcement` + `test_batch9.py::test_grant_via_sql`：`_check_password_policy` 把 `IDENTIFIED BY ''` 误判为弱口令（与其自身文档矛盾），且修掉后仍会卡在未实现的 GRANT——两处一起修，权限链路才可验证。
+
+不该再投入的项：
+
+- 4 条纯计时/吞吐断言（#4 压缩率 2.78x>3、#6 11.7–16.7M>20M、#7 0.56–0.89x>1.5、#29 计时对比）：共享沙箱上无判别力；其中 #7 在 `ThreadPoolExecutor`+GIL 架构下**不可能**达标（`lightdb/parallel/executor.py:50`），只应改架构或移出门禁，不要再调阈值。
+- 11 条 skip（`conftest.py` 多进程探测，WinError 5）：本机不可验证，不要改成 fail、不要删探测。
+- 2 条沙箱写权限（#26 HOME、#33 `dashboards/`）：不要在用例里绕过沙箱，走 ACL 或让工具尊重 `--output-dir`。
+- E 类 10 条（#11/12/13/17/24/27/31/34/35/36）是**测试侧**低成本清理，应尽快做以恢复信号；但其中 #13/#17 要先定口径，不要为了通过而扭曲引擎语义。
+- 不要为凑 #31 的 150 而堆函数，也不要为过 #34 把已移除的不可核实数据写回文档。
