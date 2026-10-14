@@ -705,6 +705,7 @@ def restore_dump(db, dump_file: str = None, content: str = None,
 
     ok = fail = 0
     errors = []
+    restored_rows = {}
     for ds in plan.statements:
         if ds.comment:
             continue
@@ -727,6 +728,25 @@ def restore_dump(db, dump_file: str = None, content: str = None,
                 f":: {ds.sql[:120]}")
         else:
             ok += 1
+            if parsed and parsed.get('command') == 'INSERT':
+                tname = parsed.get('table')
+                # 逐表累计"真正执行成功的 INSERT 行数"，与 dump 的行数哨兵
+                # 对账。原 bug 的形态正是"10 条 INSERT 全失败 → 返回
+                # (ok=0, fail=10) → 调用方只用 ok/fail 判断 → 数据库其实是
+                # 空的"。这里把对账做成恢复流程的**一部分**（不依赖
+                # `verify`，也不需要调用方多写一步）。
+                restored_rows[tname] = (
+                    restored_rows.get(tname, 0) + len(parsed.get('values') or []))
+
+    # 行数对账：dump 声明的行数（`-- lightdb:rows`，备份端真实扫描值）
+    # 与本次成功写入的行数必须逐表一致
+    for name, want in plan.expected_rows.items():
+        got = restored_rows.get(name, 0)
+        if got != want:
+            fail += 1
+            errors.append(
+                f"表 {name}: 成功写入 {got} 行 != dump 声明 {want} 行"
+                f"（{'缺少 INSERT 或部分语句失败' if got < want else '行数多出'}）")
 
     report = None
     if fail == 0 and verify:

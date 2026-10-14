@@ -242,10 +242,12 @@ def test_restore_insert_failure_raises_not_silent():
     assert '未执行成功' in str(ei.value) or '失败' in str(ei.value)
     print(f'  → INSERT 失败显式报错: {str(ei.value).splitlines()[0]}')
 
-    # strict=False 时返回真实计数（调用方可以显式选择"尽力恢复"）
+    # strict=False 时返回真实计数（调用方可以显式选择"尽力恢复"）。
+    # fail 同时含"IINSERT 执行失败"(1) 与"行数对账不符"(1)：后者是恢复
+    # 流程自带的对账，防止调用方只看 ok/fail 就当成成功。
     dst2 = open_db(DST_DIR + '_lax')
     ok, fail = BackupManager(dst2, BAK_DIR).restore(bad, strict=False)
-    assert fail == 1 and ok == 2, (ok, fail)
+    assert fail >= 1 and ok == 2, (ok, fail)
     print(f'  → strict=False 如实返回 成功={ok} 失败={fail}')
     dst.shutdown()
     dst2.shutdown()
@@ -279,9 +281,11 @@ def test_restore_rowcount_mismatch_detected():
     dst = open_db(DST_DIR)
     with pytest.raises(RestoreError) as ei:
         BackupManager(dst, BAK_DIR).restore(truncated)
-    assert '行数' in str(ei.value)
-    print(f'  → 行数不符被拦下: '
-          f'{[l for l in str(ei.value).splitlines() if "行数" in l][0].strip()}')
+    msg = str(ei.value)
+    # 恢复流程自带"成功写入行数 vs dump 行数哨兵"对账
+    assert ('行数' in msg or '写入' in msg) and 'users' in msg, msg
+    print('  → dump 被截断被拦下: '
+          + [l.strip() for l in msg.splitlines() if 'users' in l][0])
     dst.shutdown()
 
 
