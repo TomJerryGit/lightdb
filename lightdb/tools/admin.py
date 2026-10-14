@@ -9,7 +9,11 @@ import time
 
 
 def main():
-    ap = argparse.ArgumentParser(description='LightDB Admin')
+    # add_help=False：`-h` 让给 `--host`（mysql 客户端习惯），否则 argparse
+    # 直接抛 `ArgumentError: -h/--host conflicting option string: -h`，
+    # 工具一启动就退出（tests/test_batch9.py::test_admin_tool 踩的就是这个）
+    ap = argparse.ArgumentParser(description='LightDB Admin', add_help=False)
+    ap.add_argument('--help', action='help', help='显示帮助并退出')
     ap.add_argument('-h', '--host', default='127.0.0.1', dest='host')
     ap.add_argument('-P', '--port', type=int, default=8888)
     ap.add_argument('-u', '--user', default='root')

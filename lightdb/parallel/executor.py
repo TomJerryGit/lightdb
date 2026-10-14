@@ -10,11 +10,31 @@ from concurrent.futures import (
     ThreadPoolExecutor, as_completed)
 from typing import Any, Callable, Dict, List, Optional
 
+from ..logger import logger
 from .fragment import (
     Fragment, FragmentResult, FragmentSplitter)
 from .adaptive import AdaptiveParallelism
 from .work_stealing import WorkStealingScheduler
 from .merge import ResultMerger
+
+
+def _required_columns(group_cols, aggs) -> List[str]:
+    """分片真正需要读的列
+
+    `COUNT(*)` 的 `column` 是 `'*'`（**不是**列名）。原实现直接把它塞进
+    `scan_range` 的列清单，于是取回一个空的 `data['*']`，随后
+    `data[col][i]` 抛 `list index out of range`；异常又被
+    `parallel_group_by` 的 `except Exception: pass` 吞掉，partials 为空，
+    最终返回 0 组（`tests/test_v4_batch5.py::test_parallel_group_by`
+    的 `assert 0 == 100`）。这里把 `'*'` 与空列名剔掉。
+    """
+    cols = []
+    for c in list(group_cols or []) + [a.get('column') for a in aggs or []]:
+        if not c or c == '*':
+            continue
+        if c not in cols:
+            cols.append(c)
+    return cols
 
 
 class ParallelExecutor:
@@ -293,14 +313,27 @@ class ParallelExecutor:
         for future in as_completed(futures):
             try:
                 partials.append(future.result())
-            except Exception:
-                pass
+            except Exception as e:
+                # 绝不静默：分片失败会让结果**少行**（或全空），而调用方
+                # 只会看到"0 组"这种看起来合法的返回值。至少留下日志。
+                logger.warn(f"并行分组分片失败: {e}")
+
+        bad = [r for r in partials if getattr(r, 'error', '')]
+        for r in bad:
+            logger.warn(f"并行分组分片 {r.fragment_id} 失败: {r.error}")
+        good = [r for r in partials if not getattr(r, 'error', '')]
+        if fragments and not good:
+            # 全部分片都失败 → 退回串行，结果正确优先于并行度
+            logger.warn("并行分组全部分片失败，回退串行执行")
+            with self.lock:
+                self.stats['serial_queries'] += 1
+            return self._serial_group_by(column_store, group_cols, aggs)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        # 3. 合并
+        # 3. 合并（只用成功的分片；失败分片在上面已经记录）
         merged = ResultMerger.merge_group_bys(
-            partials, group_cols, aggs)
+            good, group_cols, aggs)
 
         with self.lock:
             self.stats['fragments_executed'] += len(fragments)
@@ -315,9 +348,8 @@ class ParallelExecutor:
         result = FragmentResult(frag.fragment_id)
 
         try:
-            # 读取需要的列
-            needed = list(set(group_cols + [
-                a['column'] for a in aggs if a.get('column')]))
+            # 读取需要的列（`COUNT(*)` 的 '*' 不是列名，必须剔除）
+            needed = _required_columns(group_cols, aggs)
             data = column_store.scan_range(
                 needed, frag.offset, frag.offset + frag.limit)
 
@@ -343,14 +375,19 @@ class ParallelExecutor:
                 # 累加聚合
                 for a in aggs:
                     col = a.get('column')
+                    func = a['func']
+                    alias = a['alias']
+
+                    if func == 'COUNT' and (col is None or col == '*'):
+                        # COUNT(*) / COUNT()，按行计数：原实现直接
+                        # `continue`，于是 COUNT 恒为 0
+                        groups[key][alias] += 1
+                        continue
                     if col is None or col not in data:
                         continue
                     v = data[col][i]
                     if v is None:
                         continue
-
-                    alias = a['alias']
-                    func = a['func']
 
                     if func == 'COUNT':
                         groups[key][alias] += 1

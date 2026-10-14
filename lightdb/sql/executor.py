@@ -299,6 +299,25 @@ class Executor:
         # ★ 事件调度器（可选）
         self._event_scheduler = None
 
+        # ★ 并行执行器（`tests/test_batch14.py::test_parallel_count` 读
+        # `Executor.parallel`，原实现没有该属性 → AttributeError）。
+        # 它接的是**真的** `lightdb.parallel.executor.ParallelExecutor`：
+        # 列式分片聚合/扫描（柱存 `ColumnStore` 与 `TableColumnView`
+        # 适配的存储表都能跑）。当前被真正使用的入口见
+        # `_is_plain_count` / `_parallel_count`（单表裸 COUNT 走并行分片，
+        # 行数 ≥ `parallel_min_rows` 才启用）；其余 SQL 仍走串行路径，
+        # 因为本引擎的查询路径（JOIN/子查询/表达式投影/WHERE 下推）没有
+        # 做成可交换的分片算子，硬接会改变结果语义。
+        #
+        # `parallel` 是**惰性属性**（`_parallel` 为 None 时才建）：
+        # 普通串行查询不应该平白多出一个线程池（全量测试里每个用例都建
+        # Executor，提前建池会放大资源压力、让计时类断言更容易抖动）。
+        # 构造 `ThreadPoolExecutor` 本身不建线程，线程在第一次 submit 才起。
+        # 受限环境（沙箱禁命名管道等）里构造失败 → 置 None，并行入口自动
+        # 退回串行。
+        self.parallel_enabled = True
+        self._parallel = None
+
     # ==================== 主入口 ====================
 
     # ★ GROUP BY 严格模式开关（逃生口，与 MySQL 的 ONLY_FULL_GROUP_BY 等价）
@@ -457,12 +476,23 @@ class Executor:
     def _cmd_create_table(self, p, s):
         # 分区描述要真正落到表对象上（Table._partition），否则
         # SHOW PARTITIONS / 分区裁剪都读不到（原实现把解析结果丢掉了）
+        if p.get('if_not_exists') and p['table'] in self.db.tables:
+            # `CREATE TABLE IF NOT EXISTS`：MySQL 语义下"已存在"是成功且
+            # 不改动原表。原实现把解析出来的标志丢掉，于是同一份逻辑备份
+            # 无法重复恢复（第二次恢复的第一步就报 1062）。
+            return self._ok(
+                message=f"Table '{p['table']}' already exists")
         self.db.create_table(p['table'], p['columns'],
                              partition=p.get('partition'))
         return self._ok(
             message=f"Table '{p['table']}' created")
 
     def _cmd_drop_table(self, p, s):
+        if p.get('if_exists') and p['table'] not in self.db.tables:
+            # `DROP TABLE IF EXISTS`：不存在也算成功（否则恢复脚本里的
+            # 清理语句在全新数据目录上必然失败）
+            return self._ok(
+                message=f"Unknown table '{p['table']}'")
         self.db.drop_table(p['table'])
         return self._ok(
             message=f"Table '{p['table']}' dropped")
@@ -500,15 +530,32 @@ class Executor:
                 c['name']: i
                 for i, c in enumerate(tbl.cols)
             }
+            unknown = [c for c in p['columns'] if c not in col_map]
+            if unknown:
+                # 原实现把不存在的列名静默丢掉（`row[col_map[cn]]` 用 `if
+                # cn in col_map` 守着），于是 `INSERT INTO t (nope) VALUES (1)`
+                # 变成"插入一行全 NULL"，恢复/导入时这就是静默丢数据。
+                return self._err(1054, f"未知列: {', '.join(unknown)}")
             expanded = []
             for v in values_list:
+                if len(v) != len(p['columns']):
+                    return self._err(
+                        1136, f"列数不匹配: 语句给了 {len(v)} 个值，"
+                              f"列清单有 {len(p['columns'])} 列")
                 row = [None] * len(tbl.cols)
                 for i, cn in enumerate(p['columns']):
-                    if cn in col_map:
-                        row[col_map[cn]] = (
-                            v[i] if i < len(v) else None)
+                    row[col_map[cn]] = v[i]
                 expanded.append(row)
             values_list = expanded
+        else:
+            # 没有列清单 → 值个数必须与列数**严格相等**。原实现放任不管，
+            # `VALUES (1,2,3,4,5)` 插进两列的表里也能"成功"（多出来的值
+            # 被 `_insert_locked` 补/截掉），调用方拿到的 affected=1 是假的。
+            for v in values_list:
+                if len(v) != len(tbl.cols):
+                    return self._err(
+                        1136, f"列数不匹配: 表 {tbl.name} 有 "
+                              f"{len(tbl.cols)} 列，VALUES 给了 {len(v)} 个值")
 
         n = 0
         # 必须把事务号传下去：原实现无条件走 txn_id=0（autocommit），
@@ -738,6 +785,18 @@ class Executor:
                 or expr_pred or col_rhs or order_expr or aliased):
             return self._select_advanced(
                 p, tbl, read_view=rv, where=where, session=s)
+        # 单表纯 COUNT(*) / COUNT(列)（无 WHERE、无 GROUP BY、无修饰）：
+        # 交给真正的并行聚合 —— 按主键范围分片、多线程扫描、再合并局部计数。
+        # 放在 `tbl.select()` **之前**，避免既算了投影又算一遍计数。
+        # 这是唯一一个能安全地按行分片的聚合（COUNT 与行顺序、分片集合无关：
+        # SUM 若按主键范围切分也安全，但需要把存储层行解码搬进线程，
+        # 收益不明，故不在此处扩展）。
+        if self._is_plain_count(p, where):
+            fast = self._parallel_count(tbl, str((p.get('columns') or [''])[0]))
+            if fast is not None:
+                # 结果集形状与 `_rs` 一致：行是序列（这里是一元组）
+                return self._rs([str(c) for c in p['columns']], [(fast,)])
+
         cols, rows = tbl.select(
             p['columns'], where,
             # 存储层只认单键 `(列, desc)`；走到这里时 `_order_by_needs_eval`
@@ -752,7 +811,81 @@ class Executor:
             rows = rows[off:]
             if p.get('limit') is not None:
                 rows = rows[:int(p['limit'])]
+
         return self._rs(cols, rows)
+
+    # ==================== 并行 COUNT ====================
+
+    #: 低于该行数不做并行 COUNT（分片/线程开销大于收益）
+    parallel_min_rows = 2000
+
+    @property
+    def parallel(self):
+        """并行执行器（惰性创建；不可用时为 None）
+
+        `tests/test_batch14.py::test_parallel_count` 直接读 `ex.parallel`，
+        因此这里返回的是**真的** `ParallelExecutor`（`parallel_group_by` /
+        `parallel_scan` / `parallel_aggregate` 都能在真实数据上跑），
+        不是统计桩。它只被 `_parallel_count` 用于单表裸 COUNT 的分片并行。
+        """
+        if self._parallel is None and self.parallel_enabled:
+            try:
+                from ..parallel.executor import ParallelExecutor
+                self._parallel = ParallelExecutor()
+            except Exception as e:               # pragma: no cover
+                logger.warn(f"初始化并行执行器失败（回退串行）: {e}")
+                self.parallel_enabled = False
+        return self._parallel
+
+    def _is_plain_count(self, p, where) -> bool:
+        """该查询是否是"单表裸 COUNT"（能安全交给并行分片聚合的形态）
+
+        要求：无 WHERE（分片聚合不认条件下推）、无 GROUP BY/HAVING/DISTINCT/
+        窗口/ORDER BY/LIMIT/OFFSET（都会改变结果语义）、投影只有一个项且
+        形如 `COUNT(*)` 或 `COUNT(列)`（`COUNT(DISTINCT x)`、`COUNT(x)+1`
+        一律退回既有路径）。
+        """
+        if not self.parallel_enabled:
+            return False
+        if where or p.get('group_by') or p.get('having') or p.get('distinct'):
+            return False
+        if p.get('windows') or p.get('order_by') or p.get('limit') is not None:
+            return False
+        if p.get('offset'):
+            return False
+        cols = p.get('columns') or []
+        if len(cols) != 1:
+            return False
+        col = self._split_alias(str(cols[0]))[0].strip()
+        return bool(re.fullmatch(r'COUNT\s*\(\s*(\*|[A-Za-z_]\w*)\s*\)',
+                                 col, re.IGNORECASE))
+
+    def _parallel_count(self, tbl, projection: str):
+        """用 `ParallelExecutor` 真做一次并行 COUNT；不适用时返回 None
+
+        `COUNT(*)` → 直接数分片行数（不读任何列）；`COUNT(col)` → 只读那一列。
+        任何异常/不适用都返回 None，由调用方走既有串行路径（结果正确优先）。
+        """
+        n = getattr(tbl, 'row_count', 0)
+        if self.parallel is None or n < self.parallel_min_rows:
+            return None
+        m = re.fullmatch(r'COUNT\s*\(\s*(\*|[A-Za-z_]\w*)\s*\)',
+                         self._split_alias(projection)[0].strip(),
+                         re.IGNORECASE)
+        if not m:
+            return None
+        col = '*' if m.group(1) == '*' else m.group(1)
+        if col != '*' and col not in [c['name'] for c in tbl.cols]:
+            return None
+        try:
+            from ..parallel.table_view import TableColumnView
+            workers = max(2, self.parallel.adaptive.decide(
+                n, is_expensive=True))
+            return self.parallel.parallel_aggregate(
+                TableColumnView(tbl), col, 'COUNT', workers=workers)
+        except Exception as e:                      # noqa: BLE001
+            logger.warn(f"并行 COUNT 失败，退回串行: {e}")
+            return None
 
     # ==================== 子查询条件求值（WHERE） ====================
 
@@ -5987,14 +6120,25 @@ class Executor:
             logger.warn(f"事件调度器启动失败: {e}")
 
     def stop_event_scheduler(self):
-        """停止事件调度器"""
-        if self._event_scheduler is None:
-            return
-        try:
-            self._event_scheduler.stop()
-        except Exception:
-            pass
-        self._event_scheduler = None
+        """停止事件调度器（以及并行执行器的线程池）
+
+        `tests/conftest.py` 的 `shutdown_quietly` 对 Executor 调用的就是这个
+        方法，因此并行线程池也必须在**失败路径**上被关掉，否则工作线程会
+        活到会话结束、持有 BufferPool 句柄，下一个用例的 `reset()` 就撞
+        winerror=32（docs/FAILURE_TRIAGE.md 第 4 节记录的级联形态）。
+        """
+        if self._event_scheduler is not None:
+            try:
+                self._event_scheduler.stop()
+            except Exception:
+                pass
+            self._event_scheduler = None
+        if self._parallel is not None:
+            try:
+                self._parallel.shutdown()
+            except Exception:
+                pass
+            self._parallel = None
 
     # ==================== 统计 ====================
 

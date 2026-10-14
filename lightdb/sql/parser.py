@@ -1480,6 +1480,11 @@ class Parser:
             'columns': cols,
             'checks': constraints,
             'partition': partition,
+            # `CREATE TABLE IF NOT EXISTS` 原实现被正则吃掉后丢掉：执行器
+            # 于是"表已存在就报错"，同一份 dump 无法重复恢复。此处如实
+            # 回传，由执行器决定幂等语义。
+            'if_not_exists': bool(re.match(
+                r'CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b', sql, re.IGNORECASE)),
         }
 
     def _parse_check(self, s: str):
@@ -1616,29 +1621,123 @@ class Parser:
             sql, re.IGNORECASE)
         if not m:
             raise SyntaxError("DROP TABLE 语法错误")
-        return {'command': 'DROP TABLE', 'table': m.group(1)}
+        return {'command': 'DROP TABLE', 'table': m.group(1),
+                # 同上：`IF EXISTS` 的"表不存在也算成功"语义要一路传到执行器
+                'if_exists': bool(re.match(
+                    r'DROP\s+TABLE\s+IF\s+EXISTS\b', sql, re.IGNORECASE))}
 
     # ==================== DML ====================
 
+    # `INSERT ... VALUES` 里 VALUES 关键字（后面必须跟一个 `(`，避免
+    # 把 `INSERT INTO t SELECT ...` 或列名里的 "values" 误判）
+    _INSERT_VALUES_RE = re.compile(r'\bVALUES\s*\(', re.IGNORECASE)
+    _ON_DUP_RE = re.compile(
+        r'\s*ON\s+DUPLICATE\s+KEY\s+UPDATE\b', re.IGNORECASE)
+
+    @staticmethod
+    def _read_paren_rows(sql: str, i: int):
+        """从 `sql[i] == '('` 开始，读出若干顶层分组 `(a, b), (c, d)`
+
+        返回 (行文本列表, 结束下标)。这是 `_insert` 的底层扫描器：
+        - **引号内的 `)` 不算分组结束**（`'x)y'`）；
+        - **引号可以跨行**（dump 里的 VARCHAR 真含换行）；
+        - 引号规则同 MySQL：`''` 是转义的单引号、`""` 是转义的双引号，
+          反引号整体包住标识符（`'it''s)'` 只结束一次）。
+        原实现用 `re.finditer(r'\\(([^)]*)\\)', ...)`，任何一个 `)` 都会
+        截断行、并且会跨分组匹配，于是 `'x)y'` 被存成 `'x'`——静默的数据
+        损坏。恢复路径绝对不能容忍这种截断。
+        """
+        rows = []
+        n = len(sql)
+        while i < n and sql[i] == '(':
+            start = i + 1
+            depth = 1
+            i += 1
+            while i < n:
+                ch = sql[i]
+                if ch in ("'", '"', '`'):
+                    q = ch
+                    if q == '`':
+                        i += 1
+                        while i < n and sql[i] != '`':
+                            i += 1
+                        i += 1
+                        continue
+                    i += 1
+                    while i < n:
+                        if sql[i] == q:
+                            if i + 1 < n and sql[i + 1] == q:
+                                i += 2          # '' / "" 表示一个字面引号
+                                continue
+                            i += 1
+                            break
+                        i += 1
+                    continue
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        rows.append(sql[start:i])
+                        i += 1
+                        break
+                i += 1
+            else:
+                raise SyntaxError("INSERT 的括号不匹配")
+            # 跳过 `, ` / 空白
+            while i < n and sql[i] in ' \t\r\n':
+                i += 1
+            if i < n and sql[i] == ',':
+                i += 1
+                while i < n and sql[i] in ' \t\r\n':
+                    i += 1
+                if i >= n or sql[i] != '(':
+                    raise SyntaxError("INSERT 的 VALUES 列表在逗号后缺少 '('")
+                continue
+            break
+        if not rows:
+            raise SyntaxError("INSERT 的 VALUES 列表为空")
+        return rows, i
+
     def _insert(self, sql: str) -> Dict:
-        m = re.match(
-            r'INSERT\s+INTO\s+[`"]?(\w+)[`"]?\s*(?:\(([^)]+)\))?\s+VALUES\s+(.+)',
-            sql, re.IGNORECASE | re.DOTALL)
-        if not m:
+        head = re.match(
+            r'INSERT\s+INTO\s+(?:[`"]?(\w+)[`"]?\.)?[`"]?(\w+)[`"]?',
+            sql, re.IGNORECASE)
+        if not head:
             raise SyntaxError("INSERT 语法错误")
+        table = head.group(2) or head.group(1)
 
-        table = m.group(1)
         cols = None
-        if m.group(2):
-            cols = [
-                c.strip().strip('`"')
-                for c in m.group(2).split(',')
-            ]
+        pos = head.end()             # 列清单结束位置（绝对下标）
+        m = re.match(r'\s*\(([^)]*)\)', sql[pos:])
+        if m:                        # 显式列清单：`INSERT INTO t (a, b) VALUES ...`
+            cols = [c.strip().strip('`"') for c in m.group(1).split(',')
+                    if c.strip()]
+            pos += m.end()
 
-        values = []
-        for vm in re.finditer(r'\(([^)]*)\)', m.group(3)):
-            values.append(self._value_row(vm.group(1)))
+        vm = self._INSERT_VALUES_RE.search(sql, pos)
+        if not vm:
+            raise SyntaxError("INSERT 语法错误（只支持 VALUES 形式）")
+        if sql[pos:vm.start()].strip():
+            raise SyntaxError(
+                f"INSERT 在表名（或列清单）与 VALUES 之间有多余内容: "
+                f"{sql[pos:vm.start()].strip()[:40]!r}")
 
+        # `vm.group(0)` 形如 `VALUES (`：定位那个真正的 '('
+        open_idx = vm.end() - 1
+        rows_text, end = self._read_paren_rows(sql, open_idx)
+
+        # 尾部只允许 `ON DUPLICATE KEY UPDATE ...`（恢复路径不会生成，
+        # 但客户端会；就地忽略，语义与本引擎"主键重复即报错"一致）
+        tail = sql[end:].strip()
+        if tail:
+            od = self._ON_DUP_RE.match(tail)
+            if not od:
+                raise SyntaxError(
+                    f"INSERT 尾部有多余内容: {tail[:40]!r}（只支持 "
+                    f"ON DUPLICATE KEY UPDATE）")
+
+        values = [self._value_row(t) for t in rows_text]
         return {
             'command': 'INSERT',
             'table': table,
@@ -1646,36 +1745,100 @@ class Parser:
             'values': values,
         }
 
-    def _value_row(self, s: str) -> List:
-        values, current, in_str = [], '', None
-        for ch in s:
-            if in_str:
-                if ch == in_str:
-                    in_str = None
-                    values.append(current)
-                    current = ''
-                else:
-                    current += ch
-            elif ch in ("'", '"'):
-                # 丢掉引号**前**的空白：`VALUES (1, 'hi')` 里的空格属于 SQL
-                # 语法、不属于字面量。原实现把它留在 current 里，于是
-                # 'hi' 被存成 ' hi'（实测 test_batch9::test_prepared_statement
-                # 的「多一个前导空格」就是这个根因），UPPER() 之类函数也会
-                # 跟着算错。
-                current = current.strip()
-                in_str = ch
-            elif ch == ',':
-                if current.strip():
-                    values.append(current.strip())
-                current = ''
-            else:
-                current += ch
-        if current.strip():
-            values.append(current.strip())
+    @staticmethod
+    def _unquote_literal(tok: str):
+        """把 `_value_row` 产出的 token 还原成 Python 值
 
-        return [
-            None if v.upper() == 'NULL' else v for v in values
-        ]
+        - 带引号 → 字符串（去掉引号、`''` → `'`）
+        - 不带引号 → 原样返回，交由列类型 `coerce` 决定（`42` / `3.5` /
+          `NULL`）
+
+        **反斜杠按字面保留**（SQLite / MySQL `NO_BACKSLASH_ESCAPES` 语义），
+        唯一转义是成对引号。这样"含一个反斜杠的字符串"dump 出去、
+        恢复回来仍是同一个值（否则备份/恢复会把 `C:\\tmp` 变成 `C:tmp`）。
+        必须是引号敏感、而不是"含字母就当字符串"：dump 恢复依赖它把
+        `'123'` 存成字符串而不是被 `int()` 掉。
+        """
+        if tok is None or not isinstance(tok, str):
+            return tok
+        if len(tok) >= 2 and tok[0] in ("'", '"') and tok[-1] == tok[0]:
+            q = tok[0]
+            body = tok[1:-1]
+            if q == '"':
+                return body.replace('""', '"')
+            return body.replace("''", "'")
+        return tok
+
+    def _value_row(self, s: str) -> List:
+        """把一个 VALUES 分组解析成值列表（引号内的逗号/空白不参与切分）
+
+        原实现有两个正确性缺陷（都会静默改数据）：
+        1. `''` 只被当成"空串"，`'it''s'` 被拆成 `it` 和 `s`；
+        2. 引号前的空白靠 `strip()` 处理，`' a '` 这类**值本身带空格**的
+           字符串会被削掉。
+        现在的规则：引号内的字符逐字保留（只做 `''` 反转义，反斜杠按字面
+        保留），引号外的 token 去首尾空白，`NULL` → None。类型转换交给
+        `coerce`（按列类型）而不是在这里猜。
+        """
+        values = []
+        cur = ''                 # 当前 token 的原文
+        quoted = False           # 当前 token 是否以引号字面量开头
+        i = 0
+        n = len(s)
+
+        def flush():
+            nonlocal cur, quoted
+            if quoted:
+                values.append(cur)
+            else:
+                t = cur.strip()
+                if t:
+                    values.append(None if t.upper() == 'NULL' else t)
+                elif cur:
+                    # 纯空白 token：SQL 里 `(1, , 3)` 是错误，但要显式报错
+                    # 而不是静默当成"少一列"
+                    raise SyntaxError("VALUES 里有空的取值")
+            cur = ''
+            quoted = False
+
+        while i < n:
+            ch = s[i]
+            if ch in ("'", '"') and not quoted:
+                # 引号前的 SQL 空白不属于字面量：丢掉
+                if not cur.strip():
+                    cur = ''
+                q = ch
+                cur += ch
+                quoted = True
+                i += 1
+                while i < n:
+                    cur += s[i]
+                    if s[i] == q:
+                        if i + 1 < n and s[i + 1] == q:
+                            cur += s[i + 1]      # '' / "" = 一个字面引号
+                            i += 2
+                            continue
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == ',':
+                flush()
+                i += 1
+                continue
+            cur += ch
+            i += 1
+        flush()
+
+        out = []
+        for v in values:
+            if v is None:
+                out.append(None)
+            elif isinstance(v, str) and v[:1] in ("'", '"'):
+                out.append(self._unquote_literal(v))
+            else:
+                out.append(v)
+        return out
 
     def _update(self, sql: str) -> Dict:
         m = re.match(

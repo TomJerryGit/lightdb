@@ -26,12 +26,19 @@ class BenchmarkRunner:
         except Exception:
             pass
 
-        results['insert_batch'] = self.bench_batch_insert(table, n_rows)
+        # 键名与 `bench_batch_insert()` 返回的 `name` 字段对齐：原来 run_all
+        # 用 `insert_batch` 而用例/命令行按 `batch_insert` 取，直接
+        # `KeyError: 'batch_insert'`（tests/test_batch15.py::test_benchmark）。
+        # 旧键名保留为同一对象的别名，`format_results` 跳过别名不再重复打印。
+        batch = self.bench_batch_insert(table, n_rows)
+        results['batch_insert'] = batch
+        results['insert_batch'] = batch
         results['point_select'] = self.bench_point_select(table, n_rows)
         results['range_scan'] = self.bench_range_scan(table)
         results['full_count'] = self.bench_full_count(table)
         results['concurrent_select'] = self.bench_concurrent(table, n_rows)
 
+        self.results = results
         return results
 
     def _setup(self, table, n):
@@ -178,9 +185,14 @@ class BenchmarkRunner:
         }
 
 
+_ALIAS_KEYS = {'insert_batch': 'batch_insert'}
+
+
 def format_results(results: dict) -> str:
     lines = ["=" * 60, "  Benchmark Results", "=" * 60]
     for k, v in results.items():
+        if k in _ALIAS_KEYS:
+            continue          # 别名（同一对象），不重复打印
         lines.append(f"\n[{k}]")
         for fk, fv in v.items():
             if fk == 'name':
