@@ -7,13 +7,18 @@ import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree
+except ImportError:                       # 直接 python tests/test_batch10.py
+    from conftest import safe_rmtree
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b10')
 PORT = 8899
 
 
 def reset():
     if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
+        safe_rmtree(DATA_DIR)
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -143,7 +148,7 @@ def test_batch_insert_performance():
 
     db.shutdown()
     db2.shutdown()
-    shutil.rmtree(DATA_DIR + '_b', ignore_errors=True)
+    safe_rmtree(DATA_DIR + '_b')
 
 
 def test_concurrent_load():

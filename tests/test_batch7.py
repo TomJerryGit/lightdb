@@ -5,12 +5,17 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree
+except ImportError:                       # 直接 python tests/test_batch7.py
+    from conftest import safe_rmtree
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b7')
 
 
 def reset():
     if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
+        safe_rmtree(DATA_DIR)
     os.makedirs(DATA_DIR, exist_ok=True)
 
 

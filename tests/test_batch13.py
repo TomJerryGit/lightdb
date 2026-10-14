@@ -5,12 +5,17 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree, track
+except ImportError:                       # 直接 python tests/test_batch13.py
+    from conftest import safe_rmtree, track
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b13')
 
 
 def reset():
     if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
+        safe_rmtree(DATA_DIR)
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -53,7 +58,7 @@ def test_json_in_table():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     ex = Executor(db)
 
     db.create_table('docs', [
@@ -86,7 +91,7 @@ def test_fulltext():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     ex = Executor(db)
 
     db.create_table('articles', [
@@ -134,7 +139,7 @@ def test_partition_hash():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     ex = Executor(db)
 
     sql = "CREATE TABLE logs (id INT PRIMARY KEY, msg VARCHAR) PARTITION BY HASH(id) PARTITIONS 4"
@@ -170,7 +175,7 @@ def test_partition_range():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     ex = Executor(db)
 
     sql = ("CREATE TABLE sales (id INT PRIMARY KEY, amount INT) "
@@ -204,7 +209,7 @@ def test_generated_column():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     ex = Executor(db)
 
     sql = ("CREATE TABLE users ("
@@ -241,7 +246,7 @@ def test_check_constraint():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     ex = Executor(db)
 
     sql = ("CREATE TABLE products ("
@@ -276,7 +281,7 @@ def test_json_with_fulltext():
     from lightdb.sql.parser import parser
     from lightdb.sql.executor import Executor
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     ex = Executor(db)
 
     db.create_table('blog', [

@@ -7,6 +7,11 @@ import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree, track
+except ImportError:                       # 直接 python tests/test_batch8.py
+    from conftest import safe_rmtree, track
+
 MASTER_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b8_master')
 SLAVE_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b8_slave')
 BACKUP_DIR = os.path.join(os.path.dirname(__file__), '..', 'backups_b8')
@@ -17,7 +22,7 @@ MASTER_PORT = 8891
 def reset():
     for d in (MASTER_DIR, SLAVE_DIR, BACKUP_DIR):
         if os.path.exists(d):
-            shutil.rmtree(d)
+            safe_rmtree(d)
         os.makedirs(d, exist_ok=True)
 
 
@@ -35,7 +40,7 @@ def test_binlog():
     reset()
     from lightdb.db.database import Database
 
-    db = Database(MASTER_DIR)
+    db = track(Database(MASTER_DIR))
     create_schema(db)
     tbl = db.get_table('users')
 
@@ -64,7 +69,7 @@ def test_logical_backup():
     from lightdb.backup.backup import BackupManager
 
     # 写数据
-    db = Database(MASTER_DIR)
+    db = track(Database(MASTER_DIR))
     create_schema(db)
     tbl = db.get_table('users')
     for i in range(10):
@@ -72,7 +77,7 @@ def test_logical_backup():
     db.shutdown()
 
     # 备份
-    db = Database(MASTER_DIR)
+    db = track(Database(MASTER_DIR))
     bm = BackupManager(db, BACKUP_DIR)
     dump_file = bm.dump()
     print(f"  → 备份文件: {dump_file}")
@@ -92,8 +97,8 @@ def test_logical_backup():
     # 恢复到新库
     RESTORE_DIR = MASTER_DIR + '_restore'
     if os.path.exists(RESTORE_DIR):
-        shutil.rmtree(RESTORE_DIR)
-    db2 = Database(RESTORE_DIR)
+        safe_rmtree(RESTORE_DIR)
+    db2 = track(Database(RESTORE_DIR))
     bm2 = BackupManager(db2, BACKUP_DIR)
     ok, fail = bm2.restore(dump_file)
     print(f"  → 恢复: 成功={ok}, 失败={fail}")
@@ -103,7 +108,7 @@ def test_logical_backup():
     assert tbl2.row_count == 10
     print(f"  ✅ 恢复后行数: {tbl2.row_count}")
     db2.shutdown()
-    shutil.rmtree(RESTORE_DIR, ignore_errors=True)
+    safe_rmtree(RESTORE_DIR)
 
 
 def test_replication():
@@ -119,24 +124,24 @@ def test_replication():
     from lightdb.replication.slave import SlaveReplicator
 
     # 1. 准备主库
-    master_db = Database(MASTER_DIR)
+    master_db = track(Database(MASTER_DIR))
     create_schema(master_db)
-    master_ex = Executor(master_db)
+    master_ex = track(Executor(master_db))
 
     # 2. 启动主库服务器
     cfg = Config()
     cfg.host = '127.0.0.1'
     cfg.port = MASTER_PORT
-    master_srv = MySQLServer(cfg, master_db, master_ex)
+    master_srv = track(MySQLServer(cfg, master_db, master_ex))
     t = threading.Thread(target=master_srv.serve_forever, daemon=True)
     t.start()
     time.sleep(0.5)
     print(f"  ✅ 主库启动: 127.0.0.1:{MASTER_PORT}")
 
     # 3. 准备从库
-    slave_db = Database(SLAVE_DIR)
+    slave_db = track(Database(SLAVE_DIR))
     create_schema(slave_db)
-    slave = SlaveReplicator(slave_db, '127.0.0.1', MASTER_PORT)
+    slave = track(SlaveReplicator(slave_db, '127.0.0.1', MASTER_PORT))
     slave.start()
     time.sleep(0.5)
     print("  ✅ 从库复制已启动")
@@ -195,9 +200,9 @@ def test_master_slave_status():
     from lightdb.net.server import MySQLServer
     from lightdb.config import Config
 
-    master_db = Database(MASTER_DIR)
+    master_db = track(Database(MASTER_DIR))
     create_schema(master_db)
-    master_ex = Executor(master_db)
+    master_ex = track(Executor(master_db))
 
     # 写点数据
     for i in range(3):
@@ -207,15 +212,15 @@ def test_master_slave_status():
     cfg = Config()
     cfg.host = '127.0.0.1'
     cfg.port = MASTER_PORT + 1
-    srv = MySQLServer(cfg, master_db, master_ex)
+    srv = track(MySQLServer(cfg, master_db, master_ex))
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     time.sleep(0.5)
 
     # 客户端查询
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=MASTER_PORT + 1,
-                           user='root', autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=MASTER_PORT + 1,
+                                 user='root', autocommit=True))
     cur = conn.cursor()
 
     cur.execute("SHOW MASTER STATUS")

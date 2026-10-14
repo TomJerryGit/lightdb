@@ -7,13 +7,18 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree, track
+except ImportError:                       # 直接 python tests/test_batch9.py
+    from conftest import safe_rmtree, track
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b9')
 PORT = 8895
 
 
 def reset():
     if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
+        safe_rmtree(DATA_DIR)
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -26,9 +31,9 @@ def start_server(port):
     cfg = Config()
     cfg.host = '127.0.0.1'
     cfg.port = port
-    db = Database(DATA_DIR)
-    ex = Executor(db)
-    srv = MySQLServer(cfg, db, ex)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
+    srv = track(MySQLServer(cfg, db, ex))
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     time.sleep(0.5)
@@ -79,8 +84,8 @@ def test_grant_via_sql():
     srv, db = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
 
     # CREATE USER
@@ -124,8 +129,8 @@ def test_privilege_enforcement():
 
     import pymysql
     # root 创建表
-    root_conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                                autocommit=True)
+    root_conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                      autocommit=True))
     rcur = root_conn.cursor()
     rcur.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(50))")
     rcur.execute("INSERT INTO t VALUES (1, 'a')")
@@ -134,8 +139,8 @@ def test_privilege_enforcement():
     print("  ✅ root 建表 + 创建 readonly 用户")
 
     # readonly 只能SELECT
-    ro = pymysql.connect(host='127.0.0.1', port=PORT, user='readonly',
-                         autocommit=True)
+    ro = track(pymysql.connect(host='127.0.0.1', port=PORT, user='readonly',
+                               autocommit=True))
     rc = ro.cursor()
 
     rc.execute("SELECT * FROM t")
@@ -165,8 +170,8 @@ def test_prepared_statement():
     srv, db = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
 
     cur.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50), age INT)")
@@ -200,8 +205,8 @@ def test_processlist():
     srv, db = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
 
     cur.execute("SHOW PROCESSLIST")
@@ -249,8 +254,8 @@ def test_dump_tool():
     srv, db = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
     cur.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50))")
     for i in range(5):

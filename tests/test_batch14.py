@@ -7,13 +7,18 @@ import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree, track
+except ImportError:                       # 直接 python tests/test_batch14.py
+    from conftest import safe_rmtree, track
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b14')
 PORT = 8901
 
 
 def reset():
     if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
+        safe_rmtree(DATA_DIR)
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -29,9 +34,9 @@ def start_server(port, ssl=False, semi_sync=False, audit_level='DDL'):
     cfg.ssl_enabled = ssl
     cfg.semi_sync_enabled = semi_sync
     cfg.audit_level = audit_level
-    db = Database(DATA_DIR)
-    ex = Executor(db)
-    srv = MySQLServer(cfg, db, ex)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
+    srv = track(MySQLServer(cfg, db, ex))
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     time.sleep(0.5)
@@ -87,8 +92,8 @@ def test_semi_sync_sql():
     srv, db, ex = start_server(PORT, semi_sync=True)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
     cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR)")
     print("  ✅ 建表")
@@ -132,8 +137,8 @@ def test_audit():
     srv, db, ex = start_server(PORT, audit_level='DML')
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
 
     cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR)")
@@ -219,8 +224,8 @@ def test_parallel_count():
     srv, db, ex = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
     cur.execute("CREATE TABLE big (id INT PRIMARY KEY, v VARCHAR)")
 
@@ -264,7 +269,7 @@ def test_parallel_scan():
     from lightdb.db.database import Database
     from lightdb.performance.parallel import ParallelExecutor
 
-    db = Database(DATA_DIR)
+    db = track(Database(DATA_DIR))
     db.create_table('t', [
         {'name': 'id', 'type': 'INT', 'primary': True, 'notnull': True, 'unique': False},
         {'name': 'v', 'type': 'INT', 'primary': False, 'notnull': False, 'unique': False},
@@ -273,7 +278,7 @@ def test_parallel_scan():
     for i in range(3000):
         tbl.insert([i + 1, i * 2])
 
-    pe = ParallelExecutor(max_workers=4)
+    pe = track(ParallelExecutor(max_workers=4))
 
     # 并行扫描（无条件）
     t0 = time.time()

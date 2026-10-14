@@ -7,13 +7,18 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree, track
+except ImportError:                       # 直接 python tests/test_batch15.py
+    from conftest import safe_rmtree, track
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b15')
 PORT = 8905
 
 
 def reset():
     if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
+        safe_rmtree(DATA_DIR)
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -28,9 +33,9 @@ def start_server(port, **cfg_overrides):
     cfg.port = port
     for k, v in cfg_overrides.items():
         setattr(cfg, k, v)
-    db = Database(DATA_DIR)
-    ex = Executor(db)
-    srv = MySQLServer(cfg, db, ex)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
+    srv = track(MySQLServer(cfg, db, ex))
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     time.sleep(0.4)
@@ -137,8 +142,8 @@ def test_explain_analyze():
     srv, db, ex = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
     cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR)")
     for i in range(100):
@@ -165,8 +170,8 @@ def test_check_optimize():
     srv, db, ex = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
     cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR)")
     for i in range(50):
@@ -199,8 +204,8 @@ def test_show_engine():
     srv, db, ex = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
 
     cur.execute("SHOW ENGINE INNODB")
@@ -222,8 +227,8 @@ def test_security_via_sql():
     srv, db, ex = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 autocommit=True))
     cur = conn.cursor()
 
     # 密码策略
@@ -270,8 +275,8 @@ def test_benchmark():
     from lightdb.sql.executor import Executor
     from lightdb.performance.benchmark import BenchmarkRunner, format_results
 
-    db = Database(DATA_DIR)
-    ex = Executor(db)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
     runner = BenchmarkRunner(db, ex)
 
     results = runner.run_all(n_rows=2000)
@@ -291,8 +296,8 @@ def test_full_sql_suite():
     srv, db, ex = start_server(PORT)
 
     import pymysql
-    conn = pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                           charset='utf8mb4', autocommit=True)
+    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
+                                 charset='utf8mb4', autocommit=True))
     cur = conn.cursor()
 
     # 1. 基础

@@ -6,20 +6,25 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+try:
+    from tests.conftest import safe_rmtree, track
+except ImportError:                       # 直接 python tests/test_batch12.py
+    from conftest import safe_rmtree, track
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data_b12')
 
 
 def reset():
     if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
+        safe_rmtree(DATA_DIR)
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def setup():
     from lightdb.db.database import Database
     from lightdb.sql.executor import Executor
-    db = Database(DATA_DIR)
-    ex = Executor(db)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
     db.create_table('users', [
         {'name': 'id', 'type': 'INT', 'primary': True, 'notnull': True, 'unique': False},
         {'name': 'name', 'type': 'VARCHAR', 'primary': False, 'notnull': False, 'unique': False},
@@ -70,8 +75,8 @@ def test_procedure_if_while():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
-    ex = Executor(db)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
 
     # 存储过程：根据 uid 判断，插入多条
     sql = """CREATE PROCEDURE gen_users(IN n INT)
@@ -105,8 +110,8 @@ def test_procedure_out_param():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
-    ex = Executor(db)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
 
     sql = """CREATE PROCEDURE count_users(OUT cnt INT)
     BEGIN
@@ -162,8 +167,8 @@ def test_trigger_after_insert():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
-    ex = Executor(db)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
 
     # 需要 logs 表
     try:
@@ -205,8 +210,8 @@ def test_trigger_delete():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
-    ex = Executor(db)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
 
     # 清空 logs，再插入新用户
     p = parser.parse("DELETE FROM logs")
@@ -242,8 +247,8 @@ def test_show_procedures_triggers():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = Database(DATA_DIR)
-    ex = Executor(db)
+    db = track(Database(DATA_DIR))
+    ex = track(Executor(db))
 
     for show_cmd in ['SHOW PROCEDURES', 'SHOW TRIGGERS', 'SHOW EVENTS', 'SHOW FUNCTIONS']:
         p = parser.parse(show_cmd)

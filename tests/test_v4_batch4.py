@@ -385,30 +385,37 @@ def test_hybrid_table():
         ]
         table = HybridTable('orders', cols, tmp)
 
-        # 插入
-        for i in range(100):
-            table.insert([i, f'city_{i % 5}', i * 10])
-        print(f"  ✅ 插入 100 行")
+        # HybridTable 内部有一个 BufferPool 一直持有 orders.dat 的句柄；
+        # 必须在临时目录被清理之前关闭，否则 TemporaryDirectory.__exit__
+        # 的 rmtree 会撞上「文件被占用」（winerror=32）。这里用 try/finally
+        # 保证断言失败时也关。
+        try:
+            # 插入
+            for i in range(100):
+                table.insert([i, f'city_{i % 5}', i * 10])
+            print(f"  ✅ 插入 100 行")
 
-        # 强制同步
-        table.sync_now()
+            # 强制同步
+            table.sync_now()
 
-        # OLAP 查询
-        result = table.olap_aggregate({
-            'columns': ['city'],
-            'group_by': ['city'],
-            'aggregations': [
-                {'func': 'SUM', 'column': 'amount', 'alias': 'total'},
-            ],
-        })
-        print(f"  → 聚合结果: {len(result)} 组")
-        for row in sorted(result):
-            print(f"    {row}")
+            # OLAP 查询
+            result = table.olap_aggregate({
+                'columns': ['city'],
+                'group_by': ['city'],
+                'aggregations': [
+                    {'func': 'SUM', 'column': 'amount', 'alias': 'total'},
+                ],
+            })
+            print(f"  → 聚合结果: {len(result)} 组")
+            for row in sorted(result):
+                print(f"    {row}")
 
-        # 统计
-        stats = table.stats()
-        print(f"  → {stats}")
-        print(f"  ✅ HTAP 表正确")
+            # 统计
+            stats = table.stats()
+            print(f"  → {stats}")
+            print(f"  ✅ HTAP 表正确")
+        finally:
+            table.close()
 
 
 def test_performance_vs_python():

@@ -8,13 +8,137 @@
 这里把标准流改成「无法编码的字符就替换」，与 lightdb/main.py 的处理一致：
 中文照常显示，emoji 变问号，但不再中断测试。
 """
+import gc
+import os
+import shutil
 import sys
+import time
+
+import pytest
 
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(errors='replace')
     except Exception:
         pass
+
+
+# ==================== 资源生命周期：用例结束时一定关闭 ====================
+# 背景（见 docs/FAILURE_TRIAGE.md 第 4 节与「teardown 修复后复核」）：
+# 用例通常写成 `db = Database(DATA_DIR)` … 末尾 `db.shutdown()`。一旦断言
+# 失败或中途抛异常，末尾的 shutdown 就执行不到。CPython 本可在帧销毁时
+# 回收句柄，但 pytest 会一直持有失败用例的异常回溯（traceback → 帧 →
+# 局部变量 db），句柄于是活到整个会话结束；下一个用例 reset() 里的
+# shutil.rmtree 就撞上「文件被其它进程占用」（winerror=32），把真正的
+# 实现缺陷掩盖成清理失败。
+#
+# 修法：每处 Database / MySQLServer / 客户端连接等资源创建都用 track()
+# 登记，下面的 autouse fixture 在用例结束时（正常结束、断言失败、异常、
+# fixture/setup 报错）统一关闭，与用例里显式的 shutdown() 互补。
+
+_TRACKED = []
+
+
+def track(resource):
+    """登记一个需要在本用例结束时关闭的资源，并原样返回它。
+
+    用法：``db = track(Database(DATA_DIR))`` / ``srv = track(MySQLServer(...))``
+    """
+    _TRACKED.append(resource)
+    return resource
+
+
+def shutdown_quietly(*resources):
+    """尽最大努力关闭资源；单个资源关闭失败不影响其它资源。
+
+    依次尝试 shutdown() / server_close() / stop() / stop_event_scheduler()
+    / close()，只调用对象真实拥有的方法。
+    """
+    for res in resources:
+        if res is None:
+            continue
+        for name in ('shutdown', 'server_close', 'stop',
+                     'stop_event_scheduler', 'close'):
+            fn = getattr(res, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+@pytest.fixture(autouse=True)
+def _guarantee_resource_cleanup():
+    """用例结束后强制关闭本用例登记过的资源（含失败路径）。"""
+    yield
+    pending = list(_TRACKED)
+    del _TRACKED[:]
+    shutdown_quietly(*pending)
+
+
+# ==================== 目录清理兜底：safe_rmtree ====================
+# 正常情况下，上面的 track()+fixture 已经保证句柄全部释放，rmtree 一次
+# 成功。这里再做一层兜底：万一还有别的持有者（外部进程、杀毒软件、
+# Windows 索引器）短暂占用，就有限次重试 + 短退避；仍然失败则**抛出**
+# 带路径与占用文件的异常。绝不 pytest.skip、绝不 ignore_errors——清理
+# 失败必须让用例失败，否则脏目录会让后续用例读到旧数据，把实现缺陷
+# 掩盖成"通过"。
+
+_WIN_BUSY_WINERRORS = (32, 33)   # 文件被占用 / 文件被锁定
+_RMTREE_ATTEMPTS = 5
+_RMTREE_DELAY = 0.2
+
+
+def _error_fingerprint(exc):
+    """把底层错误压成不依赖本地化文本的短描述。"""
+    return (f'{type(exc).__name__}(errno={getattr(exc, "errno", None)}, '
+            f'winerror={getattr(exc, "winerror", None)}, '
+            f'file={getattr(exc, "filename", None)!r})')
+
+
+def _occupied_files(path):
+    """列出目录下的残留文件，并指出其中仍打不开（=还被占用）的那些。"""
+    remaining, occupied = [], []
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            fp = os.path.join(root, name)
+            remaining.append(fp)
+            try:
+                with open(fp, 'r+b'):
+                    pass
+            except OSError as e:
+                occupied.append(f'{fp} [{_error_fingerprint(e)}]')
+    return remaining, occupied
+
+
+def safe_rmtree(path, attempts=_RMTREE_ATTEMPTS, delay=_RMTREE_DELAY):
+    """删除目录树；对「文件被占用」做有限次重试，仍失败则抛 RuntimeError。
+
+    - 目录不存在视为成功（幂等）。
+    - 每次失败先 gc.collect() 再退避，给即将退出的持有者一点时间。
+    - 最终失败时异常信息包含目录路径、最后一次底层错误（errno/winerror）、
+      以及仍在目录里且打不开的具体文件，便于直接定位是谁没关。
+    """
+    for i in range(1, attempts + 1):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            last = e
+            gc.collect()
+            if i < attempts:
+                time.sleep(delay)
+    remaining, occupied = _occupied_files(path)
+    detail = '；'.join(occupied) or '；'.join(remaining) or '（已无残留文件）'
+    raise RuntimeError(
+        f'safe_rmtree 清理失败：重试 {attempts} 次 × {delay}s 仍未删除 {path}。'
+        f'最后一次错误 {_error_fingerprint(last)}；'
+        f'仍被占用或残留：{detail}。'
+        '请检查该用例是否漏关 Database / MySQLServer / pymysql 连接'
+        '（用 tests/conftest.py 的 track() 登记即可自动关闭）')
 
 
 # ==================== 多进程原语能力探测 ====================

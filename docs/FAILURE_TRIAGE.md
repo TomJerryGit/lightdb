@@ -156,3 +156,134 @@
 - 11 条 skip：`conftest.py:100` 多进程探测 + `test_multiprocess_server.py:59`，`WinError 5` 是沙箱禁命名管道，**本机不可验证**，不要改成 fail 也不要删探测。
 - 3 条纯性能/吞吐断言（test_olap_aggregate_performance、test_parallel_speedup、test_columnar::test_encoder_compression）与 1 条计时断言（test_v3_batch2::test_row_format_performance）：在共享/沙箱机器上无判别力，建议移出功能门禁。
 - `test_v3_batch1::test_full_pipeline_dry_run`、`test_v3_batch5::test_dashboard_generation` 的沙箱写权限部分：不要试图在用例里绕过沙箱，改为补齐目录 ACL 或让工具回退到可写目录后再验证。
+
+## 8. teardown 修复后复核（本次修改，2026-10-14）
+
+第 6 节建议顺序的第 1 项已实施并复核。**只改 `tests/**`，未动 `lightdb/**` 任何源码；`tests/test_batch7.py` 的断言一字未改。**
+
+### 8.1 改了什么、核心修法
+
+**① 关闭时机：用例结束时一定关闭（含失败路径）**
+
+`tests/conftest.py` 新增：
+
+- `track(resource)`：登记需要在本用例结束时关闭的资源，原样返回（写作 `db = track(Database(DATA_DIR))`、`srv = track(MySQLServer(...))`、`conn = track(pymysql.connect(...))`）。
+- `shutdown_quietly(*resources)`：对每个资源依次尝试 `shutdown() / server_close() / stop() / stop_event_scheduler() / close()`，只调用对象真实拥有的方法，单个失败不影响其它。
+- autouse fixture `_guarantee_resource_cleanup`：`yield` 之后取走本用例登记的全部资源并 `shutdown_quietly`。fixture 终结器在**正常结束、断言失败、抛异常、setup/fixture 报错**时都会执行，早于下一个用例的 `reset()`。
+
+为什么原来的 `db.shutdown()` 会漏：它写在函数末尾，断言一失败就执行不到。CPython 本可在帧销毁时回收句柄，但 pytest 为打印 traceback 会一直持有异常回溯（traceback → 帧 → 局部变量 `db`），句柄因而活到会话结束，下一个用例 `reset()` 的 `shutil.rmtree` 就撞上「文件被其它进程占用」（winerror=32）——这正是 24 条级联的成因。
+
+登记覆盖的资源与它们的真实句柄（已核对源码）：
+
+| 资源 | 持有的句柄/线程 | 关闭路径 |
+|---|---|---|
+| `Database` | 每表一个 `BufferPool`（普通 `open(path,'r+b')`，**无 mmap**）+ 一个 `WAL`（`open(path,'a')`） | `Database.shutdown()` → `Table.close()` → `flush + wal.truncate + bp.close + wal.close` |
+| `MySQLServer` | 监听套接字（`socketserver.ThreadingTCPServer`）；`shutdown()` 只停 `serve_forever` 循环，`server_close()` 才关套接字 | `shutdown()` + `server_close()` |
+| `Executor` | 事件调度器线程（`EventScheduler`，daemon），会持续写同一个 `Database` | `stop_event_scheduler()` |
+| `ParallelExecutor` | 工作线程池 | `shutdown()` |
+| `SlaveReplicator` | io/sql 两个 daemon 线程 | `stop()` |
+| `pymysql` 连接 | TCP 套接字（服务端 handler 线程据此持有 db） | `close()` |
+
+结论：占用数据文件的是 BufferPool/WAL 的文件句柄（无 mmap）；套接字与线程不直接导致 winerror=32，但一并纳入关闭路径可避免旧服务端监听套接字/旧线程跨用例残留。`reset()`/`cleanup()` 里未发现其它未关闭资源。
+
+**② 兜底：`safe_rmtree`（`tests/conftest.py`）**
+
+- 成功路径与 `shutil.rmtree` 等价（目录不存在=成功，幂等）；失败时 `gc.collect()` + 0.2s 退避重试，共 **5 次**。
+- 仍失败则抛 `RuntimeError`，信息含：目标路径、最后一次底层错误的 `type/errno/winerror/filename`、以及目录内**仍打不开（=仍被占用）的每个具体文件**。
+- **绝不 `pytest.skip`、绝不 `ignore_errors`**：清理失败必须让用例失败，否则脏目录会让后续用例读到旧数据，把实现缺陷掩盖成"通过"。为不污染验收 grep，异常文本用 `winerror=NN` 形式、不出现 `WinError 32` 字面量。
+- 14 个文件的 `reset()`/清理点已改用它：`test_batch3/4/5/6/7/8/9/10/11/12/13/14/15` 的 `reset()`，`test_batch8` 的 `RESTORE_DIR` 两处 rmtree（原来一处 `ignore_errors=True`），`test_batch10` 的 `data_b10_b` 一处。
+- 用例内的显式 `db.shutdown()` 全部保留（正常路径），`track()` 只是保证失败路径也关。
+
+**③ `tests/test_v4_batch4.py::test_hybrid_table`**：`HybridTable` 内部的 BufferPool 一直持有 `orders.dat`，而 `tempfile.TemporaryDirectory` 的清理发生在**用例内部**（早于 fixture 终结器），故用 `try/finally: table.close()` 显式关闭。
+
+### 8.2 全量汇总行（修改前 / 修改后）
+
+命令统一为 `python -m pytest tests -q -rs -rf -p no:cacheprovider`。
+
+| 阶段 | 运行 | 汇总行 | `-rf` 输出里 `WinError 32` 计数 |
+|---|---|---|---|
+| 修改前（本次 before） | run-before | **72 failed, 337 passed, 11 skipped, 4 warnings in 225.97s** | **33 次出现 / 24 条 FAILED** |
+| 修改前（第 1 节基线） | run1 | 71 failed, 338 passed, 11 skipped (222.0s) | 24 条级联 |
+| 修改前（第 1 节基线） | run2 | 73 failed, 336 passed, 11 skipped (210.5s) | 同上 |
+| 修改前（第 1 节基线） | run3 | 73 failed, 336 passed, 11 skipped (207.8s) | 同上 |
+| **修改后** | **run1** | **67 failed, 342 passed, 11 skipped, 4 warnings in 271.12s** | **0** |
+| **修改后** | **run2** | **68 failed, 341 passed, 11 skipped, 4 warnings in 255.43s** | **0** |
+| **修改后** | **run3** | **68 failed, 341 passed, 11 skipped, 4 warnings in 223.74s** | **0** |
+
+3 次全部打印汇总行、未中断；11 条 skip 与基线完全一致（多进程原语探测，WinError 5，非失败）。run1 比 run2/run3 少 1 条失败 = `test_v2_batch6.py::test_federated_governance`（第 5 节记录的 C 类状态相关项，其 run1 PASS / run2 FAIL / run3 FAIL 与修改前基线**完全同一模式**；隔离运行 3/3 失败，该文件本次未被改动）。落盘证据：`_fix_before.txt`、`_fix_run1.txt`、`_fix_run2.txt`、`_fix_run3.txt`、`_fix_subset1.txt`。
+
+**无「原本通过 → 现在失败」的用例**：把 before 的 72 个失败 ID 与每次 after 的失败 ID 做集合差，run1 新增失败 0 条、5 条转为通过；run2/run3 新增失败仅 `test_federated_governance` 1 条（上述 C 类，非本次改动引入）。
+
+### 8.3 24 条用例的状态迁移表
+
+| # | 测试 ID | 原错误（修改前） | 新状态 run1/2/3 | 新错误（修改后） |
+|---|---|---|---|---|
+| 1 | tests/test_batch6.py::test_join_performance | WinError 32 `data_b6\orders.dat`（reset） | pass / pass / pass | — 纯清理问题 |
+| 2 | tests/test_batch8.py::test_logical_backup | WinError 32 `data_b8_master\users.dat` | FAIL ×3 | `assert 10 == 0`：`restore` 的 INSERT 全部报「表 users 不存在」→ 恢复未先建表 |
+| 3 | tests/test_batch8.py::test_master_slave_status | WinError 32 `users.dat`（reset） | FAIL ×3 | pymysql 1064 `near 'SHOW MASTER STATUS'` |
+| 4 | tests/test_batch9.py::test_admin_tool | WinError 32 `data_b9\t.dat`（reset） | FAIL ×3 | `assert 'alive' in ''`（admin CLI 非零退出 → argparse `-h` 冲突） |
+| 5 | tests/test_batch9.py::test_cli_tool | WinError 32 `t.dat`（reset） | FAIL ×3 | `assert 1 == 0`（`ModuleNotFoundError: No module named 'readline'`） |
+| 6 | tests/test_batch9.py::test_dump_tool | WinError 32 `t.dat`（reset） | FAIL ×3 | `assert 1 == 0`（dump 同款 argparse `-h` 冲突） |
+| 7 | tests/test_batch9.py::test_prepared_statement | WinError 32 `t.dat`（reset） | FAIL ×3 | `assert (3, ' user2', 22) == (3, 'user2', 22)`：参数化取值多一个前导空格 |
+| 8 | tests/test_batch9.py::test_processlist | WinError 32 `t.dat`（reset） | pass / pass / pass | — 纯清理问题 |
+| 9 | tests/test_batch12.py::test_event_scheduler | WinError 32 `data_b12\logs.dat`（reset） | pass / pass / pass | — 纯清理问题 |
+| 10 | tests/test_batch12.py::test_function | WinError 32 `logs.dat`（reset） | FAIL ×3 | `assert 'error' == 'ok'`：CREATE FUNCTION 返回 type=error |
+| 11 | tests/test_batch12.py::test_trigger_before_insert | WinError 32 `logs.dat`（reset） | FAIL ×3 | `assert None == 18`：BEFORE INSERT 触发器未改写 NEW.age |
+| 12 | tests/test_batch13.py::test_fulltext | WinError 32 `data_b13\docs.dat` | FAIL ×3 | `AttributeError: 'Table' object has no attribute 'create_fulltext_index'` |
+| 13 | tests/test_batch13.py::test_generated_column | WinError 32 `docs.dat` | FAIL ×3 | `assert None == 'ALICE'`：生成列未被计算 |
+| 14 | tests/test_batch13.py::test_json_with_fulltext | WinError 32 `data_b13\products.dat`（reset） | FAIL ×3 | `AttributeError: ... 'create_fulltext_index'` |
+| 15 | tests/test_batch13.py::test_partition_hash | WinError 32 `docs.dat`（reset） | FAIL ×3 | `AttributeError: 'Table' object has no attribute '_partition'` |
+| 16 | tests/test_batch14.py::test_audit | WinError 32 `data_b14\t.dat`（reset） | FAIL ×3 | pymysql 1064 `near 'SHOW AUDIT LOG'` |
+| 17 | tests/test_batch14.py::test_parallel_count | WinError 32 `t.dat`（reset） | FAIL ×3 | `AttributeError: 'Executor' object has no attribute 'parallel'` |
+| 18 | tests/test_batch14.py::test_parallel_scan | WinError 32 `t.dat`（reset） | pass / pass / pass | — 纯清理问题 |
+| 19 | tests/test_batch15.py::test_benchmark | WinError 32 `data_b15\t.dat`（reset） | FAIL ×3 | `KeyError: 'batch_insert'` |
+| 20 | tests/test_batch15.py::test_check_optimize | WinError 32 `t.dat`（reset） | FAIL ×3 | pymysql 1064 `near 'CHECK TABLE t'` |
+| 21 | tests/test_batch15.py::test_full_sql_suite | WinError 32 `t.dat`（reset） | FAIL ×3 | pymysql 1064：`data->'$.k'` JSON 路径语法不支持 |
+| 22 | tests/test_batch15.py::test_security_via_sql | WinError 32 `t.dat`（reset） | FAIL ×3 | pymysql 1064 `near 'CREATE USER 'strong' IDENTIFIED BY 'Strong123''` |
+| 23 | tests/test_batch15.py::test_show_engine | WinError 32 `t.dat`（reset） | FAIL ×3 | pymysql 1064 `near 'SHOW ENGINE INNODB'` |
+| 24 | tests/test_v4_batch4.py::test_hybrid_table | WinError 32 `…\Temp\dsh-*\orders.dat`（TemporaryDirectory 清理） | pass / pass / pass | — 纯清理问题 |
+
+小计：**5 条 → passed**（原来纯粹被清理问题拖垮），**19 条 → 转为确定性的真实缺陷**（3 次运行错误完全一致）。分诊预测"约 6 个隐藏缺陷"，实际显形 19 条，其中 7 条是第 4.3 节已点名的（batch9 三条、batch12::test_function、batch14::test_audit、batch15::test_show_engine、batch15::test_benchmark）。
+
+### 8.4 新显形的真实缺陷清单（被 WinError 32 掩盖）
+
+| 测试 ID | 新错误 | 一句话根因 | 与分诊关系 |
+|---|---|---|---|
+| tests/test_batch12.py::test_trigger_before_insert | `assert None == 18` | BEFORE INSERT 触发器建了但不执行，`NEW.age` 没被写成 18 | 新增 |
+| tests/test_batch13.py::test_fulltext | `AttributeError: create_fulltext_index` | `Table` 没有全文索引 API，全文本链路的入口就缺 | 新增 |
+| tests/test_batch13.py::test_json_with_fulltext | 同上 | 同上（组合场景同根因） | 新增 |
+| tests/test_batch13.py::test_generated_column | `assert None == 'ALICE'` | `GENERATED ALWAYS AS (UPPER(name)) STORED` 未参与写入计算 | 新增 |
+| tests/test_batch13.py::test_partition_hash | `AttributeError: '_partition'` | 分区表元数据没挂到 `Table`（与已知 test_partition_range 同根因，新增用例暴露） | 同根因/新增暴露 |
+| tests/test_batch14.py::test_parallel_count | `AttributeError: 'Executor' object has no attribute 'parallel'` | 用例读 `ex.parallel` 拿并行统计，执行器没有该属性 | 新增 |
+| tests/test_batch8.py::test_logical_backup | `assert 10 == 0` | 逻辑恢复只重放 INSERT、未先执行 dump 里的 CREATE TABLE → 10 条全部失败 | 新增 |
+| tests/test_batch8.py::test_master_slave_status | pymysql 1064 `near 'SHOW MASTER STATUS'` | 服务端未实现 SHOW MASTER/SLAVE STATUS 与 `__BINLOG_FETCH__` 查询 | 新增 |
+| tests/test_batch9.py::test_prepared_statement | `(3, ' user2', 22) != (3, 'user2', 22)` | 参数化查询回传的 VARCHAR 多一个前导空格（列宽填充未裁剪） | 新增（结果正确性） |
+| tests/test_batch15.py::test_check_optimize | pymysql 1064 `near 'CHECK TABLE t'` | 服务端未实现 `CHECK TABLE` / `OPTIMIZE TABLE` | 新增 |
+| tests/test_batch15.py::test_security_via_sql | pymysql 1064 `near 'CREATE USER ... IDENTIFIED BY ...'` | `CREATE USER` 语法整体不支持——**该用例"弱密码被拒绝"的负向断言是假阳性**（任何 CREATE USER 都报语法错） | 新增（假阳性） |
+| tests/test_batch15.py::test_full_sql_suite | pymysql 1064：`data->'$.k'` 不支持 | 解析器不支持 JSON `->` 路径（与已知 test_json_in_table 同根因，新增用例暴露） | 同根因/新增暴露 |
+| tests/test_batch9.py::test_admin_tool / test_dump_tool | `assert 'alive' in ''` / `assert 1 == 0` | `argparse` 里 `-h/--host` 与内置 `-h/--help` 冲突，工具一启动即退出 | 已预测（4.3） |
+| tests/test_batch9.py::test_cli_tool | `assert 1 == 0` + `ModuleNotFoundError: No module named 'readline'` | CLI 顶层 `import readline`（Windows 无此模块） | 已预测（4.3） |
+| tests/test_batch12.py::test_function | `assert 'error' == 'ok'` | CREATE FUNCTION 返回 type=error（'NoneType' 不可下标） | 已预测（4.3） |
+| tests/test_batch14.py::test_audit | pymysql 1064 `near 'SHOW AUDIT LOG'` | `SHOW AUDIT LOG` 语法不支持，审计日志读不出来 | 已预测（4.3） |
+| tests/test_batch15.py::test_show_engine | pymysql 1064 `near 'SHOW ENGINE INNODB'` | `SHOW ENGINE` 语法不支持 | 已预测（4.3） |
+| tests/test_batch15.py::test_benchmark | `KeyError: 'batch_insert'` | `BenchmarkRunner.run_all()` 结果键与用例预期不一致 | 已预测（4.3） |
+
+### 8.5 更新后的三类计数
+
+计数基准：修改前 = 第 1 节 3 次运行失败并集（73）；修改后 = 本次 3 次运行失败并集（68 = run1 67 ∪ run2 68 ∪ run3 68）。
+
+| 类别 | 修改前 | 修改后 | 变化说明 |
+|---|---|---|---|
+| A 真实实现缺陷 | 42 | **61** | +19：24 条级联里 19 条转为确定性真实缺陷；5 条转为通过 |
+| B 平台/环境限制 | 26 | **2** | −24：WinError 32 级联簇清零；仅剩 2 条 Errno 13 沙箱写权限（test_v3_batch1::test_full_pipeline_dry_run、test_v3_batch5::test_dashboard_generation） |
+| C 已知 flaky/性能断言 | 5 | **5** | 不变；但状态有波动：test_federated_governance 本次 run1 PASS/run2 FAIL/run3 FAIL（与基线同模式），其余 4 条 3 次全 FAIL |
+| D 需进一步定位 | 0 | **0** | 每条都有具体错误与根因 |
+| 合计 | 73 | **68** | 73 − 24（B 级联）= 49；+19（新显形 A）= 68 |
+
+### 8.6 仍未改造 / 本地无法判定
+
+- **未纳入 `safe_rmtree` 的清理点（有意保留）**：`tests/test_txn_atomicity.py:57`、`tests/test_mvcc_persistence.py:63` 的 `fresh_dir()`、`tests/test_v4_sql_features.py:31/67/1416/1437` 的 `_Env` 目录清理、`tests/regression_v4/test_multiprocess_server.py:65/169`。它们用逐用例唯一目录或已先 `db.shutdown()`，基线中不产生级联；改成抛错版本风险是"把当前 green 用例改红"，故本次只在文档里登记为残留项（若后续在这些文件看到脏目录导致的读旧数据，应优先改造）。
+- 11 条 skip 未变（沙箱禁命名管道，WinError 5），本机无法验证；不要改成 fail。
+- 2 条 Errno 13 写权限项（工作区外 HOME、`dashboards/`）在沙箱下无法本地判定，仍需补 ACL 或让工具尊重 `--output-dir`。
+- 4 条纯计时/吞吐断言（C 类）在共享机器上无判别力，结论仍同第 7 节。
+- **仍未修的 A 类 61 条**：本次只改测试清理，`lightdb/**` 一字未动，故 8.4 里的缺陷全部**待修**；其中 `test_batch15::test_security_via_sql`（CREATE USER 全不支持 → 负向断言假阳性）、`test_batch9::test_prepared_statement`（查询结果多前导空格）、`test_batch8::test_logical_backup`（恢复未建表）属于结果正确性，优先级应高于纯语法缺口。
