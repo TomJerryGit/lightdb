@@ -1542,10 +1542,27 @@ class Parser:
             up = part_stripped.upper()
 
             if up.startswith('CHECK'):
-                ck = self._parse_check(part_stripped)
-                if ck:
-                    constraints.append(ck)
+                # 表级 CHECK：解析失败/形态不支持一律 SyntaxError。
+                # 旧实现 `if ck: constraints.append(ck)` 会把 `_parse_check`
+                # 的 None（括号不配对、多余尾巴）静默吞掉 —— 约束于是凭空
+                # 消失，建表却报成功（"假成功"缺陷 A 的解析层入口）。
+                constraints.append(self._parse_check(part_stripped))
                 continue
+
+            # 表级 `CONSTRAINT 名字 CHECK (...)`：原实现把整个 part 交给
+            # `_column_def`，而它把 `CONSTRAINT` 开头的表级约束一律
+            # `return None` —— 带名字的 CHECK 因此被**静默丢弃**（实测
+            # `CREATE TABLE t (a INT, CONSTRAINT ck CHECK (a>0))` 得到
+            # `checks=[]`）。这里接住 CHECK 形态；`CONSTRAINT ... FOREIGN
+            # KEY / UNIQUE / PRIMARY KEY` 仍走原分支（不在本批次范围）。
+            if up.startswith('CONSTRAINT'):
+                cm = re.match(
+                    r'CONSTRAINT\s+[`"]?(\w+)[`"]?\s+(.*)$',
+                    part_stripped, re.IGNORECASE | re.DOTALL)
+                if cm and cm.group(2).strip().upper().startswith('CHECK'):
+                    constraints.append(self._parse_check(
+                        cm.group(2).strip(), name=cm.group(1)))
+                    continue
 
             col = self._column_def(part_stripped)
             if col:
@@ -1582,13 +1599,48 @@ class Parser:
                 r'CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b', sql, re.IGNORECASE)),
         }
 
-    def _parse_check(self, s: str):
-        m = re.match(
-            r'CHECK\s*\(\s*(.+?)\s*\)(?:\s+NOT\s+ENFORCED)?\s*$',
-            s, re.IGNORECASE | re.DOTALL)
+    def _parse_check(self, s: str, name: str = None,
+                     strict_tail: bool = True):
+        """解析一条 CHECK 约束（列级 / 表级共用）
+
+        支持 `CHECK (expr)`、`CHECK (expr) [NOT] ENFORCED`；表级形态的
+        名字由调用方从 `CONSTRAINT 名字` 里解析后传入。
+
+        与旧实现的差别（旧实现把下面两类形态**静默丢掉**，约束凭空消失）：
+
+        * 括号不配对 / 表达式为空 / 多余尾巴（`strict_tail=True` 时）
+          → SyntaxError，而不是返回 None 让调用方跳过；
+        * `CHECK (...) NOT ENFORCED` → 显式 SyntaxError。MySQL 8.0 会解析
+          后忽略该子句（一律强制），那等于"用户要求不生效、系统仍生效且
+          不告诉他"；本引擎的规则是「要么生效，要么显式报错」。列级调用
+          （`strict_tail=False`）只查 ENFORCED，其余尾巴是 `NOT NULL` /
+          `DEFAULT` 等合法的列属性，必须继续放行。
+        """
+        m = re.match(r'CHECK\s*\(', s, re.IGNORECASE)
         if not m:
-            return None
-        return {'expr': m.group(1).strip()}
+            raise SyntaxError(f"CHECK 约束语法错误: {s[:120]}")
+        # `_extract_paren` 在括号不配对时抛 SyntaxError（不返回 None）
+        expr, end = self._extract_paren(s, m.end() - 1)
+        tail = s[end + 1:].strip()
+        if tail:
+            tm = re.match(r'(NOT\s+)?ENFORCED\b', tail, re.IGNORECASE)
+            if tm:
+                if tm.group(1):
+                    raise SyntaxError(
+                        "不支持 CHECK (...) NOT ENFORCED：本引擎的 CHECK "
+                        "一律强制执行，不会按 NOT ENFORCED 放行。"
+                        "（MySQL 8.0 解析后忽略该子句，本引擎选择显式报错"
+                        "而不是静默强制）")
+            elif strict_tail:
+                raise SyntaxError(
+                    f"CHECK 约束后面有多余内容 {tail!r}: {s[:120]}")
+        expr = expr.strip()
+        if not expr:
+            raise SyntaxError(f"CHECK 约束的表达式为空: {s[:120]}")
+        ck = {'expr': expr}
+        if name:
+            ck['name'] = name
+        return ck
 
     def _parse_partition(self, ptype, pcol, rest):
         if ptype == 'HASH':
@@ -1644,6 +1696,29 @@ class Parser:
             }
         return None
 
+    @classmethod
+    def _find_check_keyword(cls, text: str):
+        """找顶层（不在字符串字面量 / 反引号标识符内）的 `CHECK` 关键字下标
+
+        必须跳过引号内容：`COMMENT '请 CHECK 这个'`、
+        `DEFAULT 'CHECK (x)'` 里的 CHECK 不是约束关键字，不能因为出现
+        这个词就判语法错（旧实现用 `re.search(r'CHECK\\s*\\(')` 找，
+        对含 `CHECK (` 的字面量同样会误判）。
+        """
+        up = text.upper()
+        for i, _ch, quoted in cls._scan_quotes(text):
+            if quoted:
+                continue
+            if not up.startswith('CHECK', i):
+                continue
+            before_ok = i == 0 or not (up[i - 1].isalnum() or up[i - 1] == '_')
+            after = i + 5
+            after_ok = after >= len(up) or not (
+                up[after].isalnum() or up[after] == '_')
+            if before_ok and after_ok:
+                return i
+        return None
+
     def _column_def(self, s: str) -> Optional[Dict]:
         """列定义（完整版）"""
         s = s.strip()
@@ -1678,12 +1753,17 @@ class Parser:
                 'stored': bool(sm) and sm.group(1).upper() == 'STORED',
             }
 
-        # CHECK
+        # CHECK（列级：`price INT CHECK (price > 0)`）
+        #
+        # 原实现用 `re.search(r'CHECK\s*\(', rest)` 找 CHECK，找不到就
+        # `check = None` 静默放行；`CHECK` 后面不是括号时也当成"没有约束"。
+        # 这里改为：出现 `CHECK` 关键字就必须能解析成一条约束，否则
+        # 显式 SyntaxError（绝不静默丢弃）。
         check = None
-        cm = re.search(r'CHECK\s*\(', rest, re.IGNORECASE)
-        if cm:
-            cexpr, _cend = self._extract_paren(rest, cm.end() - 1)
-            check = {'expr': cexpr.strip()}
+        cpos = self._find_check_keyword(rest)
+        if cpos is not None:
+            check = self._parse_check(
+                rest[cpos:], strict_tail=False)
 
         return {
             'name': name,

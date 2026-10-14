@@ -149,6 +149,9 @@ class Database:
                     # 分区描述随表元数据一起持久化（SHOW PARTITIONS /
                     # 分区裁剪都读 Table._partition）
                     self.tables[tname].set_partition(tinfo['partition'])
+                if tinfo.get('checks'):
+                    # 表级 CHECK 约束随元数据回来（重启后仍生效）
+                    self.tables[tname].set_checks(tinfo['checks'])
             if 'users' in meta:
                 self.users = meta['users']
         except Exception as e:
@@ -168,7 +171,11 @@ class Database:
         meta = {
             'tables': {
                 n: {'cols': t.cols,
-                    'partition': getattr(t, '_partition_spec', None)}
+                    'partition': getattr(t, '_partition_spec', None),
+                    # CHECK 约束随元数据持久化（列级约束本来就在 cols 里，
+                    # 表级约束在这里）。没有它，重启后表级 CHECK 就消失，
+                    # 违规数据会被静默写进来。
+                    'checks': getattr(t, '_checks', None)}
                 for n, t in self.tables.items()
             },
             'users': self.users,
@@ -183,14 +190,28 @@ class Database:
 
     def create_table(self, name: str,
                      cols: List[dict],
-                     partition: dict = None) -> Table:
+                     partition: dict = None,
+                     checks: List[dict] = None) -> Table:
+        """建表
+
+        `checks` 是 `CREATE TABLE` 里表级 CHECK 约束（`sql/parser.py` 的
+        `checks`，含 `CONSTRAINT 名字 CHECK (...)`）。**定义期**就解析并
+        校验（列引用 / 函数名 / 不支持的形态）：不合法直接抛
+        `CheckConstraintError`，绝不把一条"永远不会生效"的约束写进元数据。
+        校验通过后按 MySQL 规则补全自动名，随 `_meta.json` 一起持久化。
+        """
         if name in self.tables:
             raise ValueError(f"表 {name} 已存在")
+        from ..sql.checks import (
+            resolve_check_names, validate_check_definitions)
+        checks = resolve_check_names(name, cols, checks)
+        validate_check_definitions(name, cols, checks)
         tbl = Table(
             name, cols, str(self.data_dir),
             self.lock_manager, self.mvcc)
         if partition:
             tbl.set_partition(partition)
+        tbl.set_checks(checks)
         self.tables[name] = tbl
         self.save_meta()
         return tbl

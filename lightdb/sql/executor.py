@@ -17,6 +17,9 @@ from typing import Dict
 from ..logger import logger
 from ..db.information_schema import InformationSchema
 from ..db.table import Table as _StorageTable
+# CHECK 约束违规（MySQL ERROR 3819 / SQLSTATE HY000）：`Table.insert` /
+# `Table.update` 抛它，`execute` 在这里把它渲染成错误结果而不是 1062。
+from .checks import CheckConstraintError
 # 标量表达式（单行函数 + 算术）：解析 / 渲染 / 求值都在 parser 里，
 # 执行器与计划执行器共用同一份实现与同一套报错文案。
 # parser 不反向依赖 executor，因此这里可以模块级导入（见 sql/__init__ 的顺序）。
@@ -407,6 +410,18 @@ class Executor:
             self._record_audit(parsed, session, result,
                                time.time() - start)
             return result
+        except CheckConstraintError as e:
+            # CHECK 约束违规 / 定义错误：**必须**排在 ValueError 之前
+            # （CheckConstraintError 是它的子类），否则会被下面统一成
+            # 误导性的 1062「主键重复」。errno 取异常自带的
+            # 3819（违规）/ 3813（定义引用了不存在的列），
+            # SQLSTATE 按 MySQL 是 HY000。
+            result = self._err(
+                getattr(e, 'errno', 3819), str(e),
+                sqlstate=getattr(e, 'sqlstate', 'HY000'))
+            self._record_audit(parsed, session, result,
+                               time.time() - start)
+            return result
         except ValueError as e:
             result = self._err(1062, str(e))
             self._record_audit(parsed, session, result,
@@ -457,6 +472,16 @@ class Executor:
         from .parser import parser
         parsed = parser.parse(sql)
         if parsed is None:
+            head = (str(sql).strip().split(None, 1) or [''])[0].upper()
+            if head == 'ALTER':
+                # `ALTER TABLE` 整体尚未支持（含 `ALTER TABLE ... ADD CHECK`）。
+                # 这里给一句明确的不支持说明，而不是笼统的"无法解析 SQL"：
+                # 否则使用者会以为只是语法写错，进而以为 CHECK 已经加上
+                # （静默不生效）。**没有**顺手实现 ALTER。
+                return self._err(
+                    1064,
+                    f"ALTER TABLE 尚未支持（本引擎未实现 ALTER，"
+                    f"包括 ADD CHECK）：{sql[:120]}")
             return self._err(1064, f"无法解析 SQL: {sql[:80]}")
         # 注意：不能用 `session or {}` —— 空 dict 是 falsy，会新建一个字典，
         # 调用方传进来的会话就丢了（BEGIN 写的 s['txn'] 传不回去，
@@ -491,18 +516,28 @@ class Executor:
             'rows': [tuple(r) for r in rows],
         }
 
-    def _err(self, code: int, msg: str) -> Dict:
-        return {
+    def _err(self, code: int, msg: str, sqlstate: str = None) -> Dict:
+        out = {
             'type': 'error',
             'code': code,
             'message': msg,
         }
+        if sqlstate:
+            # 只在调用方明确给出时带上（CHECK 约束是 3819 / HY000）；
+            # 其余路径的返回结构保持不变。
+            out['sqlstate'] = sqlstate
+        return out
 
     # ==================== DDL ====================
 
     def _cmd_create_table(self, p, s):
         # 分区描述要真正落到表对象上（Table._partition），否则
-        # SHOW PARTITIONS / 分区裁剪都读不到（原实现把解析结果丢掉了）
+        # SHOW PARTITIONS / 分区裁剪都读不到（原实现把解析结果丢掉了）。
+        # 表级 CHECK 约束（p['checks']）同理：原实现只把 columns 与
+        # partition 传下去，解析器辛苦解析出来的 `checks` 被**整体丢弃**
+        # （列级 CHECK 因为藏在 cols[i]['check'] 里侥幸活下来，但没人校验），
+        # 于是 `CHECK` 既不报错也不生效。这里如实传给 create_table，
+        # 由它在定义期解析/校验/命名并持久化。
         if p.get('if_not_exists') and p['table'] in self.db.tables:
             # `CREATE TABLE IF NOT EXISTS`：MySQL 语义下"已存在"是成功且
             # 不改动原表。原实现把解析出来的标志丢掉，于是同一份逻辑备份
@@ -510,7 +545,8 @@ class Executor:
             return self._ok(
                 message=f"Table '{p['table']}' already exists")
         self.db.create_table(p['table'], p['columns'],
-                             partition=p.get('partition'))
+                             partition=p.get('partition'),
+                             checks=p.get('checks'))
         return self._ok(
             message=f"Table '{p['table']}' created")
 

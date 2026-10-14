@@ -1,4 +1,4 @@
-"""生成列 + CHECK 约束"""
+"""生成列；CHECK 约束的实现与求值在 `checks.py`"""
 import re
 
 
@@ -13,15 +13,23 @@ class GeneratedColumn:
 
 
 class CheckConstraint:
+    """单条 CHECK 约束（名字 + 表达式原文）
+
+    求值统一走 `sql/checks.py`（SQL 三值逻辑 + 显式报错）：UNKNOWN ——
+    NULL 参与比较 —— 按 SQL / MySQL 语义**放行**；求值失败一律抛
+    `CheckConstraintError`，绝不吞掉异常当成"通过"（旧实现
+    `except: return True` 正是这样把约束变成摆设的）。
+    """
+
     def __init__(self, name, expr):
         self.name = name
         self.expr = expr
 
-    def check(self, row, col_names):
-        try:
-            return bool(_eval_check(self.expr, row, col_names))
-        except (ValueError, TypeError, IndexError):
-            return True
+    def check(self, row, col_names, table=""):
+        """True = 通过（含 UNKNOWN）；False = 违规；求值失败 → 显式抛错"""
+        from .checks import RowResolver, evaluate_check
+        resolver = RowResolver(col_names, row, table)
+        return evaluate_check(self.expr, resolver, context=table) is not False
 
 
 def eval_expr(expr, row, col_names):
@@ -158,125 +166,3 @@ def _find_binop(s, op):
                     continue
             result = i
     return result
-
-
-# ==================== CHECK ====================
-
-def _eval_check(expr, row, col_names):
-    # AND
-    parts = _split_logical(expr, 'AND')
-    if len(parts) > 1:
-        return all(_eval_check(p, row, col_names) for p in parts)
-
-    parts = _split_logical(expr, 'OR')
-    if len(parts) > 1:
-        return any(_eval_check(p, row, col_names) for p in parts)
-
-    up = expr.strip().upper()
-    if up.startswith('NOT '):
-        return not _eval_check(expr.strip()[4:], row, col_names)
-
-    # 比较
-    for op in ['<=', '>=', '!=', '<>', '=', '<', '>']:
-        idx = _find_op(expr, op)
-        if idx >= 0:
-            left = expr[:idx].strip()
-            right = expr[idx + len(op):].strip()
-            a = eval_expr(left, row, col_names)
-            b = eval_expr(right, row, col_names)
-
-            # 类型兼容
-            try:
-                if isinstance(a, (int, float)) and isinstance(b, str):
-                    b = type(a)(b)
-                elif isinstance(b, (int, float)) and isinstance(a, str):
-                    a = type(b)(a)
-            except (ValueError, TypeError):
-                pass
-
-            if a is None or b is None:
-                return False
-
-            if op == '<=': return a <= b
-            if op == '>=': return a >= b
-            if op in ('!=', '<>'): return a != b
-            if op == '=': return a == b
-            if op == '<': return a < b
-            if op == '>': return a > b
-    return True
-
-
-def _split_logical(expr, kw):
-    parts, cur, depth, in_str = [], '', 0, None
-    i, n = 0, len(expr)
-    up = expr.upper()
-    klen = len(kw)
-    while i < n:
-        ch = expr[i]
-        if in_str:
-            cur += ch
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            in_str = ch
-            cur += ch
-            i += 1
-        elif ch == '(':
-            depth += 1
-            cur += ch
-            i += 1
-        elif ch == ')':
-            depth -= 1
-            cur += ch
-            i += 1
-        elif depth == 0 and up[i:i + klen] == kw:
-            left_ok = (i == 0 or not up[i - 1].isalnum())
-            right_ok = (i + klen >= n or not up[i + klen].isalnum())
-            if left_ok and right_ok:
-                parts.append(cur.strip())
-                cur = ''
-                i += klen
-            else:
-                cur += ch
-                i += 1
-        else:
-            cur += ch
-            i += 1
-    if cur.strip():
-        parts.append(cur.strip())
-    return parts
-
-
-def _find_op(expr, op):
-    depth = 0
-    in_str = None
-    i = 0
-    while i < len(expr):
-        ch = expr[i]
-        if in_str:
-            if ch == in_str:
-                in_str = None
-            i += 1
-        elif ch in ("'", '"'):
-            in_str = ch
-            i += 1
-        elif ch == '(':
-            depth += 1
-            i += 1
-        elif ch == ')':
-            depth -= 1
-            i += 1
-        elif depth == 0 and expr[i:i + len(op)] == op:
-            # 避免匹配 `<=` 内的 `<`
-            if op == '<' and i + 1 < len(expr) and expr[i + 1] in '=>':
-                i += 1
-                continue
-            if op == '>' and i + 1 < len(expr) and expr[i + 1] == '=':
-                i += 1
-                continue
-            return i
-        else:
-            i += 1
-    return -1

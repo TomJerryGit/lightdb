@@ -7,12 +7,28 @@
 import json
 import re
 import time
+import uuid
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Set, Optional
 
 
 GOV_FILE = Path.home() / '.lightdb_studio' / 'governance.json'
+
+
+def new_policy_id() -> str:
+    """生成策略 id
+
+    **必须是不会碰撞的**：旧实现是 `f"p_{int(time.time()*1000) % 1000000}"`
+    —— 毫秒时间戳取模，同一毫秒内的两次 `add_policy` 必然同 id，随后
+    `self.policies[id] = p` 把前一条策略**静默覆盖**（实测：同毫秒连续
+    添加"禁止生产 DROP" + "工作时间限制" → `policies=1`，
+    `check_policy('DROP')` 返回 `allowed=True`，即安全策略凭空消失）。
+    而且取模 1e6 让 id 每 1000 秒就整段重复一次。
+
+    改用 uuid4（122 位随机）：与时钟刻度、进程重启、调用频率都无关。
+    """
+    return f"p_{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -36,7 +52,7 @@ class Policy:
     def __post_init__(self):
         now = time.time()
         if not self.policy_id:
-            self.policy_id = f"p_{int(now*1000)%1000000}"
+            self.policy_id = new_policy_id()
         if not self.created_at:
             self.created_at = now
         if not self.updated_at:
@@ -87,19 +103,40 @@ class FederatedGovernance:
         self._load()
 
     def _load(self):
+        """读取策略库
+
+        **失败必须显式报错，不能静默变成"没有策略"**：治理引擎的默认决策
+        是"放行"，静默丢掉策略库 = 所有限制无声失效（`DROP prod.*` 立刻
+        被允许）。旧实现 `except Exception: pass` 正是这样 fail-open 的。
+        只有"文件不存在"（首次使用）才算空库。
+        """
         if not self.file.exists():
             return
         try:
             with open(self.file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            for pid, pd in data.get('policies', {}).items():
+        except Exception as e:
+            raise RuntimeError(
+                f"策略库 {self.file} 无法读取（{type(e).__name__}: {e}）。"
+                f"拒绝以降级为空策略的方式启动：那会让所有治理限制静默失效。"
+                f"请修复或移走该文件后重试。")
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"策略库 {self.file} 结构不合法（顶层应为对象，实际是 "
+                f"{type(data).__name__}）：拒绝静默降级为空策略。")
+        try:
+            for pid, pd in (data.get('policies') or {}).items():
                 self.policies[pid] = Policy(**pd)
-            for vd in data.get('violations', [])[-500:]:
+            for vd in (data.get('violations') or [])[-500:]:
                 self.violations.append(PolicyViolation(**vd))
-            for ad in data.get('audit_log', [])[-1000:]:
+            for ad in (data.get('audit_log') or [])[-1000:]:
                 self.audit_log.append(AuditRecord(**ad))
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(
+                f"策略库 {self.file} 内容无法解析（{type(e).__name__}: {e}）；"
+                f"已加载 {len(self.policies)} 条策略后放弃。"
+                f"拒绝带着不完整的策略集继续运行（缺失的策略会被当成"
+                f"'没有这条限制'）。")
 
     def save(self):
         data = {
@@ -120,6 +157,18 @@ class FederatedGovernance:
                    scope_ref: str = '', priority: int = 0,
                    description: str = '',
                    enforced: bool = True) -> Policy:
+        """新增一条策略
+
+        **绝不覆盖既有策略**：这里用 `policies[id] = p` 落库，因此 id 一旦
+        重复，前一条策略就被静默抹掉（旧实现的毫秒时间戳 id 正是如此，
+        "禁止生产 DROP"被后来的"工作时间限制"顶掉）。除了把 id 生成换成
+        uuid4，这里再加一道去重兜底：即使将来 id 生成方式被改回可能碰撞的
+        实现，也只会重新生成 id，不会覆盖任何已有策略。
+
+        对**同名**策略：本方法让两条同时存在（不做静默替换）。同名覆盖
+        与 id 撞号是同一类"静默丢失"——审计上一条限制忽然变了内容却看不
+        出痕迹。需要改既有策略请用 `update_policy(policy_id, **kwargs)`。
+        """
         p = Policy(
             name=name,
             description=description,
@@ -130,6 +179,14 @@ class FederatedGovernance:
             priority=priority,
             enforced=enforced,
         )
+        for _ in range(8):
+            if p.policy_id not in self.policies:
+                break
+            p.policy_id = new_policy_id()
+        else:
+            raise RuntimeError(
+                f"无法为策略 {name!r} 生成唯一 id（连续 8 次碰撞）；"
+                f"拒绝覆盖既有策略 {p.policy_id!r}")
         self.policies[p.policy_id] = p
         self.save()
         return p
@@ -209,9 +266,17 @@ class FederatedGovernance:
                     reason=violation.detail,
                 )
 
-        allowed = not any(
-            self.policies[v.policy_id].enforced
-            for v in violations if v.policy_id in self.policies)
+        # 违规的判定：只要有**任何一条强制执行的策略**被违反就不放行。
+        # 策略记录查不到时按"强制执行"处理 —— 违规已经产生了，此时默认
+        # 放行才是危险的（旧实现 `if v.policy_id in self.policies` 会把
+        # 查不到记录的违规直接跳过，等于 fail-open）。
+        denied = False
+        for v in violations:
+            pol = self.policies.get(v.policy_id)
+            if pol is None or pol.enforced:
+                denied = True
+                break
+        allowed = not denied
 
         if not violations:
             self._audit(

@@ -222,7 +222,7 @@ def test_batch_executor():
 
     # 向量化
     if HAS_NUMPY:
-        scanner = BatchScan(iter(data), batch_size=4096)
+        scanner = BatchScan(iter(data), col_names, batch_size=4096)
         pipeline = BatchPipeline(scanner)
         pipeline.stages.append(
             VectorizedFilter(pipeline.stages[-1], 'age', '>', 50))

@@ -209,6 +209,104 @@ class Table:
         # 全文索引（CREATE FULLTEXT INDEX）：列名 -> InvertedIndex
         self._fulltext = None
 
+        # CHECK 约束（语法/求值在 `sql/checks.py`，这里只持有定义）：
+        #   * 列级约束随列定义走（`cols[i]['check']`）——它本来就在元数据
+        #     的 `cols` 里；旧实现只是**从来没人读它**，于是 `CHECK` 完全
+        #     不生效；
+        #   * 表级约束（含 `CONSTRAINT 名字 CHECK (...)`）由
+        #     `Database.create_table` 规范化命名后 `set_checks()` 挂上，
+        #     随 `_meta.json` 的 `checks` 一起持久化（重启后仍生效）。
+        self._checks = []
+        self._refresh_check_flag()
+
+    # ==================== CHECK 约束 ====================
+
+    def _refresh_check_flag(self):
+        """缓存"这张表有没有 CHECK"，避免每行写入都重扫列定义"""
+        self._has_checks = bool(self._checks) or any(
+            (c.get('check') or {}).get('expr') for c in self.cols)
+
+    def set_checks(self, checks):
+        """挂上表级 CHECK 约束（定义已由 `Database.create_table` 校验+命名）"""
+        self._checks = [dict(c) for c in (checks or [])
+                        if isinstance(c, dict) and c.get('expr')]
+        self._refresh_check_flag()
+        return self._checks
+
+    def check_constraints(self):
+        """本表全部 CHECK 约束（列级在前、表级在后，顺序稳定）"""
+        out = []
+        for c in self.cols:
+            ck = c.get('check') or {}
+            if ck.get('expr'):
+                out.append({'name': ck.get('name') or '',
+                            'expr': ck['expr'],
+                            'column': c['name']})
+        for ck in self._checks:
+            if ck.get('expr'):
+                out.append({'name': ck.get('name') or '',
+                            'expr': ck['expr'],
+                            'column': ck.get('column')})
+        return out
+
+    def _validate_checks(self, row):
+        """写入前校验全部 CHECK；违规抛 `CheckConstraintError`（ValueError）
+
+        语义（与 MySQL 一致）：
+
+        * 表达式求值为 **UNKNOWN**（NULL 参与比较）→ **放行**；
+        * 求值为 FALSE → 抛错，文案带 `ERROR 3819 (HY000)` 与列/取值；
+        * 求值过程出错（列解析不到、函数报错等）→ 同样显式抛错，
+          **绝不**"算不出来就当通过"。
+        """
+        if not getattr(self, '_has_checks', False):
+            return
+        from ..sql.checks import (
+            CheckConstraintError, RowResolver, evaluate_check,
+            format_violation)
+        names = [c['name'] for c in self.cols]
+        for spec in self.check_constraints():
+            resolver = RowResolver(names, row, self.name)
+            verdict = evaluate_check(spec['expr'], resolver,
+                                     context=self.name)
+            if verdict is False:
+                col = spec.get('column')
+                has_value = bool(col) and col in names
+                raise CheckConstraintError(
+                    format_violation(
+                        self.name,
+                        spec['name'] or f"{self.name}_chk",
+                        spec['expr'], col,
+                        row[names.index(col)] if has_value else None,
+                        has_value),
+                    table=self.name, constraint=spec.get('name'),
+                    column=col)
+
+    def _apply_set_pairs(self, old_row, set_pairs):
+        """按 SET 列表算出新行（写入路径与"写入前整体校验"共用一份语义）"""
+        new = list(old_row)
+        for col, val in set_pairs.items():
+            ci = self._col_idx(col)
+            if ci == self.pk_idx:
+                raise ValueError("不允许修改主键")
+            new[ci] = coerce(val, self.cols[ci]['type'])
+        return new
+
+    def _validate_update_checks(self, pks, set_pairs, read_view):
+        """UPDATE 的写入前整体校验（任一目标行违规 → 整条语句不写任何行）"""
+        for pk in pks:
+            anchor = self._read_version(pk, read_view)
+            if anchor is None:
+                continue
+            _, _xmin, _xmax, apid, asid = anchor
+            page = self.bp.get_page(apid)
+            if page is None:
+                continue
+            r = self._decode_row_ver(page.get_row(asid))
+            if r is None:
+                continue
+            self._validate_checks(self._apply_set_pairs(r[0], set_pairs))
+
     # ==================== 生成列 ====================
 
     def _apply_generated(self, values):
@@ -632,6 +730,13 @@ class Table:
             pk = self._next_pk
             row[self.pk_idx] = pk
 
+        # CHECK 约束：两条写入路径（SQL `INSERT` 与 `Table.insert` 直写）
+        # 都汇到这里，因此这一处校验覆盖全部入口（SQL `UPDATE` 见
+        # `_update_locked`）。放在拿锁 / 写 WAL **之前** —— 违规时不会留下
+        # 任何半条记录。违规抛 `CheckConstraintError`（ValueError 子类），
+        # SQL 层据此返回 `ERROR 3819 (HY000)`。
+        self._validate_checks(row)
+
         # 加锁
         self._acquire_row_lock(tid, pk)
 
@@ -735,6 +840,13 @@ class Table:
     def _update_locked(self, set_pairs, where, tid,
                        read_view, owned) -> int:
         pks = self._find_pks(where, read_view)
+
+        # CHECK 约束：**先对全部目标行整体校验，再逐行写**。若一边写一边
+        # 校验，第 N 行违规时前 N-1 行已经落盘（autocommit 下退不回来），
+        # 语句报错却留下部分更新 —— 那是另一种"假成功"。
+        if getattr(self, '_has_checks', False):
+            self._validate_update_checks(pks, set_pairs, read_view)
+
         n = 0
         for pk in pks:
             self._acquire_row_lock(tid, pk)
@@ -764,12 +876,7 @@ class Table:
                 pk, old_xmin, tid, old_row,
                 table=self.name)
 
-            new = list(old_row)
-            for col, val in set_pairs.items():
-                ci = self._col_idx(col)
-                if ci == self.pk_idx:
-                    raise ValueError("不允许修改主键")
-                new[ci] = coerce(val, self.cols[ci]['type'])
+            new = self._apply_set_pairs(old_row, set_pairs)
 
             # ★ 旧版本墓碑化：
             #   - xmax 写真实事务号（并发读者靠它挡住未提交的更新）；
