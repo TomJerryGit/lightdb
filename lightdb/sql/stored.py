@@ -175,7 +175,14 @@ def parse_params(s: str):
 
 
 def call_procedure(sql, ctx):
-    """CALL name(args) — 由 PL 解释器调用"""
+    """CALL name(args) — 由 PL 解释器调用
+
+    **注意（本轮起）**：PL 体内与顶层的 CALL 都走
+    `Executor._pl_run_call` → `Executor._cmd_call`（同一份参数校验 /
+    OUT 回填 / 用户变量写回）。本函数保留给历史调用点，语义上只是
+    "真的执行一次过程"，OUT 参数无法回填到调用方（因为它拿不到
+    外层的会话/变量表）。
+    """
     m = re.match(r'\s*CALL\s+(\w+)\s*\((.*)\)\s*$', sql, re.IGNORECASE | re.DOTALL)
     if not m:
         raise SyntaxError(f"CALL 语法错误: {sql}")

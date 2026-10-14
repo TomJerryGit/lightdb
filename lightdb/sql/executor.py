@@ -36,6 +36,13 @@ from .parser import (
     SCALAR_FUNCTION_NAMES as _SCALAR_FUNCTION_NAMES,
 )
 
+# PL 解释器的常量（迭代上限默认值 / 循环嵌套上限）。放在这里而不是
+# 写死两份，是为了让"绝不无限循环"的保护只有一处定义。
+from .pl import (
+    DEFAULT_MAX_ITERATIONS as PL_DEFAULT_MAX_ITERATIONS,
+    _MAX_LOOP_LABEL_DEPTH as PL_MAX_LOOP_DEPTH,
+)
+
 
 # 哨兵：区分"调用方没传 where"与"where 被改写成恒真(None)"
 _UNSET = object()
@@ -311,6 +318,10 @@ class Executor:
         except Exception as e:                   # pragma: no cover
             logger.warn(f"初始化触发器管理器失败: {e}")
             self._trigger_mgr = None
+
+        # PL 循环的迭代上限（默认 100 万；测试/运维可调小）
+        # 也可以在会话里写 `SET SESSION pl_max_iterations = N`（优先）。
+        self._pl_max_iterations = PL_DEFAULT_MAX_ITERATIONS
 
         # ★ 事件调度器（可选）
         self._event_scheduler = None
@@ -2508,11 +2519,14 @@ class Executor:
     def _exec_function_body(self, fn, bind_sql, bind_val, session, depth):
         """执行函数体并返回 RETURN 的值
 
-        复用过程体那套：`PLParser` 切语句 + 引号感知的变量字面量替换
-        （`Executor._substitute_words`），因此函数体里的 `IF` / `DECLARE` /
-        `SET` 与过程体行为一致；区别只有两处：
+        与过程体**完全共用** `_pl_run_block`（同一个 PL 语句执行器）：因此
+        函数体里 IF / WHILE / LOOP / REPEAT / LEAVE / ITERATE / 游标 /
+        `SELECT ... INTO` / SIGNAL 的行为与过程体逐字一致 —— 这也是 MySQL
+        的语义（13.1.12：存储函数只禁止改数据的语句，不禁止循环与游标）。
+        区别只有两处：
         * 函数体的 RETURN 必须有值（无 RETURN 显式报错，不静默返回 NULL）；
-        * 不允许改数据的 SQL（创建期已校验，这里兜底）。
+        * 不允许改数据的 SQL（创建期已校验，执行期再兜一道，
+          见 `_pl_sql_run(funcs_depth=…)`）。
         """
         body = self._substitute_words(fn.body, bind_sql)
         from .pl import PLParser, PLContext, ExprParser, eval_expr
@@ -2520,6 +2534,7 @@ class Executor:
         ctx.function_name = getattr(fn, 'name', '?')
         for k, v in (bind_val or {}).items():
             ctx.variables[k] = v
+            ctx.declared_vars.add(k)
         text = self._strip_begin_end(body)
         try:
             stmts = PLParser(text).parse_program()
@@ -2527,8 +2542,12 @@ class Executor:
             raise RuntimeError(f"函数体语法错误: {e}")
         if not stmts:
             raise RuntimeError("函数体为空（本引擎要求 RETURN <表达式>）")
-        returned = self._run_pl_statements(
+        returned = self._pl_run_block(
             stmts, ctx, ExprParser, eval_expr, funcs_depth=depth + 1)
+        if self._pl_signal_set(ctx):
+            raise RuntimeError(
+                f"函数体 SIGNAL SQLSTATE {ctx.signal_state}: "
+                f"{ctx.signal_message}")
         if not ctx.return_hit:
             raise RuntimeError(
                 "函数体执行结束都没有遇到 RETURN：存储函数必须有返回值，"
@@ -5913,12 +5932,41 @@ class Executor:
     # ---------- 存储过程 / 触发器 ----------
 
     def _cmd_create_procedure(self, p, s):
+        """`CREATE PROCEDURE ...` —— 解析 → 校验 → 落 `_stored.json`
+
+        本轮补上**创建期语法/语义校验**（与 `CREATE FUNCTION` 对齐）：
+        过程体先交给 `PLParser` 解析一遍，`SIGNAL SQLSTATE '450'`（不是
+        5 个字符）、`END LOOP` 收尾不匹配、尾部多余记号这类问题在
+        **创建时**就报 1064，而不是等 CALL 的时候才失败 —— 后者会让
+        "过程已创建成功"变成一个假象。
+        """
         if self._stored is None:
             return self._err(1105, "存储过程管理器不可用")
         from .stored import parse_params
         params = parse_params(', '.join(p.get('params') or []))
+        try:
+            self._validate_procedure_body(p['name'], p['body'])
+        except SyntaxError as e:
+            return self._err(
+                1064, f"CREATE PROCEDURE {p['name']} 过程体语法错误: {e}")
+        except ValueError as e:
+            return self._err(1105, str(e))
         self._stored.create_procedure(p['name'], params, p['body'])
         return self._ok(message=f"Procedure '{p['name']}' created")
+
+    def _validate_procedure_body(self, name, body):
+        """解析过程体（不执行）：语法/结构错误在创建期显式报错"""
+        from .pl import PLParser
+        text = self._strip_begin_end(str(body or ''))
+        if not text:
+            raise ValueError(f"CREATE PROCEDURE {name}: 过程体为空")
+        try:
+            stmts = PLParser(text).parse_program()
+        except SyntaxError as e:
+            raise SyntaxError(str(e))
+        if not stmts:
+            raise ValueError(f"CREATE PROCEDURE {name}: 过程体为空")
+        return stmts
 
     # ---------- 存储函数 ----------
 
@@ -5931,11 +5979,13 @@ class Executor:
         """`CREATE FUNCTION ...` —— 解析 → 校验 → 落 `_stored.json`
 
         三条**创建期**校验（都在真正保存之前）：
-        1. 参数只支持 IN（OUT/INOUT 没有回填机制 → 显式拒绝，不静默按 IN 处理）；
+        1. 参数只支持 IN（MySQL 13.1.12：存储函数的参数只能是 IN，
+           OUT/INOUT 在 MySQL 里本身就非法，报 1064）；
         2. `RETURNS 类型` 必须在本引擎的类型清单里（CURSOR/ROW/TABLE 这类
            没有标量值语义的类型显式报错）；
-        3. 函数体交给 `PLParser` 解析并逐个语句校验（游标 / 循环 / handler /
-           事务 / 改数据的 SQL 全部显式报错）—— 校验通过才注册。
+        3. 函数体交给 `PLParser` 解析并逐个语句校验（**循环 / 游标 /
+           SELECT ... INTO / SIGNAL 合法**；handler / 事务 / 改数据的 SQL
+           显式报错 —— 与 MySQL 只禁"改数据"的边界一致）。
         """
         if self._stored is None:
             return self._err(1105, "存储函数管理器不可用")
@@ -5949,10 +5999,10 @@ class Executor:
                     if str(prm.get('mode', 'IN')).upper() in ('OUT', 'INOUT')]
         if bad_mode:
             return self._err(
-                1105, f"CREATE FUNCTION {name}: 参数 "
-                      f"{', '.join(bad_mode)} 用了 OUT/INOUT —— 函数参数只"
-                      f"支持 IN（本引擎没有用户变量回填机制，按 IN 静默处理"
-                      f"会让调用方拿到错误的返回值），显式拒绝")
+                1064, f"CREATE FUNCTION {name}: 参数 "
+                      f"{', '.join(bad_mode)} 用了 OUT/INOUT —— MySQL 语义"
+                      f"（13.1.12「CREATE FUNCTION Statement」）规定存储函数"
+                      f"的参数只能是 IN，OUT/INOUT 在函数签名里本身就非法")
 
         ret_type = str(p.get('return_type') or '').strip()
         try:
@@ -6023,10 +6073,27 @@ class Executor:
         self._check_function_stmts(name, stmts, bool(params))
 
     #: 函数体允许的 PL 语句种类（其余显式报错）
-    _FUNCTION_ALLOWED_STMTS = ('DECLARE', 'SET', 'IF', 'RETURN')
+    #:
+    #: **MySQL 依据**：存储函数禁的是"改数据 / 事务 / 锁 / 临时表"这类
+    #: 语句（MySQL 13.1.12「CREATE FUNCTION Statement」：`INSERT`、
+    #: `UPDATE`、`DELETE`、`COMMIT`、`ROLLBACK`、`LOCK TABLES`、
+    #: 改非确定性数据等会显式报错 1422），而 WHILE / LOOP / REPEAT /
+    #: 游标 / `SELECT ... INTO` / SIGNAL 在函数体里**都是合法的**（同一
+    #: 手册章节的示例里就有循环与游标）。因此这里放行这些控制流语句；
+    #: 改数据的 SQL 与 CALL 仍然显式拒绝。
+    _FUNCTION_ALLOWED_STMTS = (
+        'DECLARE', 'DECLARE_CURSOR', 'SET', 'IF', 'RETURN',
+        'WHILE', 'LOOP', 'REPEAT', 'LEAVE', 'ITERATE',
+        'SELECT_INTO', 'OPEN', 'FETCH', 'CLOSE', 'SIGNAL',
+    )
 
     def _check_function_stmts(self, name, stmts, has_params):
-        """递归校验函数体里的每条语句（越界一律显式报错）"""
+        """递归校验函数体里的每条语句（越界一律显式报错）
+
+        放行的控制流（WHILE / LOOP / REPEAT / 游标 / SELECT ... INTO /
+        SIGNAL）会**递归进语句块**继续校验，因此 `WHILE ... DO INSERT ...
+        END WHILE` 里的 INSERT 同样在这里被拦下。
+        """
         for stmt in stmts:
             if not isinstance(stmt, tuple) or not stmt:
                 raise ValueError(
@@ -6036,10 +6103,12 @@ class Executor:
             if op == 'SQL':
                 raise ValueError(
                     f"CREATE FUNCTION {name}: 函数体里的 SQL 语句不受支持: "
-                    f"{stmt[1][:80]} —— 存储函数是纯计算，不能执行 "
-                    f"INSERT / UPDATE / DELETE / SELECT ... INTO / CALL / "
-                    f"OPEN / FETCH / CLOSE 等语句（本引擎显式拒绝，不静默"
-                    f"跳过）。{self._FUNCTION_BODY_HINT}")
+                    f"{stmt[1][:80]} —— MySQL 语义禁止存储函数修改数据"
+                    f"（13.1.12：INSERT / UPDATE / DELETE / CALL / 事务与锁"
+                    f"语句都会报 ERROR 1422）。允许的是 DECLARE / SET / IF / "
+                    f"WHILE / LOOP / REPEAT / LEAVE / ITERATE / 游标 / "
+                    f"SELECT ... INTO / SIGNAL / RETURN。"
+                    f"{self._FUNCTION_BODY_HINT}")
             if op not in self._FUNCTION_ALLOWED_STMTS:
                 raise ValueError(
                     f"CREATE FUNCTION {name}: 函数体里暂不支持的语句类型 "
@@ -6051,6 +6120,11 @@ class Executor:
                     self._check_function_stmts(name, block, has_params)
                 if else_body:
                     self._check_function_stmts(name, else_body, has_params)
+            elif op in ('WHILE', 'REPEAT', 'LOOP'):
+                body = stmt[3] if len(stmt) == 4 else stmt[-1]
+                if op == 'LOOP' and len(stmt) == 3:
+                    body = stmt[2]
+                self._check_function_stmts(name, body, has_params)
 
     def _cmd_drop_function(self, p, s):
         if self._stored is None:
@@ -6123,10 +6197,32 @@ class Executor:
                     f"{p['table']}({', '.join(p.get('columns') or [])})")
 
     def _pl_arg_value(self, raw):
-        """CALL 实参 → Python 值（字面量；`@name` 取会话变量）"""
+        """CALL 实参 → Python 值（字面量；`@name` 取用户变量）
+
+        `@name` 的读取顺序与 `_write_back_out_params` 的写入位置一致：
+        ① 当前会话的 `user_vars`；② 全局 `variables.get_vm()` 的用户变量表
+        （`SELECT @x` 走的是后者，因此两条路径都要写，见
+        `_write_back_out_params`）。取不到时返回 None —— MySQL 里读未赋值
+        的用户变量本来就是 NULL。
+        """
         if raw is None:
             return None
         t = str(raw).strip()
+        if t.startswith('@'):
+            name = t.lstrip('@')
+            sess = getattr(self, '_active_session', None)
+            store = self._pl_user_var_store(sess)
+            if name in store:
+                return store[name]
+            try:
+                from .variables import get_vm
+                sid = (sess or {}).get('session_id') \
+                    if isinstance(sess, dict) else None
+                if sid is not None:
+                    return get_vm().get_session(int(sid)).get_user(name)
+            except Exception:                      # pragma: no cover
+                pass
+            return None
         if t.upper() == 'NULL':
             return None
         if len(t) >= 2 and t[0] == "'" and t[-1] == "'":
@@ -6250,12 +6346,628 @@ class Executor:
 
     @staticmethod
     def _has_pl_control_flow(body) -> bool:
+        """体里是否有需要 PL 解释器的构造（否则走"直接逐条执行"的快路）
+
+        `REPEAT` / `LOOP` / 游标 / `SIGNAL` / `SET` / `SELECT ... INTO`
+        都必须在这里被认出来 —— 漏掉任何一个，那条过程体就会被当成
+        "一堆普通 SQL"按分号切开执行（`SET s = 42` 这类 PL 赋值语句不是
+        SQL 的 SET，解析必然失败）。
+        """
         return bool(re.search(
-            r'(^|;|\s)(IF|WHILE|LOOP|DECLARE|RETURN|LEAVE|ITERATE)\b',
+            r'(^|;|\s)(IF|WHILE|LOOP|REPEAT|DECLARE|CURSOR|RETURN|'
+            r'LEAVE|ITERATE|OPEN|FETCH|CLOSE|SIGNAL|SET)\b'
+            r'|INTO\s+\w',
             str(body or ''), re.IGNORECASE))
 
+    # ==================== PL 语句执行器（过程体 / 函数体共用） ====================
+    #
+    # 设计要点（这一轮的重点）：
+    # * **只有一份实现**：过程体（`_exec_pl_body`）与函数体
+    #   （`_exec_function_body`）都走 `_pl_run_block`。`sql/pl.py` 的
+    #   `PLInterpreter` 只剩转发壳，避免"两个解释器语义不一致"。
+    # * SQL 语句里的变量名在**每次执行前**按当前值做一次引号感知的
+    #   字面量替换（`_substitute_words`），所以循环体里变量的逐轮变化
+    #   是真的生效的（旧 `pl.py::PLInterpreter._substitute_vars` 是空
+    #   实现，会把字符串 `'i'` 写进库 —— 静默错值）。
+    # * `SELECT ... INTO` 的**目标变量名**在替换时被保护（占位符），
+    #   否则参数 `n` 会被替换成 `105`，语句变成 `SELECT ... INTO 105`，
+    #   解析失败后静默什么都不做（`test_procedure_out_param` 的形态）。
+    # * 迭代上限：每执行一条语句、每求值一次循环条件都消耗 1 次配额，
+    #   超过 `ctx.max_iterations`（默认 100 万）显式报错 —— 绝不挂死。
+
+    #: `SELECT ... INTO` 目标变量名在字面量替换期间的占位前缀
+    _PL_INTO_PLACEHOLDER = '__lightdb_pl_into_'
+
+    def _pl_iteration_budget(self, ctx):
+        """取本次执行的迭代上限（会话变量 / 执行器属性可覆盖默认值）"""
+        try:
+            val = int(getattr(ctx, 'max_iterations', None)
+                      or PL_DEFAULT_MAX_ITERATIONS)
+        except (TypeError, ValueError):
+            val = PL_DEFAULT_MAX_ITERATIONS
+        return max(1, val)
+
+    def _pl_tick(self, ctx):
+        """消耗一次迭代配额；超限显式报错并终止（绝不无限循环）"""
+        ctx.iterations += 1
+        limit = self._pl_iteration_budget(ctx)
+        if ctx.iterations > limit:
+            where = ''
+            if getattr(ctx, 'function_name', None):
+                where = f"（函数 {ctx.function_name}）"
+            raise RuntimeError(
+                f"PL 执行超过迭代上限 {limit} 次{where}：循环没有收敛"
+                f"（可能条件恒真 / ITERATE 没有推进循环变量）。"
+                f"本引擎不会无限循环，已显式中止；"
+                f"上限可用环境变量 LIGHTDB_PL_MAX_ITERATIONS 或 "
+                f"`ctx.max_iterations` 调整")
+
+    def _pl_save_into_slots(self, names, ctx):
+        """`SELECT ... INTO` 目标变量 → 占位符（返回 `[(占位, 名字)]`）
+
+        占位符在 SQL 里代替变量名出现，事后由 `_pl_assign_into` 按列写回，
+        因此过程中 `ctx.variables` 的变化不会影响目标名。
+        """
+        return [(f'{self._PL_INTO_PLACEHOLDER}{i}', name)
+                for i, name in enumerate(names)]
+
+    def _pl_assign_into(self, ctx, slots, values):
+        """把 SELECT 结果的第 i 列写进第 i 个目标变量"""
+        for i, (_ph, name) in enumerate(slots):
+            ctx.variables[name] = values[i]
+
+    def _pl_bind_into_sql(self, sql, ctx, names):
+        """替换 SQL 里的**变量值**，并返回 `SELECT ... INTO` 的槽位
+
+        返回 `(SQL, 槽位列表)`。这是 `test_procedure_out_param` 那个既有
+        缺陷的落点：旧实现把 `INTO n` 里的 `n` 也当成变量值替换成
+        `105`，语句变成 `... INTO 105 ...`，`parser.parse` 返回 None，
+        然后 `if p:` 静默什么都不做 —— OUT 变量永远是 NULL。
+        现在的做法是：过程体在**上游**就先保护了目标位
+        （`_pl_protect_assign_targets`），这里只需要把剩下的变量做值
+        替换；槽位只用于"结果列 → 目标变量"的写回。
+        """
+        slots = self._pl_save_into_slots(names, ctx)
+        lowered = {str(n).lower() for n in names}
+        value_map = {k: self._sql_literal(v)
+                     for k, v in ctx.variables.items()
+                     if str(k).lower() not in lowered}
+        return self._substitute_words(sql, value_map), slots
+
+    def _pl_run_block(self, stmts, ctx, ExprParser, eval_expr,
+                      cond_tokens=None, funcs_depth=None):
+        """逐条执行 PL 语句（过程体与函数体**共用这一份实现**）
+
+        funcs_depth 不为 None 时进入**函数体模式**：表达式求值带上存储
+        函数解析回调（函数体里可以调用别的函数，共享同一个递归深度
+        计数）。函数体与过程体的**语句能力现在完全一致**（循环 / 游标 /
+        SELECT ... INTO / SIGNAL 都能用）—— 这正是 MySQL 的语义：
+        MySQL 的存储函数同样允许 WHILE / LOOP / REPEAT / 游标 / SELECT
+        ... INTO，只禁止改数据的语句（见 `_check_function_stmts`）。
+        """
+        if cond_tokens is not None:
+            self._pl_tick(ctx)
+            if not eval_expr(ExprParser(cond_tokens).parse(), ctx):
+                return None
+
+        if not isinstance(getattr(ctx, 'loop_stack', None), list):
+            ctx.loop_stack = []
+
+        def _funcs():
+            """表达式求值用的存储函数回调（**过程体与函数体都要**）
+
+            过程体里 `SET s = double_it(i)` 必须真的调用已注册的存储函数；
+            函数体里还要靠它传递递归深度计数。两边都用同一个 resolver，
+            因此行为一致（此前过程体没接，被当成"未知函数"）。
+            """
+            return self._stored_function_resolver(
+                '函数体' if funcs_depth is not None else '过程体')
+
+        if funcs_depth is not None:
+            self._check_function_stmts(
+                getattr(ctx, 'function_name', '?'), stmts, True)
+
+        for stmt in stmts:
+            self._pl_tick(ctx)
+            op = stmt[0]
+
+            if op == 'DECLARE':
+                _, name, _types, default_toks = stmt
+                value = None
+                if default_toks:
+                    value = eval_expr(ExprParser(default_toks).parse(), ctx,
+                                      funcs=_funcs())
+                if name in getattr(ctx, 'declared_vars', ()) or \
+                        name in getattr(ctx, 'cursors', {}):
+                    raise RuntimeError(
+                        f"PL: 变量 {name} 重复声明（MySQL 语义：同一块内"
+                        f"不能重复 DECLARE 同名变量）")
+                ctx.variables[name] = value
+                ctx.declared_vars.add(name)
+
+            elif op == 'DECLARE_CURSOR':
+                self._pl_declare_cursor(stmt, ctx)
+
+            elif op == 'SET':
+                _, name, expr_toks = stmt
+                ctx.variables[name] = eval_expr(
+                    ExprParser(expr_toks).parse(), ctx, funcs=_funcs())
+
+            elif op == 'IF':
+                _, branches, else_body = stmt
+                taken = False
+                for cond_toks, block in branches:
+                    self._pl_tick(ctx)
+                    if eval_expr(ExprParser(cond_toks).parse(), ctx,
+                                 funcs=_funcs()):
+                        self._pl_run_block(block, ctx, ExprParser, eval_expr,
+                                           funcs_depth=funcs_depth)
+                        taken = True
+                        break
+                if not taken and else_body:
+                    self._pl_run_block(else_body, ctx, ExprParser, eval_expr,
+                                       funcs_depth=funcs_depth)
+                if self._pl_signal_set(ctx):
+                    return self._pl_signal_value(ctx)
+
+            elif op in ('WHILE', 'LOOP', 'REPEAT'):
+                self._pl_loop(stmt, ctx, ExprParser, eval_expr,
+                              funcs_depth=funcs_depth)
+                if self._pl_signal_set(ctx):
+                    return self._pl_signal_value(ctx)
+
+            elif op == 'SELECT_INTO':
+                self._pl_select_into(stmt, ctx, funcs_depth=funcs_depth)
+
+            elif op == 'RETURN':
+                ctx.return_hit = True
+                ctx.return_value = None
+                if stmt[1]:
+                    ctx.return_value = eval_expr(
+                        ExprParser(stmt[1]).parse(), ctx, funcs=_funcs())
+                return ctx.return_value
+
+            elif op == 'LEAVE':
+                self._pl_leave(stmt, ctx)
+                return None
+
+            elif op == 'ITERATE':
+                self._pl_iterate(stmt, ctx)
+                return None
+
+            elif op == 'OPEN':
+                self._pl_open_cursor(stmt, ctx)
+
+            elif op == 'FETCH':
+                self._pl_fetch_cursor(stmt, ctx)
+
+            elif op == 'CLOSE':
+                self._pl_close_cursor(stmt, ctx)
+
+            elif op == 'SIGNAL':
+                self._pl_signal(stmt, ctx)
+                return self._pl_signal_value(ctx)
+
+            elif op == 'SQL':
+                if self._pl_signal_set(ctx):
+                    return self._pl_signal_value(ctx)
+                self._pl_sql_run(stmt[1], ctx, funcs_depth=funcs_depth)
+
+            else:
+                raise RuntimeError(f"PL 里暂不支持的语句类型: {op}")
+
+            # ---- 非局部退出的传播（这一条是 LEAVE 正确性的关键） ----
+            # `LEAVE` / `ITERATE` 设置的标记必须在**每条语句之后**检查并
+            # 立即结束当前语句块，否则循环体里 LEAVE 之后的语句还会继续
+            # 执行（实测：游标到底后 `LEAVE read_loop` 之后紧跟的
+            # `SET acc = acc + v` 仍然执行，结果 15 变 20 —— 静默错值）。
+            if ctx.return_hit or self._pl_signal_set(ctx):
+                return ctx.return_value
+            if ctx.leave_flag is not None or ctx.iterate_flag is not None:
+                return None
+        return None
+
+    # ---------- 循环 ----------
+
+    def _pl_find_loop(self, ctx, label):
+        """按**动态作用域**从内到外找循环（MySQL 的 LEAVE 语义）
+
+        返回 `(层级, {'label','kind'})`；label 为空串表示"最内层循环"。
+        找不到就抛错（显式失败，不静默跳到某处）。
+        """
+        stack = getattr(ctx, 'loop_stack', None) or []
+        if not label:
+            if not stack:
+                return None, None
+            return len(stack) - 1, stack[-1]
+        want = str(label).lower()
+        for i in range(len(stack) - 1, -1, -1):
+            if str(stack[i].get('label') or '').lower() == want:
+                return i, stack[i]
+        return None, None
+
+    def _pl_leave(self, stmt, ctx):
+        """`LEAVE [label]` —— 把控制流交给目标循环（离开它）"""
+        label = stmt[1] if len(stmt) > 1 else ''
+        idx, target = self._pl_find_loop(ctx, label)
+        if target is None:
+            shown = label or '(无标签)'
+            raise RuntimeError(
+                f"LEAVE {shown}: 没有对应的循环标签"
+                f"（当前循环栈：{self._pl_loop_stack_text(ctx)}）")
+        ctx.leave_flag = label or ''
+
+    def _pl_iterate(self, stmt, ctx):
+        """`ITERATE [label]` —— 进入目标循环的下一轮（离开当前这一轮体）"""
+        label = stmt[1] if len(stmt) > 1 else ''
+        idx, target = self._pl_find_loop(ctx, label)
+        if target is None:
+            shown = label or '(无标签)'
+            raise RuntimeError(
+                f"ITERATE {shown}: 没有对应的循环标签"
+                f"（当前循环栈：{self._pl_loop_stack_text(ctx)}）")
+        ctx.iterate_flag = label or ''
+
+    @staticmethod
+    def _pl_loop_stack_text(ctx):
+        stack = getattr(ctx, 'loop_stack', None) or []
+        if not stack:
+            return '(空)'
+        return ' > '.join(str(x.get('label') or '(无标签)') for x in stack)
+
+    def _pl_loop(self, stmt, ctx, ExprParser, eval_expr, funcs_depth=None):
+        """执行 `WHILE` / `LOOP` / `REPEAT`（含 LEAVE / ITERATE 处理）
+
+        三元组统一解析：
+        * `('WHILE', label, cond_toks, body)`   —— 每轮先判条件；
+        * `('LOOP',  label, None, body)`        —— 无条件，靠 LEAVE 退出；
+        * `('REPEAT', label, cond_toks, body)`  —— 先执行体，再判 UNTIL。
+        函数体与过程体走**同一条**路径（MySQL 同样允许函数体里有循环）。
+        """
+        op = stmt[0]
+        # 结构（标签先被前置到元组里，因此长度会 +1）：
+        #   ('LOOP',   body)                 / ('LOOP',   label, body)
+        #   ('WHILE',  label, cond, body)    （无标签时 label 是空串）
+        #   ('REPEAT', label, body, cond)
+        # 注意 WHILE/REPEAT 的 **条件与体的次序不同**（REPEAT 的 cond 在
+        # 最后），早期版本按同一次序取，REPEAT 拿到的是 token 列表当体，
+        # 直接报"'Token' object is not subscriptable"。
+        if op == 'REPEAT':
+            label = stmt[1] if len(stmt) == 4 else ''
+            body = stmt[2] if len(stmt) == 4 else stmt[1]
+            cond_toks = stmt[3] if len(stmt) == 4 else stmt[2]
+        elif op == 'LOOP':
+            label = stmt[1] if len(stmt) == 3 else ''
+            body = stmt[2] if len(stmt) == 3 else stmt[1]
+            cond_toks = None
+        else:                               # WHILE
+            label = stmt[1] if len(stmt) == 4 else ''
+            cond_toks = stmt[2] if len(stmt) == 4 else stmt[1]
+            body = stmt[3] if len(stmt) == 4 else stmt[2]
+
+        stack = ctx.loop_stack
+        if len(stack) >= PL_MAX_LOOP_DEPTH:
+            raise RuntimeError(
+                f"PL 循环嵌套超过 {PL_MAX_LOOP_DEPTH} 层（标签栈上限）")
+        stack.append({'label': label or '', 'kind': op})
+        try:
+            guard = 0
+            while True:
+                guard += 1
+                if guard > 10 * self._pl_iteration_budget(ctx):
+                    raise RuntimeError(
+                        "PL 循环调度次数异常（内部保护），已中止")
+                if op in ('WHILE', 'LOOP'):
+                    if cond_toks is not None:
+                        self._pl_tick(ctx)
+                        if not eval_expr(ExprParser(cond_toks).parse(), ctx):
+                            break
+                self._pl_run_block(body, ctx, ExprParser, eval_expr,
+                                   funcs_depth=funcs_depth)
+                if self._pl_signal_set(ctx):
+                    # SIGNAL 是"非局部退出"：一路往上抛
+                    return
+                if ctx.return_hit:
+                    return
+                if ctx.leave_flag is not None:
+                    if self._pl_leave_targets(ctx, stack, ctx.leave_flag):
+                        ctx.leave_flag = None
+                        return
+                    return                       # 交给外层同名循环
+                if ctx.iterate_flag is not None:
+                    if self._pl_leave_targets(ctx, stack, ctx.iterate_flag):
+                        ctx.iterate_flag = None
+                        if op == 'REPEAT':
+                            pass                 # REPEAT 的"下一轮"= 重跑体
+                        continue
+                    return
+                if op == 'REPEAT':
+                    self._pl_tick(ctx)
+                    if eval_expr(ExprParser(cond_toks).parse(), ctx):
+                        break
+        finally:
+            if stack and stack[-1].get('kind') == op \
+                    and str(stack[-1].get('label') or '') == str(label or ''):
+                stack.pop()
+            else:
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i].get('kind') == op and \
+                            str(stack[i].get('label') or '') == str(label or ''):
+                        del stack[i]
+                        break
+
+    @staticmethod
+    def _pl_leave_targets(ctx, stack, label):
+        """当前循环是否就是 LEAVE / ITERATE 的目标（区分同名嵌套）"""
+        if not stack:
+            return True
+        cur = stack[-1].get('label') or ''
+        if not label:
+            return True
+        return str(cur).lower() == str(label).lower()
+
+    # ---------- 游标 ----------
+
+    def _pl_cursor(self, ctx, name, create=False, select_toks=None,
+                   declared_at=0):
+        cursors = ctx.cursors
+        key = str(name or '')
+        cur = cursors.get(key) or cursors.get(key.lower())
+        if cur is None and create:
+            from .pl import PLCursor
+            cur = PLCursor(key, select_toks, declared_at)
+            cursors[key] = cur
+            ctx.cursor_order.append(key)
+        return cur
+
+    def _pl_declare_cursor(self, stmt, ctx):
+        """`DECLARE name CURSOR FOR <select>`（游标是只读的，无参数）"""
+        _, name, select_toks, declared_at = stmt
+        if self._pl_cursor(ctx, name) is not None:
+            raise RuntimeError(f"PL: 游标 {name} 重复声明")
+        if name in ctx.variables:
+            raise RuntimeError(
+                f"PL: {name} 已作为变量声明，不能再用作游标名（MySQL 语义："
+                f"同一块里的变量名与游标名不能重名）")
+        self._pl_cursor(ctx, name, create=True, select_toks=select_toks,
+                        declared_at=declared_at)
+
+    def _pl_open_cursor(self, stmt, ctx):
+        """`OPEN cur` —— 物化游标查询的全部行（OPEN 时报错不静默）"""
+        _, name = stmt
+        cur = self._pl_cursor(ctx, name)
+        if cur is None:
+            raise RuntimeError(
+                f"OPEN {name}: 游标未声明（MySQL 语义：必须先 "
+                f"DECLARE ... CURSOR FOR）")
+        if cur.is_open:
+            raise RuntimeError(
+                f"OPEN {name}: 游标已经打开（MySQL 语义：游标不可重复 "
+                f"OPEN，需先 CLOSE）")
+        from .pl import PLParser
+        sql = PLParser('').tokens_to_sql(cur.select_toks)
+        sql = self._substitute_words(
+            sql, {k: self._sql_literal(v) for k, v in ctx.variables.items()})
+        parsed = self._parse_pl_sql(sql, f"OPEN {name}")
+        res = self.execute(parsed, ctx.session)
+        if isinstance(res, dict) and res.get('type') == 'error':
+            raise RuntimeError(
+                f"OPEN {name} 失败: {res.get('message')}")
+        if not (isinstance(res, dict) and res.get('type') == 'resultset'):
+            raise RuntimeError(f"OPEN {name}: 游标查询没有结果集: {sql[:120]}")
+        cur.columns = list(res.get('columns') or [])
+        cur.rows = [tuple(r) for r in (res.get('rows') or [])]
+        cur.pos = -1
+        cur.is_open = True
+        ctx.not_found = False
+
+    def _pl_fetch_cursor(self, stmt, ctx):
+        """`FETCH cur INTO v1[, v2]` —— 到底时置 NOT FOUND（SQLSTATE 02000）"""
+        _, name, names = stmt
+        cur = self._pl_cursor(ctx, name)
+        if cur is None:
+            raise RuntimeError(f"FETCH {name}: 游标未声明")
+        if not cur.is_open:
+            raise RuntimeError(
+                f"FETCH {name}: 游标未打开（MySQL 语义：必须先 OPEN）")
+        if len(names) != len(cur.columns):
+            raise RuntimeError(
+                f"FETCH {name}: 目标变量个数 {len(names)} 与游标查询的列数 "
+                f"{len(cur.columns)} 不一致（MySQL 语义：必须一一对应）")
+        cur.pos += 1
+        if cur.pos >= len(cur.rows):
+            # MySQL：FETCH 没有更多行时置 SQLSTATE 02000（NOT FOUND），
+            # **变量保持原值**（与 SELECT ... INTO 的 0 行语义一致）。
+            ctx.not_found = True
+            return
+        ctx.not_found = False
+        row = cur.rows[cur.pos]
+        for i, v in enumerate(row):
+            if i < len(names):
+                ctx.variables[names[i]] = v
+
+    def _pl_close_cursor(self, stmt, ctx):
+        _, name = stmt
+        cur = self._pl_cursor(ctx, name)
+        if cur is None:
+            raise RuntimeError(f"CLOSE {name}: 游标未声明")
+        if not cur.is_open:
+            raise RuntimeError(f"CLOSE {name}: 游标未打开")
+        cur.is_open = False
+        cur.rows = []
+        cur.pos = -1
+
+    # ---------- SIGNAL ----------
+
+    def _pl_signal(self, stmt, ctx):
+        """`SIGNAL SQLSTATE 'xxxxx' [SET MESSAGE_TEXT = '...']`
+
+        实现方式：在 `ctx` 上登记"当前正在抛出的 SIGNAL"，由各层的
+        语句块在每次执行后检查（`_pl_signal_set`）并一路向上返回，
+        最终由 `_cmd_call` / `_exec_function_body` 转成显式错误。
+        **不用 Python 异常**是刻意的：异常会被 `execute()` 的兜底
+        `except Exception` 吞成 error dict，反而丢掉"哪一层抛的"信息。
+
+        `HANDLER` 仍未实现（见 `CREATE ... HANDLER` 的显式报错）。
+        """
+        _, state, msg, items, _pos = stmt
+        ctx.signal_state = state
+        ctx.signal_message = msg if msg is not None else \
+            (f"unhandled user-defined exception" if state == '45000'
+             else f"SQLSTATE {state}")
+        ctx.signal_items = dict(items or {})
+
+    @staticmethod
+    def _pl_signal_set(ctx):
+        return getattr(ctx, 'signal_state', None) is not None
+
+    @staticmethod
+    def _pl_signal_value(ctx):
+        return getattr(ctx, 'signal_message', None)
+
+    # ---------- SELECT ... INTO ----------
+
+    def _pl_select_into(self, stmt, ctx, funcs_depth=None):
+        """`SELECT ... INTO v1[, v2] [FROM ...]`
+
+        采用 MySQL 的语义（MySQL 13.2.10.1「SELECT ... INTO Statement」+
+        13.6.7.1「SELECT ... INTO 在存储程序里」）：
+        * **0 行**：变量**保持原值**并给出警告（ERROR 1329 是"无数据"，
+          MySQL 文档原文："If the query returns no rows, a warning with
+          error code 1329 occurs (No data), and the variable values remain
+          unchanged."）。本引擎没有 warning 通道，因此不报错、不改动。
+        * **多行**：显式报错（MySQL 就是 ERROR 1172 "Result consisted of
+          more than one row"）—— 绝不静默只取第一行。
+        * **列数与变量数不一致**：显式报错（MySQL 是 ERROR 1222
+          "The used SELECT statements have a different number of columns"）。
+        """
+        from .pl import PLParser
+        _, toks, into_pos = stmt
+        rest = toks[into_pos + 1:]
+        from_pos = next(
+            (i for i, t in enumerate(rest)
+             if t.type == 'KW' and t.value.upper() == 'FROM'), -1)
+        var_toks = rest[:from_pos] if from_pos >= 0 else rest
+        names = PLParser._target_names(var_toks)
+        if not names:
+            raise RuntimeError(
+                "SELECT ... INTO 后面缺少目标变量名（MySQL 语法："
+                "SELECT 列 INTO 变量[, 变量] FROM ...）")
+        col_sql = PLParser('').tokens_to_sql(toks[1:into_pos])
+        if from_pos < 0:
+            # `SELECT <表达式> INTO var`（无 FROM）：单值赋值；0 行语义
+            # 不适用（没有数据源），表达式出错会显式抛。
+            if len(names) != 1:
+                raise RuntimeError(
+                    f"SELECT ... INTO: 目标变量有 {len(names)} 个"
+                    f"（{'、'.join(names)}），但只有 1 个表达式 —— MySQL "
+                    f"语义要求列数与变量数一致（ERROR 1222）")
+            ep = ExprParser(toks[1:into_pos])
+            value = eval_expr(ep.parse(), ctx,
+                              funcs=self._stored_function_resolver('过程体'))
+            ctx.variables[names[0]] = value
+            return
+        tail = PLParser('').tokens_to_sql(rest[from_pos:])
+        # 注意：**不追加 LIMIT 1**（旧实现追加了，于是"多行"永远被截成
+        # 一行，ERROR 1172 的语义被静默吞掉）。用户自己写 LIMIT 时按用户
+        # 的来（`SELECT ... INTO ... LIMIT 1` 是合法且常见的写法）。
+        sql = f"SELECT {col_sql} {tail}"
+        sql, slots = self._pl_bind_into_sql(sql, ctx, names)
+        parsed = self._parse_pl_sql(sql, "SELECT ... INTO")
+        res = self.execute(parsed, ctx.session)
+        if isinstance(res, dict) and res.get('type') == 'error':
+            raise RuntimeError(
+                f"SELECT ... INTO 执行失败: {res.get('message')}")
+        if not (isinstance(res, dict) and res.get('type') == 'resultset'):
+            raise RuntimeError(
+                f"SELECT ... INTO 没有返回结果集: {sql[:120]}")
+        rows = list(res.get('rows') or [])
+        ncol = len(res.get('columns') or [])
+        if len(names) != ncol:
+            raise RuntimeError(
+                f"SELECT ... INTO: 列数 {ncol} 与目标变量个数 {len(names)} "
+                f"不一致（MySQL 语义 ERROR 1222：The used SELECT statements "
+                f"have a different number of columns）—— 目标变量："
+                f"{'、'.join(names)}；语句：{sql[:120]}")
+        if not rows:
+            # MySQL：0 行 → 变量保持原值（见方法 docstring）
+            return
+        if len(rows) > 1:
+            raise RuntimeError(
+                f"SELECT ... INTO 返回了 {len(rows)} 行，但目标变量只有 "
+                f"{len(names)} 个 —— MySQL 语义 ERROR 1172（Result consisted "
+                f"of more than one row）；请加 WHERE 或 LIMIT 1")
+        self._pl_assign_into(ctx, slots, list(rows[0]))
+
+    # ---------- 普通 SQL ----------
+
+    def _parse_pl_sql(self, sql, label):
+        """解析 PL 里拼出来的 SQL；**解析不出来就显式报错**（不静默跳过）"""
+        from .parser import parser as _p
+        parsed = _p.parse(sql)
+        if parsed is None:
+            raise RuntimeError(f"{label} 语句无法解析: {sql[:160]}")
+        return parsed
+
+    def _pl_run_call(self, sql, ctx):
+        """在 PL 体内执行 `CALL proc(args)`（嵌套过程调用）
+
+        与顶层 `CALL` 走**同一个** `_cmd_call`（参数校验 / OUT 回填 /
+        错误处理都一致），区别是**实参解析与回填的落点**：
+        * 实参是 `@user` → 用户变量（`_cmd_call` 自己处理）；
+        * 实参是 PL 局部变量（`CALL inner(n, tmp)`，MySQL 存储程序里合法）
+          → 入参取外层上下文的变量值，出参回填外层上下文的变量。
+        缺少这一层时，`CALL inner(n, tmp)` 里 `tmp` 永远保持旧值
+        （实测 `outer_proc(4)` 返回 0 而不是 50）—— 静默错值。
+        """
+        from .parser import parser as _p
+        parsed = _p.parse(str(sql))
+        if not parsed or parsed.get('command') != 'CALL':
+            raise RuntimeError(f"PL 的 CALL 语句无法解析: {str(sql)[:120]}")
+        session = ctx.session if isinstance(ctx.session, dict) else {}
+        store = self._pl_user_var_store(session)
+        store.update(ctx.variables)            # 局部变量对 _pl_arg_value 可见
+        res = self._cmd_call(parsed, session)
+        if isinstance(res, dict) and res.get('type') == 'error':
+            raise RuntimeError(
+                f"CALL {parsed.get('name')} 失败: {res.get('message')}")
+        # 局部变量实参 → 把形参的最终值写回外层上下文
+        proc = self._stored.get_procedure(parsed.get('name')) \
+            if self._stored is not None else None
+        args = list(parsed.get('args') or [])
+        for i, prm in enumerate(proc.params if proc else []):
+            mode = str(prm.get('mode', 'IN')).upper()
+            if mode not in ('OUT', 'INOUT') or i >= len(args):
+                continue
+            raw = str(args[i]).strip()
+            if not raw or raw.startswith('@'):
+                continue                       # 用户变量：_cmd_call 已回填
+            if raw in store:
+                ctx.variables[raw] = store[raw]
+
+    def _pl_sql_run(self, sql, ctx, funcs_depth=None):
+        """执行 PL 里的普通 SQL 语句（变量按当前值做字面量替换）"""
+        up = str(sql).strip().upper()
+        if up.startswith('CALL ') or up.startswith('CALL('):
+            self._pl_run_call(sql, ctx)
+            return
+        if funcs_depth is not None:
+            first = up.split(None, 1)[0] if up.split() else ''
+            if first in ('INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'LOAD',
+                         'TRUNCATE', 'CREATE', 'DROP', 'ALTER'):
+                raise RuntimeError(
+                    f"函数体里不允许执行改数据的语句: {str(sql)[:80]}"
+                    f"（MySQL 语义：存储函数不能修改数据）")
+        replaced = self._substitute_words(
+            sql, {k: self._sql_literal(v) for k, v in ctx.variables.items()})
+        parsed = self._parse_pl_sql(replaced, 'PL')
+        res = self.execute(parsed, ctx.session)
+        if isinstance(res, dict) and res.get('type') == 'error':
+            raise RuntimeError(
+                f"PL 语句执行失败: {res.get('message')}（语句：{replaced[:120]}）")
+
     def _exec_pl_body(self, body, session, variables=None):
-        """执行过程体的控制流（IF/WHILE/DECLARE/SELECT ... INTO）
+        """执行过程体的控制流（IF/WHILE/LOOP/REPEAT/SELECT ... INTO/游标）
 
         为什么不用 `sql/pl.py::PLInterpreter`：它的 `_substitute_vars` 是空
         实现 —— SQL 语句里的变量名不会被替换，`INSERT INTO t VALUES (i)` 会把
@@ -6269,136 +6981,102 @@ class Executor:
         for k, v in (variables or {}).items():
             ctx.variables[k] = v
         stmts = PLParser(body).parse_program()
-        self._run_pl_statements(stmts, ctx, ExprParser, eval_expr)
+        # 过程体的表达式同样接上**存储函数解析回调**（`_pl_run_block` 里的
+        # `_funcs()` 统一给）：过程里 `SET s = double_it(i)` 必须真的调到
+        # `CREATE FUNCTION` 定义的函数，而不是走 `call_builtin` 报
+        # "未知函数"。此前只有函数体模式接了回调，过程体漏了。
+        self._pl_run_block(stmts, ctx, ExprParser, eval_expr)
         return ctx
 
-    def _run_pl_statements(self, stmts, ctx, ExprParser, eval_expr,
-                           cond_tokens=None, funcs_depth=None):
-        """逐条执行 PL 语句（自实现，见 _exec_pl_body 的说明）
+    # ---------- 各类"PC 赋值目标名"的保护（占位符） ----------
+    #
+    # 统一的思路：过程体在交给 PL 解析器之前会做一次**参数文本替换**
+    # （`_cmd_call` 的 `_substitute_words(proc.body, bind_sql)`），
+    # 于是 `SET s = acc` / `SELECT ... INTO n` 里的目标名（OUT 形参）会
+    # 被换成 `NULL` 或 `105`，语法直接崩。做法是在替换前先把这些"赋值
+    # 目标位"换成占位符，替换完再还原成变量名。
+    _PL_PLACEHOLDER = '__lightdb_pl_target_'
 
-        funcs_depth 不为 None 时进入**函数体模式**：
-        * 表达式求值带上存储函数解析回调（函数体里可以调用别的函数，
-          并且共享同一个递归深度计数）；
-        * 出现 SQL / 循环 / SELECT INTO 时显式报错（创建期已拦，这里是
-          兜底：即使有人绕过 `CREATE FUNCTION` 校验写进 `_stored.json`，
-          调用时也一定报错而不是静默执行）。
-        过程体模式（funcs_depth is None）行为与原来逐字一致。
+    def _pl_protect_assign_targets(self, body, names):
+        """把 `SET <名字> =` / `INTO <名字>[, <名字>]` 的目标位换成占位符
+
+        返回 `(保护后的文本, {占位符: 名字})`。只动**赋值目标位**，
+        表达式里的同名变量照旧（`SET s = s + 1` 的右侧仍是真变量）。
+        实现走 `PLParser` 的 token 流（而不是正则）：token 自带原文位置
+        （`Token.pos`），按位置切片重写文本才能保证"只改目标位、其它
+        字节不动、引号内绝不误伤"。
         """
-        from .parser import parser as _p
-        if cond_tokens is not None:
-            if not eval_expr(ExprParser(cond_tokens).parse(), ctx):
-                return None
+        text = str(body or '')
+        names_up = {str(n).upper(): str(n) for n in (names or [])}
+        if not text.strip() or not names_up:
+            return text, {}
+        from .pl import PLParser as _PLP
+        try:
+            toks = _PLP(text).tokens
+        except Exception:                              # pragma: no cover
+            return text, {}
+        spans = []            # [(start, end, 占位符)]
+        mapping = {}
+        counter = 0
 
-        def _funcs():
-            if funcs_depth is None:
-                return None
-            return self._stored_function_resolver('函数体')
+        def _slot(name):
+            nonlocal counter
+            ph = f'{self._PL_PLACEHOLDER}{counter}'
+            counter += 1
+            mapping[ph] = name
+            return ph
 
-        if funcs_depth is not None:
-            self._check_function_stmts(
-                getattr(ctx, 'function_name', '?'), stmts, True)
-        for stmt in stmts:
-            op = stmt[0]
-            if op == 'DECLARE':
-                _, name, _types, default_toks = stmt
-                value = None
-                if default_toks:
-                    value = eval_expr(ExprParser(default_toks).parse(), ctx,
-                                      funcs=_funcs())
-                ctx.variables[name] = value
-            elif op == 'SET':
-                _, name, expr_toks = stmt
-                ctx.variables[name] = eval_expr(
-                    ExprParser(expr_toks).parse(), ctx, funcs=_funcs())
-            elif op == 'IF':
-                _, branches, else_body = stmt
-                taken = False
-                for cond_toks, block in branches:
-                    if eval_expr(ExprParser(cond_toks).parse(), ctx,
-                                 funcs=_funcs()):
-                        self._run_pl_statements(
-                            block, ctx, ExprParser, eval_expr,
-                            funcs_depth=funcs_depth)
-                        taken = True
-                        break
-                if not taken and else_body:
-                    self._run_pl_statements(
-                        else_body, ctx, ExprParser, eval_expr,
-                        funcs_depth=funcs_depth)
-                if ctx.return_hit:
-                    return ctx.return_value
-            elif op == 'WHILE':
-                if funcs_depth is not None:
-                    raise RuntimeError(
-                        "函数体里暂不支持 WHILE 循环（本引擎的存储函数"
-                        "只支持 DECLARE / SET / IF / RETURN）")
-                _, cond_toks, block = stmt
-                guard = 0
-                while eval_expr(ExprParser(cond_toks).parse(), ctx):
-                    guard += 1
-                    if guard > 100000:
-                        raise RuntimeError("WHILE 循环超过 10 万次，已中止")
-                    self._run_pl_statements(
-                        block, ctx, ExprParser, eval_expr)
-            elif op == 'SELECT_INTO':
-                if funcs_depth is not None:
-                    raise RuntimeError(
-                        "函数体里暂不支持 SELECT ... INTO（存储函数是纯"
-                        "计算，不能读表写变量）")
-                _, toks, into_pos = stmt
-                from .pl import PLParser
-                rest = toks[into_pos + 1:]
-                from_pos = next(
-                    (i for i, t in enumerate(rest)
-                     if t.type == 'KW' and t.value.upper() == 'FROM'), -1)
-                var_toks = rest[:from_pos] if from_pos >= 0 else rest
-                from_toks = rest[from_pos:] if from_pos >= 0 else []
-                names = [t.value for t in var_toks if t.type == 'IDENT']
-                col_sql = PLParser('').tokens_to_sql(toks[1:into_pos])
-                tail = PLParser('').tokens_to_sql(from_toks)
-                sql = self._substitute_words(
-                    f"SELECT {col_sql} {tail} LIMIT 1",
-                    {k: self._sql_literal(v)
-                     for k, v in ctx.variables.items()})
-                parsed = _p.parse(sql)
-                if parsed is None:
-                    raise RuntimeError(f"过程体 SELECT INTO 无法解析: {sql[:120]}")
-                res = self.execute(parsed, ctx.session)
-                if isinstance(res, dict) and res.get('rows'):
-                    for i, v in enumerate(res['rows'][0]):
-                        if i < len(names):
-                            ctx.variables[names[i]] = v
-            elif op == 'RETURN':
-                ctx.return_hit = True
-                ctx.return_value = None
-                if stmt[1]:
-                    ctx.return_value = eval_expr(
-                        ExprParser(stmt[1]).parse(), ctx, funcs=_funcs())
-                return ctx.return_value
-            elif op == 'SQL':
-                if funcs_depth is not None:
-                    raise RuntimeError(
-                        f"函数体里暂不支持 SQL 语句: {stmt[1][:80]}"
-                        f"（存储函数是纯计算，不能执行 INSERT / UPDATE / "
-                        f"DELETE / SELECT ... INTO / CALL）")
-                sql = stmt[1]
-                if sql.strip().upper().startswith('CALL '):
-                    from .stored import call_procedure
-                    call_procedure(sql, ctx)
-                    continue
-                sql = self._substitute_words(
-                    sql, {k: self._sql_literal(v)
-                          for k, v in ctx.variables.items()})
-                parsed = _p.parse(sql)
-                if parsed is None:
-                    raise RuntimeError(f"过程体语句无法解析: {sql[:120]}")
-                res = self.execute(parsed, ctx.session)
-                if isinstance(res, dict) and res.get('type') == 'error':
-                    raise RuntimeError(
-                        f"过程体语句执行失败: {res.get('message')}")
-            else:
-                raise RuntimeError(f"过程体里暂不支持的语句类型: {op}")
-        return None
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            up = t.value.upper() if t.type in ('KW', 'IDENT') else ''
+            if up == 'SET' and i + 1 < len(toks) \
+                    and toks[i + 1].type == 'IDENT' \
+                    and toks[i + 1].value.upper() in names_up:
+                tgt = toks[i + 1]
+                spans.append((tgt.pos, tgt.pos + len(str(tgt.value)),
+                              _slot(names_up[tgt.value.upper()])))
+                i += 2
+                continue
+            if up == 'INTO':
+                j = i + 1
+                while j < len(toks):
+                    if toks[j].type == 'IDENT' \
+                            and toks[j].value.upper() in names_up:
+                        tgt = toks[j]
+                        spans.append((tgt.pos, tgt.pos + len(str(tgt.value)),
+                                      _slot(names_up[tgt.value.upper()])))
+                        j += 1
+                        if j < len(toks) and toks[j].type == 'PUNC' \
+                                and toks[j].value == ',':
+                            j += 1
+                            continue
+                    break
+                i = j
+                continue
+            i += 1
+        if not spans:
+            return text, {}
+        out, last = [], 0
+        for start, end, ph in spans:
+            if start < last:
+                continue
+            out.append(text[last:start])
+            out.append(ph)
+            last = end
+        out.append(text[last:])
+        return ''.join(out), mapping
+
+    def _pl_restore_targets(self, text, mapping):
+        """占位符 → 原始变量名（纯文本替换，不引入引号）"""
+        if not mapping:
+            return text
+        for ph in sorted(mapping, key=len, reverse=True):
+            text = str(text).replace(ph, str(mapping[ph]))
+        return text
+
+    #: 兼容旧入口（`_run_pl_statements` 是 `_pl_run_block` 的历史名字）
+    _run_pl_statements = _pl_run_block
 
     def _run_statement_list(self, body, session, label):
         """顺序执行语句块：解析 + 执行，失败一定显式抛出（不静默）"""
@@ -6433,28 +7111,109 @@ class Executor:
             return self._err(
                 1318, f"Incorrect number of arguments for PROCEDURE "
                       f"{proc.name}; expected {len(params)}, got {len(args)}")
-        out_params = [prm['name'] for prm in params
-                      if str(prm.get('mode', 'IN')).upper() in ('OUT', 'INOUT')]
-        if out_params:
-            return self._err(
-                1105, f"CALL {proc.name}: OUT/INOUT 参数回填"
-                      f"（{', '.join(out_params)}）暂不支持 —— 本引擎没有"
-                      f"用户变量回填机制，显式失败以免调用方拿到 NULL 当成结果")
+        # OUT / INOUT 参数：MySQL 语义要求对应实参是**用户变量**（`@x`），
+        # 过程里对形参的赋值在返回时写回 `@x`。非用户变量的实参在 MySQL
+        # 里也是合法的（值被丢弃），这里照做。
         bind_sql, bind_val = {}, {}
+        out_slots = []
         for i, prm in enumerate(params):
-            value = self._pl_arg_value(args[i] if i < len(args) else None)
+            mode = str(prm.get('mode', 'IN')).upper()
+            raw = args[i] if i < len(args) else None
+            value = self._pl_arg_value(raw) if mode != 'OUT' else None
             bind_val[prm['name']] = value
             bind_sql[prm['name']] = self._sql_literal(value)
+            if mode in ('OUT', 'INOUT'):
+                out_slots.append((prm['name'], raw))
         try:
-            body = self._substitute_words(proc.body, bind_sql)
+            # 先把"赋值目标位"（`SET 形参 =` / `INTO 形参`）换成占位符，
+            # 再做参数值替换 —— 否则 `SET s = acc` 会变成 `SET NULL = 0`，
+            # 过程体的 PL 解析直接失败（这是 test_procedure_out_param
+            # 那条路径上的既有缺陷）。
+            protected, targets = self._pl_protect_assign_targets(
+                proc.body, [prm['name'] for prm in params])
+            body = self._substitute_words(protected, bind_sql)
+            body = self._pl_restore_targets(body, targets)
             plain = self._strip_begin_end(body)
-            if self._has_pl_control_flow(plain):
-                self._exec_pl_body(plain, s, bind_val)
-            else:
-                self._run_statement_list(body, s, f"CALL {proc.name}")
+            # **统一走 PL 解释器**（过程体与函数体共用一份实现）：
+            # 不再区分"有没有控制流"。旧实现把纯 SQL 过程体交给
+            # `_run_statement_list`（主 SQL 解析器），于是 `SET s = 42`
+            # 这种 PL 赋值语句解析失败、OUT 参数也永远回填不了。
+            ctx = self._exec_pl_body(plain, s, bind_val)
+            if self._pl_signal_set(ctx):
+                return self._err(
+                    1644, f"CALL {proc.name}: SIGNAL SQLSTATE "
+                          f"{ctx.signal_state}: {ctx.signal_message}")
+            self._write_back_out_params(ctx, out_slots, s)
         except Exception as e:
             return self._err(1105, f"CALL {proc.name} 失败: {e}")
         return self._ok(message=f"Procedure '{proc.name}' called")
+
+    #: 过程调用的用户变量存放位置（会话 dict 里的键名）
+    _PL_USER_VARS_KEY = 'user_vars'
+
+    def _pl_user_var_store(self, session):
+        """取"用户变量表"（`@name` 的唯一权威存储）
+
+        三个写入/读取点必须共用同一份表，否则 OUT 参数回填就成了
+        "写在一处、读在另一处"的静默 NULL：
+        * 会话 dict 里的 `user_vars`（同一会话内的后续语句）；
+        * 本执行器自持的 `_pl_user_vars`（`execute_sql(sql, {})` 每次
+          都新建会话 dict，只写会话里下一次语句就读不到）；
+        * `variables.get_vm()` 里按 session_id 的会话（`SELECT @x`
+          在没有会话 dict 时按 session_id 查它）。
+        本方法返回前两者共用的同一份 dict（挂到执行器上），第三份由
+        调用方按 session_id 补写。
+        """
+        store = getattr(self, '_pl_user_vars', None)
+        if not isinstance(store, dict):
+            store = self._pl_user_vars = {}
+        if isinstance(session, dict):
+            sess_store = session.get(self._PL_USER_VARS_KEY)
+            if not isinstance(sess_store, dict):
+                session[self._PL_USER_VARS_KEY] = store
+            else:
+                store = sess_store
+                self._pl_user_vars = store
+        return store
+
+    def _write_back_out_params(self, ctx, out_slots, session):
+        """把 OUT / INOUT 形参的最终值写回实参的 `@用户变量`
+
+        为什么必须写回：不写回的话调用方拿到的永远是 NULL —— 那是静默
+        错值（`CALL p(@c)` 之后 `SELECT @c` 是 0/空），比显式报错更糟。
+        实参不是用户变量时按 MySQL 语义丢弃（不报错）。
+        """
+        if not out_slots:
+            return
+        store = self._pl_user_var_store(session)
+        # 全局 `variables` 模块的会话（按 session_id）也写一份：
+        # `SELECT @x` 在没有会话 dict 时查的就是它。
+        sess_obj = None
+        sid = session.get('session_id') or session.get('id') \
+            if isinstance(session, dict) else None
+        if sid is not None:
+            try:
+                from .variables import get_vm
+                sess_obj = get_vm().get_session(int(sid))
+            except Exception:                          # pragma: no cover
+                sess_obj = None
+        for pname, raw in out_slots:
+            name = str(raw or '').strip()
+            if not name:
+                continue
+            # 实参是 PL 局部变量（`CALL inner(n, tmp)`）时也要回填 ——
+            # 只认 `@user` 会让嵌套调用里的局部变量永远保持旧值
+            # （实测 `outer_proc(4)` 返回 0 而不是 50，静默错值）。
+            # 非用户变量的实参在 MySQL 顶层 CALL 里是"值被丢弃"，但对
+            # 存储程序内部的 CALL 必须是可写的局部变量引用。
+            key = name[1:] if name.startswith('@') else name
+            value = ctx.variables.get(pname)
+            store[key] = value
+            if sess_obj is not None and name.startswith('@'):
+                try:
+                    sess_obj.set_user(name, value)
+                except Exception:                      # pragma: no cover
+                    pass
 
     def _fire_triggers(self, timing, event, table, old_row=None,
                        new_row=None, session=None):
@@ -6711,6 +7470,36 @@ class Executor:
         s['database'] = p['database']
         return self._ok(
             message=f"Database changed to {p['database']}")
+
+    def _cmd_select_variables(self, p, s):
+        """`SELECT @var[, @var]` —— 读**用户变量**（MySQL 13.7.6.2）
+
+        `CALL p(@out)` 之后必须有办法把 `@out` 读出来验证回填，否则
+        OUT/INOUT 的正确性无法从外部观测（旧实现直接报"列 '@s' 不存在"）。
+        取值顺序与本执行器写回 OUT 参数的位置一致：
+        会话 `user_vars` → `variables` 模块的用户变量表（按 session_id）。
+        未赋值的用户变量是 NULL（MySQL 语义），不是错误。
+        """
+        store = self._pl_user_var_store(s)
+        sess_obj = None
+        try:
+            from .variables import get_vm
+            sid = s.get('session_id') if isinstance(s, dict) else None
+            if sid is not None:
+                sess_obj = get_vm().get_session(int(sid))
+        except Exception:                              # pragma: no cover
+            sess_obj = None
+        cols, values = [], []
+        for v in p.get('variables') or []:
+            cols.append(v)
+            name = str(v).lstrip('@$')
+            value = None
+            if isinstance(store, dict) and name in store:
+                value = store[name]
+            elif sess_obj is not None:
+                value = sess_obj.get_user(name)
+            values.append(value)
+        return self._rs(cols, [tuple(values)])
 
     def _cmd_explain(self, p, s):
         """EXPLAIN / EXPLAIN ANALYZE

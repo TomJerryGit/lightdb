@@ -142,6 +142,15 @@ class Parser:
             return self._drop_table(sql)
         if upper.startswith('INSERT'):
             return self._insert(sql)
+        # `SELECT @var` / `SELECT @a, @b`：MySQL 的用户变量读取。
+        # 必须在通用 SELECT 之前识别 —— 否则 `@s` 会被当成列名，
+        # 报"列 '@s' 不存在"（CALL 带 OUT 参数后无法验证写回值）。
+        uvm = re.match(
+            r'SELECT\s+((?:@\w+|\$\w+)(?:\s*,\s*@\w+|\s*,\s*\$\w+)*)\s*$',
+            sql, re.IGNORECASE)
+        if uvm:
+            return {'command': 'SELECT VARIABLES',
+                    'variables': [v.strip() for v in uvm.group(1).split(',')]}
         if upper.startswith('SELECT'):
             return self._select(sql)
         if upper.startswith('UPDATE'):
@@ -1875,7 +1884,11 @@ class Parser:
         def flush():
             nonlocal cur, quoted
             if quoted:
-                values.append(cur)
+                # 引号字面量：**只去掉引号之外的尾部空白**（值内部的
+                # 空格属于值本身，必须保留）。否则
+                # `VALUES (1, 'Alice' , 30)` 会存成 `"'Alice' "`
+                # —— 一段带引号又带空格的脏数据（静默错值）。
+                values.append(cur.rstrip())
             else:
                 t = cur.strip()
                 if t:
@@ -1890,9 +1903,12 @@ class Parser:
         while i < n:
             ch = s[i]
             if ch in ("'", '"') and not quoted:
-                # 引号前的 SQL 空白不属于字面量：丢掉
-                if not cur.strip():
-                    cur = ''
+                # 引号前的 SQL 空白不属于字面量：丢掉。
+                # 必须 `cur = cur.strip()`（而不是"全空白才清空"）——
+                # 否则 `VALUES (1, 'Alice' , 30)` 里 `'Alice'` 之后的那个
+                # 空格会被并进字符串，存成 `"'Alice' "`（静默错值，
+                # 实测就是 PL 过程体经 token 重建后多出的空格）。
+                cur = cur.strip()
                 q = ch
                 cur += ch
                 quoted = True

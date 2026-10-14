@@ -75,8 +75,14 @@ def test_procedure_if_while():
     from lightdb.sql.executor import Executor
     from lightdb.sql.parser import parser
 
-    db = track(Database(DATA_DIR))
-    ex = track(Executor(db))
+    # 断言要求 users 表空（WHILE i < n 从 i=100 起恰好插 5 行）。
+    # 本用例原来直接复用上一个用例留下的 DATA_DIR，因此把上个用例插入的
+    # Alice 行一起数进来 → 6 != 5。这是**用例的初始状态问题**，不是循环
+    # 语义问题（MySQL 里 `WHILE i < 105` 从 100 循环也是 5 行）。
+    # 与 test_create_procedure / test_trigger_* 等用例一致：先 reset 再建表，
+    # 这样本用例单跑、或跟在任何用例后面跑，初始状态都一样。
+    reset()
+    db, ex = setup()
 
     # 存储过程：根据 uid 判断，插入多条
     sql = """CREATE PROCEDURE gen_users(IN n INT)

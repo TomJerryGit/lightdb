@@ -3941,7 +3941,12 @@ def test_stored_function_persists_after_reopen():
 
 
 def test_stored_function_errors_are_explicit():
-    """函数相关错误全部显式：参数个数 / 不存在 / 函数体不支持 / 类型 / OUT"""
+    """函数相关错误全部显式：参数个数 / 不存在 / 改数据 / 类型 / OUT
+
+    注意（本轮修正）：**循环与游标在函数体里是合法的**（MySQL 13.1.12
+    只禁止改数据的语句），旧断言把它们当成"必须报错"编码错了，已改成
+    断言它们真的能跑出结果。
+    """
     with _FnEnv() as e:
         e.ok("CREATE FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
 
@@ -3953,33 +3958,44 @@ def test_stored_function_errors_are_explicit():
         msg = e.err("SELECT nope_fn(a) FROM t")
         assert '不支持的函数' in msg and 'NOPE_FN' in msg
 
-        # 3) 函数体含不支持的语句：游标
-        msg = e.err("""CREATE FUNCTION bad_cur() RETURNS INT
+        # 3) **游标与循环在函数体里是合法的**（本轮修正的断言）
+        #
+        # 旧断言（本轮删除）：游标 / WHILE 在函数体里"不受支持，必须报错"。
+        # 那条断言编码的不是 MySQL 语义：MySQL 13.1.12「CREATE FUNCTION
+        # Statement」只禁止存储函数修改数据 / 事务 / 锁 / 临时表（违反时报
+        # ERROR 1422），**循环与游标在函数体里完全合法**（同章示例里就有
+        # `DECLARE ... CURSOR` 与 WHILE）。因此这里改成断言它们**能用**：
+        e.ok("""CREATE FUNCTION cur_first() RETURNS INT
         BEGIN
-            DECLARE cur CURSOR FOR SELECT id FROM t;
-            RETURN 1;
+            DECLARE v INT DEFAULT -1;
+            DECLARE cur CURSOR FOR SELECT id FROM t ORDER BY id;
+            OPEN cur;
+            FETCH cur INTO v;
+            CLOSE cur;
+            RETURN v;
         END""")
-        assert '函数体' in msg and 'bad_cur' in msg
-        # 3b) 循环
-        msg = e.err("""CREATE FUNCTION bad_loop(x INT) RETURNS INT
+        assert e.q("SELECT cur_first()")[1] == [(1,)]
+        e.ok("""CREATE FUNCTION sum_while(x INT) RETURNS INT
         BEGIN
             DECLARE i INT DEFAULT 0;
+            DECLARE s INT DEFAULT 0;
             WHILE i < x DO
                 SET i = i + 1;
+                SET s = s + i;
             END WHILE;
-            RETURN i;
+            RETURN s;
         END""")
-        assert 'WHILE' in msg
-        # 3c) 改数据的 SQL
+        assert e.q("SELECT sum_while(4)")[1] == [(10,)]
+        # 3c) 改数据的 SQL：MySQL 同样禁止（ERROR 1422），必须显式报错
         msg = e.err("""CREATE FUNCTION bad_ins(x INT) RETURNS INT
         BEGIN
             INSERT INTO t VALUES (99, 'x', x);
             RETURN x;
         END""")
         assert 'INSERT' in msg
-        # 三个坏函数都没被注册
+        # 坏函数没被注册（游标 / 循环这两个"合法的"不在名单里）
         names = [r[0] for r in e.q("SHOW FUNCTIONS")[1]]
-        for bad in ('bad_cur', 'bad_loop', 'bad_ins'):
+        for bad in ('bad_ins',):
             assert bad not in names, names
 
         # 4) 不支持的 RETURNS 类型
@@ -4024,4 +4040,526 @@ def test_drop_function_and_if_exists():
             pass
         else:
             raise AssertionError('IF NOT EXISTS 位置错误应显式报语法错误')
+
+
+# ==========================================================================
+# PL 解释器（过程 / 函数共享）：循环 / SELECT ... INTO / 游标 / SIGNAL —— 追加
+# ==========================================================================
+#
+# 背景：本文件上面的存储函数用例锁住的是"纯计算"形态。这一组追加用例覆盖
+# 本轮补上的**循环与数据读取**：
+#   * WHILE / LOOP / REPEAT 三个循环形态，**过程体与函数体都能用**
+#     （MySQL 13.1.12：存储函数同样允许循环，只禁止改数据的语句）；
+#   * LEAVE / ITERATE 的标签作用域（嵌套循环 + 有标签 + 无标签）；
+#   * `SELECT ... INTO`（含 COUNT(*) 标量）读表，0 行 / 多行 / 列数不匹配
+#     三种边界都显式处理（MySQL：0 行变量保持原值，多行 ERROR 1172，
+#     列数不符 ERROR 1222）；
+#   * 游标 DECLARE / OPEN / FETCH / CLOSE + 隐式 NOT FOUND 条件退出；
+#   * 迭代上限：必然超限的循环**显式报错**，绝不挂死；
+#   * SIGNAL SQLSTATE 主动抛错。
+#
+# 断言全部基于真实执行结果（不 mock、不断言文案细节）。
+
+class _PlEnv:
+    """过程/函数共用的数据环境（独立数据目录，退出时清理）"""
+
+    DIR = os.path.join(ROOT, 'data_sql_features_pl_test')
+
+    def __enter__(self):
+        from lightdb.db.database import Database
+        from lightdb.sql.executor import Executor
+        from lightdb.sql.parser import parser
+
+        shutil.rmtree(self.DIR, ignore_errors=True)
+        self.db = Database(self.DIR)
+        self.ex = Executor(self.db)
+        self.parser = parser
+        self.ex.execute_sql(
+            "CREATE TABLE nums (id INT PRIMARY KEY, n INT)", {})
+        for i, n in enumerate([1, 2, 3, 4, 5], start=1):
+            self.ex.execute_sql("INSERT INTO nums VALUES (%d, %d)" % (i, n), {})
+        # 会话 dict 长期复用：用户变量（OUT 参数回填）存在里面
+        self.session = {}
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.db.shutdown()
+        except Exception:
+            pass
+        shutil.rmtree(self.DIR, ignore_errors=True)
+        return False
+
+    def run(self, sql):
+        return self.ex.execute(self.parser.parse(sql), self.session)
+
+    def ok(self, sql):
+        r = self.run(sql)
+        assert r.get('type') == 'ok', \
+            f'语句应成功: {sql} -> {r.get("message")}'
+        return r
+
+    def err(self, sql):
+        r = self.run(sql)
+        assert r.get('type') == 'error', \
+            f'语句应显式报错（绝不静默）: {sql} -> {r}'
+        return str(r.get('message') or '')
+
+    def q(self, sql):
+        r = self.run(sql)
+        assert r.get('type') == 'resultset', \
+            f'查询失败: {sql} -> {r.get("message")}'
+        return r['columns'], [tuple(x) for x in r['rows']]
+
+    def call(self, sql, out_name):
+        """CALL 后读回 OUT 用户变量（`CALL p(@x)` / `SELECT @x`）"""
+        self.ok(sql)
+        return self.q(f"SELECT @{out_name}")[1][0][0]
+
+
+def test_procedure_while_accumulates():
+    """过程里的 WHILE：累加 1..n，结果必须是真值（不是 NULL/静默忽略）"""
+    with _PlEnv() as e:
+        e.ok("""CREATE PROCEDURE sum_to(IN n INT, OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 1;
+            DECLARE acc INT DEFAULT 0;
+            WHILE i <= n DO
+                SET acc = acc + i;
+                SET i = i + 1;
+            END WHILE;
+            SET s = acc;
+        END""")
+        assert e.call("CALL sum_to(100, @s)", 's') == 5050
+        assert e.call("CALL sum_to(1, @s)", 's') == 1
+        # 0 次循环：acc 保持 DEFAULT 0
+        assert e.call("CALL sum_to(0, @s)", 's') == 0
+
+
+def test_procedure_loop_and_repeat():
+    """`LOOP ... LEAVE` 与 `REPEAT ... UNTIL`（过程里）"""
+    with _PlEnv() as e:
+        e.ok("""CREATE PROCEDURE loop_sum(IN n INT, OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 1;
+            DECLARE acc INT DEFAULT 0;
+            my_loop: LOOP
+                IF i > n THEN
+                    LEAVE my_loop;
+                END IF;
+                SET acc = acc + i;
+                SET i = i + 1;
+            END LOOP;
+            SET s = acc;
+        END""")
+        assert e.call("CALL loop_sum(100, @x)", 'x') == 5050
+        e.ok("""CREATE PROCEDURE repeat_sum(IN n INT, OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            DECLARE acc INT DEFAULT 0;
+            REPEAT
+                SET i = i + 1;
+                SET acc = acc + i;
+            UNTIL i >= n END REPEAT;
+            SET s = acc;
+        END""")
+        assert e.call("CALL repeat_sum(4, @y)", 'y') == 10
+        # REPEAT 是"先执行体再判条件"：n=0 时体仍然执行一次
+        assert e.call("CALL repeat_sum(0, @y)", 'y') == 1
+
+
+def test_function_while_in_projection_and_where():
+    """函数里的 WHILE：阶乘 / 斐波那契，在投影与 WHERE 里都是真结果"""
+    with _PlEnv() as e:
+        e.ok("""CREATE FUNCTION fact(n INT) RETURNS BIGINT
+        BEGIN
+            DECLARE i INT DEFAULT 1;
+            DECLARE r BIGINT DEFAULT 1;
+            WHILE i <= n DO
+                SET r = r * i;
+                SET i = i + 1;
+            END WHILE;
+            RETURN r;
+        END""")
+        assert e.q("SELECT fact(5), fact(10)")[1] == [(120, 3628800)]
+        # WHERE 里调用（逐行求值路径）
+        assert e.q("SELECT id FROM nums WHERE fact(n) > 100 ORDER BY id")[1] == \
+            [(5,)]
+        e.ok("""CREATE FUNCTION fib(n INT) RETURNS INT
+        BEGIN
+            DECLARE a INT DEFAULT 0;
+            DECLARE b INT DEFAULT 1;
+            DECLARE i INT DEFAULT 0;
+            DECLARE tmp INT DEFAULT 0;
+            WHILE i < n DO
+                SET tmp = a + b;
+                SET a = b;
+                SET b = tmp;
+                SET i = i + 1;
+            END WHILE;
+            RETURN a;
+        END""")
+        assert e.q("SELECT fib(0), fib(1), fib(2), fib(5), fib(10)")[1] == \
+            [(0, 1, 1, 5, 55)]
+        # 函数里也可以调用另一个函数（嵌套 + 循环）
+        e.ok("CREATE FUNCTION fib2(n INT) RETURNS INT RETURN fib(n) * 2")
+        assert e.q("SELECT fib2(10)")[1] == [(110,)]
+
+
+def test_select_into_reads_table_in_function_and_procedure():
+    """`SELECT ... INTO`：函数读 COUNT(*) 并 RETURN，过程读单列并 OUT"""
+    with _PlEnv() as e:
+        e.ok("""CREATE FUNCTION cnt_rows() RETURNS INT
+        BEGIN
+            DECLARE n INT DEFAULT -1;
+            SELECT COUNT(*) INTO n FROM nums;
+            RETURN n;
+        END""")
+        assert e.q("SELECT cnt_rows()")[1] == [(5,)]
+        e.ok("""CREATE FUNCTION sum_col() RETURNS INT
+        BEGIN
+            DECLARE s INT DEFAULT -1;
+            SELECT SUM(n) INTO s FROM nums;
+            RETURN s;
+        END""")
+        assert e.q("SELECT sum_col()")[1] == [(15,)]
+        # 多列 → 多个变量（列数与变量数一致）
+        e.ok("""CREATE FUNCTION pair() RETURNS INT
+        BEGIN
+            DECLARE a INT DEFAULT 0;
+            DECLARE b INT DEFAULT 0;
+            SELECT COUNT(*), SUM(n) INTO a, b FROM nums;
+            RETURN a * 1000 + b;
+        END""")
+        assert e.q("SELECT pair()")[1] == [(5015,)]
+        # 过程里读单列（带 WHERE + LIMIT，用户写 LIMIT 时尊重用户的）
+        e.ok("""CREATE PROCEDURE pick(OUT v INT)
+        BEGIN
+            DECLARE m INT DEFAULT -1;
+            SELECT n INTO m FROM nums WHERE n >= 3 ORDER BY n LIMIT 1;
+            SET v = m;
+        END""")
+        assert e.call("CALL pick(@m)", 'm') == 3
+        # 变量出现在 WHERE 里（循环/条件里的变量逐轮生效）
+        e.ok("""CREATE FUNCTION find_by(threshold INT) RETURNS INT
+        BEGIN
+            DECLARE got INT DEFAULT -1;
+            SELECT n INTO got FROM nums WHERE n > threshold
+            ORDER BY n LIMIT 1;
+            RETURN got;
+        END""")
+        assert e.q("SELECT find_by(3)")[1] == [(4,)]
+
+
+def test_select_into_zero_multi_row_and_column_mismatch():
+    """`SELECT ... INTO` 的三个边界：0 行 / 多行 / 列数不匹配"""
+    with _PlEnv() as e:
+        # 0 行：变量**保持原值**（MySQL：1329 warning + 值不变）
+        e.ok("""CREATE PROCEDURE zero_rows(OUT v INT)
+        BEGIN
+            DECLARE x INT DEFAULT 777;
+            SELECT n INTO x FROM nums WHERE n > 100;
+            SET v = x;
+        END""")
+        assert e.call("CALL zero_rows(@z)", 'z') == 777
+        # 多行：显式报错（MySQL ERROR 1172）
+        e.ok("""CREATE PROCEDURE multi(OUT v INT)
+        BEGIN
+            DECLARE x INT DEFAULT -1;
+            SELECT n INTO x FROM nums;
+            SET v = x;
+        END""")
+        msg = e.err("CALL multi(@v)")
+        assert '1172' in msg and 'more than one row' in msg, msg
+        # 列数与变量数不一致：显式报错（MySQL ERROR 1222）
+        e.ok("""CREATE PROCEDURE colmis(OUT v INT)
+        BEGIN
+            DECLARE x INT DEFAULT -1;
+            SELECT id, n INTO x FROM nums LIMIT 1;
+            SET v = x;
+        END""")
+        msg = e.err("CALL colmis(@v)")
+        assert '1222' in msg and 'different number of columns' in msg, msg
+        # 目标变量数多于列数（反向）同样报错
+        e.ok("""CREATE PROCEDURE colmis2(OUT v INT)
+        BEGIN
+            DECLARE x INT DEFAULT -1;
+            DECLARE y INT DEFAULT -1;
+            SELECT id INTO x, y FROM nums LIMIT 1;
+            SET v = x;
+        END""")
+        assert '1222' in e.err("CALL colmis2(@v)")
+
+
+def test_nested_loops_with_labels_leave_and_iterate():
+    """嵌套循环 + 标签：ITERATE 跳过一轮、LEAVE 退出指定层"""
+    with _PlEnv() as e:
+        e.ok("""CREATE PROCEDURE nested(OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            DECLARE j INT DEFAULT 0;
+            DECLARE acc INT DEFAULT 0;
+            outer_loop: WHILE i < 3 DO
+                SET i = i + 1;
+                SET j = 0;
+                inner_loop: WHILE j < 5 DO
+                    SET j = j + 1;
+                    IF j = 2 THEN
+                        ITERATE inner_loop;
+                    END IF;
+                    IF j = 4 THEN
+                        LEAVE inner_loop;
+                    END IF;
+                    SET acc = acc + 1;
+                END WHILE;
+            END WHILE;
+            SET s = acc;
+        END""")
+        # 每轮内层只有 j=1、j=3 各加一次 → 3 * 2 = 6
+        assert e.call("CALL nested(@acc)", 'acc') == 6
+        # 内层 LEAVE 外层标签：一次跳出两层
+        e.ok("""CREATE PROCEDURE leave_outer(OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            DECLARE j INT DEFAULT 0;
+            DECLARE acc INT DEFAULT 0;
+            outer_loop: WHILE i < 5 DO
+                SET i = i + 1;
+                SET j = 0;
+                inner_loop: WHILE j < 5 DO
+                    SET j = j + 1;
+                    SET acc = acc + 1;
+                    IF i = 3 AND j = 2 THEN
+                        LEAVE outer_loop;
+                    END IF;
+                END WHILE;
+            END WHILE;
+            SET s = acc;
+        END""")
+        # 前两轮各 5 次 + 第三轮 2 次 = 12
+        assert e.call("CALL leave_outer(@x)", 'x') == 12
+        # 无标签 LEAVE / ITERATE 作用于最内层循环
+        e.ok("""CREATE PROCEDURE unlabeled(OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            DECLARE acc INT DEFAULT 0;
+            WHILE i < 10 DO
+                SET i = i + 1;
+                IF i = 3 THEN
+                    ITERATE;
+                END IF;
+                IF i = 6 THEN
+                    LEAVE;
+                END IF;
+                SET acc = acc + i;
+            END WHILE;
+            SET s = acc;
+        END""")
+        # i=1,2,4,5 累加 = 12（3 被 ITERATE 跳过，6 触发 LEAVE）
+        assert e.call("CALL unlabeled(@u)", 'u') == 12
+
+
+def test_function_body_allows_loops_and_cursor():
+    """函数体里的循环 / 游标合法（MySQL 13.1.12：只禁止改数据）"""
+    with _PlEnv() as e:
+        e.ok("""CREATE FUNCTION first_n(n INT) RETURNS INT
+        BEGIN
+            DECLARE v INT DEFAULT -1;
+            DECLARE cur CURSOR FOR SELECT n FROM nums ORDER BY id;
+            DECLARE cnt INT DEFAULT 0;
+            OPEN cur;
+            read_loop: LOOP
+                FETCH cur INTO v;
+                IF NOT FOUND THEN
+                    LEAVE read_loop;
+                END IF;
+                SET cnt = cnt + 1;
+                IF cnt >= n THEN
+                    LEAVE read_loop;
+                END IF;
+            END LOOP;
+            CLOSE cur;
+            RETURN v;
+        END""")
+        assert e.q("SELECT first_n(1), first_n(3)")[1] == [(1, 3)]
+        # 函数体里的 SELECT ... INTO 读表
+        e.ok("""CREATE FUNCTION max_n() RETURNS INT
+        BEGIN
+            DECLARE m INT DEFAULT -1;
+            SELECT MAX(n) INTO m FROM nums;
+            RETURN m;
+        END""")
+        assert e.q("SELECT max_n()")[1] == [(5,)]
+        # 改数据的语句仍然显式拒绝（MySQL ERROR 1422 语义）
+        msg = e.err("""CREATE FUNCTION bad_ins(x INT) RETURNS INT
+        BEGIN
+            INSERT INTO nums VALUES (99, x);
+            RETURN x;
+        END""")
+        assert 'INSERT' in msg and 'bad_ins' in msg, msg
+
+
+def test_loop_iteration_cap_errors_instead_of_hanging():
+    """迭代上限：必然超限的循环**显式报错**（绝不无限循环）"""
+    with _PlEnv() as e:
+        e.ok("""CREATE PROCEDURE runaway(OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            LOOP
+                SET i = i + 1;
+            END LOOP;
+            SET s = i;
+        END""")
+        # 把上限调小到 500（默认 100 万），避免用例真的跑满百万次
+        old = e.ex._pl_max_iterations
+        e.ex._pl_max_iterations = 500
+        try:
+            msg = e.err("CALL runaway(@s)")
+        finally:
+            e.ex._pl_max_iterations = old
+        assert '迭代上限' in msg and '500' in msg, msg
+        # 函数体里的失控循环同样被拦住
+        e.ok("""CREATE FUNCTION runaway_fn() RETURNS INT
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            WHILE 1 = 1 DO
+                SET i = i + 1;
+            END WHILE;
+            RETURN i;
+        END""")
+        e.ex._pl_max_iterations = 500
+        try:
+            msg = e.err("SELECT runaway_fn()")
+        finally:
+            e.ex._pl_max_iterations = old
+        assert '迭代上限' in msg and '500' in msg, msg
+        # 报错后执行器仍可正常工作（状态没有被搞坏）
+        assert e.q("SELECT COUNT(*) FROM nums")[1] == [(5,)]
+
+
+def test_cursor_fetch_and_not_found_condition():
+    """游标：OPEN / FETCH / CLOSE，用隐式 `NOT FOUND` 条件退出"""
+    with _PlEnv() as e:
+        e.ok("""CREATE PROCEDURE cur_sum(OUT s INT)
+        BEGIN
+            DECLARE v INT DEFAULT 0;
+            DECLARE acc INT DEFAULT 0;
+            DECLARE cur CURSOR FOR SELECT n FROM nums ORDER BY id;
+            OPEN cur;
+            read_loop: LOOP
+                FETCH cur INTO v;
+                IF NOT FOUND THEN
+                    LEAVE read_loop;
+                END IF;
+                SET acc = acc + v;
+            END LOOP;
+            CLOSE cur;
+            SET s = acc;
+        END""")
+        assert e.call("CALL cur_sum(@cs)", 'cs') == 15
+        # 游标查询 0 行：第一次 FETCH 就 NOT FOUND，循环体不执行
+        e.ok("""CREATE FUNCTION empty_cursor_count() RETURNS INT
+        BEGIN
+            DECLARE v INT DEFAULT -1;
+            DECLARE c INT DEFAULT 0;
+            DECLARE cur CURSOR FOR SELECT n FROM nums WHERE n > 100;
+            OPEN cur;
+            cl: LOOP
+                FETCH cur INTO v;
+                IF NOT FOUND THEN
+                    LEAVE cl;
+                END IF;
+                SET c = c + 1;
+            END LOOP;
+            CLOSE cur;
+            RETURN c;
+        END""")
+        assert e.q("SELECT empty_cursor_count()")[1] == [(0,)]
+        # 游标相关错误全部显式：未声明 / 未打开 / 重复打开 / FETCH 列数不符
+        e.ok("""CREATE PROCEDURE bad_cursor(OUT s INT)
+        BEGIN
+            SET s = 0;
+            OPEN nope;
+        END""")
+        assert '未声明' in e.err("CALL bad_cursor(@s)")
+        e.ok("""CREATE PROCEDURE bad_cursor2(OUT s INT)
+        BEGIN
+            DECLARE v INT DEFAULT 0;
+            DECLARE cur CURSOR FOR SELECT n FROM nums;
+            SET s = 0;
+            FETCH cur INTO v;
+        END""")
+        assert '未打开' in e.err("CALL bad_cursor2(@s)")
+
+
+def test_signal_sqlstate_raises_explicit_error():
+    """`SIGNAL SQLSTATE 'xxxxx' SET MESSAGE_TEXT='...'` 主动抛错"""
+    with _PlEnv() as e:
+        e.ok("""CREATE PROCEDURE must_be_positive(IN x INT)
+        BEGIN
+            IF x < 0 THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'x 不能是负数';
+            END IF;
+        END""")
+        msg = e.err("CALL must_be_positive(-1)")
+        assert '45000' in msg and 'x 不能是负数' in msg, msg
+        # 条件不成立时不抛错
+        assert e.ok("CALL must_be_positive(3)")['type'] == 'ok'
+        # SQLSTATE 必须是 5 个字符（MySQL 语义）→ 创建期显式报错
+        msg = e.err("""CREATE PROCEDURE bad_signal(OUT s INT)
+        BEGIN
+            SIGNAL SQLSTATE '450' SET MESSAGE_TEXT = 'x';
+            SET s = 1;
+        END""")
+        assert 'SQLSTATE' in msg and '5' in msg, msg
+
+
+def test_leave_iterate_without_matching_label_errors():
+    """`LEAVE` / `ITERATE` 的标签必须存在（找不到就显式报错）"""
+    with _PlEnv() as e:
+        e.ok("""CREATE PROCEDURE bad_leave(OUT s INT)
+        BEGIN
+            SET s = 0;
+            LEAVE nope;
+        END""")
+        assert 'nope' in e.err("CALL bad_leave(@s)")
+        e.ok("""CREATE PROCEDURE bad_iterate(OUT s INT)
+        BEGIN
+            DECLARE i INT DEFAULT 0;
+            REPEAT
+                SET i = i + 1;
+                ITERATE nope;
+            UNTIL i > 3 END REPEAT;
+            SET s = i;
+        END""")
+        assert 'nope' in e.err("CALL bad_iterate(@s)")
+
+
+def test_nested_call_between_procedures_and_functions():
+    """过程调过程、过程调函数、函数读表：跨调用共享真实值"""
+    with _PlEnv() as e:
+        e.ok("CREATE FUNCTION double_it(x INT) RETURNS INT RETURN x * 2")
+        e.ok("""CREATE PROCEDURE use_fn(IN n INT, OUT s INT)
+        BEGIN
+            DECLARE acc INT DEFAULT 0;
+            DECLARE i INT DEFAULT 1;
+            WHILE i <= n DO
+                SET acc = acc + double_it(i);
+                SET i = i + 1;
+            END WHILE;
+            SET s = acc;
+        END""")
+        # (1+2+3+4+5)*2 = 30
+        assert e.call("CALL use_fn(5, @s)", 's') == 30
+        e.ok("""CREATE PROCEDURE inner_proc(IN n INT, OUT s INT)
+        BEGIN
+            SET s = n + 1;
+        END""")
+        e.ok("""CREATE PROCEDURE outer_proc(IN n INT, OUT s INT)
+        BEGIN
+            DECLARE tmp INT DEFAULT 0;
+            CALL inner_proc(n, tmp);
+            SET s = tmp * 10;
+        END""")
+        assert e.call("CALL outer_proc(4, @t)", 't') == 50
 
