@@ -19,6 +19,7 @@
 """
 import hashlib
 import json
+import threading
 from pathlib import Path
 from typing import Dict, List
 
@@ -55,6 +56,22 @@ class Database:
             }
         }
         self.autocommit = True
+
+        # ★ 复制器注册位（本进程真实在跑 / 已配置的从库复制器）
+        #
+        # 为什么放在 Database 上：`SHOW SLAVE STATUS` 由 **执行器** 渲染，而
+        # 复制器是 `replication/slave.py::SlaveReplicator`（net 层/用例直接
+        # 构造）。两者之间原先没有任何通道，执行器只能"猜"（恒报未运行）
+        # —— 列对、语义假。Database 是执行器与复制器共同持有的对象，因此
+        # 在这里留一个注册位：复制器构造时挂进来、停止后仍保留（MySQL 在
+        # STOP SLAVE 后也会继续显示配置与最后位点），执行器据此报**真实**状态。
+        self._replicator = None
+        self._replicator_lock = threading.RLock()
+
+        # 逻辑 binlog（`replication/binlog.py::Binlog`）按需创建：只有真正
+        # 用到的实例（MasterReplicator / 备份）才会有文件句柄，避免给每个
+        # Database 都平白多一个常驻句柄（Windows 上会让数据目录删不掉）。
+        self._binlog = None
 
         self._load()
         self._advance_mvcc_epoch()
@@ -251,6 +268,72 @@ class Database:
         for tbl in self.tables.values():
             tbl._read_views.pop(tid, None)
 
+    # ==================== 复制器注册（SHOW SLAVE STATUS 的数据源）====================
+
+    def attach_replicator(self, replicator):
+        """登记本实例的从库复制器（`SlaveReplicator.__init__` 调用）
+
+        同一时刻只保留一个：新的复制器接管时旧的只做告警，不静默丢掉
+        （MySQL 的复制通道也只有一条；多个复制器同时写同一个从库实例本身
+        就是错误配置，这里让后来者接管并把这件事记进日志）。
+        """
+        with self._replicator_lock:
+            old = self._replicator
+            self._replicator = replicator
+        if old is not None and old is not replicator:
+            logger.warn(
+                "已有从库复制器被替换（同一实例只支持一条复制通道）："
+                f"{getattr(old, 'master_host', '?')}:"
+                f"{getattr(old, 'master_port', '?')} -> "
+                f"{getattr(replicator, 'master_host', '?')}:"
+                f"{getattr(replicator, 'master_port', '?')}")
+        return replicator
+
+    def detach_replicator(self, replicator=None):
+        """注销复制器（RESET SLAVE 语义；普通 stop() 不注销）
+
+        `replicator=None` 表示无条件注销当前登记项。
+        """
+        with self._replicator_lock:
+            if replicator is None or self._replicator is replicator:
+                self._replicator = None
+
+    @property
+    def replicator(self):
+        """当前登记的从库复制器（没有则为 None）"""
+        with self._replicator_lock:
+            return self._replicator
+
+    def replication_status(self):
+        """复制器自报的真实状态快照（没有登记复制器时返回 None）
+
+        复制器可能正被 io/sql 两个线程并发修改，所以取值走它自己的
+        `show_status()` 快照（内部加锁），执行器只读这份快照。
+        """
+        rep = self.replicator
+        if rep is None:
+            return None
+        try:
+            return rep.show_status()
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.error(f"读取复制器状态失败: {e}")
+            return None
+
+    # ==================== 逻辑 binlog（按需创建）====================
+
+    @property
+    def binlog(self):
+        """本实例的逻辑 binlog（`replication/binlog.py::Binlog`）
+
+        `MasterReplicator` / `BackupManager` 都按 `db.binlog` 取用；原先
+        `Database` 没有这个属性，两处都是构造即 `AttributeError`
+        （见 docs/FAILURE_TRIAGE.md）。这里按需创建并复用。
+        """
+        if self._binlog is None:
+            from ..replication.binlog import Binlog
+            self._binlog = Binlog(str(self.data_dir))
+        return self._binlog
+
     # ==================== 生命周期 ====================
 
     def vacuum(self, horizon: int = None) -> int:
@@ -279,6 +362,11 @@ class Database:
         for tbl in self.tables.values():
             try:
                 tbl.close()
+            except Exception:
+                pass
+        if self._binlog is not None:
+            try:
+                self._binlog.close()
             except Exception:
                 pass
 

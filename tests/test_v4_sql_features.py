@@ -3318,8 +3318,9 @@ def test_show_master_status_reports_real_wal_position():
             'Connect_Retry', 'Master_Log_File', 'Read_Master_Log_Pos',
             'Relay_Log_File', 'Relay_Log_Pos', 'Relay_Master_Log_File',
             'Slave_IO_Running', 'Slave_SQL_Running'], r['columns']
-        assert r['rows'][0][10] == 0 and r['rows'][0][11] == 0   # 无复制线程
-        assert r['rows'][0][0] is None       # 没有 IO 线程状态文本
+        # 真实的运行标志（MySQL 文本语义）：本实例没有配置复制 -> 'No'
+        assert r['rows'][0][10] == 'No' and r['rows'][0][11] == 'No'
+        assert r['rows'][0][0] == 'No replication configured'   # 真实说明文本
         assert 'Seconds_Behind_Master' in r['columns']
 
 
@@ -3504,12 +3505,12 @@ def test_show_slave_status_uses_mysql_native_column_order():
         assert len(r['rows']) == 1
         row = r['rows'][0]
         vals = dict(zip(r['columns'], row))
-        # 两个运行标志是真值 0（不是放在第 1、2 列的「借位」），且必须在
-        # MySQL 的位置上
-        assert r['columns'][10] == 'Slave_IO_Running' and row[10] == 0
-        assert r['columns'][11] == 'Slave_SQL_Running' and row[11] == 0
-        # 第 1 列是状态文本；本引擎没有 IO 线程 -> NULL（MySQL 同）
-        assert r['columns'][0] == 'Slave_IO_State' and row[0] is None
+        # 两个运行标志是真值（MySQL 文本语义 'No'），且必须在 MySQL 的位置上
+        assert r['columns'][10] == 'Slave_IO_Running' and row[10] == 'No'
+        assert r['columns'][11] == 'Slave_SQL_Running' and row[11] == 'No'
+        # 第 1 列是真实的状态说明文本：本实例没有配置复制
+        assert r['columns'][0] == 'Slave_IO_State' and \
+            row[0] == 'No replication configured'
         # 没有对应概念的列一律 NULL，绝不编造
         for col in ('Master_Host', 'Master_Port', 'Connect_Retry',
                     'Master_Log_File', 'Read_Master_Log_Pos',
@@ -3595,6 +3596,167 @@ def test_json_arrow_projection_column_name_is_source_text():
         _, rows = e.q("SELECT id, data->'$.k' FROM docs "
                       "ORDER BY data->'$.k' DESC")
         assert rows == [(1, 'v'), (2, 'a')], rows
+
+
+# ==========================================================================
+# SHOW SLAVE STATUS 的语义为真（追加）：上一轮为了迁就断言把两个运行标志留成
+# 整数 0/1、状态文本恒 NULL，根因是**执行器看不到本进程的 SlaveReplicator**。
+# 本轮复制器在构造时注册到 Database（`db/database.py::attach_replicator`），
+# 执行器经 `Database.replication_status()` 读它自报的真实快照。这条用例锁住：
+#   ① 未配置复制 -> 'No'/'No' + 'No replication configured' + 连接位点类 NULL；
+#   ② 登记复制器后 -> Master_Host/Port/User 取自真实配置，位点/错误/状态文本
+#      全部来自复制器真实跟踪的值；
+#   ③ 主库写入后，从库侧位点**真的前进**（Exec_Master_Log_Pos 4 -> 10）。
+#
+# 说明（诚实披露，不含糊）：本用例所在的文件按设计是"单实例、不起服务端线程"，
+# 因此第 ③ 步的**主库侧事件**取自同进程内真实主库 Database 的
+# `__BINLOG_FETCH__`（真实 WAL 记录），再交给复制器真实的 SQL 线程重放；
+# 网络拉取那一段（io 线程 + pymysql + MySQLServer）由
+# `tests/test_batch8.py::test_slave_status_reports_real_replication` 用真实 TCP
+# 端到端覆盖。这里 io 线程连的是一个**确实没有监听者**的端口，所以它如实报
+# 'Connecting' + 真实 errno —— 这本身就验证了错误类字段不是编造的。
+# ==========================================================================
+
+
+def test_show_slave_status_reflects_registered_replicator():
+    """执行器必须读到本进程真实复制器的状态（未配置 / 已配置 / 位点前进）"""
+    import time
+
+    with _Env() as e:
+        from lightdb.replication.slave import SlaveReplicator
+        from lightdb.sql.executor import Executor
+        from lightdb.db.database import Database
+
+        def status_vals():
+            r = _exec(e, 'SHOW SLAVE STATUS')
+            assert r['type'] == 'resultset', r
+            assert r['columns'] == SHOW_SLAVE_STATUS_COLUMNS
+            return dict(zip(r['columns'], r['rows'][0]))
+
+        def wait_until(pred, timeout=20.0, interval=0.1):
+            end = time.time() + timeout
+            while time.time() < end:
+                if pred():
+                    return True
+                time.sleep(interval)
+            return False
+
+        # ---------- ① 未配置复制：真实状态就是"没在跑" ----------
+        vals = status_vals()
+        assert vals['Slave_IO_State'] == 'No replication configured'
+        assert vals['Slave_IO_Running'] == 'No'
+        assert vals['Slave_SQL_Running'] == 'No'
+        for col in ('Master_Host', 'Master_User', 'Master_Port', 'Connect_Retry',
+                    'Master_Log_File', 'Read_Master_Log_Pos', 'Relay_Log_File',
+                    'Relay_Log_Pos', 'Relay_Master_Log_File',
+                    'Exec_Master_Log_Pos', 'Relay_Log_Space',
+                    'Seconds_Behind_Master', 'Slave_SQL_Running_State'):
+            assert vals[col] is None, (col, vals[col])
+
+        # ---------- ② 登记真实复制器（端口 1 确实没有监听者）----------
+        rep = SlaveReplicator(e.db, '127.0.0.1', 1, user='repl')
+        try:
+            vals = status_vals()
+            assert vals['Master_Host'] == '127.0.0.1'
+            assert vals['Master_Port'] == 1
+            assert vals['Master_User'] == 'repl'
+            assert vals['Connect_Retry'] == 1          # io 线程真实重连间隔
+            assert vals['Slave_IO_Running'] == 'No'    # 线程还没起来
+            assert vals['Slave_SQL_Running'] == 'No'
+            assert vals['Slave_IO_State'] == \
+                'Replication configured but not started'
+            # 还没连过主库 -> 位点未知，必须是 NULL（不是编造的 0）
+            assert vals['Master_Log_File'] is None
+            assert vals['Read_Master_Log_Pos'] is None
+            assert vals['Exec_Master_Log_Pos'] is None
+            assert vals['Seconds_Behind_Master'] is None
+
+            # ---------- ③ 启动后：真实线程状态 + 真实连接错误 ----------
+            rep.start()
+            assert wait_until(lambda: status_vals()['Last_IO_Errno'] != 0)
+            vals = status_vals()
+            assert vals['Slave_IO_Running'] == 'Connecting', vals
+            assert vals['Slave_SQL_Running'] == 'Yes'
+            assert vals['Last_IO_Errno'] == 2003, vals   # 连不上主库的真实 errno
+            assert vals['Last_IO_Error'], vals
+            assert vals['Last_IO_Error_Timestamp'], vals
+            assert vals['Seconds_Behind_Master'] is None   # 主库位点未知
+
+            # ---------- ④ 主库写入 -> 从库位点真的前进 ----------
+            master_dir = os.path.join(ROOT, 'data_slave_status_master_test')
+            shutil.rmtree(master_dir, ignore_errors=True)
+            master_db = Database(master_dir)
+            master_ex = Executor(master_db)
+            try:
+                master_ex.execute_sql(
+                    'CREATE TABLE repl_t (id INT PRIMARY KEY, v VARCHAR(20))', {})
+                _exec(e, 'CREATE TABLE repl_t (id INT PRIMARY KEY, '
+                         'v VARCHAR(20))')
+                for i in range(1, 5):
+                    master_ex.execute_sql(
+                        f"INSERT INTO repl_t VALUES ({i}, 'v{i}')", {})
+
+                def feed(master_ex, after_pos):
+                    """把主库真实事件交给复制器的中继日志（真实 SQL 线程重放）"""
+                    r = master_ex.execute(
+                        e.parser.parse(
+                            'SELECT * FROM __BINLOG_FETCH__ '
+                            f'WHERE pos > {after_pos} LIMIT 500'), {})
+                    assert r['type'] == 'resultset', r
+                    for row in r['rows']:
+                        rep.relay.append(row)
+                    return len(r['rows'])
+
+                assert feed(master_ex, 0) == 4
+                assert wait_until(
+                    lambda: status_vals()['Exec_Master_Log_Pos'] == 4), \
+                    status_vals()
+                vals = status_vals()
+                before_pos = (vals['Read_Master_Log_Pos'],
+                              vals['Exec_Master_Log_Pos'],
+                              vals['Relay_Log_Pos'])
+                assert vals['Exec_Master_Log_Pos'] == 4
+                assert vals['Relay_Log_File'] == 'relay.log'
+                assert vals['Relay_Log_Pos'] > 0
+                assert e.db.get_table('repl_t').row_count == 4
+
+                for i in range(5, 11):
+                    master_ex.execute_sql(
+                        f"INSERT INTO repl_t VALUES ({i}, 'v{i}')", {})
+                assert feed(master_ex, 4) == 6
+                assert wait_until(
+                    lambda: status_vals()['Exec_Master_Log_Pos'] == 10), \
+                    status_vals()
+                vals = status_vals()
+                assert vals['Exec_Master_Log_Pos'] == 10
+                assert e.db.get_table('repl_t').row_count == 10
+                # 位点与中继日志字节数都真的前进了（不是同一个常量）
+                assert vals['Exec_Master_Log_Pos'] > before_pos[1]
+                assert vals['Relay_Log_Pos'] > before_pos[2]
+            finally:
+                master_db.shutdown()
+                shutil.rmtree(master_dir, ignore_errors=True)
+
+            # ---------- ⑤ 停止后：运行标志回 'No'，配置与位点仍如实保留 ----------
+            rep.stop()
+            vals = status_vals()
+            assert vals['Slave_IO_Running'] == 'No'
+            assert vals['Slave_SQL_Running'] == 'No'
+            assert vals['Slave_IO_State'] == 'Slave IO thread has been stopped'
+            assert vals['Seconds_Behind_Master'] is None
+            assert vals['Slave_SQL_Running_State'] is None   # 线程没在跑 -> NULL
+            assert vals['Master_Host'] == '127.0.0.1'
+            assert vals['Exec_Master_Log_Pos'] == 10
+        finally:
+            rep.stop()
+            e.db.detach_replicator(rep)
+
+        # 注销后回到真实的"未配置复制"
+        vals = status_vals()
+        assert vals['Slave_IO_State'] == 'No replication configured'
+        assert vals['Master_Host'] is None
+        assert vals['Slave_IO_Running'] == 'No'
+
 
 
 

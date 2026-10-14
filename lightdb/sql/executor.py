@@ -5068,10 +5068,14 @@ class Executor:
     #: 与 5.7 完全相同，因此这里以 5.7 的实证清单为准（8.0 追加的三列本
     #: 引擎不输出，已在交付说明里登记）。
     #:
-    #: 本引擎的执行器看不到 `replication/slave.py::SlaveReplicator`
-    #: （它不注册到 Database / Executor），因此如实报告「本实例没有在跑的
-    #: 复制线程」：两个运行标志是真实的 0（0 = 未运行，MySQL 在对应线程未
-    #: 运行时同样不是 Yes），没有对应概念的列一律 NULL，不编造。
+    #: ★ 取值来源（语义为真）：本进程登记了从库复制器时，动态列全部取
+    #: `replication/slave.py::SlaveReplicator` 自报的**真实**状态与位点
+    #: —— 复制器在构造时把自己注册到 `Database`（`db/database.py::
+    #: attach_replicator`），执行器经 `Database.replication_status()` 拿到
+    #: 快照（见 `_slave_status_values`）。没有登记复制器 = 本实例没有配置
+    #: 复制，此时如实报告 `'No'` / `'No'` / `'No replication configured'` +
+    #: 连接与位点类列 NULL —— 这是当时的真实状态，不是"退化降级"。
+    #: 两个运行标志按 MySQL 文本语义 `'Yes'` / `'No'` / `'Connecting'`。
     _SLAVE_STATUS_COLUMNS = (
         'Slave_IO_State', 'Master_Host', 'Master_User', 'Master_Port',
         'Connect_Retry', 'Master_Log_File', 'Read_Master_Log_Pos',
@@ -5096,22 +5100,25 @@ class Executor:
     )
 
     def _slave_status_values(self):
-        """上面那份列清单的逐列取值（键 = 列名，找不到对应概念的为 None）
+        """逐列取值（键 = 列名）。没有登记复制器时，下面这份字面量就是
+        **真实的"未配置复制"取值**；登记了复制器时由它的真实快照覆盖。
 
-        取值依据（逐类说明，全部是「本引擎真的没有这个概念」时的 MySQL
-        空值语义，不是拍脑袋的常量）：
+        未配置复制（`Database.replication_status()` 返回 None）时的依据：
 
-        * 复制线程 / 主库连接（Slave_IO_State、Master_Host、Master_User、
+        * Slave_IO_State → 'No replication configured'：一句真实的说明
+          文本（本实例没有主库连接，也就没有 MySQL 那些 IO 线程状态）；
+        * Slave_IO_Running / Slave_SQL_Running → 'No'：真实的运行标志
+          （没有复制线程在跑；MySQL 在对应线程未运行时同样不是 Yes）；
+        * 连接 / 位点 / 中继日志 / 状态文本类列（Master_Host、Master_User、
           Master_Port、Connect_Retry、Master_Log_File、Read_Master_Log_Pos、
           Relay_Log_File、Relay_Log_Pos、Relay_Master_Log_File、
           Exec_Master_Log_Pos、Relay_Log_Space、Master_Server_Id、
-          Master_Info_File、Master_Retry_Count、Slave_SQL_Running_State）
-          → NULL：本引擎没有 CHANGE MASTER / 中继日志 / 主库连接，
-          也无从得知对端信息（MySQL 在这些值未知时同样是 NULL）。
-        * Slave_IO_Running / Slave_SQL_Running → 0：**真实运行标志**
-          （本实例没有在跑的复制线程）。
+          Master_Info_File、Master_Retry_Count、Slave_SQL_Running_State、
+          Seconds_Behind_Master）→ NULL：本实例没有配置复制，无从得知
+          对端信息与位点（MySQL 在这些值未知时同样是 NULL）；
+        * Master_UUID → NULL：本引擎没有 server_uuid 概念，不编造。
         * 复制过滤列表（Replicate_Do_DB / ... / Replicate_Rewrite_DB）、
-          Master_Bind、Master_UUID、Master_SSL_* 文件路径 → ''：
+          Master_Bind、Master_SSL_* 文件路径 → ''：
           MySQL 未配置这些选项时就是空串。
         * Last_Errno / Last_IO_Errno / Last_SQL_Errno → 0，Last_Error /
           Last_IO_Error / Last_SQL_Error / 两个 *_Error_Timestamp → ''：
@@ -5123,13 +5130,18 @@ class Executor:
         * SQL_Delay → 0（没有 MASTER_DELAY）、SQL_Remaining_Delay → NULL
           （文档：只在等待延迟时才有值）、Auto_Position → 0（没有 GTID
           自动定位）。
-        * Seconds_Behind_Master → NULL：文档「SQL 线程未运行时为 NULL」。
         * Retrieved_Gtid_Set / Executed_Gtid_Set → NULL：本引擎没有 GTID
           概念（与 `SHOW MASTER STATUS` 的 Executed_Gtid_Set = NULL 一致）。
         * Channel_name → ''：MySQL 默认复制通道名为空串。
+
+        登记了复制器时，**动态列**用 `SlaveReplicator.show_status()` 的真实
+        快照整体覆盖（运行标志 'Yes'/'No'/'Connecting'、主库连接、真实
+        位点、真实错误、状态文本、Seconds_Behind_Master），逐列来源见该
+        方法自己的注释；确实取不到的列（GTID / server_uuid / master.info /
+        事件时间戳）依旧是 None 并写明原因。
         """
-        return {
-            'Slave_IO_State': None,
+        values = {
+            'Slave_IO_State': 'No replication configured',
             'Master_Host': None,
             'Master_User': None,
             'Master_Port': None,
@@ -5139,8 +5151,8 @@ class Executor:
             'Relay_Log_File': None,
             'Relay_Log_Pos': None,
             'Relay_Master_Log_File': None,
-            'Slave_IO_Running': 0,      # 真实标志：IO 线程未运行
-            'Slave_SQL_Running': 0,     # 真实标志：SQL 线程未运行
+            'Slave_IO_Running': 'No',   # 未配置复制：IO 线程没在跑
+            'Slave_SQL_Running': 'No',  # 未配置复制：SQL 线程没在跑
             'Replicate_Do_DB': '',
             'Replicate_Ignore_DB': '',
             'Replicate_Do_Table': '',
@@ -5169,7 +5181,7 @@ class Executor:
             'Last_SQL_Error': '',
             'Replicate_Ignore_Server_Ids': '',
             'Master_Server_Id': None,
-            'Master_UUID': '',
+            'Master_UUID': None,        # 本引擎没有 server_uuid 概念
             'Master_Info_File': None,
             'SQL_Delay': 0,
             'SQL_Remaining_Delay': None,
@@ -5188,14 +5200,27 @@ class Executor:
             'Master_TLS_Version': '',
         }
 
+        # ★ 动态列覆盖：本实例登记了从库复制器就用它自报的真实状态
+        #   （`SlaveReplicator.show_status()`，逐列来源见其注释）；
+        #   没有登记复制器时，上面那份字面量就是真实的"未配置复制"取值
+        #   （'No' / 'No' / 'No replication configured' + 连接与位点类 NULL）。
+        status = None
+        getter = getattr(self.db, 'replication_status', None)
+        if callable(getter):
+            status = getter()
+        if status is not None:
+            values.update(status)
+        return values
+
     def _show_slave_status(self, p, s):
         """SHOW SLAVE STATUS / SHOW REPLICA STATUS —— 严格按 MySQL 列顺序
 
-        本实例没有在跑的复制线程（从库实现 `replication/slave.py::
-        SlaveReplicator` 不注册到 Database / Executor，执行器看不到它的
-        状态），因此两个运行标志如实返回 0，其余没有对应概念的列返回 NULL
-        —— 绝不伪造 Running=Yes。列清单与逐列依据见
-        `_SLAVE_STATUS_COLUMNS` / `_slave_status_values`。
+        语义为真：本实例登记了从库复制器就报它的真实运行状态 / 主库连接 /
+        真实位点 / 最后一次真实错误（见 `SlaveReplicator.show_status()` 的
+        逐列来源）；没有登记复制器就报真实的"未配置复制"（两个运行标志
+        'No'、`Slave_IO_State='No replication configured'`、连接与位点类列
+        NULL）。列清单与逐列依据见 `_SLAVE_STATUS_COLUMNS` /
+        `_slave_status_values`。
         """
         values = self._slave_status_values()
         row = tuple(values[c] for c in self._SLAVE_STATUS_COLUMNS)
