@@ -17,15 +17,83 @@ _FROM_SUBQUERY_KEYWORDS = {
     'LEFT', 'RIGHT', 'CROSS', 'OUTER', 'FULL', 'UNION', 'ON', 'AS',
 }
 
+# ==================== JSON 路径运算符（`col->'$.k'` / `col->>'$.k'`） ====================
+#
+# MySQL 的 `->` / `->>` 不是普通运算符，而是「按路径取 JSON 值」的语法糖:
+#     col->'$.k'   ≡ JSON_EXTRACT(col, '$.k')     （结果仍是 JSON 值）
+#     col->>'$.k'  ≡ JSON_UNQUOTE(JSON_EXTRACT(col, '$.k'))  （结果是 TEXT）
+# 本引擎的标量表达式求值器（parse_scalar_expr / eval_expr_node）与
+# `JSON_EXTRACT` / `JSON_UNQUOTE` 两个标量函数是已经成型的通用机制，所以这里
+# 在**解析期**把 `->` 语法糖改写成等价函数调用：投影、WHERE/HAVING、JOIN ON、
+# GROUP BY / ORDER BY 各处一律复用同一条求值路径，不需要在每个执行分支里
+# 单独加注解。
+#
+# 只支持 `列 -> '字符串字面量路径'` 形态：左侧不是列引用（如 `f(x)->'$.a'`）
+# 或右侧不是字符串字面量（如 `col->$.a`、`col->?`）都是**显式 SyntaxError**，
+# 绝不静默当成别的含义。
+_JSON_PATH_OP_RE = re.compile(
+    r"""(?P<base>[`"]?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?[`"]?)"""
+    r"""\s*(?P<op>->>|->)\s*'(?P<path>(?:[^']|'')*)'""")
+
+
+def _json_op_repl(m: 're.Match') -> str:
+    base = m.group('base')
+    path = m.group('path').replace("''", "'")
+    if not path.startswith('$'):
+        raise SyntaxError(
+            f"JSON 路径必须以 $ 开头（MySQL 语法）: "
+            f"{m.group('base')}{m.group('op')}'{path}'")
+    expr = f"JSON_EXTRACT({base}, '{path}')"
+    if m.group('op') == '->>':
+        return f"JSON_UNQUOTE({expr})"
+    return expr
+
+
+def rewrite_json_paths(text):
+    """把 `col->'$.k'` / `col->>'$.k'` 改写成 JSON_EXTRACT / JSON_UNQUOTE
+
+    幂等（改写结果里不再有 `->`），链式写法 `a->'$.x'->'$.y'` 逐轮收敛。
+    残留的、不符合上述形态的 `->`（引号外的）→ 显式 SyntaxError。
+    """
+    s = str(text) if text is not None else text
+    if not isinstance(s, str) or '->' not in s:
+        return s
+    for _ in range(8):
+        new = _JSON_PATH_OP_RE.sub(_json_op_repl, s)
+        if new == s:
+            break
+        s = new
+    for i, _ch, quoted in Parser._scan_quotes(s):
+        if quoted:
+            continue
+        if s.startswith('->', i):
+            raise SyntaxError(
+                f"不支持的 JSON 路径写法: {str(text).strip()} —— "
+                f"本引擎只支持 `列 -> '$.路径'` / `列 ->> '$.路径'`"
+                f"（左侧必须是列引用，右侧必须是字符串字面量路径）")
+    return s
+
 
 class Parser:
     """SQL 解析器"""
 
     def parse(self, sql: str) -> Optional[Dict]:
+        """解析入口：在结果 AST 上附加原始语句文本（`source_sql`）
+
+        `source_sql` 只用于审计 / 诊断（`SHOW AUDIT LOG` 需要真实语句文本，
+        而 pymysql 入口 `net/server.py` 只把 AST 交给执行器，拿不到原文），
+        不参与任何语义判断。
+        """
         sql = sql.strip().rstrip(';').strip()
         if not sql:
             return None
+        parsed = self._parse_inner(sql)
+        if isinstance(parsed, dict) and 'source_sql' not in parsed:
+            parsed = dict(parsed)
+            parsed['source_sql'] = sql
+        return parsed
 
+    def _parse_inner(self, sql: str) -> Optional[Dict]:
         upper = sql.upper()
 
         # WITH [RECURSIVE] name AS (subquery), ... <主体语句>
@@ -46,10 +114,20 @@ class Parser:
             return self._parse_union(union_parts)
 
         if upper.startswith('EXPLAIN'):
-            inner = self.parse(sql[len('EXPLAIN'):].strip())
+            rest = sql[len('EXPLAIN'):].strip()
+            analyze = False
+            if re.match(r'ANALYZE\b', rest, re.IGNORECASE):
+                # MySQL 的 `EXPLAIN ANALYZE <stmt>`：先执行再给出真实耗时。
+                # 原实现把 'ANALYZE SELECT ...' 交给 ANALYZE 分支，`(\w+)`
+                # 吃掉了 'SELECT' 当表名 → 计划对象为 None（报
+                # "'NoneType' object has no attribute 'explain_row'"）。
+                analyze = True
+                rest = rest[len('ANALYZE'):].strip()
+            inner = self.parse(rest)
             if inner is None:
                 raise SyntaxError("EXPLAIN 需要跟随一条 SQL")
-            return {'command': 'EXPLAIN', 'inner': inner}
+            return {'command': 'EXPLAIN', 'inner': inner,
+                    'analyze': analyze}
 
         if upper.startswith('ANALYZE'):
             m = re.match(
@@ -82,6 +160,11 @@ class Parser:
                 upper.startswith('DESC ')):
             return self._show_columns(sql)
 
+        # ---------- MySQL 兼容的运维 / 复制 / 安全语句 ----------
+        stmt = self._parse_ops_stmt(sql, upper)
+        if stmt is not None:
+            return stmt
+
         if upper in ('BEGIN', 'START TRANSACTION'):
             return {'command': 'BEGIN'}
         if upper == 'COMMIT':
@@ -95,6 +178,238 @@ class Parser:
             return {'command': 'USE', 'database': m.group(1)}
 
         return None
+
+    # ============ 运维 / 复制 / 安全语句（MySQL 兼容面） ============
+
+    def _show_result(self, show_stmt: str, **extra) -> Dict:
+        """构造「以结果集回传的 SHOW/CHECK 类语句」
+
+        为什么 `command` 是 `SELECT`：`net/server.py::_send_execution_result`
+        只在 `cmd == 'SELECT'`（或返回结果集的 `EXPLAIN`）时才把执行结果序列化
+        成 MySQL 结果集，其它命令名一律回 OK 包 —— 那样客户端 `fetchall()`
+        什么都拿不到。`net/**` 不在本次可改范围内，因此这里用
+        `command='SELECT'` + `show_stmt` 标记，执行器在 `_cmd_select` 最前面
+        按标记分流（见 `executor._exec_show_stmt`）。返回的 AST 补齐了普通
+        SELECT 的全部键，避免下游按 SELECT 结构访问时缺键。
+        """
+        d = {
+            'command': 'SELECT', 'table': None, 'table_alias': None,
+            'subquery': None, 'no_from': True, 'joins': [],
+            'columns': ['*'], 'windows': [], 'projection': [],
+            'distinct': False, 'where': None, 'group_by': None,
+            'having': None, 'order_by': None, 'limit': None,
+            'offset': None, 'show_stmt': show_stmt,
+        }
+        d.update(extra)
+        return d
+
+    def _parse_ops_stmt(self, sql: str, upper: str):
+        """解析运维/复制/安全语句；不认识则返回 None（交回兜底 1064）"""
+        # ---- 复制状态 ----
+        if upper in ('SHOW MASTER STATUS', 'SHOW BINARY LOG STATUS'):
+            return self._show_result('MASTER_STATUS')
+        if upper in ('SHOW SLAVE STATUS', 'SHOW REPLICA STATUS'):
+            return self._show_result('SLAVE_STATUS')
+        if upper.startswith('SHOW BINLOG EVENTS'):
+            return self._show_result('BINLOG_EVENTS')
+
+        # ---- 存储引擎状态 ----
+        em = re.match(
+            r'SHOW\s+ENGINE\s+([`"]?\w+[`"]?)'
+            r'(?:\s+(STATUS|MUTEX))?\s*$', sql, re.IGNORECASE)
+        if em:
+            return self._show_result(
+                'ENGINE',
+                engine=em.group(1).strip('`"').upper(),
+                engine_kind=(em.group(2) or 'STATUS').upper())
+
+        # ---- 审计日志 ----
+        am = re.match(r'SHOW\s+AUDIT\s+LOG(?:\s+LIMIT\s+(\d+))?\s*$',
+                      sql, re.IGNORECASE)
+        if am:
+            return self._show_result(
+                'AUDIT_LOG',
+                limit=int(am.group(1)) if am.group(1) else None)
+
+        # ---- 表检查 / 优化（可带多个表，MySQL 语法） ----
+        for kw, tag in (('CHECK', 'CHECK_TABLE'),
+                        ('OPTIMIZE', 'OPTIMIZE_TABLE')):
+            tm = re.match(
+                rf'{kw}\s+TABLE\s+(.+?)\s*$', sql, re.IGNORECASE | re.DOTALL)
+            if tm:
+                names = [
+                    t.strip().strip('`"')
+                    for t in self._split_top_level(tm.group(1))
+                    if t.strip()
+                ]
+                # 去掉 FOR UPGRADE / QUICK / FAST / MEDIUM / EXTENDED 等选项
+                names = [n for n in names
+                         if n.upper() not in (
+                             'FOR', 'UPGRADE', 'QUICK', 'FAST', 'MEDIUM',
+                             'EXTENDED', 'CHANGED', 'LOCAL', 'NO_WRITE_TO_BINLOG')]
+                if not names:
+                    raise SyntaxError(f"{kw} TABLE 缺少表名: {sql}")
+                return self._show_result(tag, tables=names)
+
+        # ---- 分区 ----
+        pm = re.match(r'SHOW\s+PARTITIONS\s+FROM\s+[`"]?(\w+)[`"]?\s*$',
+                      sql, re.IGNORECASE)
+        if pm:
+            return self._show_result('PARTITIONS', table=pm.group(1))
+
+        # ---- 安全面 ----
+        if upper in ('SHOW IP WHITELIST', 'SHOW IP WHITE LIST'):
+            return self._show_result('IP_WHITELIST')
+        wm = re.match(r'(ADD|REMOVE|DELETE)\s+IP\s+WHITELIST\s+(\S+)\s*$',
+                      sql, re.IGNORECASE)
+        if wm:
+            return {
+                'command': f'{wm.group(1).upper()} IP WHITELIST',
+                'entry': wm.group(2).strip().strip("'\""),
+            }
+        if upper in ('SHOW SECURITY', 'SHOW SECURITY STATUS'):
+            return self._show_result('SECURITY')
+
+        # ---- 用户 / 口令策略（DCL） ----
+        if re.match(r'CREATE\s+USER\b', sql, re.IGNORECASE):
+            return self._create_user(sql)
+        dm = re.match(r'DROP\s+USER\s+(?:IF\s+EXISTS\s+)?(.+?)\s*$',
+                      sql, re.IGNORECASE | re.DOTALL)
+        if dm:
+            return {
+                'command': 'DROP USER',
+                'users': [self._parse_account(a)
+                          for a in self._split_top_level(dm.group(1))
+                          if a.strip()],
+            }
+        sm = re.match(r'SET\s+PASSWORD\s+POLICY\s+(.+?)\s*$',
+                      sql, re.IGNORECASE | re.DOTALL)
+        if sm:
+            opts = {}
+            for item in self._split_top_level(sm.group(1)):
+                item = item.strip()
+                if not item:
+                    continue
+                kv = re.match(r'(\w+)\s*=\s*(.+?)\s*$', item)
+                if not kv:
+                    raise SyntaxError(f"SET PASSWORD POLICY 选项错误: {item}")
+                opts[kv.group(1).lower()] = kv.group(2).strip().strip("'\"")
+            return {'command': 'SET PASSWORD POLICY', 'options': opts}
+
+        # ---- 存储过程 / 触发器 / 全文索引 ----
+        if re.match(r'CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\b',
+                    sql, re.IGNORECASE):
+            return self._create_procedure(sql)
+        cm = re.match(r'CALL\s+[`"]?(\w+)[`"]?\s*\((.*)\)\s*$',
+                      sql, re.IGNORECASE | re.DOTALL)
+        if cm:
+            args = [a.strip() for a in self._split_top_level(cm.group(2))]
+            return {'command': 'CALL', 'name': cm.group(1),
+                    'args': [a for a in args if a]}
+        if re.match(r'CREATE\s+TRIGGER\b', sql, re.IGNORECASE):
+            return self._create_trigger(sql)
+        if re.match(r'CREATE\s+FULLTEXT\s+INDEX\b', sql, re.IGNORECASE):
+            return self._create_fulltext_index(sql)
+        return None
+
+    def _parse_account(self, text: str) -> Dict:
+        """`'user'@'host'` → {'user','host'}（省略 host 按 '%'）"""
+        t = text.strip()
+        m = re.match(
+            r"""^(?:'([^']*)'|"([^"]*)"|([A-Za-z_]\w*))"""
+            r"""(?:\s*@\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_%.\w]*)))?""",
+            t)
+        if not m:
+            raise SyntaxError(f"账号写法错误: {text}")
+        user = m.group(1) if m.group(1) is not None else (
+            m.group(2) if m.group(2) is not None else m.group(3))
+        host = m.group(4) if m.group(4) is not None else (
+            m.group(5) if m.group(5) is not None else m.group(6))
+        return {'user': user, 'host': host or '%'}
+
+    def _create_user(self, sql: str) -> Dict:
+        m = re.match(r'CREATE\s+USER\s+(IF\s+NOT\s+EXISTS\s+)?(.+?)\s*$',
+                     sql, re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise SyntaxError("CREATE USER 语法错误")
+        if_not_exists = bool(m.group(1))
+        accounts = []
+        for part in self._split_top_level(m.group(2)):
+            part = part.strip()
+            if not part:
+                continue
+            # `IDENTIFIED [WITH plugin] BY 'pwd'`
+            pm = re.search(
+                r"""IDENTIFIED\s+(?:WITH\s+\w+\s+)?BY\s+"""
+                r"""('(?:[^']|'')*'|NULL)""", part, re.IGNORECASE)
+            password = None
+            has_ident = bool(pm)
+            if pm:
+                raw = pm.group(1)
+                password = (None if raw.upper() == 'NULL'
+                            else raw[1:-1].replace("''", "'"))
+                part = part[:pm.start()].strip()
+            elif re.search(r'IDENTIFIED\s+WITH\b', part, re.IGNORECASE):
+                raise SyntaxError(
+                    f"CREATE USER 只支持 IDENTIFIED BY '密码' / "
+                    f"IDENTIFIED WITH <plugin> BY '密码': {sql}")
+            acct = self._parse_account(part)
+            acct['password'] = password
+            acct['has_ident'] = has_ident
+            accounts.append(acct)
+        if not accounts:
+            raise SyntaxError(f"CREATE USER 缺少账号: {sql}")
+        return {'command': 'CREATE USER', 'accounts': accounts,
+                'if_not_exists': if_not_exists}
+
+    def _create_procedure(self, sql: str) -> Dict:
+        m = re.match(
+            r'CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+'
+            r'[`"]?(\w+)[`"]?\s*\(', sql, re.IGNORECASE)
+        if not m:
+            raise SyntaxError("CREATE PROCEDURE 语法错误")
+        open_idx = sql.index('(', m.end() - 1)
+        end = self._matching_paren(sql, open_idx)
+        params = self._split_top_level(sql[open_idx + 1:end])
+        body = sql[end + 1:].strip()
+        body = re.sub(r'^(?:COMMENT\s+\'(?:[^\']|\'\')*\'\s*)+', '',
+                      body, flags=re.IGNORECASE).strip()
+        if not body:
+            raise SyntaxError("CREATE PROCEDURE 缺少过程体")
+        return {'command': 'CREATE PROCEDURE', 'name': m.group(1),
+                'params': [p.strip() for p in params if p.strip()],
+                'body': body}
+
+    def _create_trigger(self, sql: str) -> Dict:
+        m = re.match(
+            r'CREATE\s+TRIGGER\s+[`"]?(\w+)[`"]?\s+'
+            r'(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)\s+ON\s+'
+            r'[`"]?(\w+)[`"]?\s+FOR\s+EACH\s+ROW\s+(.+)$',
+            sql, re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise SyntaxError(
+                f"CREATE TRIGGER 语法错误（需要 "
+                f"CREATE TRIGGER 名 BEFORE|AFTER INSERT|UPDATE|DELETE ON 表 "
+                f"FOR EACH ROW <语句块>）: {sql[:120]}")
+        return {'command': 'CREATE TRIGGER', 'name': m.group(1),
+                'timing': m.group(2).upper(), 'event': m.group(3).upper(),
+                'table': m.group(4), 'body': m.group(5).strip()}
+
+    def _create_fulltext_index(self, sql: str) -> Dict:
+        m = re.match(
+            r'CREATE\s+FULLTEXT\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+            r'[`"]?(\w+)[`"]?\s+ON\s+[`"]?(\w+)[`"]?\s*\((.*)\)\s*$',
+            sql, re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise SyntaxError(f"CREATE FULLTEXT INDEX 语法错误: {sql[:120]}")
+        cols = [c.strip().strip('`"')
+                for c in self._split_top_level(m.group(3))]
+        cols = [c for c in cols if c]
+        if not cols:
+            raise SyntaxError("CREATE FULLTEXT INDEX 缺少列名")
+        return {'command': 'CREATE FULLTEXT INDEX', 'name': m.group(1),
+                'table': m.group(2), 'columns': cols,
+                'if_not_exists': 'IF NOT EXISTS' in sql.upper()}
 
     # ==================== UNION ====================
 
@@ -599,8 +914,20 @@ class Parser:
             })
 
         # 列（窗口函数从列表达式里抽出来，交给执行器单独计算）
+        # JSON 路径语法糖在投影里同样先改写（`SELECT data->'$.k' FROM docs`），
+        # 改写后是普通标量函数投影，走既有投影求值路径。
         raw_columns = (['*'] if cols_str == '*'
-                       else self._split_top_level(cols_str))
+                       else [rewrite_json_paths(c)
+                             for c in self._split_top_level(cols_str)])
+        for c in raw_columns:
+            if re.search(r'\bAGAINST\s*\(', str(c), re.IGNORECASE):
+                # MySQL 允许 `SELECT MATCH(c) AGAINST('x') ...`（返回相关度
+                # 分数），本引擎没实现打分投影。原来会一路走到
+                # 「列 'MATCH(c) AGAINST(...)' 不存在」这种误导性错误，
+                # 这里直接说明原因（显式失败，不静默给 NULL）。
+                raise SyntaxError(
+                    "MATCH ... AGAINST 目前只支持出现在 WHERE 里："
+                    "本引擎未实现相关度打分投影（MySQL 在这里返回分数）")
         columns, windows, projection = self._split_windows(raw_columns)
 
         # WHERE / GROUP / HAVING / ORDER / LIMIT
@@ -623,7 +950,7 @@ class Parser:
             rest, 'GROUP', ('HAVING', 'ORDER', 'LIMIT'))
         if gtext is not None:
             group_by = [
-                c.strip()
+                rewrite_json_paths(c.strip())
                 for c in self._split_top_level(gtext)
             ]
 
@@ -650,7 +977,7 @@ class Parser:
         if otext is not None:
             keys = []
             for pos, raw in enumerate(self._split_top_level(otext)):
-                item = raw.strip()
+                item = rewrite_json_paths(raw.strip())
                 if not item:
                     continue
                 desc = False
@@ -729,6 +1056,10 @@ class Parser:
         不会被外层拆开，所以这里不需要再动切分逻辑。
         """
         s = s.strip()
+        # JSON 路径语法糖（`data->'$.k'`）必须在括号/AND-OR 切分之前改写：
+        # 否则 `->` 里的 `>` 会被 `_split_top_level_comparison` 当成比较运算符，
+        # 整段条件解析失败（原实现直接报「WHERE 条件错误」）。
+        s = rewrite_json_paths(s)
         self._check_paren_balance(s)
 
         # `NOT EXISTS (...)` / `NOT IN (...)` 是独立谓词形态（有自己的
@@ -840,6 +1171,26 @@ class Parser:
                 'column': im.group(1),
                 'op': 'NOT IN' if im.group(2) else 'IN',
                 'subquery': inner,
+            }
+
+        # MATCH(列[, 列...]) AGAINST('查询词' [IN BOOLEAN MODE])
+        # 全文检索谓词（MySQL 语法）。解析期只产出标记，命中行集由执行器
+        # 用表上的倒排索引真算（见 executor._apply_match），不做假数据。
+        fm = re.match(
+            r"""MATCH\s*\(\s*(?P<cols>[`"]?\w+[`"]?"""
+            r"""(?:\s*,\s*[`"]?\w+[`"]?)*)\s*\)\s*"""
+            r"""AGAINST\s*\(\s*'(?P<q>(?:[^']|'')*)'\s*"""
+            r"""(?:IN\s+(?P<mode>BOOLEAN|NATURAL\s+LANGUAGE)\s+MODE\s*)?\)\s*$""",
+            s, re.IGNORECASE | re.DOTALL)
+        if fm:
+            cols = [c.strip().strip('`"')
+                    for c in fm.group('cols').split(',')]
+            mode = (fm.group('mode') or 'NATURAL LANGUAGE').upper()
+            return {
+                'op': 'MATCH',
+                'columns': [c for c in cols if c],
+                'against': fm.group('q').replace("''", "'"),
+                'mode': ' '.join(mode.split()),
             }
 
         # IN (v1, v2)
@@ -1055,16 +1406,39 @@ class Parser:
 
     # ==================== DDL ====================
 
+    @staticmethod
+    def _extract_paren(text: str, open_idx: int):
+        """取 `text[open_idx] == '('` 的配对右括号内部文本
+
+        返回 (内部文本, 右括号下标)。引号内的括号不计。
+        必须用配对扫描而不是 `\\((.*)\\)`：后者是贪婪的，
+        `CREATE TABLE t (...) PARTITION BY HASH(id)` 会把列定义切到
+        `PARTITION BY HASH(id` 的右括号上（分区描述被整段吞掉 —— 这正是
+        原来 `Table._partition` 为 None 的原因）；非贪婪版本又会把
+        `GENERATED ALWAYS AS (UPPER(a))` 的表达式截成 `UPPER(a`。
+        """
+        depth = 0
+        for i, ch, quoted in Parser._scan_quotes(text):
+            if i < open_idx or quoted:
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return text[open_idx + 1:i], i
+        raise SyntaxError(f"括号不匹配: {text[:120]}")
+
     def _create_table(self, sql: str) -> Dict:
         m = re.match(
-            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?(\w+)[`"]?\s*\((.*)\)\s*(.*)$',
-            sql, re.IGNORECASE | re.DOTALL)
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?(\w+)[`"]?\s*\(',
+            sql, re.IGNORECASE)
         if not m:
             raise SyntaxError("CREATE TABLE 语法错误")
 
         table = m.group(1)
-        body = m.group(2)
-        tail = m.group(3).strip()
+        body, end = self._extract_paren(sql, m.end() - 1)
+        tail = sql[end + 1:].strip()
 
         cols = []
         constraints = []
@@ -1192,24 +1566,24 @@ class Parser:
         col_type = parts[1].upper()
         rest = (parts[2] if len(parts) > 2 else '')
 
-        # 生成列
+        # 生成列（表达式用配对括号提取：`GENERATED ALWAYS AS (UPPER(a))`）
         generated = None
-        gm = re.search(
-            r'GENERATED\s+ALWAYS\s+AS\s*\(\s*(.+?)\s*\)(?:\s+(STORED|VIRTUAL))?',
-            rest, re.IGNORECASE | re.DOTALL)
+        gm = re.search(r'GENERATED\s+ALWAYS\s+AS\s*\(', rest, re.IGNORECASE)
         if gm:
+            gexpr, gend = self._extract_paren(rest, gm.end() - 1)
+            after = rest[gend + 1:]
+            sm = re.match(r'\s*(STORED|VIRTUAL)', after, re.IGNORECASE)
             generated = {
-                'expr': gm.group(1).strip(),
-                'stored': (gm.group(2) or 'VIRTUAL').upper() == 'STORED',
+                'expr': gexpr.strip(),
+                'stored': bool(sm) and sm.group(1).upper() == 'STORED',
             }
 
         # CHECK
         check = None
-        cm = re.search(
-            r'CHECK\s*\(\s*(.+?)\s*\)',
-            rest, re.IGNORECASE | re.DOTALL)
+        cm = re.search(r'CHECK\s*\(', rest, re.IGNORECASE)
         if cm:
-            check = {'expr': cm.group(1).strip()}
+            cexpr, _cend = self._extract_paren(rest, cm.end() - 1)
+            check = {'expr': cexpr.strip()}
 
         return {
             'name': name,
@@ -1283,6 +1657,12 @@ class Parser:
                 else:
                     current += ch
             elif ch in ("'", '"'):
+                # 丢掉引号**前**的空白：`VALUES (1, 'hi')` 里的空格属于 SQL
+                # 语法、不属于字面量。原实现把它留在 current 里，于是
+                # 'hi' 被存成 ' hi'（实测 test_batch9::test_prepared_statement
+                # 的「多一个前导空格」就是这个根因），UPPER() 之类函数也会
+                # 跟着算错。
+                current = current.strip()
                 in_str = ch
             elif ch == ',':
                 if current.strip():
@@ -1955,7 +2335,7 @@ def validate_group_by(parsed, strict=True):
 
 # 支持的单行标量函数名（**唯一清单**，报错文案与参数校验都取自这里）
 SCALAR_FUNCTION_NAMES = ('LOWER', 'UPPER', 'LENGTH', 'TRIM', 'ABS',
-                         'ROUND', 'CONCAT')
+                         'ROUND', 'CONCAT', 'JSON_EXTRACT', 'JSON_UNQUOTE')
 
 # 每个标量函数的参数个数：(最少, 最多)，None 表示不限
 SCALAR_FUNCTION_ARITY = {
@@ -1966,6 +2346,8 @@ SCALAR_FUNCTION_ARITY = {
     'ABS': (1, 1),
     'ROUND': (1, 2),
     'CONCAT': (2, None),
+    'JSON_EXTRACT': (2, 2),
+    'JSON_UNQUOTE': (1, 1),
 }
 
 # 聚合函数名（与 executor._AGG_FUNCS / plan_executor._is_agg_expr 的超集一致）
@@ -2394,6 +2776,24 @@ def apply_scalar_function(name, values):
             return _round_half_up(values[0], digits)
         if name == 'CONCAT':
             return ''.join(str(v) for v in values)
+        if name == 'JSON_EXTRACT':
+            # `col->'$.k'` 的改写目标。JSON 文本（或已解析的 dict/list）按
+            # JSON 路径取值；**键/下标不存在 → NULL**（MySQL 标准语义，
+            # 不是空串、不是报错）。json_func.json_extract 已实现该语义。
+            from .json_func import json_extract
+            return json_extract(values[0], str(values[1]))
+        if name == 'JSON_UNQUOTE':
+            # `col->>'$.k'` 的改写目标：把 JSON 值转成 TEXT。字符串原样
+            # （JSON 的引号已由 json_extract 去掉），对象/数组转紧凑 JSON
+            # 文本，布尔转 true/false，数字转十进制文本。
+            import json as _json
+            v = values[0]
+            if isinstance(v, (dict, list)):
+                return _json.dumps(v, ensure_ascii=False,
+                                   separators=(',', ':'))
+            if isinstance(v, bool):
+                return 'true' if v else 'false'
+            return str(v)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"函数 {name} 的参数不合法: {exc}")
     raise ValueError(unsupported_function_message(name))

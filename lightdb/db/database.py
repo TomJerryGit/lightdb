@@ -128,6 +128,10 @@ class Database:
                     tname, tinfo['cols'], str(self.data_dir),
                     self.lock_manager, self.mvcc,
                 )
+                if tinfo.get('partition'):
+                    # 分区描述随表元数据一起持久化（SHOW PARTITIONS /
+                    # 分区裁剪都读 Table._partition）
+                    self.tables[tname].set_partition(tinfo['partition'])
             if 'users' in meta:
                 self.users = meta['users']
         except Exception as e:
@@ -146,7 +150,8 @@ class Database:
     def save_meta(self):
         meta = {
             'tables': {
-                n: {'cols': t.cols}
+                n: {'cols': t.cols,
+                    'partition': getattr(t, '_partition_spec', None)}
                 for n, t in self.tables.items()
             },
             'users': self.users,
@@ -160,12 +165,15 @@ class Database:
     # ==================== 表管理 ====================
 
     def create_table(self, name: str,
-                     cols: List[dict]) -> Table:
+                     cols: List[dict],
+                     partition: dict = None) -> Table:
         if name in self.tables:
             raise ValueError(f"表 {name} 已存在")
         tbl = Table(
             name, cols, str(self.data_dir),
             self.lock_manager, self.mvcc)
+        if partition:
+            tbl.set_partition(partition)
         self.tables[name] = tbl
         self.save_meta()
         return tbl

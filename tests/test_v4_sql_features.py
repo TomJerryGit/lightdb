@@ -3263,6 +3263,194 @@ def test_join_order_by_qualified_columns_multi_key():
         assert rows == [(2, 30), (1, 20)], rows
 
 
+# ==========================================================================
+# MySQL 兼容面：复制状态 / 审计 / 表检查 / 引擎状态 / DCL 口令策略 / JSON 路径
+#
+# 本节的 6 个用例覆盖本次新增的 6 项语句。全部走**单实例**
+# `Executor.execute(p, {})`（不启服务端线程、不碰 pymysql），因此可稳定重复；
+# pymysql 入口的等价验证在既有用例里（tests/test_batch8.py::
+# test_master_slave_status、tests/test_batch14.py::test_audit、
+# tests/test_batch15.py 的 test_check_optimize / test_show_engine /
+# test_security_via_sql / test_full_sql_suite）。
+# ==========================================================================
+
+
+def _exec(e, sql):
+    """执行一条语句并返回执行器结果字典（不要求是结果集）"""
+    p = e.parser.parse(sql)
+    assert p is not None, f'解析失败: {sql}'
+    return e.ex.execute(p, {})
+
+
+def test_show_master_status_reports_real_wal_position():
+    """SHOW MASTER STATUS / SHOW SLAVE STATUS / __BINLOG_FETCH__
+
+    位点来自**真实 WAL 记录**（本引擎没有独立 binlog 文件），
+    不是硬编码常量：新增写入后位点必须继续增长。
+    """
+    with _Env() as e:
+        r = _exec(e, 'SHOW MASTER STATUS')
+        assert r['type'] == 'resultset', r
+        assert r['columns'] == ['File', 'Position', 'Binlog_Do_DB',
+                                'Binlog_Ignore_DB', 'Executed_Gtid_Set']
+        row = r['rows'][0]
+        assert row[0] == 'binlog.000001'
+        # _Env 建了 8(emp)+3(users)+3(orders) = 14 条真实 INSERT
+        assert row[1] >= 14, row
+        assert row[4] is None            # GTID 无对应概念 -> NULL
+
+        ev = _exec(e, 'SELECT * FROM __BINLOG_FETCH__ WHERE pos >= 1 LIMIT 100')
+        assert ev['type'] == 'resultset', ev
+        assert [c for c in ev['columns']] == [
+            'pos', 'lsn', 'txn_id', 'event_type', 'table_name', 'data']
+        assert len(ev['rows']) == row[1]
+        assert ev['rows'][0][3] == 'INSERT'
+
+        _exec(e, "INSERT INTO emp VALUES (99, 'Zoe', 'Eng', 70)")
+        pos2 = _exec(e, 'SHOW MASTER STATUS')['rows'][0][1]
+        assert pos2 == row[1] + 1, (row[1], pos2)
+
+        r = _exec(e, 'SHOW SLAVE STATUS')
+        assert r['type'] == 'resultset'
+        assert r['rows'][0][0] == 0 and r['rows'][0][1] == 0   # 无复制线程
+        assert 'Seconds_Behind_Master' in r['columns']
+
+
+def test_show_audit_log_records_real_statements():
+    """SHOW AUDIT LOG：真实语句审计（时间/用户/命令/成败/耗时/SQL 原文）"""
+    with _Env() as e:
+        r = _exec(e, 'SHOW AUDIT LOG')
+        assert r['type'] == 'resultset', r
+        assert r['columns'] == ['ts', 'user', 'cmd', 'success',
+                                'elapsed_ms', 'sql']
+        cmds = [x[2] for x in r['rows']]
+        assert 'CREATE TABLE' in cmds and 'INSERT' in cmds, cmds
+        # SQL 原文真的记下来了（不是命令名占位）
+        assert any(str(x[5]).startswith('CREATE TABLE emp')
+                   for x in r['rows'])
+        # 失败的 DML 也记录（success=0），不静默丢
+        bad = _exec(e, 'INSERT INTO no_such_table VALUES (1)')
+        assert bad['type'] == 'error'
+        last = _exec(e, 'SHOW AUDIT LOG')['rows'][-1]
+        assert last[3] == 0 and 'no_such_table' in last[5], last
+        assert len(_exec(e, 'SHOW AUDIT LOG LIMIT 2')['rows']) == 2
+
+
+def test_check_and_optimize_table_verify_real_storage():
+    """CHECK TABLE 真去逐个主键定位堆行；OPTIMIZE TABLE 真回收+刷盘"""
+    with _Env() as e:
+        r = _exec(e, 'CHECK TABLE emp')
+        assert r['type'] == 'resultset', r
+        assert r['columns'] == ['Table', 'Msg_text', 'Msg_type', 'Op']
+        assert r['rows'][0][1] == 'OK', r['rows']
+        assert r['rows'][0][3] == 'check'
+        # 第二行是真实校验统计（索引项数来自真的走了一遍索引）
+        assert '8' in r['rows'][1][1], r['rows']
+
+        r = _exec(e, 'CHECK TABLE no_such_table')
+        assert r['rows'][0][2] == 'error'
+        assert 'exist' in r['rows'][0][1]
+
+        r = _exec(e, 'OPTIMIZE TABLE emp')
+        assert r['rows'][0][1] == 'OK' and r['rows'][0][3] == 'optimize'
+        _, rows = e.q('SELECT COUNT(*) FROM emp')
+        assert rows[0][0] == 8            # 优化后数据仍在
+        r = _exec(e, 'OPTIMIZE TABLE no_such_table')
+        assert r['rows'][0][2] == 'error'
+
+
+def test_show_engine_innodb_status_reports_real_stats():
+    """SHOW ENGINE INNODB：真实表/页/BTree/WAL 统计；不支持的形态显式报错"""
+    with _Env() as e:
+        r = _exec(e, 'SHOW ENGINE INNODB')
+        assert r['type'] == 'resultset', r
+        assert r['columns'] == ['Type', 'Name', 'Status']
+        assert r['rows'][0][0] == 'InnoDB' and r['rows'][0][1] == ''
+        text = r['rows'][0][2]
+        assert 'TABLE emp' in text and 'rows=8' in text, text
+        assert 'Log records (data events):' in text
+        assert 'btree_height=' in text
+
+        for sql in ('SHOW ENGINE INNODB MUTEX', 'SHOW ENGINE MYISAM'):
+            r = _exec(e, sql)
+            assert r['type'] == 'error', (sql, r)
+            assert '不支持' in r['message']
+
+
+def test_create_user_password_policy_rejects_weak():
+    """CREATE USER 弱口令必须被真的拒绝，强口令落地为哈希；策略可调"""
+    with _Env() as e:
+        r = _exec(e, "CREATE USER 'weak' IDENTIFIED BY '123'")
+        assert r['type'] == 'error', r
+        assert r['code'] == 1819, r
+        assert 'policy' in r['message'] and '长度' in r['message'], r
+        assert 'weak' not in e.db.users          # 拒绝时不产生用户
+
+        r = _exec(e, "CREATE USER 'strong' IDENTIFIED BY 'Strong123'")
+        assert r['type'] == 'ok', r
+        h = e.db.users['strong']['auth_hash']
+        from lightdb.db.database import hash_native_password
+        assert h == hash_native_password('Strong123')
+        assert len(h) == 40 and 'Strong123' not in h    # 只存哈希，不存明文
+
+        # 策略真的可改，并且立刻影响后续 CREATE USER
+        assert _exec(e, 'SET PASSWORD POLICY min_length = 12')['type'] == 'ok'
+        r = _exec(e, "CREATE USER 'mid' IDENTIFIED BY 'Strong123'")
+        assert r['type'] == 'error' and r['code'] == 1819, r
+        assert '12' in r['message'], r
+        assert _exec(
+            e, "CREATE USER 'mid' IDENTIFIED BY 'Str0ngPassw0rd'")['type'] \
+            == 'ok'
+        assert 'mid' in e.db.users
+
+        # 重复创建 / DROP USER
+        r = _exec(e, "CREATE USER 'strong' IDENTIFIED BY 'Other123'")
+        assert r['type'] == 'error' and r['code'] == 1396, r
+        assert _exec(e, "DROP USER 'strong'")['type'] == 'ok'
+        assert 'strong' not in e.db.users
+
+        # SHOW SECURITY 反映真实策略
+        vals = dict(_exec(e, 'SHOW SECURITY')['rows'])
+        assert vals['password_policy.min_length'] == '12'
+        assert vals['authentication_plugin'] == 'mysql_native_password'
+
+
+def test_json_path_operator_extract_null_and_errors():
+    """`col->'$.k'` / `col->>'$.k'`：投影与 WHERE 都可用，缺键 -> NULL"""
+    with _Env() as e:
+        assert _exec(
+            e, 'CREATE TABLE docs (id INT PRIMARY KEY, data JSON)')['type'] \
+            == 'ok'
+        _exec(e, """INSERT INTO docs VALUES (1, '{"k": "v", "n": 3}')""")
+        _exec(e, """INSERT INTO docs VALUES (2, '{"k": "w"}')""")
+        _exec(e, """INSERT INTO docs VALUES (3, '{"k": null}')""")
+
+        # 投影：-> 取 JSON 值，->> 转文本
+        _, rows = e.q("SELECT id, data->'$.k' AS k FROM docs ORDER BY id")
+        assert [r[1] for r in rows] == ['v', 'w', None], rows
+        _, rows = e.q("SELECT id, data->>'$.n' AS n FROM docs ORDER BY id")
+        assert rows[0][1] == '3', rows
+
+        # WHERE：命中 1 行；键不存在 -> NULL -> 不命中（标准三值语义）
+        _, rows = e.q("SELECT id FROM docs WHERE data->'$.k' = 'v'")
+        assert rows == [(1,)], rows
+        _, rows = e.q("SELECT id FROM docs WHERE data->'$.missing' = 'v'")
+        assert rows == [], rows
+        _, rows = e.q("SELECT id, data->'$.missing' AS m FROM docs "
+                      "WHERE id = 2")
+        assert rows == [(2, None)], rows
+
+        # 非法形态显式报错（不静默当字符串/空集）
+        for bad in ("SELECT * FROM docs WHERE data->'no-dollar' = 'v'",
+                    'SELECT * FROM docs WHERE data->$.k = 1',
+                    "SELECT MATCH(data) AGAINST('v') FROM docs"):
+            try:
+                e.parser.parse(bad)
+            except SyntaxError:
+                continue
+            raise AssertionError(f'应当显式报语法错误: {bad}')
+
+
 
 
 

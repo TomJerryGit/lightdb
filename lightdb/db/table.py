@@ -199,6 +199,145 @@ class Table:
         # 崩溃恢复期的"版本位置重映射"（见 _resolve_old_loc），空闲时为空
         self._recovery_remap: Dict[tuple, tuple] = {}
 
+        # 分区元数据（CREATE TABLE ... PARTITION BY ...）：None = 未分区。
+        # `_partition_spec` 是解析器给的原始描述（随 Database 元数据持久化），
+        # `_partition` 是 PartitionManager 实例（SHOW PARTITIONS / prune 用）。
+        self._partition_spec = None
+        self._partition = None
+        self._partition_col_idx = None
+
+        # 全文索引（CREATE FULLTEXT INDEX）：列名 -> InvertedIndex
+        self._fulltext = None
+
+    # ==================== 生成列 ====================
+
+    def _apply_generated(self, values):
+        """按表达式计算生成列的值（GENERATED ALWAYS AS (expr) [STORED]）
+
+        本引擎把生成列按 **STORED** 语义处理：写入时就地算好并随行落盘，
+        读路径不需要再求值，SELECT 到的就是真实存储值（VINTUAL 的"读时
+        计算"在纯 Python 引擎里没有收益，且会让索引/恢复路径各写一份）。
+        表达式由 `sql/generated.py` 求值（支持 UPPER/LOWER/CONCAT/ABS/
+        COALESCE/算术），解析失败或求值失败都**显式抛错**，不写 NULL 了事。
+        """
+        if not any(c.get('generated') for c in self.cols):
+            return values
+        from ..sql.generated import eval_expr as _gen_eval
+        values = list(values)
+        col_names = [c['name'] for c in self.cols]
+        for i, c in enumerate(self.cols):
+            gen = c.get('generated')
+            if not gen:
+                continue
+            try:
+                values[i] = _gen_eval(gen['expr'], values, col_names)
+            except Exception as e:
+                raise ValueError(
+                    f"生成列 {c['name']} 的表达式 {gen['expr']} 求值失败: {e}")
+        return values
+
+    # ==================== 分区 ====================
+
+    def set_partition(self, spec):
+        """挂上分区描述（spec 为 parser._parse_partition 的返回值）
+
+        RANGE / LIST / HASH 都映射到 `sql/partition.py` 的 PartitionManager，
+        这样 `_partition.prune(where)` / `Partition.match(pk)` 与执行器、用例
+        （tests/test_batch13.py 读 `tbl._partition.partitions`）共用一份实现。
+        """
+        self._partition_spec = spec
+        if not spec:
+            self._partition = None
+            self._partition_col_idx = None
+            return None
+        from ..sql.partition import PartitionManager
+        pm = PartitionManager()
+        ptype = str(spec.get('type', '')).upper()
+        if ptype == 'HASH':
+            pm.define_hash(spec.get('col'), int(spec.get('num') or 4))
+        elif ptype == 'RANGE':
+            pm.define_range(
+                spec.get('col'),
+                [(r.get('lo'), r.get('hi'), r.get('name'))
+                 for r in (spec.get('ranges') or [])])
+        elif ptype == 'LIST':
+            pm.define_list(
+                spec.get('col'),
+                [(l.get('values'), l.get('name'))
+                 for l in (spec.get('lists') or [])])
+        else:
+            raise ValueError(f"不支持的分区类型: {ptype}")
+        self._partition = pm
+        names = [c['name'] for c in self.cols]
+        col = spec.get('col')
+        if col in names:
+            self._partition_col_idx = names.index(col)
+        return pm
+
+    # ==================== 全文索引 ====================
+
+    def create_fulltext_index(self, columns, name=None, if_not_exists=False):
+        """在列上建全文索引（倒排索引），并对**现有行**建索引
+
+        `columns` 可以是单列名字符串或列名列表。索引挂在表对象上，
+        之后每次 insert / delete / update 都会同步维护（见 _index_fulltext /
+        _unindex_fulltext），保证 MATCH ... AGAINST 的结果来自真实数据。
+        索引本身不持久化（是派生数据）：重开库后需重新 CREATE FULLTEXT INDEX，
+        这一点在交付说明里登记。
+        """
+        from ..sql.fulltext import FullTextManager
+        cols = [columns] if isinstance(columns, str) else list(columns or [])
+        if not cols:
+            raise ValueError("全文索引至少需要一列")
+        names = [c['name'] for c in self.cols]
+        for c in cols:
+            if c not in names:
+                raise KeyError(f"列 {c} 不存在")
+        if if_not_exists and self._fulltext is not None \
+                and all(c in self._fulltext.indexes for c in cols):
+            return False
+        if self._fulltext is None:
+            self._fulltext = FullTextManager()
+        for c in cols:
+            self._fulltext.create_index(c)
+        # 用现有行回填索引（真数据，不是空索引）
+        with self._lock:
+            for pk, page_id, slot_id in self.bt.scan():
+                page = self.bp.get_page(page_id)
+                rb = page.get_row(slot_id) if page is not None else None
+                vals = self._decode_row(rb) if rb is not None else None
+                if vals is None:
+                    continue
+                for c in cols:
+                    self._fulltext.indexes[c].add(pk, vals[names.index(c)])
+        return True
+
+    def has_fulltext_index(self, column) -> bool:
+        return (self._fulltext is not None
+                and column in self._fulltext.indexes)
+
+    def fulltext_search(self, column, query):
+        if not self.has_fulltext_index(column):
+            raise KeyError(f"列 {column} 上没有全文索引")
+        return self._fulltext.search(column, query)
+
+    def _index_fulltext(self, pk, row):
+        if self._fulltext is None:
+            return
+        try:
+            self._fulltext.index_row(
+                pk, row, [c['name'] for c in self.cols])
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"全文索引写入失败 {self.name}/{pk}: {e}")
+
+    def _unindex_fulltext(self, pk):
+        if self._fulltext is None:
+            return
+        try:
+            self._fulltext.remove_row(pk)
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"全文索引删除失败 {self.name}/{pk}: {e}")
+
     # ==================== 事务辅助 ====================
 
     def _stmt_tid(self, txn_id: int) -> int:
@@ -473,6 +612,11 @@ class Table:
             values = list(values) + [None] * (
                 len(self.cols) - len(values))
 
+        # 生成列（GENERATED ALWAYS AS (...) STORED）：写入前按表达式真算，
+        # 用户给的值被覆盖（MySQL 里给生成列赋值本来就是错误，这里不静默
+        # 保留用户值，而是以表达式结果为准）。
+        values = self._apply_generated(values)
+
         # 类型转换 + 约束检查
         row = []
         for i, c in enumerate(self.cols):
@@ -529,6 +673,8 @@ class Table:
         # 写索引：指向最新版本（覆盖旧的索引项）
         self.bt.insert(pk, page_id, slot_id)
         self._next_pk = max(self._next_pk, pk + 1)
+        # 全文索引与数据同步（有全文索引时才做事）
+        self._index_fulltext(pk, row)
 
         # 物理 undo：本事务插入的行，回滚时删除
         if owned:
@@ -672,6 +818,9 @@ class Table:
             if (np, ns) != head_loc:
                 self.bt.delete(pk)
                 self.bt.insert(pk, np, ns)
+            # 全文索引跟随最新版本（旧版本的行值不再作为命中来源）
+            self._unindex_fulltext(pk)
+            self._index_fulltext(pk, new)
 
             # 回滚时还要把这个新版本清掉（否则页上留一个不可见死行）
             if owned and undo_act is not None:
@@ -754,6 +903,8 @@ class Table:
             if not page.update_row_inplace(asid, old_ver):
                 page.restore_row(asid, old_ver)
             # ★ 不调用 bt.delete(pk)：索引项必须留着指向墓碑
+            # 全文索引则要摘掉：被删除的行不应再被 MATCH 命中
+            self._unindex_fulltext(pk)
             n += 1
         return n
 

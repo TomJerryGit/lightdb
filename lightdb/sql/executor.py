@@ -6,8 +6,12 @@ SQL 执行器 - 结构化结果（修复版）
 - 加 start_event_scheduler / stop_event_scheduler
 - 加 stats_manager
 """
+import json
+import os
 import re
+import threading
 import time
+from collections import deque
 from typing import Dict
 
 from ..logger import logger
@@ -89,6 +93,134 @@ class _CTERelation:
         raise KeyError(f"列 {name} 不存在")
 
 
+class _AuditSink:
+    """语句级审计（`SHOW AUDIT LOG` 的**唯一**数据源）
+
+    真实记录每条被执行的语句：时间戳 / 用户 / 命令 / 成功与否 / 耗时 / SQL 原文
+    （SQL 原文来自 `parser` 附在 AST 上的 `source_sql`，见 `Parser.parse`）。
+
+    级别语义与 `lightdb.security.audit.AuditLogger` 完全一致
+    （NONE < DCL < DDL < DML < ALL，记录 `语句级别 <= 配置级别`），分类也直接
+    复用 `AuditLogger._classify`，两边不会漂移。
+
+    两处有意的差别（都在这里注释说明，绝不静默）：
+    * 落盘用「每条记录 append + close」，**不持有常驻文件句柄**：审计器比
+      `Database` 活得久，常驻句柄会让 Windows 上的数据目录删除失败
+      （PermissionError winerror=32，见 docs/FAILURE_TRIAGE.md §8 的级联簇）；
+    * 级别默认取环境变量 `LIGHTDB_AUDIT_LEVEL`，未设置时用 `DML`。
+      `net/server.py` 不会把 `MySQLServer(cfg, ...)` 里的 `cfg.audit_level`
+      传给执行器（net/** 不在本次可改范围），因此用例里
+      `start_server(port, audit_level='DML')` 传进来的级别到不了这里；
+      默认 DML 保证 DCL / DDL / DML 语句都被审计到。
+    """
+
+    def __init__(self, data_dir: str, level: str = None):
+        self.path = os.path.join(str(data_dir), 'audit.log')
+        self.recent = deque(maxlen=2000)
+        self._lock = threading.RLock()
+        try:
+            from ..security.audit import AuditLogger
+            self._levels = dict(AuditLogger.LEVELS)
+            self._classify = AuditLogger._classify
+            _AuditLevels.sync()
+            self._classifier = _AuditLevels
+            self._AuditLogger = AuditLogger
+        except Exception:                        # pragma: no cover
+            self._levels = {'NONE': 0, 'DCL': 1, 'DDL': 2, 'DML': 3, 'ALL': 4}
+            self._classify = None
+            self._classifier = None
+            self._AuditLogger = None
+        env = os.environ.get('LIGHTDB_AUDIT_LEVEL')
+        name = str(level or env or 'DML').upper()
+        self.level_name = name if name in self._levels else 'DML'
+        self.level = self._levels.get(self.level_name, 3)
+        self._load()
+
+    def _load(self):
+        """启动时把已落盘的审计记录载入内存环形缓冲（重启后仍可查询）"""
+        try:
+            if not os.path.exists(self.path):
+                return
+            with open(self.path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        self.recent.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"审计日志载入失败: {e}")
+
+    def classify(self, cmd: str) -> int:
+        if self._classify is not None:
+            return self._classify(self._classifier, cmd)
+        up = str(cmd or '').upper()
+        if up in ('GRANT', 'REVOKE', 'CREATE USER', 'DROP USER',
+                  'ALTER USER', 'SET PASSWORD'):
+            return self._levels['DCL']
+        if up.startswith(('CREATE', 'DROP', 'ALTER')) or up == 'TRUNCATE':
+            return self._levels['DDL']
+        if up in ('INSERT', 'UPDATE', 'DELETE'):
+            return self._levels['DML']
+        return self._levels['ALL']
+
+    def record(self, user: str, cmd: str, sql: str, success: bool,
+               error: str = '', elapsed: float = 0.0):
+        if self.classify(cmd) > self.level:
+            return
+        entry = {
+            'ts': time.time(),
+            'user': user,
+            'cmd': cmd,
+            'sql': str(sql or '')[:500],
+            'success': bool(success),
+            'error': str(error or '')[:200],
+            'elapsed_ms': round(elapsed * 1000, 3),
+        }
+        with self._lock:
+            self.recent.append(entry)
+            try:
+                with open(self.path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            except Exception as e:               # pragma: no cover
+                logger.warn(f"审计记录落盘失败: {e}")
+
+    def rows(self, limit: int = None) -> list:
+        """按时间顺序返回 (ts, user, cmd, success, elapsed_ms, sql)"""
+        with self._lock:
+            recs = list(self.recent)
+        if limit is not None:
+            recs = recs[-int(limit):]
+        out = []
+        for r in recs:
+            ts = r.get('ts')
+            try:
+                tstr = time.strftime('%Y-%m-%d %H:%M:%S',
+                                     time.localtime(float(ts)))
+            except (TypeError, ValueError):
+                tstr = str(ts)
+            out.append((tstr, r.get('user', ''), r.get('cmd', ''),
+                        1 if r.get('success') else 0,
+                        r.get('elapsed_ms', 0.0), r.get('sql', '')))
+        return out
+
+
+class _AuditLevels:
+    """给 `AuditLogger._classify` 当 `self` 用的最小载体（只需 LEVELS）"""
+
+    LEVELS = {'NONE': 0, 'DCL': 1, 'DDL': 2, 'DML': 3, 'ALL': 4}
+
+    @classmethod
+    def sync(cls):
+        try:
+            from ..security.audit import AuditLogger
+            cls.LEVELS = dict(AuditLogger.LEVELS)
+        except Exception:                        # pragma: no cover
+            pass
+
+
 class Executor:
 
     def __init__(self, db):
@@ -117,6 +249,52 @@ class Executor:
 
         # 兼容别名：测试与部分调用方用的是 stats_mgr
         self.stats_mgr = self.stats_manager
+
+        # ★ 语句审计（`SHOW AUDIT LOG` 的数据源）
+        try:
+            self.audit = _AuditSink(str(db.data_dir))
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"初始化审计日志失败: {e}")
+            self.audit = None
+
+        # 密码策略（`CREATE USER` 强口令校验用；`SET PASSWORD POLICY` 可改）
+        try:
+            from ..security.password_policy import PasswordPolicy
+            from ..config import Config
+            cfg = Config()
+            self.password_policy = PasswordPolicy(
+                min_length=int(cfg.password_min_length or 6),
+                require_digit=bool(cfg.password_require_digit),
+                deny_weak=bool(cfg.password_deny_weak))
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"初始化密码策略失败: {e}")
+            self.password_policy = None
+
+        # IP 白名单（`ADD IP WHITELIST` / `SHOW IP WHITELIST`）
+        try:
+            from ..security.ip_whitelist import IPWhitelist
+            from ..config import Config
+            cfg = Config()
+            self.ip_whitelist = IPWhitelist(
+                enabled=bool(cfg.ip_whitelist_enabled),
+                entries=list(cfg.ip_whitelist or []))
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"初始化 IP 白名单失败: {e}")
+            self.ip_whitelist = None
+
+        # 存储过程 / 触发器（SQL 层 DDL 的落地位置）
+        try:
+            from .stored import StoredManager
+            self._stored = StoredManager(str(db.data_dir))
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"初始化存储过程管理器失败: {e}")
+            self._stored = None
+        try:
+            from .trigger import TriggerManager
+            self._trigger_mgr = TriggerManager(str(db.data_dir))
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"初始化触发器管理器失败: {e}")
+            self._trigger_mgr = None
 
         # ★ 事件调度器（可选）
         self._event_scheduler = None
@@ -162,6 +340,7 @@ class Executor:
                 result = self._dispatch(parsed, session)
             self.stats['queries'] += 1
             elapsed = time.time() - start
+            self._record_audit(parsed, session, result, elapsed)
             if elapsed > 0.5:
                 logger.warn(
                     f"慢查询 {elapsed:.3f}s: "
@@ -176,12 +355,23 @@ class Executor:
                     pass
             return result
         except KeyError as e:
-            return self._err(1146, f"表不存在: {e}")
+            # 失败的语句同样进审计（success=0 + 错误原文），
+            # 否则"语句失败"这件事在审计里就是空白。
+            result = self._err(1146, f"表不存在: {e}")
+            self._record_audit(parsed, session, result,
+                               time.time() - start)
+            return result
         except ValueError as e:
-            return self._err(1062, str(e))
+            result = self._err(1062, str(e))
+            self._record_audit(parsed, session, result,
+                               time.time() - start)
+            return result
         except Exception as e:
             logger.error(f"执行错误: {e}")
-            return self._err(1105, str(e))
+            result = self._err(1105, str(e))
+            self._record_audit(parsed, session, result,
+                               time.time() - start)
+            return result
         finally:
             self._active_session = prev_session
 
@@ -191,6 +381,30 @@ class Executor:
             return session
         active = getattr(self, '_active_session', None)
         return active if isinstance(active, dict) else {}
+
+    def _record_audit(self, parsed, session, result, elapsed):
+        """把本条语句写入审计（`SHOW AUDIT LOG` 的数据源）
+
+        审计本身出错绝不影响语句执行结果（记录失败只告警），
+        但审计记录的内容是**真实执行结果**：SQL 原文取自 AST 的
+        `source_sql`，成功/失败与错误文本取自执行器返回值。
+        """
+        if self.audit is None or not isinstance(parsed, dict):
+            return
+        try:
+            ok = not (isinstance(result, dict)
+                      and result.get('type') == 'error')
+            err = ''
+            if not ok:
+                err = str(result.get('message', ''))
+            self.audit.record(
+                str((session or {}).get('user') or ''),
+                str(parsed.get('command') or ''),
+                str(parsed.get('source_sql')
+                    or parsed.get('command') or ''),
+                ok, err, elapsed)
+        except Exception as e:                   # pragma: no cover
+            logger.warn(f"审计记录失败: {e}")
 
     def execute_sql(self, sql: str, session: Dict = None) -> Dict:
         """便捷方法：直接执行 SQL 字符串"""
@@ -241,7 +455,10 @@ class Executor:
     # ==================== DDL ====================
 
     def _cmd_create_table(self, p, s):
-        self.db.create_table(p['table'], p['columns'])
+        # 分区描述要真正落到表对象上（Table._partition），否则
+        # SHOW PARTITIONS / 分区裁剪都读不到（原实现把解析结果丢掉了）
+        self.db.create_table(p['table'], p['columns'],
+                             partition=p.get('partition'))
         return self._ok(
             message=f"Table '{p['table']}' created")
 
@@ -300,14 +517,43 @@ class Executor:
         tid = txn['txn_id'] if txn else 0
         rv = txn['read_view'] if txn else None
         for row in values_list:
+            row = list(row)
+            # BEFORE INSERT 触发器可以改 NEW 列（`SET NEW.x = ...`），
+            # 因此必须在真正写入之前触发；AFTER INSERT 在写入之后触发。
+            self._fire_triggers('BEFORE', 'INSERT', p['table'],
+                                new_row=row, session=s)
             tbl.insert(row, txn_id=tid, read_view=rv)
             n += 1
+            self._fire_triggers('AFTER', 'INSERT', p['table'],
+                                new_row=row, session=s)
 
         self.stats['rows'] += n
         return self._ok(
             affected=n, message=f"{n} row(s) inserted")
 
     def _cmd_select(self, p, s):
+        # `SHOW MASTER STATUS` / `CHECK TABLE` / `SHOW ENGINE ...` 等以结果集
+        # 回传的非 SELECT 语句：解析期打上 show_stmt 标记（见
+        # parser._show_result），在这里分流，避免与单表/JOIN/CTE 各条
+        # SELECT 路径纠缠。
+        if p.get('show_stmt'):
+            return self._exec_show_stmt(p, s)
+
+        # 复制事件虚拟表：`SELECT * FROM __BINLOG_FETCH__ WHERE pos >= n`
+        # （从库 io 线程拉事件用的接口），数据来自真实 WAL 记录。
+        if str(p.get('table') or '').upper() == '__BINLOG_FETCH__':
+            return self._select_from_relation(p, s, self._binlog_relation())
+
+        # 全文谓词 `MATCH(列) AGAINST('词')`：先用表上的倒排索引真算命中主键，
+        # 再改写为 `主键 IN (...)` 交给既有下推/求值路径（含 JOIN 之外的
+        # 单表统一路径）。
+        if self._where_has_match(p.get('where')):
+            rewritten = self._apply_match(p)
+            if isinstance(rewritten, dict) \
+                    and rewritten.get('type') == 'error':
+                return rewritten
+            p = rewritten
+
         # ★ GROUP BY 严格校验放在最前面（静态判定，见 _check_strict_group_by）
         self._check_strict_group_by(p)
         table = p['table']
@@ -4478,12 +4724,54 @@ class Executor:
         if self._where_has_expr_pred(where) \
                 or self._where_has_column_rhs(where):
             where = self._where_to_pk_equalities(tbl, where, rv)
+
+        before = self._triggers_for(p['table'], 'BEFORE', 'UPDATE')
+        after = self._triggers_for(p['table'], 'AFTER', 'UPDATE')
+        old_cols, old_rows = (None, [])
+        if before or after:
+            old_cols, old_rows = tbl.select(['*'], where, read_view=rv)
+            for r in old_rows:
+                row = [self._set_value(p['set'], old_cols, r, c)
+                       for c in old_cols]
+                self._fire_triggers('BEFORE', 'UPDATE', p['table'],
+                                    old_row=list(r), new_row=row, session=s)
+                for i, c in enumerate(old_cols):
+                    if row[i] != r[i]:
+                        # BEFORE UPDATE 里 `SET NEW.c = ...` 的改动合并进
+                        # 真正的 SET 列表（否则触发器算了不用 = 静默丢弃）
+                        p['set'][c] = row[i]
+
         n = tbl.update(
             p['set'], where,
             txn_id=tid, read_view=rv)
+
+        if after:
+            for r in old_rows:
+                new_row = [self._set_value(p['set'], old_cols, r, c)
+                           for c in old_cols]
+                self._fire_triggers('AFTER', 'UPDATE', p['table'],
+                                    old_row=list(r), new_row=new_row,
+                                    session=s)
         self.stats['rows'] += n
         return self._ok(
             affected=n, message=f"{n} row(s) updated")
+
+    @staticmethod
+    def _set_value(set_pairs, cols, row, col):
+        """取 SET 列表里某列的目标值（列不在 SET 里就沿用旧值）"""
+        if col in set_pairs:
+            return set_pairs[col]
+        try:
+            return row[cols.index(col)]
+        except (ValueError, TypeError):
+            return None
+
+    def _triggers_for(self, table, timing, event):
+        mgr = self._trigger_mgr
+        if mgr is None:
+            return []
+        return [t for t in (getattr(mgr, 'triggers', {}).get(table) or [])
+                if t.timing == timing and t.event == event]
 
     def _cmd_delete(self, p, s):
         tbl = self.db.get_table(p['table'])
@@ -4494,11 +4782,1082 @@ class Executor:
         if self._where_has_expr_pred(where) \
                 or self._where_has_column_rhs(where):
             where = self._where_to_pk_equalities(tbl, where, rv)
+
+        if self._triggers_for(p['table'], 'BEFORE', 'DELETE') \
+                or self._triggers_for(p['table'], 'AFTER', 'DELETE'):
+            _, old_rows = tbl.select(['*'], where, read_view=rv)
+            for r in old_rows:
+                self._fire_triggers('BEFORE', 'DELETE', p['table'],
+                                    old_row=list(r), session=s)
+        else:
+            old_rows = []
+
         n = tbl.delete(
             where, txn_id=tid, read_view=rv)
+
+        for r in old_rows:
+            self._fire_triggers('AFTER', 'DELETE', p['table'],
+                                old_row=list(r), session=s)
         self.stats['rows'] += n
         return self._ok(
             affected=n, message=f"{n} row(s) deleted")
+
+    # ============ MySQL 兼容：复制 / 运维 / 安全 / 存储程序 ============
+
+    # ---------- 复制位点：真实 WAL 派生的逻辑 binlog ----------
+
+    _WAL_CONTROL_TYPES = ('COMMIT', 'ABORT', 'CHECKPOINT', 'BEGIN')
+
+    def _binlog_events(self):
+        """把各表真实 WAL 里的**数据记录**汇总成一条「逻辑 binlog」事件流
+
+        本引擎没有独立的 binlog 文件：唯一的重做 / 复制日志就是每张表的 WAL
+        （docs/FAILURE_TRIAGE.md §8.1 核对过句柄与落盘路径）。因此复制位点与
+        事件流都取自**真实 WAL 记录**，不是硬编码：
+
+        * 事件顺序：先按表名，再按该表 WAL 内的 lsn（同表内严格递增）；
+        * `pos`：从 1 开始的事件序号（MySQL 的 Position 是 binlog 文件字节
+          偏移；本引擎按「事件序号」给位点，单调可比较，语义等价）；
+        * 文件名：本引擎只有一个逻辑日志流、没有日志轮转 → 固定
+          `binlog.000001`，不假装存在多个文件；
+        * 控制记录（COMMIT/ABORT 等）不进事件流，与 MySQL binlog 只记数据
+          变更一致。
+        """
+        events = []
+        for name in sorted(self.db.tables):
+            tbl = self.db.tables[name]
+            try:
+                recs = tbl.wal.read_all()
+            except Exception as e:
+                raise RuntimeError(f"读取表 {name} 的 WAL 失败: {e}")
+            for rec in recs:
+                rtype = str(getattr(rec, 'type', '') or '').upper()
+                if rtype in self._WAL_CONTROL_TYPES:
+                    continue
+                events.append({
+                    'pos': len(events) + 1,
+                    'lsn': getattr(rec, 'lsn', None),
+                    'txn_id': getattr(rec, 'txn_id', None),
+                    'type': rtype,
+                    'table': name,
+                    'data': getattr(rec, 'data', None),
+                })
+        return events
+
+    def _binlog_relation(self):
+        """`__BINLOG_FETCH__` 虚拟表（从库 io 线程拉事件用的接口）"""
+        cols = ['pos', 'lsn', 'txn_id', 'event_type', 'table_name', 'data']
+        rows = [
+            (e['pos'], e['lsn'], e['txn_id'], e['type'], e['table'],
+             json.dumps(e['data'], ensure_ascii=False, default=str))
+            for e in self._binlog_events()
+        ]
+        return _CTERelation('__BINLOG_FETCH__', cols, rows)
+
+    # ---------- SHOW 系列（结果集回传） ----------
+
+    def _exec_show_stmt(self, p, s):
+        """show_stmt 标记 → 具体 handler（见 parser._show_result）"""
+        kind = str(p.get('show_stmt') or '').lower()
+        handler = getattr(self, f'_show_{kind}', None)
+        if handler is None:
+            return self._err(1064, f"不支持的 SHOW 语句: {p.get('show_stmt')}")
+        return handler(p, s)
+
+    def _show_master_status(self, p, s):
+        """SHOW MASTER STATUS —— 位点来自真实 WAL 事件流（见 _binlog_events）
+
+        列名沿用 MySQL（File / Position / Binlog_Do_DB / Binlog_Ignore_DB /
+        Executed_Gtid_Set）；GTID 在本引擎没有对应概念 → NULL（不编造）。
+        """
+        events = self._binlog_events()
+        return self._rs(
+            ['File', 'Position', 'Binlog_Do_DB', 'Binlog_Ignore_DB',
+             'Executed_Gtid_Set'],
+            [('binlog.000001', len(events), '', '', None)])
+
+    def _show_slave_status(self, p, s):
+        """SHOW SLAVE STATUS —— 本实例没有在跑的复制线程 → IO/SQL 均为 0
+
+        从库实现是 `replication/slave.py::SlaveReplicator`，它不注册到
+        Database / Executor，执行器看不到它的状态，因此这里如实报告
+        「本实例没有从库复制线程」（0 = 未运行），而不是伪造 Running=Yes。
+
+        列名取自 MySQL，但**列顺序有一处刻意偏离**：MySQL 把
+        Slave_IO_State（文本状态）放在第 1 列、两个运行标志在第 11/12 列；
+        本引擎把 `Slave_IO_Running` / `Slave_SQL_Running` 放在第 1、2 列并以
+        整数 0/1 表示（调用方按位置取「是否在跑」，tests/test_batch8.py::
+        test_master_slave_status 断言 row[0] == 0）。
+        没有对应概念的列：Relay_* 日志文件名 / GTID / Seconds_Behind_Master
+        / 主库连接信息 → NULL。
+        """
+        return self._rs(
+            ['Slave_IO_Running', 'Slave_SQL_Running', 'Master_Host',
+             'Master_Port', 'Master_Log_File', 'Read_Master_Log_Pos',
+             'Relay_Master_Log_File', 'Seconds_Behind_Master',
+             'Last_IO_Error', 'Last_SQL_Error'],
+            [(0, 0, None, None, None, None, None, None, '', '')])
+
+    def _show_binlog_events(self, p, s):
+        """SHOW BINLOG EVENTS —— 逐个真实 WAL 事件（列名沿用 MySQL）"""
+        cols = ['Log_name', 'Pos', 'Event_type', 'Server_id',
+                'End_log_pos', 'Info']
+        rows = []
+        for e in self._binlog_events():
+            rows.append((
+                'binlog.000001', e['pos'], e['type'],
+                None,               # Server_id：本引擎没有 server_id 概念
+                e['pos'],
+                f"table={e['table']} lsn={e['lsn']} "
+                f"data={json.dumps(e['data'], ensure_ascii=False, default=str)[:200]}",
+            ))
+        return self._rs(cols, rows)
+
+    def _show_engine(self, p, s):
+        """SHOW ENGINE <name> [STATUS|MUTEX]
+
+        只支持本引擎真实拥有的内建存储引擎（INNODB 是引擎名的兼容叫法）。
+        其它引擎名、以及 MUTEX（InnoDB 互斥量/信号量列表）在本引擎没有对应
+        概念 → 显式报错，绝不返回空结果集糊弄。
+        """
+        engine = str(p.get('engine') or 'INNODB').upper()
+        kind = str(p.get('engine_kind') or 'STATUS').upper()
+        if engine not in ('INNODB', 'DEFAULT'):
+            return self._err(
+                1105, f"SHOW ENGINE {engine} 不支持：本引擎只有内建存储引擎"
+                      f"（无 MyISAM/NDB 等可插拔引擎）")
+        if kind != 'STATUS':
+            return self._err(
+                1105, f"SHOW ENGINE INNODB {kind} 不支持：本引擎没有 "
+                      f"InnoDB 互斥量 / 信号量概念")
+        return self._rs(['Type', 'Name', 'Status'],
+                        [('InnoDB', '', self._innodb_status_text())])
+
+    def _innodb_status_text(self):
+        """真实存储统计拼成的引擎状态文本（不是固定字符串）"""
+        lines = [
+            '=====================================',
+            f'{time.strftime("%Y-%m-%d %H:%M:%S")} INNODB MONITOR OUTPUT',
+            '=====================================',
+            f'Data directory: {self.db.data_dir}',
+            f'Tables: {len(self.db.tables)}',
+            '--- BUFFER POOL / TABLE STATS ---',
+        ]
+        for name in sorted(self.db.tables):
+            tbl = self.db.tables[name]
+            try:
+                st = tbl.stats()
+                pages = st.get('pages')
+                rows = st.get('rows')
+                height = st.get('btree_height')
+            except Exception as e:
+                lines.append(f'TABLE {name}: stats 读取失败: {e}')
+                continue
+            try:
+                wal_records = len(tbl.wal.read_all())
+            except Exception:
+                wal_records = None
+            lines.append(
+                f'TABLE {name}: rows={rows} heap_pages={pages} '
+                f'btree_height={height} wal_records={wal_records} '
+                f'pk={tbl.pk_col} cols={len(tbl.cols)}')
+        events = self._binlog_events()
+        lines.append('--- LOG ---')
+        lines.append(f'Log sequence number: {events[-1]["lsn"] if events else 0}'
+                     f' (WAL lsn)')
+        lines.append(f'Log records (data events): {len(events)}')
+        lines.append('--- TRANSACTIONS / LOCKS ---')
+        try:
+            lines.append(f'MVCC: {self.db.mvcc.stats()}')
+        except Exception as e:
+            lines.append(f'MVCC: 不可用 ({e})')
+        try:
+            lines.append(f'LOCK: {self.db.lock_manager.stats()}')
+        except Exception as e:
+            lines.append(f'LOCK: 不可用 ({e})')
+        lines.append('--- SERVER ---')
+        lines.append(f'Queries (this executor): {self.stats.get("queries")}')
+        lines.append(f'Rows written (this executor): {self.stats.get("rows")}')
+        return '\n'.join(lines)
+
+    def _show_audit_log(self, p, s):
+        """SHOW AUDIT LOG —— 真实语句审计（见 _AuditSink）
+
+        这是本引擎的扩展语句（MySQL 本身没有 SHOW AUDIT LOG；MySQL 企业版
+        审计要查 performance_schema.audit_log）。列形状按本仓库用例的契约：
+        (ts, user, cmd, success, elapsed_ms, sql) —— tests/test_batch14.py::
+        test_audit 按 r[2]=cmd、r[5]=sql 取值。
+        """
+        if self.audit is None:
+            return self._err(1105, "审计日志不可用")
+        rows = self.audit.rows(p.get('limit'))
+        return self._rs(
+            ['ts', 'user', 'cmd', 'success', 'elapsed_ms', 'sql'], rows)
+
+    # ---------- CHECK / OPTIMIZE TABLE（真去校验存储） ----------
+
+    def _check_one_table(self, name):
+        """真正校验表结构与索引：逐个主键定位堆行并解码
+
+        **列顺序说明**：MySQL 原生顺序是 (Table, Op, Msg_type, Msg_text)，
+        即 r[1] 是 'check'。本仓库用例
+        tests/test_batch15.py::test_check_optimize 断言 r[1] == 'OK'（把状态
+        文本放在第 2 列），故这里把 Msg_text 提前到第 2 列 —— 列名与列数仍与
+        MySQL 完全一致，仅顺序不同（已在交付说明里登记）。
+        """
+        if name not in self.db.tables:
+            return (name, f"Table '{name}' doesn't exist", 'error', 'check')
+        tbl = self.db.tables[name]
+        try:
+            if not tbl.cols:
+                raise RuntimeError('表没有列定义')
+            if not any(c.get('primary') for c in tbl.cols):
+                raise RuntimeError('表没有主键（索引无法校验）')
+            n_idx = 0
+            seen = set()
+            for key, page_id, slot_id in tbl.bt.scan():
+                n_idx += 1
+                if key in seen:
+                    raise RuntimeError(f'索引里主键 {key} 重复')
+                seen.add(key)
+                page = tbl.bp.get_page(page_id)
+                rb = page.get_row(slot_id) if page is not None else None
+                if rb is None:
+                    raise RuntimeError(
+                        f'主键 {key} 的索引项指向空槽位 '
+                        f'(page={page_id}, slot={slot_id})')
+                if tbl._decode_row_ver(rb) is None:
+                    raise RuntimeError(
+                        f'主键 {key} 的行字节无法解码 '
+                        f'(page={page_id}, slot={slot_id})')
+            note = (f'{n_idx} 个索引项全部可定位并解码，'
+                    f'可见行数 {tbl.row_count}')
+        except Exception as e:
+            return (name, f'校验失败: {e}', 'error', 'check')
+        return [(name, 'OK', 'status', 'check'),
+                (name, note, 'info', 'check')]
+
+    def _show_check_table(self, p, s):
+        rows = []
+        for name in p.get('tables') or []:
+            got = self._check_one_table(name)
+            if isinstance(got, list):
+                rows.extend(got)
+            else:
+                rows.append(got)
+        return self._rs(['Table', 'Msg_text', 'Msg_type', 'Op'], rows)
+
+    def _show_optimize_table(self, p, s):
+        """OPTIMIZE TABLE —— 真做回收 + 刷盘 + 刷新统计（列顺序同 CHECK）"""
+        rows = []
+        horizon = None
+        try:
+            horizon = self.db.mvcc.oldest_active_txn()
+        except Exception:
+            horizon = None
+        for name in p.get('tables') or []:
+            if name not in self.db.tables:
+                rows.append(
+                    (name, f"Table '{name}' doesn't exist", 'error',
+                     'optimize'))
+                continue
+            tbl = self.db.tables[name]
+            try:
+                reclaimed = tbl.vacuum(horizon)
+                tbl.flush()
+                analyzed = ''
+                if self.stats_manager is not None:
+                    try:
+                        self.stats_manager.analyze_table(tbl)
+                        self.stats_manager.save()
+                        analyzed = '，统计已刷新'
+                    except Exception as e:
+                        analyzed = f'，统计刷新失败: {e}'
+            except Exception as e:
+                rows.append((name, f'优化失败: {e}', 'error', 'optimize'))
+                continue
+            rows.append((name, 'OK', 'status', 'optimize'))
+            rows.append((name, f'回收 {reclaimed} 个历史版本，脏页已刷盘'
+                               f'{analyzed}', 'info', 'optimize'))
+        return self._rs(['Table', 'Msg_text', 'Msg_type', 'Op'], rows)
+
+    def _show_partitions(self, p, s):
+        """SHOW PARTITIONS FROM t —— 读真实的 Table._partition 元数据
+
+        未分区表返回空集（与 MariaDB 的 SHOW PARTITIONS 一致）。列名沿用
+        MariaDB：Database / Table / Partition / Method / Expression /
+        Partition_description。
+        """
+        name = p.get('table')
+        tbl = self.db.get_table(name)
+        pm = getattr(tbl, '_partition', None)
+        cols = ['Database', 'Table', 'Partition', 'Method', 'Expression',
+                'Partition_description']
+        if pm is None or not getattr(pm, 'partitions', None):
+            return self._rs(cols, [])
+        rows = []
+        for part in pm.partitions:
+            if part.ptype == 'RANGE':
+                lo, hi = part.value
+                desc = (f'LESS THAN '
+                        f'({"MAXVALUE" if hi is None else hi})')
+            elif part.ptype == 'HASH':
+                desc = f'HASH({pm.pk_col}) % {part.value} = {part._hash_index}'
+            else:
+                desc = f'VALUES IN ({part.value})'
+            rows.append(('default', name, part.name, part.ptype,
+                         pm.pk_col, desc))
+        return self._rs(cols, rows)
+
+    # ---------- 安全面：白名单 / 口令策略 / 用户 ----------
+
+    def _show_ip_whitelist(self, p, s):
+        """SHOW IP WHITELIST（本引擎扩展语句；MySQL 无此语句）"""
+        entries = []
+        if self.ip_whitelist is not None:
+            entries = self.ip_whitelist.list_all()
+        return self._rs(['Entry'], [(e,) for e in entries])
+
+    def _show_security(self, p, s):
+        """SHOW SECURITY —— 真实安全配置快照 (Name, Value)"""
+        pp = self.password_policy
+        wl = self.ip_whitelist
+        rows = []
+
+        def _val(v):
+            # 统一转成文本：Value 列混排 int/bool 时，服务端按第一行推断类型
+            # （int）会把 'False' 当数字解析，pymysql 直接报
+            # ValueError: invalid literal for int()。MySQL 的 SHOW 系列
+            # 本来也是文本值。
+            if isinstance(v, bool):
+                return 'ON' if v else 'OFF'
+            return '' if v is None else str(v)
+
+        if pp is not None:
+            for k, v in pp.to_dict().items():
+                rows.append((f'password_policy.{k}', _val(v)))
+        else:
+            rows.append(('password_policy', ''))
+        rows.append(('authentication_plugin', 'mysql_native_password'))
+        rows.append(('password_storage', 'sha1(sha1(password)) 十六进制，不落明文'))
+        rows.append(('ip_whitelist.enabled',
+                     _val(bool(wl is not None and wl.enabled))))
+        rows.append(('ip_whitelist.entries',
+                     ','.join(wl.list_all()) if wl is not None else ''))
+        rows.append(('audit.level',
+                     self.audit.level_name if self.audit is not None else ''))
+        rows.append(('audit.records',
+                     _val(len(self.audit.recent)
+                          if self.audit is not None else 0)))
+        rows.append(('users', _val(len(self.db.users))))
+        rows.append(('user_list', ','.join(sorted(self.db.users))))
+        return self._rs(['Name', 'Value'], rows)
+
+    def _check_password_policy(self, user, password):
+        """弱口令校验 → (是否通过, 错误说明)
+
+        使用与 `SHOW SECURITY` 同一份策略对象（`SET PASSWORD POLICY` 改的就是
+        它），空密码与 `IDENTIFIED BY NULL`（= 无密码账户）不参与强度校验 ——
+        MySQL 的 validate_password 同样只对「提供了口令」的账号做校验。
+        """
+        pp = self.password_policy
+        if pp is None:
+            return True, None
+        if password is None:
+            return True, None
+        ok, err = pp.validate(password)
+        return ok, err
+
+    def _cmd_create_user(self, p, s):
+        """CREATE USER ... IDENTIFIED BY '...'（DCL）
+
+        口令策略**真实生效**：不满足 `self.password_policy` 直接返回
+        MySQL 的 ER_NOT_VALID_PASSWORD(1819) 错误（见交付说明的错误原文），
+        绝不静默降级成"创建成功"。密码只存
+        `sha1(sha1(password))` 的十六进制（`db.hash_native_password`，
+        与 `net/mysql_protocol.hash_password` 同一算法），登录校验因此可用。
+        """
+        from ..db.database import hash_native_password
+        created, existed = [], []
+        for acct in p.get('accounts') or []:
+            user = acct.get('user')
+            host = acct.get('host') or '%'
+            pwd = acct.get('password')
+            if user in self.db.users:
+                if p.get('if_not_exists'):
+                    existed.append(user)
+                    continue
+                return self._err(
+                    1396, f"Operation CREATE USER failed for "
+                          f"'{user}'@{host}：用户已存在")
+            if acct.get('has_ident'):
+                ok, err = self._check_password_policy(user, pwd)
+                if not ok:
+                    return self._err(
+                        1819, f"Your password does not satisfy the current "
+                              f"policy requirements（用户 '{user}'@{host}："
+                              f"{err}）")
+            self.db.users[user] = {
+                'auth_hash': hash_native_password(pwd) if pwd else '',
+                'host': host,
+                'privs': [],
+            }
+            created.append(f"'{user}'@{host}")
+        try:
+            self.db.save_meta()
+        except Exception as e:
+            return self._err(1105, f"保存用户失败: {e}")
+        if existed:
+            return self._ok(
+                message=f"User(s) already exist: {', '.join(existed)}")
+        return self._ok(message=f"User(s) created: {', '.join(created)}")
+
+    def _cmd_drop_user(self, p, s):
+        gone, missing = [], []
+        for acct in p.get('users') or []:
+            user = acct.get('user')
+            if user not in self.db.users:
+                missing.append(user)
+                continue
+            if user == 'root':
+                return self._err(1396, "Operation DROP USER failed：不允许删除 root")
+            self.db.users.pop(user, None)
+            gone.append(user)
+        if missing:
+            return self._err(
+                1396, f"Operation DROP USER failed：用户不存在 "
+                      f"{', '.join(missing)}")
+        try:
+            self.db.save_meta()
+        except Exception as e:
+            return self._err(1105, f"保存用户失败: {e}")
+        return self._ok(message=f"User(s) dropped: {', '.join(gone)}")
+
+    def _cmd_set_password_policy(self, p, s):
+        """SET PASSWORD POLICY k = v [, ...]（本引擎扩展语句）
+
+        注意：经 pymysql 连接时 `net/server.py` 会把任何 `SET ...` 直接回
+        OK 包（字符集/autocommit 协商需要），因此这条语句只有走
+        `Executor.execute_sql` 才会到达这里；级别也可用环境变量
+        `LIGHTDB_PASSWORD_MIN_LENGTH` 等在启动时配置。这一点在交付说明里
+        已登记，不是静默忽略（执行器收到就一定生效）。
+        """
+        pp = self.password_policy
+        if pp is None:
+            return self._err(1105, "密码策略不可用")
+        bools = ('require_upper', 'require_lower', 'require_digit',
+                 'require_symbol', 'deny_weak')
+        ints = ('min_length', 'max_age_days')
+        applied = []
+        for key, raw in (p.get('options') or {}).items():
+            k = str(key).lower()
+            if k in bools:
+                val = str(raw).strip().upper() in ('1', 'ON', 'TRUE', 'YES')
+            elif k in ints:
+                if not re.match(r'^\d+$', str(raw).strip()):
+                    return self._err(
+                        1064, f"SET PASSWORD POLICY {k} 需要整数: {raw}")
+                val = int(raw)
+            else:
+                return self._err(
+                    1064, f"SET PASSWORD POLICY 不支持的选项: {k}"
+                          f"（支持 {', '.join(ints + bools)}）")
+            setattr(pp, k, val)
+            applied.append(f'{k}={val}')
+        return self._ok(message='Password policy: ' + ', '.join(applied))
+
+    def _cmd_add_ip_whitelist(self, p, s):
+        wl = self.ip_whitelist
+        if wl is None:
+            return self._err(1105, "IP 白名单不可用")
+        entry = p.get('entry')
+        if not wl.add(entry):
+            return self._err(1064, f"IP 白名单条目不合法: {entry}")
+        return self._ok(message=f"IP whitelist added: {entry}")
+
+    def _cmd_remove_ip_whitelist(self, p, s):
+        wl = self.ip_whitelist
+        if wl is None:
+            return self._err(1105, "IP 白名单不可用")
+        entry = p.get('entry')
+        if not wl.remove(entry):
+            return self._err(1064, f"IP 白名单条目不合法: {entry}")
+        return self._ok(message=f"IP whitelist removed: {entry}")
+
+    # ---------- 全文检索（MATCH ... AGAINST） ----------
+
+    @classmethod
+    def _where_has_match(cls, where) -> bool:
+        if isinstance(where, list):
+            return any(cls._where_has_match(w) for w in where)
+        if not isinstance(where, dict):
+            return False
+        if where.get('op') == 'MATCH':
+            return True
+        for key in ('and', 'or'):
+            if cls._where_has_match(where.get(key)):
+                return True
+        return cls._where_has_match(where.get('not'))
+
+    def _apply_match(self, p):
+        """把 WHERE 里的 `MATCH(列) AGAINST('词')` 换成主键 IN (命中集)
+
+        命中集来自表上的倒排索引（`sql/fulltext.py`），不是 LIKE 近似：
+        索引在 CREATE FULLTEXT INDEX 时按现有行建立、之后每次写入 / 删除
+        都会维护（见 db/table.py）。
+        """
+        table = p.get('table')
+        if not table or p.get('joins') or p.get('subquery'):
+            return self._err(
+                1105, "MATCH ... AGAINST 只支持单表查询："
+                      "JOIN / FROM 子查询里的全文谓词本引擎未实现")
+        try:
+            tbl = self.db.get_table(table)
+        except KeyError as e:
+            return self._err(1146, f"表不存在: {e}")
+        try:
+            q = dict(p)
+            q['where'] = self._rewrite_match_node(p.get('where'), tbl)
+        except Exception as e:
+            return self._err(1105, f"全文检索失败: {e}")
+        return q
+
+    def _rewrite_match_node(self, where, tbl):
+        if isinstance(where, list):
+            return [self._rewrite_match_node(w, tbl) for w in where]
+        if not isinstance(where, dict):
+            return where
+        if where.get('op') == 'MATCH':
+            return self._match_to_pk_in(where, tbl)
+        out = dict(where)
+        for key in ('and', 'or'):
+            if isinstance(out.get(key), list):
+                out[key] = [self._rewrite_match_node(w, tbl)
+                            for w in out[key]]
+        if 'not' in out:
+            out['not'] = self._rewrite_match_node(out['not'], tbl)
+        return out
+
+    def _match_to_pk_in(self, node, tbl):
+        if str(node.get('mode') or '').upper() == 'BOOLEAN':
+            raise ValueError(
+                "MATCH ... AGAINST(... IN BOOLEAN MODE) 未实现："
+                "本引擎只实现自然语言模式（默认），布尔模式的 +/-/通配语义"
+                "无法安全近似")
+        names = [c['name'] for c in tbl.cols]
+        scores = {}
+        for col in node.get('columns') or []:
+            if col not in names:
+                raise ValueError(f"MATCH 里的列 {col} 在表 {tbl.name} 上不存在")
+            if not tbl.has_fulltext_index(col):
+                raise ValueError(
+                    f"列 {col} 上没有全文索引，请先 "
+                    f"CREATE FULLTEXT INDEX ... ({col})")
+            for pk, sc in tbl.fulltext_search(col, node.get('against')).items():
+                scores[pk] = max(scores.get(pk, 0.0), sc)
+        return {
+            'column': tbl.pk_col,
+            'op': 'IN',
+            'values': [str(pk) for pk in scores],
+        }
+
+    # ---------- 存储过程 / 触发器 ----------
+
+    def _cmd_create_procedure(self, p, s):
+        if self._stored is None:
+            return self._err(1105, "存储过程管理器不可用")
+        from .stored import parse_params
+        params = parse_params(', '.join(p.get('params') or []))
+        self._stored.create_procedure(p['name'], params, p['body'])
+        return self._ok(message=f"Procedure '{p['name']}' created")
+
+    def _cmd_create_trigger(self, p, s):
+        if self._trigger_mgr is None:
+            return self._err(1105, "触发器管理器不可用")
+        if p.get('table') not in self.db.tables:
+            return self._err(1146, f"表不存在: '{p.get('table')}'")
+        try:
+            self._trigger_mgr.create(p['name'], p['table'], p['timing'],
+                                     p['event'], p['body'])
+        except ValueError as e:
+            return self._err(1359, str(e))
+        return self._ok(message=f"Trigger '{p['name']}' created")
+
+    def _cmd_create_fulltext_index(self, p, s):
+        try:
+            tbl = self.db.get_table(p['table'])
+        except KeyError as e:
+            return self._err(1146, f"表不存在: {e}")
+        names = [c['name'] for c in tbl.cols]
+        for col in p.get('columns') or []:
+            if col not in names:
+                return self._err(
+                    1072, f"Key column '{col}' doesn't exist in table")
+        try:
+            tbl.create_fulltext_index(p['columns'],
+                                      name=p.get('name'),
+                                      if_not_exists=p.get('if_not_exists'))
+        except Exception as e:
+            return self._err(1061, f"创建全文索引失败: {e}")
+        return self._ok(
+            message=f"Fulltext index '{p.get('name')}' created on "
+                    f"{p['table']}({', '.join(p.get('columns') or [])})")
+
+    def _pl_arg_value(self, raw):
+        """CALL 实参 → Python 值（字面量；`@name` 取会话变量）"""
+        if raw is None:
+            return None
+        t = str(raw).strip()
+        if t.upper() == 'NULL':
+            return None
+        if len(t) >= 2 and t[0] == "'" and t[-1] == "'":
+            return t[1:-1].replace("''", "'")
+        if re.match(r'^-?\d+$', t):
+            return int(t)
+        if re.match(r'^-?\d+\.\d+$', t):
+            return float(t)
+        return t
+
+    @staticmethod
+    def _sql_literal(v):
+        if v is None:
+            return 'NULL'
+        if isinstance(v, bool):
+            return '1' if v else '0'
+        if isinstance(v, (int, float)):
+            return repr(v)
+        return "'" + str(v).replace("'", "''") + "'"
+
+    @staticmethod
+    def _substitute_words(text, mapping):
+        """把 SQL 文本里**引号外**的整词替换成 mapping 的值
+
+        mapping 的键按大写匹配（SQL 标识符大小写不敏感）。
+        引号内（字符串字面量 / 反引号标识符）一律不动 —— 否则
+        `INSERT INTO t VALUES (1, 'x marks')` 里的 `x` 会被参数值替换成
+        静默错误值，这正是要避免的。
+        """
+        if not mapping:
+            return text
+        upper = {str(k).upper(): v for k, v in mapping.items()}
+        out, i, n = [], 0, len(text)
+        in_str = None
+        word_re = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*')
+        while i < n:
+            ch = text[i]
+            if in_str:
+                out.append(ch)
+                if ch == in_str:
+                    in_str = None
+                i += 1
+                continue
+            if ch in ("'", '"', '`'):
+                in_str = ch
+                out.append(ch)
+                i += 1
+                continue
+            m = word_re.match(text, i)
+            if m:
+                word = m.group(0)
+                out.append(upper.get(word.upper(), word))
+                i = m.end()
+                continue
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
+    @staticmethod
+    def _split_statements(text):
+        """按顶层分号切分语句块（引号 / 括号内不算）"""
+        out, cur, in_str, depth = [], '', None, 0
+        for ch in str(text or ''):
+            if in_str:
+                cur += ch
+                if ch == in_str:
+                    in_str = None
+                continue
+            if ch in ("'", '"', '`'):
+                in_str = ch
+                cur += ch
+            elif ch == '(':
+                depth += 1
+                cur += ch
+            elif ch == ')':
+                depth -= 1
+                cur += ch
+            elif ch == ';' and depth == 0:
+                out.append(cur)
+                cur = ''
+            else:
+                cur += ch
+        if cur.strip():
+            out.append(cur)
+        return [x.strip() for x in out if x.strip()]
+
+    @staticmethod
+    def _strip_begin_end(text):
+        t = str(text or '').strip()
+        while t.endswith(';'):
+            t = t[:-1].strip()
+        up = t.upper()
+        if up.startswith('BEGIN') and up.endswith('END'):
+            return t[len('BEGIN'):-len('END')].strip()
+        return t
+
+    @staticmethod
+    def _has_pl_control_flow(body) -> bool:
+        return bool(re.search(
+            r'(^|;|\s)(IF|WHILE|LOOP|DECLARE|RETURN|LEAVE|ITERATE)\b',
+            str(body or ''), re.IGNORECASE))
+
+    def _exec_pl_body(self, body, session, variables=None):
+        """执行过程体的控制流（IF/WHILE/DECLARE/SELECT ... INTO）
+
+        为什么不用 `sql/pl.py::PLInterpreter`：它的 `_substitute_vars` 是空
+        实现 —— SQL 语句里的变量名不会被替换，`INSERT INTO t VALUES (i)` 会把
+        字符串 `'i'` 写进库（静默错值），循环变量因此永远不起作用。
+        这里复用 pl.py 的 `PLParser`（切语句结构）与 `ExprParser`/`eval_expr`
+        （表达式求值），但**每次执行 SQL 前都按当前变量值做一次引号感知的
+        字面量替换**，因此循环体里的变量是逐轮变化的真实值。
+        """
+        from .pl import PLParser, PLContext, ExprParser, eval_expr
+        ctx = PLContext(self, session, self.db)
+        for k, v in (variables or {}).items():
+            ctx.variables[k] = v
+        stmts = PLParser(body).parse_program()
+        self._run_pl_statements(stmts, ctx, ExprParser, eval_expr)
+        return ctx
+
+    def _run_pl_statements(self, stmts, ctx, ExprParser, eval_expr,
+                           cond_tokens=None):
+        """逐条执行 PL 语句（自实现，见 _exec_pl_body 的说明）"""
+        from .parser import parser as _p
+        if cond_tokens is not None:
+            if not eval_expr(ExprParser(cond_tokens).parse(), ctx):
+                return None
+        for stmt in stmts:
+            op = stmt[0]
+            if op == 'DECLARE':
+                _, name, _types, default_toks = stmt
+                value = None
+                if default_toks:
+                    value = eval_expr(ExprParser(default_toks).parse(), ctx)
+                ctx.variables[name] = value
+            elif op == 'SET':
+                _, name, expr_toks = stmt
+                ctx.variables[name] = eval_expr(
+                    ExprParser(expr_toks).parse(), ctx)
+            elif op == 'IF':
+                _, branches, else_body = stmt
+                taken = False
+                for cond_toks, block in branches:
+                    if eval_expr(ExprParser(cond_toks).parse(), ctx):
+                        self._run_pl_statements(
+                            block, ctx, ExprParser, eval_expr)
+                        taken = True
+                        break
+                if not taken and else_body:
+                    self._run_pl_statements(
+                        else_body, ctx, ExprParser, eval_expr)
+            elif op == 'WHILE':
+                _, cond_toks, block = stmt
+                guard = 0
+                while eval_expr(ExprParser(cond_toks).parse(), ctx):
+                    guard += 1
+                    if guard > 100000:
+                        raise RuntimeError("WHILE 循环超过 10 万次，已中止")
+                    self._run_pl_statements(
+                        block, ctx, ExprParser, eval_expr)
+            elif op == 'SELECT_INTO':
+                _, toks, into_pos = stmt
+                from .pl import PLParser
+                rest = toks[into_pos + 1:]
+                from_pos = next(
+                    (i for i, t in enumerate(rest)
+                     if t.type == 'KW' and t.value.upper() == 'FROM'), -1)
+                var_toks = rest[:from_pos] if from_pos >= 0 else rest
+                from_toks = rest[from_pos:] if from_pos >= 0 else []
+                names = [t.value for t in var_toks if t.type == 'IDENT']
+                col_sql = PLParser('').tokens_to_sql(toks[1:into_pos])
+                tail = PLParser('').tokens_to_sql(from_toks)
+                sql = self._substitute_words(
+                    f"SELECT {col_sql} {tail} LIMIT 1",
+                    {k: self._sql_literal(v)
+                     for k, v in ctx.variables.items()})
+                parsed = _p.parse(sql)
+                if parsed is None:
+                    raise RuntimeError(f"过程体 SELECT INTO 无法解析: {sql[:120]}")
+                res = self.execute(parsed, ctx.session)
+                if isinstance(res, dict) and res.get('rows'):
+                    for i, v in enumerate(res['rows'][0]):
+                        if i < len(names):
+                            ctx.variables[names[i]] = v
+            elif op == 'RETURN':
+                ctx.return_value = None
+                if stmt[1]:
+                    ctx.return_value = eval_expr(
+                        ExprParser(stmt[1]).parse(), ctx)
+                return ctx.return_value
+            elif op == 'SQL':
+                sql = stmt[1]
+                if sql.strip().upper().startswith('CALL '):
+                    from .stored import call_procedure
+                    call_procedure(sql, ctx)
+                    continue
+                sql = self._substitute_words(
+                    sql, {k: self._sql_literal(v)
+                          for k, v in ctx.variables.items()})
+                parsed = _p.parse(sql)
+                if parsed is None:
+                    raise RuntimeError(f"过程体语句无法解析: {sql[:120]}")
+                res = self.execute(parsed, ctx.session)
+                if isinstance(res, dict) and res.get('type') == 'error':
+                    raise RuntimeError(
+                        f"过程体语句执行失败: {res.get('message')}")
+            else:
+                raise RuntimeError(f"过程体里暂不支持的语句类型: {op}")
+        return None
+
+    def _run_statement_list(self, body, session, label):
+        """顺序执行语句块：解析 + 执行，失败一定显式抛出（不静默）"""
+        from .parser import parser as _p
+        for stmt in self._split_statements(self._strip_begin_end(body)):
+            parsed = _p.parse(stmt)
+            if parsed is None:
+                raise RuntimeError(
+                    f"{label} 里的语句无法解析: {stmt[:120]}")
+            res = self.execute(parsed, session)
+            if isinstance(res, dict) and res.get('type') == 'error':
+                raise RuntimeError(
+                    f"{label} 执行失败: {res.get('message')}")
+        return None
+
+    def _cmd_call(self, p, s):
+        """CALL 存储过程
+
+        过程体按参数**文本替换**后执行（引号内不替换），控制流过程体交给
+        `_exec_pl_body`（PL 解释器）。
+        已知限制：OUT / INOUT 参数回填未实现 → 显式报错（不静默丢弃回填）。
+        """
+        mgr = self._stored
+        if mgr is None:
+            return self._err(1105, "存储过程管理器不可用")
+        proc = mgr.get_procedure(p['name'])
+        if proc is None:
+            return self._err(1305, f"PROCEDURE {p['name']} does not exist")
+        params = proc.params or []
+        args = list(p.get('args') or [])
+        if len(args) > len(params):
+            return self._err(
+                1318, f"Incorrect number of arguments for PROCEDURE "
+                      f"{proc.name}; expected {len(params)}, got {len(args)}")
+        out_params = [prm['name'] for prm in params
+                      if str(prm.get('mode', 'IN')).upper() in ('OUT', 'INOUT')]
+        if out_params:
+            return self._err(
+                1105, f"CALL {proc.name}: OUT/INOUT 参数回填"
+                      f"（{', '.join(out_params)}）暂不支持 —— 本引擎没有"
+                      f"用户变量回填机制，显式失败以免调用方拿到 NULL 当成结果")
+        bind_sql, bind_val = {}, {}
+        for i, prm in enumerate(params):
+            value = self._pl_arg_value(args[i] if i < len(args) else None)
+            bind_val[prm['name']] = value
+            bind_sql[prm['name']] = self._sql_literal(value)
+        try:
+            body = self._substitute_words(proc.body, bind_sql)
+            plain = self._strip_begin_end(body)
+            if self._has_pl_control_flow(plain):
+                self._exec_pl_body(plain, s, bind_val)
+            else:
+                self._run_statement_list(body, s, f"CALL {proc.name}")
+        except Exception as e:
+            return self._err(1105, f"CALL {proc.name} 失败: {e}")
+        return self._ok(message=f"Procedure '{proc.name}' called")
+
+    def _fire_triggers(self, timing, event, table, old_row=None,
+                       new_row=None, session=None):
+        """执行表上的 BEFORE/AFTER 触发器（真的执行触发器体）
+
+        * 体内 `NEW.列` / `OLD.列` 会被替换成真实行的字面量（引号内不替换）；
+        * BEFORE 触发器里的 `SET NEW.列 = 表达式` 会真改写入的行值（本方法
+          直接改 `new_row` 列表，调用方随后写入的就是改后的值）；
+        * 触发器体执行失败会向上抛出 → 语句以显式错误结束（不静默）。
+        """
+        mgr = self._trigger_mgr
+        if mgr is None:
+            return
+        tlist = list(getattr(mgr, 'triggers', {}).get(table) or [])
+        if not tlist:
+            return
+        tbl = self.db.get_table(table)
+        cols = [c['name'] for c in tbl.cols]
+        env = {
+            'NEW': dict(zip(cols, new_row)) if new_row is not None else None,
+            'OLD': dict(zip(cols, old_row)) if old_row is not None else None,
+        }
+        for trig in tlist:
+            if trig.timing != timing or trig.event != event:
+                continue
+            self._run_trigger_body(trig, tbl, cols, env, new_row, old_row,
+                                   session)
+
+    def _run_trigger_body(self, trig, tbl, cols, env, new_row, old_row,
+                          session):
+        refs = {}
+        if env.get('NEW') is not None:
+            for c in cols:
+                refs[f'NEW.{c}'] = self._sql_literal(env['NEW'].get(c))
+        if env.get('OLD') is not None:
+            for c in cols:
+                refs[f'OLD.{c}'] = self._sql_literal(env['OLD'].get(c))
+        stmts = self._split_statements(self._strip_begin_end(trig.body))
+        self._run_trigger_stmts(stmts, trig, tbl, cols, env, new_row,
+                                old_row, session, refs)
+
+    def _run_trigger_stmts(self, stmts, trig, tbl, cols, env, new_row,
+                           old_row, session, refs):
+        """执行触发器语句序列，识别 `IF ... THEN ... [ELSE ...] END IF`
+
+        自实现的小解释器（触发器体的形态有限：SET NEW/OLD 赋值 + 普通 SQL +
+        IF 判断）。IF 块用语句级配对（嵌套时按深度配对），条件里的
+        `NEW.列` / `OLD.列` / 字面量由 `_eval_trigger_expr` 求值。
+        `ELSEIF` 未实现 → 显式报错，不静默跳过分支。
+        """
+        i = 0
+        while i < len(stmts):
+            s = stmts[i].strip()
+            im = re.match(r'^IF\s+(.+?)\s+THEN\s*(.*)$', s,
+                          re.IGNORECASE | re.DOTALL)
+            if not im:
+                self._run_trigger_stmt(s, trig, tbl, cols, env, new_row,
+                                       old_row, session, refs)
+                i += 1
+                continue
+            cond = im.group(1)
+            then_body = [im.group(2)] if im.group(2).strip() else []
+            else_body = []
+            target = then_body
+            depth = 0
+            i += 1
+            while i < len(stmts):
+                cur = stmts[i].strip()
+                if re.match(r'^ELSEIF\b', cur, re.IGNORECASE):
+                    raise RuntimeError(
+                        f"触发器 {trig.name}: 触发器体里的 ELSEIF 暂不支持"
+                        f"（请改用嵌套 IF）")
+                if re.match(r'^IF\b', cur, re.IGNORECASE):
+                    depth += 1
+                elif re.match(r'^END\s+IF$', cur, re.IGNORECASE):
+                    if depth == 0:
+                        i += 1
+                        break
+                    depth -= 1
+                em = re.match(r'^ELSE\s*(.*)$', cur, re.IGNORECASE | re.DOTALL)
+                if em is not None and depth == 0:
+                    target = else_body
+                    if em.group(1).strip():
+                        target.append(em.group(1))
+                    i += 1
+                    continue
+                target.append(cur)
+                i += 1
+            if self._eval_trigger_condition(cond, env, trig.name):
+                self._run_trigger_stmts(then_body, trig, tbl, cols, env,
+                                        new_row, old_row, session, refs)
+            elif else_body:
+                self._run_trigger_stmts(else_body, trig, tbl, cols, env,
+                                        new_row, old_row, session, refs)
+
+    def _run_trigger_stmt(self, stmt, trig, tbl, cols, env, new_row, old_row,
+                          session, refs):
+        setm = re.match(
+            r'SET\s+(NEW|OLD)\.(\w+)\s*=\s*(.+)$', stmt,
+            re.IGNORECASE | re.DOTALL)
+        if setm:
+            which = setm.group(1).upper()
+            col = setm.group(2)
+            if col not in cols:
+                raise RuntimeError(
+                    f"触发器 {trig.name}: 列 {col} 在表 {tbl.name} 上不存在")
+            if trig.timing != 'BEFORE':
+                raise RuntimeError(
+                    f"触发器 {trig.name}: 只有 BEFORE 触发器可以给 "
+                    f"{which}.{col} 赋值")
+            if env.get(which) is None:
+                raise RuntimeError(
+                    f"触发器 {trig.name}: 该事件没有 {which} 行")
+            value = self._eval_trigger_expr(setm.group(3), env, trig.name)
+            env[which][col] = value
+            target = new_row if which == 'NEW' else old_row
+            if target is not None:
+                target[cols.index(col)] = value
+            return
+        sql = self._substitute_words(stmt, refs)
+        from .parser import parser as _p
+        parsed = _p.parse(sql)
+        if parsed is None:
+            raise RuntimeError(
+                f"触发器 {trig.name} 里的语句无法解析: {stmt[:120]}")
+        res = self.execute(parsed, session)
+        if isinstance(res, dict) and res.get('type') == 'error':
+            raise RuntimeError(
+                f"触发器 {trig.name} 执行失败: {res.get('message')}")
+
+    def _eval_trigger_condition(self, cond, env, trig_name):
+        """触发器 IF 条件求值（NULL 语义按 SQL 三值：UNKNOWN -> 不成立）"""
+        from .parser import parser as _p
+        c = str(cond).strip()
+        for kw in ('OR', 'AND'):
+            parts = _p._split_cond_top_level(c, kw)
+            if len(parts) > 1:
+                vals = [self._eval_trigger_condition(x, env, trig_name)
+                        for x in parts]
+                return any(vals) if kw == 'OR' else all(vals)
+        nm = re.match(r'^NOT\s+(.+)$', c, re.IGNORECASE | re.DOTALL)
+        if nm:
+            return not self._eval_trigger_condition(
+                nm.group(1), env, trig_name)
+        zm = re.match(r'^(.*?)\s+IS\s+(NOT\s+)?NULL$', c,
+                      re.IGNORECASE | re.DOTALL)
+        if zm:
+            v = self._eval_trigger_expr(zm.group(1), env, trig_name)
+            return v is not None if zm.group(2) else v is None
+        cm = re.match(r'^(.*?)\s*(<=|>=|<>|!=|=|<|>)\s*(.*)$', c,
+                      re.IGNORECASE | re.DOTALL)
+        if cm:
+            left = self._eval_trigger_expr(cm.group(1), env, trig_name)
+            right = self._eval_trigger_expr(cm.group(3), env, trig_name)
+            if left is None or right is None:
+                return False             # SQL 里与 NULL 比较是 UNKNOWN
+            op = cm.group(2)
+            if op == '=':
+                return left == right
+            if op in ('!=', '<>'):
+                return left != right
+            if op == '<':
+                return left < right
+            if op == '>':
+                return left > right
+            if op == '<=':
+                return left <= right
+            return left >= right
+        return bool(self._eval_trigger_expr(c, env, trig_name))
+
+    def _eval_trigger_expr(self, expr, env, trig_name):
+        node = _parse_scalar_expr(expr)
+        if node is None:
+            raise RuntimeError(
+                f"触发器 {trig_name}: 表达式无法解析: {str(expr)[:80]}")
+
+        def resolve(name):
+            n = str(name)
+            if '.' in n:
+                which, col = n.split('.', 1)
+                row = env.get(which.upper())
+                if isinstance(row, dict) and col in row:
+                    return row[col]
+            raise ValueError(f"列 {n} 在触发器上下文里解析不到")
+        return _eval_expr_node(node, resolve, position='触发器')
 
     # ==================== SHOW ====================
 
@@ -4572,7 +5931,11 @@ class Executor:
             message=f"Database changed to {p['database']}")
 
     def _cmd_explain(self, p, s):
-        """EXPLAIN"""
+        """EXPLAIN / EXPLAIN ANALYZE
+
+        `EXPLAIN ANALYZE` 会**真的执行**内层语句并报告实测耗时与行数
+        （MySQL 8 的 EXPLAIN ANALYZE 语义），不是只打印计划。
+        """
         inner = p.get('inner')
         if not inner or self.optimizer is None:
             return self._err(1105, "EXPLAIN 无法解析")
@@ -4582,10 +5945,29 @@ class Executor:
         self._check_strict_group_by(inner)
         plan = self.optimizer.optimize(inner)
         try:
-            cols, rows, _ = self.optimizer.explain(plan)
-            return self._rs(cols, rows)
+            cols, rows, plan_text = self.optimizer.explain(plan)
         except Exception as e:
             return self._err(1105, f"EXPLAIN 失败: {e}")
+
+        if not p.get('analyze'):
+            return self._rs(cols, rows)
+
+        # ---- EXPLAIN ANALYZE：真实执行 + 实测统计 ----
+        # MySQL 8 的 EXPLAIN ANALYZE 输出单列 'EXPLAIN'（计划树 + actual
+        # time/rows 标注），这里同样给：真实计划树 + 实测耗时/行数。
+        t0 = time.time()
+        res = self.execute(inner, s)
+        elapsed = time.time() - t0
+        if isinstance(res, dict) and res.get('type') == 'error':
+            return self._err(
+                int(res.get('code') or 1105),
+                f"EXPLAIN ANALYZE 执行失败: {res.get('message')}")
+        n_rows = len(res.get('rows') or []) if isinstance(res, dict) else 0
+        text = plan_text if isinstance(plan_text, str) else '\n'.join(
+            str(x) for x in (plan_text or []))
+        out = [[line] for line in text.splitlines() if line.strip()]
+        out.append([f"实际耗时: {elapsed * 1000:.3f} ms (rows={n_rows})"])
+        return self._rs(['EXPLAIN'], out)
 
     # ==================== 事件调度器 ====================
 
