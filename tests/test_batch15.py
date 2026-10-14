@@ -178,13 +178,26 @@ def test_check_optimize():
         cur.execute(f"INSERT INTO t VALUES ({i+1}, 'v{i}')")
 
     cur.execute("CHECK TABLE t")
+    cols = [d[0] for d in cur.description]
     r = cur.fetchone()
     print(f"  → CHECK TABLE: {r}")
-    assert r[1] == 'OK'
+    # MySQL 原生列序 (Table, Op, Msg_type, Msg_text)：Op='check' 在第 2 列
+    assert cols == ['Table', 'Op', 'Msg_type', 'Msg_text'], cols
+    assert r[0] == 't' and r[1] == 'check', r
+    assert r[2] == 'status' and r[3] == 'OK', r
+    # 第二行是真实校验统计（Msg_type='info'，Msg_text 是人可读文本）
+    info = cur.fetchone()
+    print(f"  → CHECK TABLE info: {info}")
+    assert info[1] == 'check' and info[2] == 'info', info
+    assert '50' in str(info[3]), info        # 50 个索引项真的走了一遍
 
     cur.execute("OPTIMIZE TABLE t")
     r = cur.fetchone()
     print(f"  → OPTIMIZE TABLE: {r}")
+    assert r[1] == 'optimize' and r[2] == 'status' and r[3] == 'OK', r
+    info = cur.fetchone()
+    assert info[1] == 'optimize' and info[2] == 'info', info
+    assert str(info[3]).strip(), info
 
     # 验证数据还在
     cur.execute("SELECT COUNT(*) FROM t")

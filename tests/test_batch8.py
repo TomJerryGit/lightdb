@@ -230,9 +230,18 @@ def test_master_slave_status():
     assert row[1] >= 3
 
     cur.execute("SHOW SLAVE STATUS")
+    cols = [d[0] for d in cur.description]
     row = cur.fetchone()
-    print(f"  → SHOW SLAVE STATUS: Running={row[0]}")
-    assert row[0] == 0
+    print(f"  → SHOW SLAVE STATUS: {len(cols)} 列，"
+          f"Slave_IO_Running={row[10]}, Slave_SQL_Running={row[11]}")
+    # MySQL 原生列顺序：第 1 列是 Slave_IO_State，两个运行标志在第 11/12 列
+    assert cols[:12] == [
+        'Slave_IO_State', 'Master_Host', 'Master_User', 'Master_Port',
+        'Connect_Retry', 'Master_Log_File', 'Read_Master_Log_Pos',
+        'Relay_Log_File', 'Relay_Log_Pos', 'Relay_Master_Log_File',
+        'Slave_IO_Running', 'Slave_SQL_Running'], cols
+    assert row[10] == 0 and row[11] == 0, row    # 真实的运行标志：无复制线程
+    assert row[0] is None                       # 第 1 列是状态文本（本引擎无）
 
     # 测试 BINLOG_FETCH
     cur.execute("SELECT * FROM __BINLOG_FETCH__ WHERE pos >= 1 LIMIT 100")

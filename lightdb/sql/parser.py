@@ -916,9 +916,27 @@ class Parser:
         # 列（窗口函数从列表达式里抽出来，交给执行器单独计算）
         # JSON 路径语法糖在投影里同样先改写（`SELECT data->'$.k' FROM docs`），
         # 改写后是普通标量函数投影，走既有投影求值路径。
-        raw_columns = (['*'] if cols_str == '*'
-                       else [rewrite_json_paths(c)
-                             for c in self._split_top_level(cols_str)])
+        #
+        # ★ 但 MySQL 的**输出列名**是用户写的原文（`data->'$.k'`），不是改写后
+        # 的 `JSON_EXTRACT(data, '$.k')`。改写只在内部进行，因此这里额外记一份
+        # **与投影列表逐项对齐**的原文表（`json_display`：无改写处为 None），
+        # 供执行器取列名（executor `_projection_displays`）。
+        # 用「逐项对齐」而不是「表达式 -> 原文」字典：`SELECT data->'$.k',
+        # JSON_EXTRACT(data, '$.k')` 里第二项的改写结果与第一项的原文完全同形，
+        # 字典会把两项都显示成 `data->'$.k'`（MySQL 只显示第一项为原文）。
+        # 有 `AS 别名` 时列名就是别名（与 MySQL 一致），记 None。
+        json_display = []
+        if cols_str == '*':
+            raw_columns = ['*']
+            json_display.append(None)
+        else:
+            raw_columns = []
+            for c in self._split_top_level(cols_str):
+                rewritten = rewrite_json_paths(c)
+                raw_columns.append(rewritten)
+                _src_expr, src_alias = _split_select_alias(c)
+                json_display.append(
+                    None if (src_alias or rewritten == c) else _src_expr)
         for c in raw_columns:
             if re.search(r'\bAGAINST\s*\(', str(c), re.IGNORECASE):
                 # MySQL 允许 `SELECT MATCH(c) AGAINST('x') ...`（返回相关度
@@ -1026,6 +1044,8 @@ class Parser:
             'columns': columns,
             'windows': windows,
             'projection': projection,
+            # `data->'$.k'` 等 JSON 路径投影的「输出列名用原文」表
+            'json_display': json_display,
             'distinct': distinct,
             'where': where,
             'group_by': group_by,

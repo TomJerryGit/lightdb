@@ -2375,16 +2375,21 @@ class Executor:
         """
         projection = p.get('projection') or [
             ('col', c) for c in (p.get('columns') or ['*'])]
+        displays = self._projection_displays(p, projection)
 
         if any(k == 'col' and str(t).strip() == '*'
                for k, t in projection):
             expanded = []
-            for k, t in projection:
+            exp_displays = []
+            for i, (k, t) in enumerate(projection):
                 if k == 'col' and str(t).strip() == '*':
                     expanded.extend(('col', c) for c in base_cols)
+                    exp_displays.extend([None] * len(base_cols))
                 else:
                     expanded.append((k, t))
+                    exp_displays.append(displays[i])
             projection = expanded
+            displays = exp_displays
 
         session = self._use_session(session)
         if outer_name is None:
@@ -2394,10 +2399,11 @@ class Executor:
         sub_cache = {}
 
         out_cols, plan_items = [], []
-        for kind, text in projection:
+        for i, (kind, text) in enumerate(projection):
             if kind == 'win':
                 continue
-            item = self._projection_item_plan(str(text), base_cols)
+            item = self._projection_item_plan(
+                str(text), base_cols, displays[i])
             out_cols.append(item[2])
             plan_items.append(item)
 
@@ -2414,8 +2420,29 @@ class Executor:
             sort_values=self._order_by_sort_values(
                 p, out_cols, base_cols, rows))
 
-    def _projection_item_plan(self, text, base_cols):
+    @staticmethod
+    def _projection_displays(p, projection):
+        """投影项的「MySQL 输出列名覆盖」表：`data->'$.k'` 显示**原文**
+
+        解析期把 `data->'$.k'` 改写成等价的 `JSON_EXTRACT(data, '$.k')`
+        （内部求值走这条路径），但 MySQL 的输出列名是用户写的原文。
+        `p['json_display']`（parser `_select` 产出）是**与投影列表逐项对齐**
+        的原文表，无覆盖处为 None；长度不一致时整体不覆盖（宁可沿用既有
+        命名，也不按错位的位置改名）。带 `AS 别名` 的项在解析期就记为 None
+        （列名是别名，与 MySQL 一致）。
+
+        `SELECT *` 展开时由调用方同步展开本表（见 `_project_rows`）。
+        """
+        disp = list((p or {}).get('json_display') or [])
+        if len(disp) != len(projection):
+            return [None] * len(projection)
+        return disp
+
+    def _projection_item_plan(self, text, base_cols, display=None):
         """单个投影项 -> (kind, spec, 输出列名)
+
+        display：MySQL 输出列名（仅 `data->'$.k'` 这类原文覆盖用，见
+        `_projection_displays`）。无别名时优先用它，其次才是解析后的表达式文本。
 
         kind ∈ {'const','col','arith','expr','sub'}。认不出来的形态抛
         ValueError：投影是用户直接看得到的结果，宁可变报错也不能安静地
@@ -2432,7 +2459,7 @@ class Executor:
         if sub is not None:
             # 输出列名保留子查询原文（不要做限定符归一化，否则列名会被改写）
             return ('sub', sub, alias or expr.strip())
-        label = alias or self._strip_qualifier(expr)
+        label = alias or display or self._strip_qualifier(expr)
         is_lit, val = self._literal_value(expr)
         if is_lit:
             # 字面量列（`SELECT 1 FROM orders`）只出现在常量投影里
@@ -4172,17 +4199,22 @@ class Executor:
         windows = p.get('windows') or []
         projection = p.get('projection') or [
             ('col', c) for c in (p.get('columns') or ['*'])]
+        displays = self._projection_displays(p, projection)
 
         # 展开 SELECT *
         if any(k == 'col' and str(t).strip() == '*'
                for k, t in projection):
             expanded = []
-            for k, t in projection:
+            exp_displays = []
+            for i, (k, t) in enumerate(projection):
                 if k == 'col' and str(t).strip() == '*':
                     expanded.extend(('col', c) for c in base_cols)
+                    exp_displays.extend([None] * len(base_cols))
                 else:
                     expanded.append((k, t))
+                    exp_displays.append(displays[i])
             projection = expanded
+            displays = exp_displays
 
         computed = {}
         for w in windows:
@@ -4194,12 +4226,13 @@ class Executor:
         sub_cache = {}
 
         out_cols, plan_items = [], []
-        for kind, text in projection:
+        for i, (kind, text) in enumerate(projection):
             if kind == 'win':
                 out_cols.append(text['alias'])
                 plan_items.append(('win', id(text), text['alias']))
                 continue
-            item = self._projection_item_plan(str(text), base_cols)
+            item = self._projection_item_plan(
+                str(text), base_cols, displays[i])
             out_cols.append(item[2])
             plan_items.append(item)
 
@@ -4679,7 +4712,23 @@ class Executor:
         if self.strict_group_by is not None:
             executor.strict_group_by = self.strict_group_by
         cols, rows = executor.execute(plan)
-        return self._rs(cols, rows)
+        return self._rs(self._plan_display_cols(p, cols), rows)
+
+    def _plan_display_cols(self, p, cols):
+        """把计划路径的输出列名换成 MySQL 的输出列名（`data->'$.k'` 显示原文）
+
+        计划执行器 `_exec_Project` 的列名来自 `p['columns']`（已在解析期被
+        改写成 `JSON_EXTRACT(...)`），且会按「最后一个点号」切短名 —— 对
+        `JSON_EXTRACT(d.data, '$.k')` 会切出 `data, '$.k')` 这种无意义的列名。
+        MySQL 在这里显示的是用户写的原文，因此按位置还原：用
+        `p['json_display']`（与投影列表逐项对齐，无改写处为 None）覆盖；
+        项数不一致（`SELECT *` 展开 / 投影里有窗口函数）时原样返回。
+        """
+        disp = list((p or {}).get('json_display') or [])
+        cols = [str(c) for c in cols]
+        if not any(d for d in disp) or len(disp) != len(cols):
+            return cols
+        return [disp[i] or cols[i] for i in range(len(cols))]
 
     def _join_qualifiers(self, p) -> list:
         """JOIN 查询里所有可作外层限定符的名字（别名优先，其次表名）
@@ -5009,27 +5058,148 @@ class Executor:
              'Executed_Gtid_Set'],
             [('binlog.000001', len(events), '', '', None)])
 
-    def _show_slave_status(self, p, s):
-        """SHOW SLAVE STATUS —— 本实例没有在跑的复制线程 → IO/SQL 均为 0
+    #: MySQL `SHOW SLAVE STATUS` 的列清单（**严格按文档顺序**）
+    #
+    #: 来源：MySQL 5.7 Reference Manual 13.7.5.34「SHOW SLAVE STATUS
+    #: Statement」里 `\G` 的完整输出（57 列，从 Slave_IO_State 到
+    #: Master_TLS_Version；Master_TLS_Version 自 5.7.10 起）。MySQL 8.0
+    #: 只在其后追加了 `Master_public_key_path` / `Get_master_public_key`
+    #: （8.0.19）与 `Network_Namespace`（8.0.22），前 57 列的名称与顺序
+    #: 与 5.7 完全相同，因此这里以 5.7 的实证清单为准（8.0 追加的三列本
+    #: 引擎不输出，已在交付说明里登记）。
+    #:
+    #: 本引擎的执行器看不到 `replication/slave.py::SlaveReplicator`
+    #: （它不注册到 Database / Executor），因此如实报告「本实例没有在跑的
+    #: 复制线程」：两个运行标志是真实的 0（0 = 未运行，MySQL 在对应线程未
+    #: 运行时同样不是 Yes），没有对应概念的列一律 NULL，不编造。
+    _SLAVE_STATUS_COLUMNS = (
+        'Slave_IO_State', 'Master_Host', 'Master_User', 'Master_Port',
+        'Connect_Retry', 'Master_Log_File', 'Read_Master_Log_Pos',
+        'Relay_Log_File', 'Relay_Log_Pos', 'Relay_Master_Log_File',
+        'Slave_IO_Running', 'Slave_SQL_Running',
+        'Replicate_Do_DB', 'Replicate_Ignore_DB',
+        'Replicate_Do_Table', 'Replicate_Ignore_Table',
+        'Replicate_Wild_Do_Table', 'Replicate_Wild_Ignore_Table',
+        'Last_Errno', 'Last_Error', 'Skip_Counter', 'Exec_Master_Log_Pos',
+        'Relay_Log_Space', 'Until_Condition', 'Until_Log_File',
+        'Until_Log_Pos', 'Master_SSL_Allowed', 'Master_SSL_CA_File',
+        'Master_SSL_CA_Path', 'Master_SSL_Cert', 'Master_SSL_Cipher',
+        'Master_SSL_Key', 'Seconds_Behind_Master',
+        'Master_SSL_Verify_Server_Cert', 'Last_IO_Errno', 'Last_IO_Error',
+        'Last_SQL_Errno', 'Last_SQL_Error', 'Replicate_Ignore_Server_Ids',
+        'Master_Server_Id', 'Master_UUID', 'Master_Info_File', 'SQL_Delay',
+        'SQL_Remaining_Delay', 'Slave_SQL_Running_State',
+        'Master_Retry_Count', 'Master_Bind', 'Last_IO_Error_Timestamp',
+        'Last_SQL_Error_Timestamp', 'Master_SSL_Crl', 'Master_SSL_Crlpath',
+        'Retrieved_Gtid_Set', 'Executed_Gtid_Set', 'Auto_Position',
+        'Replicate_Rewrite_DB', 'Channel_name', 'Master_TLS_Version',
+    )
 
-        从库实现是 `replication/slave.py::SlaveReplicator`，它不注册到
-        Database / Executor，执行器看不到它的状态，因此这里如实报告
-        「本实例没有从库复制线程」（0 = 未运行），而不是伪造 Running=Yes。
+    def _slave_status_values(self):
+        """上面那份列清单的逐列取值（键 = 列名，找不到对应概念的为 None）
 
-        列名取自 MySQL，但**列顺序有一处刻意偏离**：MySQL 把
-        Slave_IO_State（文本状态）放在第 1 列、两个运行标志在第 11/12 列；
-        本引擎把 `Slave_IO_Running` / `Slave_SQL_Running` 放在第 1、2 列并以
-        整数 0/1 表示（调用方按位置取「是否在跑」，tests/test_batch8.py::
-        test_master_slave_status 断言 row[0] == 0）。
-        没有对应概念的列：Relay_* 日志文件名 / GTID / Seconds_Behind_Master
-        / 主库连接信息 → NULL。
+        取值依据（逐类说明，全部是「本引擎真的没有这个概念」时的 MySQL
+        空值语义，不是拍脑袋的常量）：
+
+        * 复制线程 / 主库连接（Slave_IO_State、Master_Host、Master_User、
+          Master_Port、Connect_Retry、Master_Log_File、Read_Master_Log_Pos、
+          Relay_Log_File、Relay_Log_Pos、Relay_Master_Log_File、
+          Exec_Master_Log_Pos、Relay_Log_Space、Master_Server_Id、
+          Master_Info_File、Master_Retry_Count、Slave_SQL_Running_State）
+          → NULL：本引擎没有 CHANGE MASTER / 中继日志 / 主库连接，
+          也无从得知对端信息（MySQL 在这些值未知时同样是 NULL）。
+        * Slave_IO_Running / Slave_SQL_Running → 0：**真实运行标志**
+          （本实例没有在跑的复制线程）。
+        * 复制过滤列表（Replicate_Do_DB / ... / Replicate_Rewrite_DB）、
+          Master_Bind、Master_UUID、Master_SSL_* 文件路径 → ''：
+          MySQL 未配置这些选项时就是空串。
+        * Last_Errno / Last_IO_Errno / Last_SQL_Errno → 0，Last_Error /
+          Last_IO_Error / Last_SQL_Error / 两个 *_Error_Timestamp → ''：
+          文档明确「错误号 0 + 空串 = 没有错误」，与「无复制线程」一致。
+        * Until_Condition → 'None'、Until_Log_File → ''、Until_Log_Pos → 0：
+          没有 START SLAVE UNTIL；'None' 是文档给出的取值。
+        * Master_SSL_Allowed / Master_SSL_Verify_Server_Cert → 'No'：
+          文档取值，且本引擎的复制实现没有到主库的 TLS（No = 不允许）。
+        * SQL_Delay → 0（没有 MASTER_DELAY）、SQL_Remaining_Delay → NULL
+          （文档：只在等待延迟时才有值）、Auto_Position → 0（没有 GTID
+          自动定位）。
+        * Seconds_Behind_Master → NULL：文档「SQL 线程未运行时为 NULL」。
+        * Retrieved_Gtid_Set / Executed_Gtid_Set → NULL：本引擎没有 GTID
+          概念（与 `SHOW MASTER STATUS` 的 Executed_Gtid_Set = NULL 一致）。
+        * Channel_name → ''：MySQL 默认复制通道名为空串。
         """
-        return self._rs(
-            ['Slave_IO_Running', 'Slave_SQL_Running', 'Master_Host',
-             'Master_Port', 'Master_Log_File', 'Read_Master_Log_Pos',
-             'Relay_Master_Log_File', 'Seconds_Behind_Master',
-             'Last_IO_Error', 'Last_SQL_Error'],
-            [(0, 0, None, None, None, None, None, None, '', '')])
+        return {
+            'Slave_IO_State': None,
+            'Master_Host': None,
+            'Master_User': None,
+            'Master_Port': None,
+            'Connect_Retry': None,
+            'Master_Log_File': None,
+            'Read_Master_Log_Pos': None,
+            'Relay_Log_File': None,
+            'Relay_Log_Pos': None,
+            'Relay_Master_Log_File': None,
+            'Slave_IO_Running': 0,      # 真实标志：IO 线程未运行
+            'Slave_SQL_Running': 0,     # 真实标志：SQL 线程未运行
+            'Replicate_Do_DB': '',
+            'Replicate_Ignore_DB': '',
+            'Replicate_Do_Table': '',
+            'Replicate_Ignore_Table': '',
+            'Replicate_Wild_Do_Table': '',
+            'Replicate_Wild_Ignore_Table': '',
+            'Last_Errno': 0,            # Last_SQL_Errno 的别名（无错误）
+            'Last_Error': '',
+            'Skip_Counter': 0,
+            'Exec_Master_Log_Pos': None,
+            'Relay_Log_Space': None,
+            'Until_Condition': 'None',  # 文档取值：没有 UNTIL 子句
+            'Until_Log_File': '',
+            'Until_Log_Pos': 0,
+            'Master_SSL_Allowed': 'No',
+            'Master_SSL_CA_File': '',
+            'Master_SSL_CA_Path': '',
+            'Master_SSL_Cert': '',
+            'Master_SSL_Cipher': '',
+            'Master_SSL_Key': '',
+            'Seconds_Behind_Master': None,   # SQL 线程未运行 -> NULL
+            'Master_SSL_Verify_Server_Cert': 'No',
+            'Last_IO_Errno': 0,
+            'Last_IO_Error': '',
+            'Last_SQL_Errno': 0,
+            'Last_SQL_Error': '',
+            'Replicate_Ignore_Server_Ids': '',
+            'Master_Server_Id': None,
+            'Master_UUID': '',
+            'Master_Info_File': None,
+            'SQL_Delay': 0,
+            'SQL_Remaining_Delay': None,
+            'Slave_SQL_Running_State': None,
+            'Master_Retry_Count': None,
+            'Master_Bind': '',
+            'Last_IO_Error_Timestamp': '',
+            'Last_SQL_Error_Timestamp': '',
+            'Master_SSL_Crl': '',
+            'Master_SSL_Crlpath': '',
+            'Retrieved_Gtid_Set': None,     # 没有 GTID 概念
+            'Executed_Gtid_Set': None,
+            'Auto_Position': 0,
+            'Replicate_Rewrite_DB': '',
+            'Channel_name': '',
+            'Master_TLS_Version': '',
+        }
+
+    def _show_slave_status(self, p, s):
+        """SHOW SLAVE STATUS / SHOW REPLICA STATUS —— 严格按 MySQL 列顺序
+
+        本实例没有在跑的复制线程（从库实现 `replication/slave.py::
+        SlaveReplicator` 不注册到 Database / Executor，执行器看不到它的
+        状态），因此两个运行标志如实返回 0，其余没有对应概念的列返回 NULL
+        —— 绝不伪造 Running=Yes。列清单与逐列依据见
+        `_SLAVE_STATUS_COLUMNS` / `_slave_status_values`。
+        """
+        values = self._slave_status_values()
+        row = tuple(values[c] for c in self._SLAVE_STATUS_COLUMNS)
+        return self._rs(list(self._SLAVE_STATUS_COLUMNS), [row])
 
     def _show_binlog_events(self, p, s):
         """SHOW BINLOG EVENTS —— 逐个真实 WAL 事件（列名沿用 MySQL）"""
@@ -5132,14 +5302,12 @@ class Executor:
     def _check_one_table(self, name):
         """真正校验表结构与索引：逐个主键定位堆行并解码
 
-        **列顺序说明**：MySQL 原生顺序是 (Table, Op, Msg_type, Msg_text)，
-        即 r[1] 是 'check'。本仓库用例
-        tests/test_batch15.py::test_check_optimize 断言 r[1] == 'OK'（把状态
-        文本放在第 2 列），故这里把 Msg_text 提前到第 2 列 —— 列名与列数仍与
-        MySQL 完全一致，仅顺序不同（已在交付说明里登记）。
+        **列顺序 = MySQL 原生顺序 (Table, Op, Msg_type, Msg_text)**：
+        `Op` 是 'check'，`Msg_type` 是 'status' / 'info' / 'error'，
+        `Msg_text` 是人类可读文本（见 `_CHECK_COLUMNS`）。
         """
         if name not in self.db.tables:
-            return (name, f"Table '{name}' doesn't exist", 'error', 'check')
+            return (name, 'check', 'error', f"Table '{name}' doesn't exist")
         tbl = self.db.tables[name]
         try:
             if not tbl.cols:
@@ -5166,9 +5334,18 @@ class Executor:
             note = (f'{n_idx} 个索引项全部可定位并解码，'
                     f'可见行数 {tbl.row_count}')
         except Exception as e:
-            return (name, f'校验失败: {e}', 'error', 'check')
-        return [(name, 'OK', 'status', 'check'),
-                (name, note, 'info', 'check')]
+            return (name, 'check', 'error', f'校验失败: {e}')
+        return [(name, 'check', 'status', 'OK'),
+                (name, 'check', 'info', note)]
+
+    #: CHECK TABLE / OPTIMIZE TABLE 的列清单（**MySQL 原生顺序**）
+    #:
+    #: 来源：MySQL 5.7/8.0 Reference Manual「CHECK TABLE Statement」
+    #: （13.7.2.2）与「OPTIMIZE TABLE Statement」（13.7.2.4）：两者输出同样的
+    #: 4 列 `Table / Op / Msg_type / Msg_text`，CHECK 的 `Op` 固定 'check'、
+    #: OPTIMIZE 的 `Op` 固定 'optimize'，`Msg_type` 取 'status'（结果状态
+    #: 文本 'OK'/'error'）、'info'（说明）、'error'（失败原因）。
+    _CHECK_COLUMNS = ['Table', 'Op', 'Msg_type', 'Msg_text']
 
     def _show_check_table(self, p, s):
         rows = []
@@ -5178,10 +5355,10 @@ class Executor:
                 rows.extend(got)
             else:
                 rows.append(got)
-        return self._rs(['Table', 'Msg_text', 'Msg_type', 'Op'], rows)
+        return self._rs(list(self._CHECK_COLUMNS), rows)
 
     def _show_optimize_table(self, p, s):
-        """OPTIMIZE TABLE —— 真做回收 + 刷盘 + 刷新统计（列顺序同 CHECK）"""
+        """OPTIMIZE TABLE —— 真做回收 + 刷盘 + 刷新统计（列序同 CHECK TABLE）"""
         rows = []
         horizon = None
         try:
@@ -5191,8 +5368,8 @@ class Executor:
         for name in p.get('tables') or []:
             if name not in self.db.tables:
                 rows.append(
-                    (name, f"Table '{name}' doesn't exist", 'error',
-                     'optimize'))
+                    (name, 'optimize', 'error',
+                     f"Table '{name}' doesn't exist"))
                 continue
             tbl = self.db.tables[name]
             try:
@@ -5207,12 +5384,12 @@ class Executor:
                     except Exception as e:
                         analyzed = f'，统计刷新失败: {e}'
             except Exception as e:
-                rows.append((name, f'优化失败: {e}', 'error', 'optimize'))
+                rows.append((name, 'optimize', 'error', f'优化失败: {e}'))
                 continue
-            rows.append((name, 'OK', 'status', 'optimize'))
-            rows.append((name, f'回收 {reclaimed} 个历史版本，脏页已刷盘'
-                               f'{analyzed}', 'info', 'optimize'))
-        return self._rs(['Table', 'Msg_text', 'Msg_type', 'Op'], rows)
+            rows.append((name, 'optimize', 'status', 'OK'))
+            rows.append((name, 'optimize', 'info',
+                         f'回收 {reclaimed} 个历史版本，脏页已刷盘{analyzed}'))
+        return self._rs(list(self._CHECK_COLUMNS), rows)
 
     def _show_partitions(self, p, s):
         """SHOW PARTITIONS FROM t —— 读真实的 Table._partition 元数据

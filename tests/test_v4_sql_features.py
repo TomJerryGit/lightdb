@@ -3312,7 +3312,14 @@ def test_show_master_status_reports_real_wal_position():
 
         r = _exec(e, 'SHOW SLAVE STATUS')
         assert r['type'] == 'resultset'
-        assert r['rows'][0][0] == 0 and r['rows'][0][1] == 0   # 无复制线程
+        # MySQL 原生列序：第 1 列 Slave_IO_State，运行标志在第 11/12 列
+        assert r['columns'][:12] == [
+            'Slave_IO_State', 'Master_Host', 'Master_User', 'Master_Port',
+            'Connect_Retry', 'Master_Log_File', 'Read_Master_Log_Pos',
+            'Relay_Log_File', 'Relay_Log_Pos', 'Relay_Master_Log_File',
+            'Slave_IO_Running', 'Slave_SQL_Running'], r['columns']
+        assert r['rows'][0][10] == 0 and r['rows'][0][11] == 0   # 无复制线程
+        assert r['rows'][0][0] is None       # 没有 IO 线程状态文本
         assert 'Seconds_Behind_Master' in r['columns']
 
 
@@ -3341,22 +3348,24 @@ def test_check_and_optimize_table_verify_real_storage():
     with _Env() as e:
         r = _exec(e, 'CHECK TABLE emp')
         assert r['type'] == 'resultset', r
-        assert r['columns'] == ['Table', 'Msg_text', 'Msg_type', 'Op']
-        assert r['rows'][0][1] == 'OK', r['rows']
-        assert r['rows'][0][3] == 'check'
+        # MySQL 原生列序 (Table, Op, Msg_type, Msg_text)
+        assert r['columns'] == ['Table', 'Op', 'Msg_type', 'Msg_text']
+        assert r['rows'][0] == ('emp', 'check', 'status', 'OK'), r['rows']
         # 第二行是真实校验统计（索引项数来自真的走了一遍索引）
-        assert '8' in r['rows'][1][1], r['rows']
+        assert r['rows'][1][1] == 'check' and r['rows'][1][2] == 'info'
+        assert '8' in r['rows'][1][3], r['rows']
 
         r = _exec(e, 'CHECK TABLE no_such_table')
-        assert r['rows'][0][2] == 'error'
-        assert 'exist' in r['rows'][0][1]
+        assert r['rows'][0][1] == 'check' and r['rows'][0][2] == 'error'
+        assert 'exist' in r['rows'][0][3]
 
         r = _exec(e, 'OPTIMIZE TABLE emp')
-        assert r['rows'][0][1] == 'OK' and r['rows'][0][3] == 'optimize'
+        assert r['rows'][0] == ('emp', 'optimize', 'status', 'OK'), r['rows']
+        assert r['rows'][1][1] == 'optimize' and r['rows'][1][2] == 'info'
         _, rows = e.q('SELECT COUNT(*) FROM emp')
         assert rows[0][0] == 8            # 优化后数据仍在
         r = _exec(e, 'OPTIMIZE TABLE no_such_table')
-        assert r['rows'][0][2] == 'error'
+        assert r['rows'][0][1] == 'optimize' and r['rows'][0][2] == 'error'
 
 
 def test_show_engine_innodb_status_reports_real_stats():
@@ -3449,6 +3458,143 @@ def test_json_path_operator_extract_null_and_errors():
             except SyntaxError:
                 continue
             raise AssertionError(f'应当显式报语法错误: {bad}')
+
+
+# ==========================================================================
+# MySQL 原生列序 / 列名加锁（追加于 2026-10：本引擎曾为迁就既有断言而刻意
+# 偏离 MySQL —— ①SHOW SLAVE STATUS 把运行标志挪到第 1、2 列；②CHECK TABLE
+# 写成 (Table, Msg_text, Msg_type, Op)；③`data->'$.k'` 显示改写后的
+# JSON_EXTRACT(...)。三处已按 MySQL 语义恢复，这里把真实列序/列名锁死，
+# 避免将来又被改回去。
+# ==========================================================================
+
+#: MySQL 5.7 Reference Manual 13.7.5.34「SHOW SLAVE STATUS Statement」`\G`
+#: 输出的完整列清单（57 列）。MySQL 8.0 只在其后追加 Master_public_key_path /
+#: Get_master_public_key / Network_Namespace，前 57 列名称与顺序完全相同。
+SHOW_SLAVE_STATUS_COLUMNS = [
+    'Slave_IO_State', 'Master_Host', 'Master_User', 'Master_Port',
+    'Connect_Retry', 'Master_Log_File', 'Read_Master_Log_Pos',
+    'Relay_Log_File', 'Relay_Log_Pos', 'Relay_Master_Log_File',
+    'Slave_IO_Running', 'Slave_SQL_Running',
+    'Replicate_Do_DB', 'Replicate_Ignore_DB',
+    'Replicate_Do_Table', 'Replicate_Ignore_Table',
+    'Replicate_Wild_Do_Table', 'Replicate_Wild_Ignore_Table',
+    'Last_Errno', 'Last_Error', 'Skip_Counter', 'Exec_Master_Log_Pos',
+    'Relay_Log_Space', 'Until_Condition', 'Until_Log_File', 'Until_Log_Pos',
+    'Master_SSL_Allowed', 'Master_SSL_CA_File', 'Master_SSL_CA_Path',
+    'Master_SSL_Cert', 'Master_SSL_Cipher', 'Master_SSL_Key',
+    'Seconds_Behind_Master', 'Master_SSL_Verify_Server_Cert',
+    'Last_IO_Errno', 'Last_IO_Error', 'Last_SQL_Errno', 'Last_SQL_Error',
+    'Replicate_Ignore_Server_Ids', 'Master_Server_Id', 'Master_UUID',
+    'Master_Info_File', 'SQL_Delay', 'SQL_Remaining_Delay',
+    'Slave_SQL_Running_State', 'Master_Retry_Count', 'Master_Bind',
+    'Last_IO_Error_Timestamp', 'Last_SQL_Error_Timestamp',
+    'Master_SSL_Crl', 'Master_SSL_Crlpath', 'Retrieved_Gtid_Set',
+    'Executed_Gtid_Set', 'Auto_Position', 'Replicate_Rewrite_DB',
+    'Channel_name', 'Master_TLS_Version',
+]
+
+
+def test_show_slave_status_uses_mysql_native_column_order():
+    """SHOW SLAVE STATUS 必须按 MySQL 原生列序输出（锁定，不许挪列）"""
+    with _Env() as e:
+        r = _exec(e, 'SHOW SLAVE STATUS')
+        assert r['type'] == 'resultset', r
+        assert r['columns'] == SHOW_SLAVE_STATUS_COLUMNS, r['columns']
+        assert len(r['rows']) == 1
+        row = r['rows'][0]
+        vals = dict(zip(r['columns'], row))
+        # 两个运行标志是真值 0（不是放在第 1、2 列的「借位」），且必须在
+        # MySQL 的位置上
+        assert r['columns'][10] == 'Slave_IO_Running' and row[10] == 0
+        assert r['columns'][11] == 'Slave_SQL_Running' and row[11] == 0
+        # 第 1 列是状态文本；本引擎没有 IO 线程 -> NULL（MySQL 同）
+        assert r['columns'][0] == 'Slave_IO_State' and row[0] is None
+        # 没有对应概念的列一律 NULL，绝不编造
+        for col in ('Master_Host', 'Master_Port', 'Connect_Retry',
+                    'Master_Log_File', 'Read_Master_Log_Pos',
+                    'Relay_Log_File', 'Relay_Log_Pos',
+                    'Relay_Master_Log_File', 'Exec_Master_Log_Pos',
+                    'Seconds_Behind_Master', 'Master_Server_Id',
+                    'Master_Info_File', 'Master_Retry_Count',
+                    'SQL_Remaining_Delay', 'Slave_SQL_Running_State',
+                    'Retrieved_Gtid_Set', 'Executed_Gtid_Set'):
+            assert vals[col] is None, (col, vals[col])
+        # 「错误号 0 + 空串 = 没有错误」（文档语义）
+        assert vals['Last_Errno'] == 0 and vals['Last_Error'] == ''
+        assert vals['Last_IO_Errno'] == 0 and vals['Last_IO_Error'] == ''
+        assert vals['Last_SQL_Errno'] == 0 and vals['Last_SQL_Error'] == ''
+        assert vals['Until_Condition'] == 'None'
+        assert vals['Auto_Position'] == 0
+
+        # SHOW REPLICA STATUS 是同一份结果（MySQL 8.0 同列名同顺序）
+        r2 = _exec(e, 'SHOW REPLICA STATUS')
+        assert r2['columns'] == SHOW_SLAVE_STATUS_COLUMNS
+        assert r2['rows'] == r['rows']
+
+
+def test_check_optimize_table_use_mysql_native_columns():
+    """CHECK/OPTIMIZE TABLE 必须是 (Table, Op, Msg_type, Msg_text)"""
+    with _Env() as e:
+        r = _exec(e, 'CHECK TABLE emp')
+        assert r['columns'] == ['Table', 'Op', 'Msg_type', 'Msg_text']
+        assert r['rows'][0] == ('emp', 'check', 'status', 'OK'), r['rows']
+        assert r['rows'][1][1] == 'check' and r['rows'][1][2] == 'info'
+        assert r['rows'][1][3] and r['rows'][1][3] != 'OK'   # 人可读统计文本
+
+        r = _exec(e, 'CHECK TABLE no_such_table')
+        assert r['columns'] == ['Table', 'Op', 'Msg_type', 'Msg_text']
+        assert r['rows'][0] == ('no_such_table', 'check', 'error',
+                                "Table 'no_such_table' doesn't exist")
+
+        r = _exec(e, 'OPTIMIZE TABLE emp')
+        assert r['columns'] == ['Table', 'Op', 'Msg_type', 'Msg_text']
+        assert r['rows'][0] == ('emp', 'optimize', 'status', 'OK'), r['rows']
+        assert r['rows'][1][1] == 'optimize' and r['rows'][1][2] == 'info'
+
+        r = _exec(e, 'OPTIMIZE TABLE no_such_table')
+        assert r['rows'][0][1] == 'optimize' and r['rows'][0][2] == 'error'
+        assert r['rows'][0][3] == "Table 'no_such_table' doesn't exist"
+
+
+def test_json_arrow_projection_column_name_is_source_text():
+    """`data->'$.k'` / `->>` 无别名投影的输出列名 = 用户写的**原文**"""
+    with _Env() as e:
+        assert _exec(e, 'CREATE TABLE docs (id INT PRIMARY KEY, data JSON)')[
+            'type'] == 'ok'
+        _exec(e, """INSERT INTO docs VALUES (1, '{"k": "v"}')""")
+
+        cols, rows = e.q("SELECT id, data->'$.k' FROM docs")
+        assert cols == ['id', "data->'$.k'"], cols
+        assert rows == [(1, 'v')], rows
+
+        cols, _ = e.q("SELECT data->>'$.k' FROM docs")
+        assert cols == ["data->>'$.k'"], cols
+
+        # 别名优先（MySQL 同）：列名是别名，不是原文
+        cols, _ = e.q("SELECT data->'$.k' AS k FROM docs")
+        assert cols == ['k'], cols
+
+        # 手写 JSON_EXTRACT(...) 的列名保持手写形态（不被反改成 -> ）
+        cols, _ = e.q("SELECT JSON_EXTRACT(data, '$.k') FROM docs")
+        assert cols == ["JSON_EXTRACT(data, '$.k')"], cols
+
+        # 两项同形时逐项定位：第一项显示原文、第二项保持手写形态
+        # （不能靠「改写结果 -> 原文」的文本字典命中两项）
+        cols, vals = e.q(
+            "SELECT data->'$.k', JSON_EXTRACT(data, '$.k') FROM docs")
+        assert cols == ["data->'$.k'", "JSON_EXTRACT(data, '$.k')"], cols
+        assert vals == [('v', 'v')], vals
+
+        # ORDER BY 仍按表达式求值（列名改了不影响排序语义）
+        _exec(e, """INSERT INTO docs VALUES (2, '{"k": "a"}')""")
+        cols, rows = e.q("SELECT id, data->'$.k' FROM docs "
+                         "ORDER BY data->'$.k'")
+        assert cols == ['id', "data->'$.k'"]
+        assert rows == [(2, 'a'), (1, 'v')], rows
+        _, rows = e.q("SELECT id, data->'$.k' FROM docs "
+                      "ORDER BY data->'$.k' DESC")
+        assert rows == [(1, 'v'), (2, 'a')], rows
 
 
 
