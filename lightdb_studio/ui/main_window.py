@@ -105,8 +105,12 @@ class MainWindow(QMainWindow):
         # 兜底：如果调用方没走 `lightdb_studio.app`（测试/嵌入方直接建窗口），
         # 字体目录变量还没设，Qt 会报 "Cannot find font directory"。
         # 在 QApplication 已存在时设置无效但无害；正常入口在 app.py 里已经设过。
+        # 注意：必须从**中立模块** `core.fonts` 导入。此前这里写的是
+        # `from ..app import ensure_font_dir`，会把入口模块 app.py 当普通模块
+        # **第二次执行**（模块级代码与启动计时标记重跑一遍），并且构成
+        # `app -> main_window -> app` 循环导入。
         try:
-            from ..app import ensure_font_dir
+            from ..core.fonts import ensure_font_dir
             ensure_font_dir()
         except Exception as e:                        # noqa: BLE001
             print('字体目录设置失败（不影响功能）: %s' % e, file=sys.stderr)
