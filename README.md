@@ -19,6 +19,49 @@
 - **桌面端在 Python ≤ 3.11 无法启动**：`lightdb_studio/core/reports.py:172` 的 f-string 含反斜杠，属于 Python 3.12 才允许的语法。
 - **Web 版可运行**（17 个 API 端点，JWT 校验有效），但存在硬编码签名密钥与默认口令等问题，详见审计报告。
 - **文档中的性能数字未经仓库自身工具验证**：仓库内没有任何基准产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录不存在；`tests/regression_v4/test_performance_v4.py:13-18` 中的 12000 / 80000 QPS 目标**从未被任何测试断言**。这些数字应视为设计目标，而非实测结果。
+
+### ⚠️ 性能声明状态说明（2026-10 阶段 0 收尾，**必读**）
+
+> 本节覆盖 `README` / `docs/**` 里全部 OLAP / 列存 / 并行 / Cython 性能数字，
+> 逐条给出**当前真实状态**。原始文档**不删除**，其段落内保留原文以便对照。
+
+- **未接入 SQL 执行路径**：`lightdb/olap/**`（向量化引擎）、`lightdb/columnar/**`
+  （列存 `ColumnStore`）、`lightdb/parallel/**`（并行执行）在 `Executor` /
+  `plan_executor` 里**零引用**；`lightdb/cython/*.pyx` 的编译产物
+  （`.pyd` / `.so` / `.c`）在仓库里**0 个**（`predicate_v4.py` 只是引入了
+  回退包装，`status()['any_accelerated']` 为 `False`）。因此阶段 0 已修好的
+  向量化聚合/过滤错值**仍未接线**——错值目前不会在生产查询路径上出现，
+  但这只是"没接线"，不是"已修复"。
+- **以下数字是设计目标，不是实测**：`12,000 QPS`（单线程点查）、
+  `92,000 QPS`（8 核）、`3.5M rows/s`（OLAP 扫描）、`85M rows/s`（大表聚合）、
+  `41x`（列存加速比）、`12.5x`（Cython B+Tree）、`3.15x`（向量化过滤）——
+  它们只出现在设计文档与 `PERF_TARGETS` 常量里，**没有任何仓库内产物或
+  断言支撑**。
+- **可复现的实测数字**（来源 [docs/review/01_engine.md](docs/review/01_engine.md)，
+  与 [docs/review/04_ROADMAP.md](docs/review/04_ROADMAP.md) 一致）：
+
+  | 项 | 实测 | 与文档声明的关系 |
+  |---|---|---|
+  | 逐行 INSERT | **1,501 rows/s** | 写路径由逐语句固定开销主导 |
+  | 批量 INSERT（500 行/语句） | **1,356 rows/s** | **批量反而更慢**（WAL + 审计逐语句 `flush()`） |
+  | 点查 | **888 q/s**（进程内 1.13 ms）/ **1,138 q/s**（TCP） | 白皮书 12,000 QPS → **差 13.5 倍** |
+  | 范围扫描 / 聚合 | **4.8k / 11k rows/s** | 纯 Python 逐行量级 |
+  | 并发点查 1→4→8 客户端 | 1,163 → 925 → **749 q/s（−36%）** | 并发不扩展而是**回退** |
+  | WAL 运行期增长 | **≈200 B/行**，无 checkpoint/轮转 | 长跑实例磁盘无界增长 |
+  | 10 轮 × 2000 行 UPDATE 后 `.dat` | **669 KB → 16 MB**（≈800 B/更新） | `vacuum()` 只释放槽位、不紧凑 |
+
+- **仍未验证**：Cython **从未编译验证**（本机无 Cython、无 C 编译器）；
+  并行执行只覆盖单表裸 `COUNT` 且实测 **0.49x 负加速**；列存/OLAP 的
+  `GROUP BY` 返回 0 行、向量化 `SUM` 曾因 `int32` 溢出返回错值。
+- **历史文档状态**：[docs/V4_DECISION.md](docs/V4_DECISION.md) 已被**有意截断**
+  （44 行，含"原文档在此处截断，后续章节缺失"）以移除不可核实的数据；
+  本 README **不补写**其中缺失的历史内容，只在此处如实标注该文件不完整。
+  同类的"数据可信度声明"已在 [docs/ARCHITECTURE_v4.md](docs/ARCHITECTURE_v4.md)、
+  [docs/PERFORMANCE_WHITEPAPER_v3.md](docs/PERFORMANCE_WHITEPAPER_v3.md)、
+  [docs/PERFORMANCE_WHITEPAPER_v4.md](docs/PERFORMANCE_WHITEPAPER_v4.md)、
+  [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
+  顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
+
 - 一次完整测试运行的结果为 **268 个测试中 118 失败 / 150 通过**。
 
 ### ✅ 本次会话已修复（2026-10，含实测验证）

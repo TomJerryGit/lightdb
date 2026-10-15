@@ -198,3 +198,26 @@ python -m pytest <6 个关键 id> -q --tb=line -p no:cacheprovider        → 6 
 - **不能信的**：向量化聚合（错值）、批处理过滤（不生效）、CHECK 约束（无效）、权限/GRANT（未实现）、分区（假成功）、列存 GROUP BY（0 行）。这些**静默给出错误结果**，优先级高于任何性能优化。
 - **最制约的三件事**：① 无 checkpoint/WAL 轮转 + 审计逐语句 flush（文件与延迟双增长）；② 单线程执行 + 线程池 GIL（并发回退 36%）；③ OLAP/列存/Cython 三层均未接入 SQL 执行路径（性能宣称无落点）。
 - 与文档的偏差需按 `docs/PERFORMANCE_WHITEPAPER_v4.md` 卷首的「数据可信度声明」处理：该文档数字为**设计目标**，本次实测未复现任何一项。
+
+---
+
+## 6. 阶段 0 收尾后的更新（2026-10 追加，上文保持评估时原貌）
+
+- **性能数字的落点不变**：`lightdb/olap/**`、`lightdb/columnar/**`、
+  `lightdb/parallel/**` 在 `Executor` / `plan_executor` 里仍是**零引用**，
+  `lightdb/cython/*.pyx` 的编译产物仍是 **0 个**。因此 §2.3 第 3 条
+  （"OLAP / 列存 / Cython 三层全部未接入 SQL 执行路径"）与本文引用的
+  白皮书数字（3.5M / 85M rows/s、41x、12.5x）**继续有效**，仍是设计目标。
+  本文 §2.2 的实测数字是当前**唯一**可复现的性能基线：逐行 INSERT
+  **1,501 rows/s**、批量 INSERT **1,356 rows/s**（批量反而更慢）、点查
+  **888 q/s** 进程内（1.13 ms）/ **1,138 q/s** TCP（0.88 ms）、并发 1→4→8
+  客户端 1,163→925→**749 q/s（−36%）**、WAL **≈200 B/行**、
+  10 轮 × 2000 行 UPDATE 后 `.dat` **669 KB→16 MB**（≈800 B/更新）。
+- **已修复（阶段 0）**：向量化聚合 `int32` 溢出错值、`VectorizedFilter`
+  批间条件失效、`CHECK` 约束完全不生效、联邦策略 id 撞号。其中 CHECK
+  额外补齐了**备份/恢复路径**：`TableSchema.canonical_ddl`（`SHOW CREATE
+  TABLE` 与逻辑 dump 共用的唯一 DDL 实现）现在导出列级内联 CHECK 与表级
+  `CONSTRAINT <name> CHECK (...)`，dump 里新增 `-- lightdb:check` /
+  `-- lightdb:checks` 哨兵，恢复端读回逐条对账（缺失 → `RestoreError`）。
+  **向量化聚合/过滤的两个错值仍处于"未接线"状态** —— 修的是算法，
+  没有接线，所以既不会在生产路径出错，也**没有**任何性能收益。

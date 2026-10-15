@@ -2,6 +2,31 @@
 
 # LightDB v4.0 性能白皮书
 
+> ⚠️ **状态说明（2026-10 阶段 0 收尾补充，正文一字未删）**：
+>
+> - **未接入 SQL 执行路径**：`lightdb/olap/**`（向量化）、`lightdb/columnar/**`
+>   （列存 `ColumnStore`）、`lightdb/parallel/**`（并行）在 `Executor` /
+>   `plan_executor` 里**零引用** → 本文的 **3.5M rows/s（OLAP 扫描）、
+>   85M rows/s（大表聚合）、41x（列存）** 在查询路径上**没有落点**。
+> - **未编译验证**：`lightdb/cython/*.pyx` 的编译产物（`.pyd`/`.so`/`.c`）为
+>   **0 个**，`status()['any_accelerated'] == False`，本机无 Cython 与 C 编译器
+>   → **12.5x（B+Tree）、3-4x（行编解码）、3.15x（向量化过滤）** 属设计目标；
+>   `row_format_v4`/`predicate_v4` 原先谎报"使用 Cython"，已改为读
+>   `any_accelerated`。
+> - **未验证 / 曾返回错值**：列存 `GROUP BY` 返回 0 行；向量化 `SUM` 曾因
+>   `np.array` 默认 `int32` 溢出返回错值（阶段 0 修好算法，**仍未接线**）；
+>   并行只覆盖单表裸 `COUNT`，实测 **0.49x 负加速**。
+> - **可复现的实测数字**（[review/01_engine.md](review/01_engine.md)，与
+>   [review/04_ROADMAP.md](review/04_ROADMAP.md) 一致）：逐行 INSERT
+>   **1,501 rows/s**、批量 INSERT **1,356 rows/s**（批量反而更慢）、点查
+>   **888 q/s** 进程内（1.13 ms）/ **1,138 q/s** TCP、范围扫描/聚合
+>   **4.8k / 11k rows/s**、并发 1→4→8 客户端 1,163→925→**749 q/s（−36%）**、
+>   WAL **≈200 B/行**（无 checkpoint/轮转）、10 轮 × 2000 行 UPDATE 后 `.dat`
+>   **669 KB→16 MB**（≈800 B/更新）。
+> - **结论**：白皮书的 **12,000 QPS** 与实测 **888 q/s**（进程内点查）相差
+>   **13.5 倍**；正文所有数字请读作**设计目标或估计值**，不是本机实测。
+>   本文档保持原貌以便对照，本文件**不补写**任何未经验证的历史内容。
+
 > ⚠️ **数据可信度声明（2026-10 审计）**：本文档中的 QPS、加速比、压缩比、rows/s 等数字**并非由本仓库内的工具产出** —— `lightdb/benchmark/` 下没有任何基准运行产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录也不存在（`~/.lightdb_studio/` 下只有空的 `reports/`、`soak/`）。其中 12000 QPS / 80000 QPS 目标只出现在 `tests/regression_v4/test_performance_v4.py:13-18` 的 `PERF_TARGETS` 字典里，**从未被任何测试断言**。因此本文数字应视为**设计目标或估计值**，而非实测结果。正文表格保持原貌以便对照，完整审计结论见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。
 
 **版本**：4.0.0

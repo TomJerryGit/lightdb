@@ -20,10 +20,15 @@ dump/restore"（原实现正是这样：备份端不带 `DROP TABLE IF EXISTS`�
     DROP TABLE IF EXISTS users;
     CREATE TABLE users (
       id INT NOT NULL PRIMARY KEY,
-      name VARCHAR NULL
+      name VARCHAR NULL,
+      age INT NULL CHECK (age >= 0),
+      CONSTRAINT users_chk_2 CHECK (name <> '')
     );
     -- lightdb:rows users 10
-    INSERT INTO users VALUES (1, 'u0');
+    -- lightdb:check users name=users_chk_1 expr=age >= 0
+    -- lightdb:check users name=users_chk_2 expr=name <> ''
+    -- lightdb:checks users 2
+    INSERT INTO users VALUES (1, 'u0', 20);
     ...
     -- table: orders rows=0
     DROP TABLE IF EXISTS orders;
@@ -32,19 +37,55 @@ dump/restore"（原实现正是这样：备份端不带 `DROP TABLE IF EXISTS`�
       amount DECIMAL NULL
     );
     -- lightdb:rows orders 0
+    -- lightdb:checks orders 0
 
 标识符**不加反引号**（列名/表名限制在 `[A-Za-z_]\\w*`）；`DROP TABLE IF
 EXISTS` + 裸 `CREATE TABLE` 是 mysqldump 默认组合，DROP 提供"重复恢复到
 同一库"的幂等性。行数哨兵 `-- lightdb:rows <表> <行数>` 由备份端真实扫描
 得出，是恢复端"读回校验"的期望值来源（`--no-data` 也写 0 行）。
 
+**CHECK 约束**同样有哨兵（`-- lightdb:check` / `-- lightdb:checks`），与
+`-- lightdb:rows` 是同一个设计：备份端把**真实读出来的**约束清单写成注释，
+恢复端拿去和"dump 里 CREATE TABLE 解析出来的约束"对账。为什么要两处都写：
+`CREATE TABLE` 是给人看、能被手工编辑的文本，而"手改 dump 删掉一条 CHECK"
+是**必须能被发现**的静默失效（恢复端只看 CREATE TABLE 的话，"dump 少了
+约束"和"原本就没有约束"完全无法区分）。`-- lightdb:checks <表> <条数>`
+是截断/篡改的第二道哨兵（条数与逐条声明不符 → 报错）。
+
+    格式：`-- lightdb:check <表> name=<名字> expr=<表达式原文>`
+    解析：`name=` 到 ` expr=` 之间是名字；` expr=` 之后到行尾是表达式
+    （表达式里的空格原样保留，末尾空白忽略）；一行一条、顺序即引擎里的
+    顺序（列级在前、表级在后）。
+
 已知限制（有意保留，不在本格式里承诺）：
 1. **只保存主键索引**。本引擎的 BTree 就是主键索引，`SHOW COLUMNS` 的
    `Key=PRI/UNI` 之外的二级索引没有持久化表达；多列主键（KEY 行）直接
    报错而不是猜。
-2. **`DEFAULT` / `AUTO_INCREMENT` / 生成列 / CHECK 约束不导出**：本引擎
-   的行布局里没有这些元数据（`Table.cols` 只有 name/type/primary/unique/
-   notnull/generated/check），导出会造出恢复端不认识的语法。
+2. **`DEFAULT` / `AUTO_INCREMENT` / 生成列不导出**：本引擎的行布局里没有
+   这些元数据（`Table.cols` 只有 name/type/primary/unique/notnull/
+   generated/check），导出会造出恢复端不认识的语法。
+2b. **CHECK 约束导出**（2026-10 修复，原先登记为"不导出"）：列级 CHECK
+   内联在列定义里（`price INT NULL CHECK (price > 0)`），表级 CHECK 写成
+   `CONSTRAINT <名字> CHECK (<expr>)` 行。
+   **依据（已核对 MySQL 8.0 文档）**：MySQL 8.0.16+ 的 `CREATE TABLE`
+   确实接受**列内联**的列级约束（`c1 INT CHECK (c1 > 10)`、
+   `c2 INT CONSTRAINT c2_positive CHECK (c2 > 0)`），因此内联写法的
+   **语法合法**；而 MySQL 的 `SHOW CREATE TABLE` 会把列级与表级**统一**
+   渲染成末尾的 `CONSTRAINT ... CHECK` 行，逐条按"在语句里出现的顺序"
+   编号（`t1_chk_1`…）。本引擎选择**内联**列级，理由有二：① 列级约束
+   本来就存在 `cols[i]['check']` 里，内联让 dump 文本自证"这条约束属于
+   哪一列"，恢复端不必猜一个匿名约束该挂到哪一列；② 与 MySQL 渲染成
+   表级相比，内联在**语义上等价**（两条路径都进 `Table.check_constraints()`
+   并逐行求值），只在文本形态上不同。两种形态的**出现顺序都保持
+   "列级在前、表级在后"**，自动编号也用同一份 `checks.resolve_check_names`
+   （顺序编号 `表名_chk_n`），所以 dump 侧与恢复后引擎侧的约束名字逐字符
+   一致。
+   恢复端把两者都交给
+   `Database.create_table(checks=...)` / `cols[i]['check']` 重建，并**读回
+   校验**约束集合与表达式（不一致 → `RestoreError`，而不是"恢复成功但
+   约束没了"）。
+   `CHECK (...) NOT ENFORCED` 仍**显式拒绝**（见 `parser._parse_check`）：
+   本引擎的 CHECK 一律强制，不会因为要导出就放宽。
 3. **字符串转义只认 `''`**（MySQL 的 `NO_BACKSLASH_ESCAPES` 风格），
    见 `sql_literal`；`\\` 按字面保留，因此与"反斜杠转义"模式的客户端
    dump 混用时反斜杠串不保证等价（会显式报错而不是静默改数据）。
@@ -63,6 +104,8 @@ from ..logger import logger
 FORMAT_HEADER = '-- lightdb-logical-dump v1'
 ROWS_MARKER = '-- lightdb:rows '
 TABLE_MARKER = '-- table: '
+CHECK_MARKER = '-- lightdb:check '
+CHECKS_COUNT_MARKER = '-- lightdb:checks '
 
 # 表名/列名：本引擎的上限（不支持空格、点号、反引号本身）
 _IDENT_RE = re.compile(r'^[A-Za-z_]\w*$')
@@ -126,9 +169,18 @@ def sql_literal(v) -> str:
 
 @dataclass
 class TableSchema:
-    """一张表的结构（dump 里 CREATE TABLE 的规范化表达）"""
+    """一张表的结构（dump 里 CREATE TABLE 的规范化表达）
+
+    `columns` 里的每项可有 `check`（列级 CHECK：`{'name','expr'}`）；
+    `table_checks` 是表级 CHECK（`CONSTRAINT <name> CHECK (<expr>)`）。
+
+    ⚠️ CHECK 是**约束**不是"列属性"：老版本这里既没有 `check` 也没有
+    `table_checks`，于是 `SHOW CREATE TABLE` / 逻辑 dump 都只写列定义，
+    "备份 → 恢复到新库"会把约束静默丢光（同会话一直在清的那类静默失效）。
+    """
     name: str
-    columns: list = field(default_factory=list)   # [{name,type,primary,unique,notnull}]
+    columns: list = field(default_factory=list)   # [{name,type,primary,unique,notnull,check}]
+    table_checks: list = field(default_factory=list)  # [{'name','expr'}]
 
     @property
     def col_names(self):
@@ -141,6 +193,24 @@ class TableSchema:
                 return c['name']
         return self.columns[0]['name'] if self.columns else None
 
+    def check_specs(self):
+        """全部 CHECK，列级在前、表级在后（与 `Table.check_constraints()` 同序）
+
+        ⚠️ 不能改顺序：恢复端拿它和引擎里的约束逐项比对，顺序不一致会
+        把"集合相同"误判成"约束不一致"。
+        """
+        out = []
+        for c in self.columns:
+            ck = c.get('check') or {}
+            if ck.get('expr'):
+                out.append({'name': ck.get('name') or '',
+                            'expr': str(ck['expr']).strip()})
+        for ck in self.table_checks:
+            if ck.get('expr'):
+                out.append({'name': ck.get('name') or '',
+                            'expr': str(ck['expr']).strip()})
+        return out
+
     def as_engine_cols(self):
         """转成 `Database.create_table` / `Table` 认识的 cols 结构"""
         return [
@@ -148,19 +218,39 @@ class TableSchema:
              'primary': bool(c.get('primary')),
              'unique': bool(c.get('unique')),
              'notnull': bool(c.get('notnull')),
-             'generated': None, 'check': None}
+             'generated': None,
+             # 列级 CHECK 必须原样带回 `cols`：它本来就随列定义持久化
+             # （`_meta.json` 的 cols），丢了就等于恢复后少一条约束。
+             'check': ({'name': c['check']['name'],
+                        'expr': c['check']['expr']}
+                       if (c.get('check') or {}).get('expr') else None)}
             for c in self.columns
         ]
 
     @classmethod
-    def from_engine_cols(cls, name, cols):
-        return cls(name=name, columns=[
-            {'name': c['name'], 'type': normalize_type(c['type']),
-             'primary': bool(c.get('primary')),
-             'unique': bool(c.get('unique')),
-             'notnull': bool(c.get('notnull'))}
-            for c in cols
-        ])
+    def from_engine_cols(cls, name, cols, checks=None):
+        columns = []
+        for c in cols:
+            ck = c.get('check') or {}
+            columns.append({
+                'name': c['name'], 'type': normalize_type(c['type']),
+                'primary': bool(c.get('primary')),
+                'unique': bool(c.get('unique')),
+                'notnull': bool(c.get('notnull')),
+                'check': ({'name': ck.get('name') or '',
+                           'expr': str(ck['expr']).strip()}
+                          if ck.get('expr') else None),
+            })
+        table_checks = []
+        for ck in (checks or []):
+            if isinstance(ck, dict) and ck.get('expr'):
+                table_checks.append({'name': ck.get('name') or '',
+                                     'expr': str(ck['expr']).strip()})
+        schema = cls(name=name, columns=columns, table_checks=table_checks)
+        # 用与 `Database.create_table` 完全相同的一份命名规则补全自动名：
+        # 否则"dump 里的匿名约束"与"恢复后引擎自动命名的约束"名字对不上，
+        # 恢复校验会把一次正确恢复误判成失败。
+        return _assign_check_names(schema)
 
     def canonical_ddl(self, if_not_exists: bool = False) -> str:
         """规范 DDL（默认**不带** `IF NOT EXISTS`，与 mysqldump 一致）
@@ -169,15 +259,48 @@ class TableSchema:
         还有个硬约束：`tests/test_batch8.py::test_logical_backup` 断言
         备份文本里含 `CREATE TABLE users`（不能改成 `CREATE TABLE IF
         NOT EXISTS users`）。
+
+        CHECK 的落位（`SHOW CREATE TABLE` 与逻辑 dump **共用这一份**）：
+
+        * 列级 → 内联在该列定义的末尾：`price INT NULL CHECK (price > 0)`。
+          MySQL 8.0.16+ 的 `CREATE TABLE` 接受列内联的列级约束
+          （`c1 INT CHECK (c1 > 10)`），语法合法；而 MySQL 的
+          `SHOW CREATE TABLE` 会把列级与表级**统一**渲染到末尾的
+          `CONSTRAINT ... CHECK` 行。本引擎选择内联，是因为列级约束本来
+          就存在 `cols[i]['check']` 里 —— 内联让 dump/DDL 文本自证"这条
+          约束属于哪一列"，恢复端不必猜匿名约束该挂到哪一列（语义与
+          MySQL 等价，只是文本形态不同）。
+        * 表级 → 显式 `CONSTRAINT <name> CHECK (<expr>)` 行（名字来自
+          `Database.create_table` 的规范化命名，与 dump 侧同一份规则）。
+        * 两者都保持"**列级在前、表级在后**"，与
+          `Table.check_constraints()` 的顺序一致，自动编号同规则。
+
+        没有任何 CHECK 时输出与旧版本**逐字节相同**（老 dump 的解析/恢复
+        行为不变）。
         """
         parts = []
         for c in self.columns:
-            parts.append(f"  {c['name']} {c['type']}"
-                         + (' NOT NULL' if c.get('notnull') else ' NULL')
-                         + (' PRIMARY KEY' if c.get('primary') else ''))
+            line = (f"  {c['name']} {c['type']}"
+                    + (' NOT NULL' if c.get('notnull') else ' NULL')
+                    + (' PRIMARY KEY' if c.get('primary') else ''))
+            ck = c.get('check') or {}
+            if ck.get('expr'):
+                line += f" CHECK ({ck['expr']})"
+            parts.append(line)
+        # 表级约束的自动名序号要**接在列级之后**（MySQL 的 `表名_chk_n`
+        # 按约束在语句里的出现顺序编号），否则 dump 里写出的名字与恢复后
+        # 引擎重新编号的名字会错位。
+        n = sum(1 for c in self.columns if (c.get('check') or {}).get('expr'))
+        for ck in self.table_checks:
+            if not ck.get('expr'):
+                continue
+            n += 1
+            cname = ck.get('name') or f"{self.name}_chk_{n}"
+            parts.append(f"  CONSTRAINT {cname} CHECK ({ck['expr']})")
         head = ('CREATE TABLE IF NOT EXISTS ' if if_not_exists
                 else 'CREATE TABLE ')
         return f"{head}{self.name} (\n" + ',\n'.join(parts) + "\n)"
+
 
     def assert_supported(self):
         if not _IDENT_RE.match(self.name):
@@ -192,12 +315,60 @@ class TableSchema:
                 raise BackupError(
                     f"表 {self.name} 的列 {c['name']} 类型 {c['type']!r} "
                     f"不在支持的集合 {sorted(_KNOWN_TYPES)} 内")
+        for spec in self.check_specs():
+            if not str(spec['expr'] or '').strip():
+                raise BackupError(
+                    f"表 {self.name} 有一条空表达式的 CHECK 约束，"
+                    f"无法导出（导出空约束等于恢复出一张没有约束的表）")
+            if not _check_ident_ok(spec['name']):
+                raise BackupError(
+                    f"表 {self.name} 的 CHECK 约束名 {spec['name']!r} 含"
+                    f"不支持的字符（只支持 [A-Za-z_]\\w*）")
         if not any(c.get('primary') for c in self.columns):
             raise BackupError(f"表 {self.name} 没有主键，无法按主键扫描备份")
 
 
 _KNOWN_TYPES = {'INT', 'BIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'BOOLEAN',
                 'VARCHAR', 'TEXT', 'DATETIME', 'DATE', 'JSON', 'BLOB'}
+
+
+def _check_ident_ok(name, table: str = '') -> bool:
+    """CHECK 约束名/列名是否能用本格式的裸标识符写出
+
+    约束名走的是**同一套**标识符规则（`[A-Za-z_]\\w*`，不加反引号）：
+    dump 文本里的 `CONSTRAINT a b CHECK ...` 在解析端会被当成"表名后多余
+    内容"，与其恢复时才发现，不如导出时就显式报错。
+    """
+    return bool(_IDENT_RE.match(str(name or '')))
+
+
+def _assign_check_names(schema: 'TableSchema') -> 'TableSchema':
+    """按 `checks.resolve_check_names` 的规则补全缺失的约束名
+
+    必须用**同一份实现**（`sql/checks.py`）命名，否则"dump 侧算出的名字"
+    与"恢复后引擎里实际的名字"会出现偏差，校验就会把一次正确恢复判成失败。
+    """
+    from .checks import resolve_check_names
+    # 传到 `resolve_check_names` 的是**副本**，它只改副本里的名字
+    cols = [{'name': c['name'],
+             'check': (dict(c['check']) if (c.get('check') or {}).get('expr')
+                       else None)}
+            for c in schema.columns]
+    table_checks = [dict(ck) for ck in schema.table_checks
+                    if isinstance(ck, dict) and ck.get('expr')]
+    resolved = resolve_check_names(schema.name, cols, table_checks)
+    for col, stub in zip(schema.columns, cols):
+        ck = stub.get('check') or {}
+        if ck.get('expr'):
+            col['check'] = {'name': ck.get('name') or '',
+                            'expr': str(ck['expr']).strip()}
+    # `resolve_check_names` 按输入顺序产出表级清单（已滤掉空项），
+    # 与上面过滤后的输入逐项对应；写回 **schema 自己的** dict（不是副本）。
+    for src, ck in zip(schema.table_checks, resolved):
+        src['name'] = ck.get('name') or ''
+        src['expr'] = str(ck.get('expr')).strip()
+    return schema
+
 
 # 类型别名/归一化，与 `Parser._normalize_type` 完全一致：
 # 备份文本里写 `VARCHAR(50)` 还是 `VARCHAR` 必须归一成同一个类型，
@@ -271,15 +442,40 @@ def parse_create_table(stmt: str) -> TableSchema:
         raise BackupError(f"CREATE TABLE 括号不匹配: {stmt[:80]!r}")
 
     columns = []
+    table_checks = []
     for part in _split_top_level(body):
         part = part.strip()
         if not part:
             continue
+        up = part.upper()
+
+        # 表级 CHECK 行：`[CONSTRAINT <名字>] CHECK (<expr>)`
+        #
+        # 老版本走到下面 `_DDL_COL_RE` 匹配失败的分支直接 `raise`（不会静默
+        # 丢），但结果是"带表级 CHECK 的 dump 根本恢复不了"。现在显式解析，
+        # 表达式交给 `parse_check_predicate` 语法自检 —— 解析不了必须报错，
+        # 绝不"跳过这条约束、假装恢复成功"。
+        ck_name = None
+        ck_body = part
+        if up.startswith('CONSTRAINT'):
+            cnm = re.match(r'CONSTRAINT\s+`?([A-Za-z_]\w*)`?\s+(.*)$',
+                           part, re.IGNORECASE | re.DOTALL)
+            if not cnm:
+                raise BackupError(
+                    f"表 {name} 的约束行 {part[:60]!r} 无法解析"
+                    f"（本格式只支持 CONSTRAINT <名字> CHECK (<expr>)）")
+            ck_name, ck_body = cnm.group(1), cnm.group(2).strip()
+        if ck_body.upper().startswith('CHECK'):
+            ck = _parse_check_clause(ck_body, table=f"{name}")
+            if ck_name:
+                ck['name'] = ck_name
+            table_checks.append(ck)
+            continue
+
         cm = _DDL_COL_RE.match(part)
         if not cm:
             # 表级约束行（`PRIMARY KEY (a, b)`）：多列主键本格式不支持，
             # 显式报错而不是忽略掉一个约束
-            up = part.upper()
             if up.startswith('PRIMARY KEY') and ',' in part:
                 raise BackupError(
                     f"表 {name} 使用多列主键，lightdb-logical-dump v1 不支持")
@@ -290,10 +486,28 @@ def parse_create_table(stmt: str) -> TableSchema:
             raise BackupError(f"表 {name} 里有无法解析的列定义: {part[:60]!r}")
 
         cname, ctype, tail = cm.group(1), normalize_type(cm.group(2)), cm.group(3)
+        # 列级 CHECK（内联在列定义末尾）：先摘出来，剩下的尾巴才按
+        # NOT NULL / PRIMARY KEY / UNIQUE 判定，否则 `CHECK` 会被当成
+        # "本格式不支持的属性"而拒收（正是"备份写不出、恢复读不回"的形态）。
+        col_check = None
+        cpos = _find_check_keyword(tail)
+        if cpos is not None:
+            col_check = _parse_check_clause(tail[cpos:], table=f"{name}.{cname}")
+            tail = tail[:cpos]
         tup = tail.upper()
         unknown = [t for t in re.findall(r'[A-Z_]+', tup)
                    if t not in ('NOT', 'NULL', 'PRIMARY', 'KEY', 'UNIQUE')]
         if unknown:
+            # 明确点出 MySQL 允许、但本引擎解析器不接受的形态：
+            # `列 类型 CONSTRAINT 名字 CHECK (expr)`（列内联命名约束）。
+            # 这里**显式拒绝**而不是跳过 —— 跳过就等于静默丢掉一条 CHECK。
+            if 'CONSTRAINT' in tup:
+                raise BackupError(
+                    f"表 {name} 的列 {cname} 使用了列内联的命名约束写法"
+                    f"{part[:60]!r}：本引擎的 `_column_def` 解析不了"
+                    f"（只接受未命名的列级 `... CHECK (expr)` 或表级 "
+                    f"`CONSTRAINT 名字 CHECK (expr)`）。请改写后再导出/恢复，"
+                    f"本格式不会跳过这条约束")
             raise BackupError(
                 f"表 {name} 的列 {cname} 带本格式不支持的属性 {unknown}")
         columns.append({
@@ -301,11 +515,78 @@ def parse_create_table(stmt: str) -> TableSchema:
             'primary': 'PRIMARY KEY' in tup,
             'unique': 'UNIQUE' in tup,
             'notnull': bool(re.search(r'\bNOT\s+NULL\b', tup)),
+            'check': col_check,
         })
 
-    schema = TableSchema(name=name, columns=columns)
+    schema = TableSchema(name=name, columns=columns,
+                         table_checks=table_checks)
+    # 匿名约束按与 `Database.create_table` 相同的规则补名，再自检支持面
+    _assign_check_names(schema)
     schema.assert_supported()
     return schema
+
+
+def _find_check_keyword(text: str):
+    """返回 `text` 里**不在引号内**的 `CHECK` 关键字起始下标；没有则 None
+
+    必须引号感知：`COMMENT 'CHECK (x)'` 之类的字符串里出现 CHECK 时不能
+    误当成约束起点（本格式不支持 COMMENT，但解析器必须先把边界找对，
+    否则报错信息会指到字符串里，误导排查）。
+    """
+    quoted_idx = {i for i, _c, q in _scan_quotes(text) if q}
+    for m in re.finditer(r'\bCHECK\b', text, re.IGNORECASE):
+        if m.start() not in quoted_idx:
+            return m.start()
+    return None
+
+
+def _parse_check_clause(text: str, table: str = '') -> dict:
+    """解析 `CHECK (<expr>) [ENFORCED]` → `{'expr': ...}`
+
+    与 SQL 解析器（`Parser._parse_check`）保持**同一套边界规则**：
+
+    * 括号不配对 / 表达式为空 / 多余尾巴 → 显式 `BackupError`（不静默丢）；
+    * `NOT ENFORCED` → 显式 `BackupError`。本引擎的 CHECK 一律强制，
+      不会因为"要能导出"就放宽成静默强制或静默忽略（与阶段 0 的决定一致）。
+    """
+    m = re.match(r'CHECK\s*\(', text, re.IGNORECASE)
+    if not m:
+        raise BackupError(f"CHECK 约束语法错误: {text[:80]!r}")
+    # `_extract_paren`：配对扫描，引号内括号不计
+    depth = 0
+    end = None
+    for i, ch, quoted in _scan_quotes(text):
+        if quoted or i < m.end() - 1:
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end is None:
+        raise BackupError(f"CHECK 约束括号不配对: {text[:80]!r}")
+    expr = text[m.end():end].strip()
+    tail = text[end + 1:].strip()
+    if tail:
+        tm = re.match(r'(NOT\s+)?ENFORCED\b', tail, re.IGNORECASE)
+        if tm:
+            if tm.group(1):
+                raise BackupError(
+                    "不支持 CHECK (...) NOT ENFORCED：本引擎的 CHECK 一律"
+                    "强制执行，不会按 NOT ENFORCED 放行（也不导出成这种"
+                    "形态）。")
+        else:
+            raise BackupError(
+                f"CHECK 约束后面有多余内容 {tail!r}: {text[:80]!r}")
+    if not expr:
+        raise BackupError(f"CHECK 约束的表达式为空: {text[:80]!r}")
+    # 语法自检：解析不了（含本引擎不支持的形态）→ 显式报错。
+    # 恢复端绝不能把"这条约束永远不会生效"的 dump 当成功。
+    from .checks import parse_check_predicate
+    parse_check_predicate(expr)
+    return {'name': '', 'expr': expr}
 
 
 def _scan_quotes(text: str):
@@ -475,14 +756,76 @@ def count_rows(tbl) -> int:
 
 
 def table_schemas(db) -> list:
-    """目标库全部表的 TableSchema（按表名排序，dump 结果稳定可比对）"""
+    """目标库全部表的 TableSchema（按表名排序，dump 结果稳定可比对）
+
+    CHECK 约束在这里被**真正读出来**：列级在 `cols[i]['check']`，表级在
+    `Table._checks`。老版本只读 name/type/primary/unique/notnull，于是
+    "备份 → 恢复"把约束静默丢光。
+    """
     out = []
     for name in sorted(db.tables):
-        out.append(TableSchema.from_engine_cols(name, db.tables[name].cols))
+        tbl = db.tables[name]
+        out.append(TableSchema.from_engine_cols(
+            name, tbl.cols, getattr(tbl, '_checks', None)))
     return out
 
 
+def check_ddl(db, name: str, if_not_exists: bool = False) -> str:
+    """`SHOW CREATE TABLE` 的**唯一**实现（与逻辑 dump 共用一份渲染）
+
+    引擎侧（`Executor._show_create_table`）与备份侧（`render_dump` →
+    `TableSchema.canonical_ddl`）都从这里出发，避免出两条会各自漂移的
+    DDL 生成路径。CHECK 的落位见 `TableSchema.canonical_ddl`。
+    """
+    if name not in db.tables:
+        raise BackupError(f"表 {name} 不存在")
+    tbl = db.tables[name]
+    schema = TableSchema.from_engine_cols(
+        name, tbl.cols, getattr(tbl, '_checks', None))
+    schema.assert_supported()
+    return schema.canonical_ddl(if_not_exists=if_not_exists)
+
+
 # ==================== 生成 dump ====================
+
+def check_attestation_line(table: str, spec: dict) -> str:
+    """一条 CHECK 的哨兵行（`-- lightdb:check <表> name=.. expr=..`）"""
+    name = str(spec.get('name') or '')
+    expr = str(spec.get('expr') or '').strip()
+    return f"{CHECK_MARKER}{table} name={name} expr={expr}"
+
+
+def checks_count_line(table: str, n: int) -> str:
+    return f"{CHECKS_COUNT_MARKER}{table} {n}"
+
+
+def decode_check_attestation(line: str):
+    """哨兵行 → (表名, {'name','expr'})；不是 CHECK 哨兵则返回 None
+
+    解析不合法（缺 `name=` / `expr=`、表名非法）→ `BackupError`：哨兵行是
+    恢复端唯一的"约束期望值来源"，读不懂它就必须停下来，绝不能"当没有
+    这一行"继续恢复。
+    """
+    s = line.strip()
+    if not s.startswith(CHECK_MARKER):
+        return None
+    body = s[len(CHECK_MARKER):]
+    parts = body.split(None, 1)
+    if not parts or not _IDENT_RE.match(parts[0]):
+        raise BackupError(f"CHECK 哨兵格式错误（表名）: {s!r}")
+    table, rest = parts[0], (parts[1] if len(parts) > 1 else '')
+    if not rest.startswith('name='):
+        raise BackupError(f"CHECK 哨兵格式错误（缺 name=）: {s!r}")
+    rest = rest[len('name='):]
+    nm = re.match(r'([A-Za-z_]\w*)?\s+expr=(.*)$', rest, re.DOTALL)
+    if not nm:
+        raise BackupError(f"CHECK 哨兵格式错误（缺 expr=）: {s!r}")
+    name = nm.group(1) or ''
+    expr = nm.group(2).strip()
+    if not expr:
+        raise BackupError(f"CHECK 哨兵的表达式为空: {s!r}")
+    return table, {'name': name, 'expr': expr}
+
 
 def render_dump(schemas, row_provider, no_data: bool = False,
                 no_create: bool = False, source: str = 'LightDB',
@@ -494,8 +837,9 @@ def render_dump(schemas, row_provider, no_data: bool = False,
     共用这一份渲染逻辑，避免两边转义/顺序不一致。
 
     顺序（恢复端可以依赖）：每张表 `DROP TABLE IF EXISTS` → `CREATE
-    TABLE` → 行数哨兵注释 → 全部 INSERT。`DROP` 提供幂等，所以
-    `CREATE` 不必写 `IF NOT EXISTS`（也与 mysqldump 默认输出一致）。
+    TABLE` → 行数哨兵注释 → **CHECK 哨兵注释** → 全部 INSERT。`DROP` 提供
+    幂等，所以 `CREATE` 不必写 `IF NOT EXISTS`（也与 mysqldump 默认输出
+    一致）。
     """
     lines = []
     if include_header:
@@ -516,6 +860,12 @@ def render_dump(schemas, row_provider, no_data: bool = False,
         # 行数哨兵**始终**写（含 `--no-data` 的 0 行与空表）：它就是恢复端
         # "读回校验"的唯一期望值来源，缺了它就无法区分"空表"和"dump 被截断"
         lines.append(f"{ROWS_MARKER}{schema.name} {len(rows)}")
+        # CHECK 哨兵：同样始终写（0 条也写），否则"dump 里本来没有 CHECK"
+        # 与"CHECK 被删掉"无法区分
+        specs = schema.check_specs()
+        for spec in specs:
+            lines.append(check_attestation_line(schema.name, spec))
+        lines.append(checks_count_line(schema.name, len(specs)))
         for r in rows:
             vals = ', '.join(sql_literal(v) for v in r)
             lines.append(f"INSERT INTO {schema.name} VALUES ({vals});")
@@ -562,11 +912,16 @@ class DumpStatement:
 
 @dataclass
 class DumpPlan:
-    """一份 dump 的"预演"结果：结构 + 语句 + 期望行数"""
+    """一份 dump 的"预演"结果：结构 + 语句 + 期望行数 + 期望 CHECK"""
     statements: list = field(default_factory=list)
     order: list = field(default_factory=list)          # 建表顺序
     schemas: dict = field(default_factory=dict)        # name -> TableSchema
     expected_rows: dict = field(default_factory=dict)  # name -> int
+    #: name -> [{'name','expr'}, ...]（`-- lightdb:check` 哨兵，备份端真实
+    #: 读出的约束清单；老版本 dump 没有这一段 → 空 + `has_check_attestation`
+    #: 为 False，恢复端据此**如实说明**"无法核对约束"而不是假装核对过）
+    expected_checks: dict = field(default_factory=dict)
+    has_check_attestation: bool = False
     dropped: set = field(default_factory=set)
     version: str = None
     ignorable: int = 0
@@ -642,6 +997,14 @@ def parse_dump(content: str) -> DumpPlan:
 
     # 行数哨兵（`-- lightdb:rows t N`）覆盖逐条 INSERT 的统计：
     # 它来自备份端真实的扫描行数，恢复后必须逐表对齐。
+    #
+    # CHECK 哨兵（`-- lightdb:check` / `-- lightdb:checks`）同样来自备份端
+    # 真实读出的约束：**先解析 CREATE TABLE 得到结构，再拿它和哨兵对账**，
+    # 两者不一致（手改 dump 删掉一条 CHECK 却留着哨兵，或反过来）在这里
+    # 就报错 —— 而不是恢复完才靠"恢复后读回"发现（那时已经区分不出
+    # "dump 本来就没有约束"和"约束被删了"）。
+    checks_declared = {}          # name -> 逐条哨兵的原始清单
+    checks_count = {}
     for line in content.splitlines():
         s = line.strip()
         if s.startswith(ROWS_MARKER):
@@ -649,6 +1012,50 @@ def parse_dump(content: str) -> DumpPlan:
             if len(parts) != 2 or not parts[1].isdigit():
                 raise BackupError(f"行数哨兵格式错误: {s!r}")
             plan.expected_rows[parts[0]] = int(parts[1])
+        elif s.startswith(CHECK_MARKER):
+            table, spec = decode_check_attestation(s)
+            checks_declared.setdefault(table, []).append(spec)
+            plan.has_check_attestation = True
+        elif s.startswith(CHECKS_COUNT_MARKER):
+            parts = s[len(CHECKS_COUNT_MARKER):].split()
+            if len(parts) != 2 or not parts[1].isdigit():
+                raise BackupError(f"CHECK 条数哨兵格式错误: {s!r}")
+            if not _IDENT_RE.match(parts[0]):
+                raise BackupError(f"CHECK 条数哨兵表名非法: {s!r}")
+            checks_count[parts[0]] = int(parts[1])
+            plan.has_check_attestation = True
+
+    if plan.has_check_attestation:
+        for table, specs in checks_declared.items():
+            want_n = checks_count.get(table)
+            if want_n is None:
+                raise BackupError(
+                    f"表 {table} 有 CHECK 哨兵行但没有 `-- lightdb:checks "
+                    f"{table} <条数>` 行（dump 被截断或手改过）")
+            if want_n != len(specs):
+                raise BackupError(
+                    f"表 {table}: `-- lightdb:checks` 声明 {want_n} 条 CHECK，"
+                    f"实际只有 {len(specs)} 条 `-- lightdb:check` 行"
+                    f"（dump 被截断或手改过）")
+        for table, n in checks_count.items():
+            if n != len(checks_declared.get(table, [])):
+                raise BackupError(
+                    f"表 {table}: `-- lightdb:checks` 声明 {n} 条 CHECK，"
+                    f"实际只有 {len(checks_declared.get(table, []))} 条"
+                    f" `-- lightdb:check` 行（dump 被截断或手改过）")
+            plan.expected_checks[table] = list(checks_declared.get(table, []))
+        # 哨兵与 CREATE TABLE 必须一致：这是"手改 dump"能被打出来的关键
+        for name in plan.order:
+            schema = plan.schemas[name]
+            want = [(str(s.get('name') or ''), str(s.get('expr') or '').strip())
+                    for s in plan.expected_checks.get(name, [])]
+            have = [(str(s.get('name') or ''), str(s.get('expr') or '').strip())
+                    for s in schema.check_specs()]
+            if want != have:
+                raise BackupError(
+                    f"表 {name}: dump 里的 CHECK 哨兵与 CREATE TABLE 声明的"
+                    f"约束不一致（哨兵 {want} / CREATE TABLE {have}）——"
+                    f"dump 被手改或截断，拒绝恢复（静默接受会丢掉约束）")
     return plan
 
 
@@ -751,6 +1158,19 @@ def restore_dump(db, dump_file: str = None, content: str = None,
     report = None
     if fail == 0 and verify:
         report = verify_restore(db, plan)
+        # 如实报告"这次恢复里 CHECK 是怎么核对的"：有哨兵 → 能识别"约束被
+        # 删"；老版本 dump 没哨兵 → 只能退化成"与 CREATE TABLE 文本对账"，
+        # 明确写进报告，不让人误以为约束被完整核对过。
+        n_ck = sum(len(v) for v in plan.expected_checks.values())
+        if plan.has_check_attestation:
+            report.checks.append(
+                f"INFO 恢复对账: CHECK 哨兵覆盖 {len(plan.expected_checks)} "
+                f"表 / {n_ck} 条约束（能识别'约束被删'）")
+        else:
+            report.checks.append(
+                "INFO 恢复对账: 本 dump 没有 `-- lightdb:check` 哨兵"
+                "（旧版本产物），CHECK 只能与 CREATE TABLE 文本对账，"
+                "**无法识别'约束被删除'**；请用当前版本重新导出备份")
         if not report.ok and strict:
             raise RestoreError(
                 f"恢复到 {db.data_dir} 后校验失败（{len(report.errors)} 项）:\n"
@@ -771,14 +1191,18 @@ def _parse_sql(stmt: str):
 
 
 def verify_restore(db, plan: DumpPlan) -> VerifyReport:
-    """读回校验：行数、主键、逐字段值、列结构
+    """读回校验：行数、主键、逐字段值、列结构、**CHECK 约束**
 
     校验项（与原库比对的是"dump 里声明的结构/行数"，dump 本身由
     `build_dump` 从原库读出——测试里再拿原库对象做一次比对）：
     1. 表存在，且列名/类型与 dump 的 CREATE TABLE 完全一致（顺序也一致）；
     2. 行数 == 哨兵行数（空表 = 0 也要对上）；
     3. 主键（BTree）条目数 == 行数，且主键值非 NULL、互不重复；
-    4. 逐行字段值都能解码（含 NULL / 含引号与换行的字符串不被截断）。
+    4. 逐行字段值都能解码（含 NULL / 含引号与换行的字符串不被截断）；
+    5. **CHECK 约束逐条对上**：dump 里声明的每一条约束（列级 + 表级）
+       在恢复后的表里都存在、表达式相同、引用的列都存在；dump 里没有的
+       约束不允许凭空出现。少一条 → `RestoreError`（"备份→恢复"丢掉
+       约束正是本次要清掉的静默失效），多一条 → 同样报错。
     """
     rep = VerifyReport()
     for name in plan.order:
@@ -795,6 +1219,9 @@ def verify_restore(db, plan: DumpPlan) -> VerifyReport:
         rep.add(got_cols == want_cols,
                 f"表 {name}: 列结构 {'一致' if got_cols == want_cols else '不一致'}"
                 f" 期望={want_cols} 实际={got_cols}")
+
+        # ---- CHECK 约束（dump 声明 vs 恢复后真实挂上的）----
+        _verify_checks(rep, name, plan, schema, tbl)
 
         rows = list(iter_rows(tbl))
         rep.rows[name] = len(rows)
@@ -820,3 +1247,81 @@ def verify_restore(db, plan: DumpPlan) -> VerifyReport:
         rep.add(null_pk == 0 and bad_pk == 0,
                 f"表 {name}: 主键唯一且非空（NULL={null_pk} 重复={bad_pk}）")
     return rep
+
+
+def _check_sig(specs):
+    """约束集合的可比对签名：`((名字, 表达式), ...)`（顺序也参与比较）"""
+    return tuple((str(s.get('name') or ''), str(s.get('expr') or '').strip())
+                 for s in specs)
+
+
+def _verify_checks(rep: VerifyReport, name: str, plan: DumpPlan,
+                   schema: TableSchema, tbl):
+    """恢复后**读回** CHECK 约束并逐条对账（不一致 → 报告 FAIL）
+
+    期望值来源优先级：
+
+    1. `-- lightdb:check` 哨兵（`plan.expected_checks`）—— 备份端**真实
+       读出来**的约束清单，是最可信的期望值；
+    2. 没有哨兵的老版本 dump → 退回"CREATE TABLE 文本里解析出来的约束"，
+       并在报告里**如实写明**用的是降级来源（不假装核对过）。
+    """
+    if name in plan.expected_checks:
+        want = _check_sig(plan.expected_checks[name])
+        src_note = '哨兵'
+    else:
+        want = _check_sig(schema.check_specs())
+        src_note = ('CREATE TABLE 文本（老版本 dump 无 CHECK 哨兵，'
+                    '无法识别"约束被删"）')
+    try:
+        have_specs = tbl.check_constraints()
+    except Exception as e:                          # noqa: BLE001
+        rep.add(False, f"表 {name}: 读取 CHECK 约束失败: "
+                       f"{type(e).__name__}: {e}")
+        return
+    have = _check_sig(have_specs)
+
+    if want == have:
+        if want:
+            rep.add(True, f"表 {name}: CHECK 约束 {len(want)} 条逐条一致"
+                          f"（期望来源: {src_note}） {list(want)}")
+        else:
+            rep.add(True, f"表 {name}: CHECK 约束 0 条（dump 与恢复后都没有）")
+    else:
+        missing = [s for s in want if s not in have]
+        extra = [s for s in have if s not in want]
+        detail = []
+        if missing:
+            detail.append(f"丢失 {missing}")
+        if extra:
+            detail.append(f"多出 {extra}")
+        rep.add(False, f"表 {name}: CHECK 约束不一致（dump {len(want)} 条 / "
+                       f"恢复后 {len(have)} 条；{'；'.join(detail)}；"
+                       f"期望来源: {src_note}）")
+
+    # 约束引用的列必须都还存在 —— 列引用失效的约束在写入时会**每次都抛
+    # CheckConstraintError**（不会静默放行），但那已经不是 dump 声明的语义了
+    if have:
+        col_names = [c['name'] for c in tbl.cols]
+        for spec in have_specs:
+            try:
+                cols = check_expr_columns(spec['expr'])
+            except Exception as e:                  # noqa: BLE001
+                rep.add(False, f"表 {name}: CHECK 约束 {spec.get('name')!r} "
+                               f"表达式无法解析: {e}")
+                continue
+            unknown = [c for c in cols if c not in col_names]
+            if not unknown:
+                rep.add(True, f"表 {name}: CHECK 约束 "
+                              f"{spec.get('name')!r} 引用的列 {cols} 全部存在")
+            else:
+                rep.add(False,
+                        f"表 {name}: CHECK 约束 {spec.get('name')!r} 引用了"
+                        f"不存在的列 {unknown}（表达式 {spec['expr']!r}）")
+
+
+def check_expr_columns(expr: str) -> list:
+    """一条 CHECK 表达式引用的列名（交给 `sql/checks.py` 的同一份实现）"""
+    from .checks import check_columns, parse_check_predicate
+    return [str(c) for c in check_columns(parse_check_predicate(expr))]
+

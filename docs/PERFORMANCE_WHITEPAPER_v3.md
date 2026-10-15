@@ -2,6 +2,24 @@
 
 # LightDB v3.0 性能白皮书
 
+> ⚠️ **状态说明（2026-10 阶段 0 收尾补充，正文一字未删）**：
+>
+> - 本文的 **3.0x/4.1x（行编解码）、1.37x（批处理）、3.15x（向量化过滤）、
+>   +50%/+20%（并发/预读）** 在 **SQL 执行路径上未验证**：
+>   `lightdb/olap/**`、`lightdb/columnar/**`、`lightdb/parallel/**` 在
+>   `Executor` / `plan_executor` 里**零引用**；`lightdb/cython/*.pyx` 的编译
+>   产物（`.pyd`/`.so`/`.c`）为 **0 个**（`any_accelerated=False`，**从未编译
+>   验证**，本机无 Cython/C 编译器）。
+> - **未验证 / 曾返回错值**：向量化过滤 `VectorizedFilter` 批间条件失效
+>   （实测 50,000 行 vs 应 16,317）、向量化 `SUM` 因 `int32` 溢出返回错值
+>   （阶段 0 修好算法，但仍未接线）、列存 `GROUP BY` 返回 0 行。
+> - **可复现的实测数字**（[review/01_engine.md](review/01_engine.md)）：逐行
+>   INSERT **1,501 rows/s**、批量 INSERT **1,356 rows/s**（批量反而更慢）、
+>   点查 **888 q/s** 进程内 / **1,138 q/s** TCP、范围扫描/聚合
+>   **4.8k / 11k rows/s**、并发 1→8 客户端 **−36%**、WAL **≈200 B/行**、
+>   10 轮 UPDATE 后 `.dat` **669 KB→16 MB**。
+> - 正文表格保持原貌以便对照；本文件**不补写**任何未经验证的历史内容。
+
 > ⚠️ **数据可信度声明（2026-10 审计）**：本文档中的 QPS、加速比、压缩比、rows/s 等数字**并非由本仓库内的工具产出** —— `lightdb/benchmark/` 下没有任何基准运行产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录也不存在（`~/.lightdb_studio/` 下只有空的 `reports/`、`soak/`）。其中 12000 QPS / 80000 QPS 目标只出现在 `tests/regression_v4/test_performance_v4.py:13-18` 的 `PERF_TARGETS` 字典里，**从未被任何测试断言**。因此本文数字应视为**设计目标或估计值**，而非实测结果。正文表格保持原貌以便对照，完整审计结论见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。
 
 **版本**：3.0.0

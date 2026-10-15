@@ -5685,6 +5685,29 @@ class Executor:
                          f'回收 {reclaimed} 个历史版本，脏页已刷盘{analyzed}'))
         return self._rs(list(self._CHECK_COLUMNS), rows)
 
+    def _show_create_table(self, p, s):
+        """`SHOW CREATE TABLE t` —— 真实 DDL，**含 CHECK 约束**
+
+        两列（`Table` / `Create Table`），列名与 MySQL 一致；DDL 文本不是
+        在这里拼的，而是走 `sql/logical_dump.py::check_ddl` —— 那是
+        `TableSchema.canonical_ddl` 的**同一份实现**，逻辑 dump / 备份 /
+        恢复校验都从它出发。原因就是本批要修的那类缺陷：DDL 生成一旦有
+        两条路径，`SHOW CREATE TABLE` 就会输出一份"看起来对、但缺约束"
+        的表结构，而备份路径另写一份（CHECK 丢失就是这么发生的）。
+
+        表不存在 → 1146（`Unknown table`），与 MySQL 一致，不返回空结果集。
+        """
+        from .logical_dump import BackupError, check_ddl
+        name = p.get('table')
+        try:
+            ddl = check_ddl(self.db, name)
+        except BackupError as e:
+            return self._err(1146, f"Table '{name}' doesn't exist: {e}")
+        except CheckConstraintError as e:               # 约束定义坏了
+            return self._err(getattr(e, 'errno', 3819), str(e),
+                             getattr(e, 'sqlstate', None))
+        return self._rs(['Table', 'Create Table'], [(name, ddl)])
+
     def _show_partitions(self, p, s):
         """SHOW PARTITIONS FROM t —— 读真实的 Table._partition 元数据
 

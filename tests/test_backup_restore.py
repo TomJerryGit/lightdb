@@ -383,3 +383,349 @@ def test_restore_reports_per_field_values_via_select():
     assert rows == [[1, "O'Brien (x)", 30], [2, None, None]], rows
     print(f'  → SELECT 读回: {rows}')
     dst.shutdown()
+
+
+# ==================== 6. CHECK 约束必须进备份/恢复路径 ====================
+#
+# 阶段 0 刚把 CHECK 修好（SQL 与直写两条路径都校验、随 `_meta.json`
+# 持久化），但 `SHOW CREATE TABLE` 与逻辑 dump **不导出 CHECK**，于是
+# "备份 → 恢复到新库"会静默丢掉约束 —— 与本次一直在清的那类静默失效同级。
+# 下面三组用例把它锁死：能导出、恢复后真生效、dump 里缺约束必须报错。
+
+#: 源库里两张表：列级 CHECK + 表级 CONSTRAINT，外加一个 NULL 放行场景
+CHECK_SRC_DIR = os.path.join(BASE, 'data_bak_ck_src')
+CHECK_DST_DIR = os.path.join(BASE, 'data_bak_ck_dst')
+CHECK_BAK_DIR = os.path.join(BASE, 'backups_bak_ck')
+
+CHECK_DDL = [
+    # 表级：命名约束 + 匿名约束（名字由引擎按 MySQL 规则补 `t_chk_n`）
+    ("orders",
+     "CREATE TABLE orders ("
+     "  id INT NOT NULL PRIMARY KEY,"
+     "  qty INT NULL,"
+     "  cap INT NULL,"
+     "  note VARCHAR NULL,"
+     "  CONSTRAINT qty_nonneg CHECK (qty >= 0),"
+     "  CHECK (qty <= cap))",
+     # 合法行：(id, qty, cap, note)
+     [(1, 5, 10, 'ok'), (2, 0, 0, None), (3, None, 10, 'null qty → UNKNOWN 放行')]),
+    # 列级：内联在列定义里
+    ("products",
+     "CREATE TABLE products ("
+     "  id INT NOT NULL PRIMARY KEY,"
+     "  price INT CHECK (price > 0),"
+     "  age INT CHECK (age IS NULL OR age >= 18))",
+     [(1, 100, 20), (2, 1, None)]),
+]
+
+
+def _check_env_reset():
+    for d in (CHECK_SRC_DIR, CHECK_DST_DIR, CHECK_BAK_DIR):
+        if os.path.exists(d):
+            safe_rmtree(d)
+        os.makedirs(d, exist_ok=True)
+
+
+def _check_env_cleanup():
+    """用例结束时删掉本次专用目录（本组用例**自己**清理，不留给全量运行）
+
+    只删自己创建的三处（`data_bak_ck_src` / `data_bak_ck_dst` /
+    `backups_bak_ck`），不动既有用例的 `data_bak_src|dst`、`backups_bak`。
+    """
+    for d in (CHECK_SRC_DIR, CHECK_DST_DIR, CHECK_BAK_DIR):
+        if os.path.exists(d):
+            safe_rmtree(d)
+
+
+def test_check_constraints_survive_backup_restore_to_new_dir():
+    """新目录恢复：SHOW CREATE TABLE 含 CHECK、违规插入仍被拒(3819)、合法插入成功
+
+    1. 建两张表（表级 + 列级各一，含 NULL 放行场景）并写合法数据；
+    2. `BackupManager.dump()` → `restore()` 到**新的数据目录**；
+    3. 新库 `SHOW CREATE TABLE` 原文里必须有 CHECK（列级内联 + 表级
+       `CONSTRAINT ... CHECK`）；
+    4. 恢复库上执行违规 INSERT/UPDATE → 必须 ERROR 3819 HY000；
+    5. 合法 INSERT 仍成功；NULL 场景仍放行。
+    """
+    _check_env_reset()
+    from lightdb.backup.backup import BackupManager
+    from lightdb.sql.executor import Executor
+
+    # ---- 1. 源库 ----
+    src = open_db(CHECK_SRC_DIR)
+    src_ex = Executor(src)
+    for name, ddl, rows in CHECK_DDL:
+        r = src_ex.execute_sql(ddl, {})
+        assert r['type'] == 'ok', (name, r)
+        for row in rows:
+            vals = ', '.join('NULL' if v is None
+                             else (repr(v) if isinstance(v, str) else str(v))
+                             for v in row)
+            r = src_ex.execute_sql(f"INSERT INTO {name} VALUES ({vals})", {})
+            assert r['type'] == 'ok', (name, vals, r)
+
+    dump_file = BackupManager(src, CHECK_BAK_DIR).dump()
+    with open(dump_file, 'r', encoding='utf-8') as f:
+        dump_text = f.read()
+    src.shutdown()
+
+    # dump 文本里必须已经有 CHECK（列级内联 / 表级 CONSTRAINT）
+    assert 'CHECK (price > 0)' in dump_text, dump_text
+    assert 'CONSTRAINT qty_nonneg CHECK (qty >= 0)' in dump_text, dump_text
+    assert 'CONSTRAINT orders_chk_2 CHECK (qty <= cap)' in dump_text, dump_text
+    print('  → dump 里 CHECK 原文:')
+    for line in dump_text.splitlines():
+        if 'CHECK' in line:
+            print(f'      {line.strip()}')
+
+    # ---- 2. 恢复到新目录 ----
+    dst = open_db(CHECK_DST_DIR)
+    ok, fail = BackupManager(dst, CHECK_BAK_DIR).restore(dump_file)
+    assert fail == 0, f'恢复不应有失败语句 (ok={ok}, fail={fail})'
+    report = BackupManager(dst, CHECK_BAK_DIR).verify(dump_file)
+    assert report.ok, report.errors
+    dst_ex = Executor(dst)
+
+    # ---- 3. SHOW CREATE TABLE 含 CHECK ----
+    print('  → 恢复后 SHOW CREATE TABLE orders:')
+    r = dst_ex.execute_sql('SHOW CREATE TABLE orders', {})
+    assert r['type'] == 'resultset', r
+    assert r['columns'] == ['Table', 'Create Table'], r['columns']
+    ddl_text = r['rows'][0][1]
+    for line in ddl_text.splitlines():
+        print(f'      {line}')
+    assert 'CHECK (qty >= 0)' in ddl_text, ddl_text
+    assert 'CHECK (qty <= cap)' in ddl_text, ddl_text
+    assert 'CONSTRAINT qty_nonneg CHECK (qty >= 0)' in ddl_text, ddl_text
+    assert 'CONSTRAINT orders_chk_2 CHECK (qty <= cap)' in ddl_text, ddl_text
+
+    print('  → 恢复后 SHOW CREATE TABLE products:')
+    r = dst_ex.execute_sql('SHOW CREATE TABLE products', {})
+    assert r['type'] == 'resultset', r
+    ddl_text = r['rows'][0][1]
+    for line in ddl_text.splitlines():
+        print(f'      {line}')
+    # 列级 CHECK 内联在列定义里
+    assert 'price INT NULL CHECK (price > 0)' in ddl_text, ddl_text
+    assert 'age INT NULL CHECK (age IS NULL OR age >= 18)' in ddl_text, ddl_text
+
+    # 引擎元数据里也真的挂着这些约束（不是只有文本）
+    assert [c['expr'] for c in dst.get_table('orders').check_constraints()] == \
+        ['qty >= 0', 'qty <= cap']
+    assert [c['expr'] for c in dst.get_table('products').check_constraints()] == \
+        ['price > 0', 'age IS NULL OR age >= 18']
+
+    # ---- 4. 违规插入仍被拒（3819 / HY000）----
+    r = dst_ex.execute_sql("INSERT INTO orders VALUES (9, -1, 10, 'bad')", {})
+    assert r['type'] == 'error' and r['code'] == 3819, r
+    assert r['sqlstate'] == 'HY000', r
+    print(f"  → 违规 INSERT orders 原文: {r['message']}")
+    r2 = dst_ex.execute_sql("INSERT INTO orders VALUES (10, 1, 0, 'bad')", {})
+    assert r2['type'] == 'error' and r2['code'] == 3819, r2
+    print(f"  → 违规 INSERT orders 原文: {r2['message']}")
+    r3 = dst_ex.execute_sql(
+        "INSERT INTO products VALUES (9, -5, 20)", {})
+    assert r3['type'] == 'error' and r3['code'] == 3819, r3
+    print(f"  → 违规 INSERT products 原文: {r3['message']}")
+    r4 = dst_ex.execute_sql("INSERT INTO products VALUES (10, 5, 3)", {})
+    assert r4['type'] == 'error' and r4['code'] == 3819, r4
+    print(f"  → 违规 INSERT products 原文: {r4['message']}")
+    # UPDATE 同样拦
+    r5 = dst_ex.execute_sql("UPDATE orders SET qty = -3 WHERE id = 1", {})
+    assert r5['type'] == 'error' and r5['code'] == 3819, r5
+    print(f"  → 违规 UPDATE orders 原文: {r5['message']}")
+    # 存储层直写也拦（同一份校验）
+    with pytest.raises(ValueError) as ei:
+        dst.get_table('products').insert([11, -1, 20])
+    assert '3819' in str(ei.value)
+
+    # ---- 5. 合法插入 + NULL 放行 ----
+    for sql in ("INSERT INTO orders VALUES (11, 3, 3, 'ok')",
+                "INSERT INTO orders VALUES (12, NULL, 5, 'NULL → UNKNOWN')",
+                "INSERT INTO products VALUES (12, 1, NULL)",
+                "INSERT INTO products VALUES (13, 7, 18)"):
+        r = dst_ex.execute_sql(sql, {})
+        assert r['type'] == 'ok', (sql, r)
+    print('  → 4 条合法 INSERT 全部成功（含 2 个 NULL → UNKNOWN 放行场景）')
+
+    n_orders = dst_ex.execute_sql('SELECT COUNT(*) FROM orders', {})['rows'][0][0]
+    n_products = dst_ex.execute_sql(
+        'SELECT COUNT(*) FROM products', {})['rows'][0][0]
+    print(f'  → 行数对账: orders={n_orders}（原 3 + 合法 2）'
+          f' products={n_products}（原 2 + 合法 2）')
+    assert (n_orders, n_products) == (5, 4)
+    dst.shutdown()
+    _check_env_cleanup()
+
+
+def test_dump_without_check_is_rejected_not_silently_accepted():
+    """手改 dump 去掉 CHECK → 恢复必须显式报错，而不是"恢复成功但没约束"
+
+    这是本组用例的核心：dump 里少了约束时**不能静默接受**。两道独立的闸：
+
+    * **解析期**（`parse_dump`）：`CREATE TABLE` 文本与 `-- lightdb:check`
+      哨兵对账 —— 手改 DDL 但留着哨兵 → `BackupError`；
+    * **恢复后读回**（`verify_restore`）：把哨兵/DDL 声明与恢复后引擎里
+      真实挂着的约束逐条对账 —— 连哨兵一起改"一致地删掉" → `RestoreError`。
+    """
+    _check_env_reset()
+    from lightdb.backup.backup import BackupManager
+    from lightdb.sql.executor import Executor
+    from lightdb.sql.logical_dump import BackupError, RestoreError
+
+    src = open_db(CHECK_SRC_DIR)
+    src_ex = Executor(src)
+    for name, ddl, rows in CHECK_DDL:
+        assert src_ex.execute_sql(ddl, {})['type'] == 'ok'
+    src_ex.execute_sql("INSERT INTO products VALUES (1, 10, 20)", {})
+    src_ex.execute_sql("INSERT INTO orders VALUES (1, 1, 2, 'x')", {})
+    dump_file = BackupManager(src, CHECK_BAK_DIR).dump()
+    src.shutdown()
+
+    with open(dump_file, 'r', encoding='utf-8') as f:
+        text = f.read()
+    assert 'CHECK (price > 0)' in text
+    assert '-- lightdb:check products name=products_chk_1 expr=price > 0' in text
+
+    # ① 手改：只删 DDL 里的列级 CHECK（哨兵留着）→ 解析期就拦下
+    tampered_col = os.path.join(CHECK_BAK_DIR, 'tampered_col.sql')
+    bad = text.replace(' CHECK (price > 0)', '')
+    assert 'CHECK (price > 0)' not in bad and 'CHECK (qty >= 0)' in bad
+    with open(tampered_col, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(bad)
+    dst = open_db(CHECK_DST_DIR)
+    with pytest.raises(BackupError) as ei:
+        BackupManager(dst, CHECK_BAK_DIR).restore(tampered_col)
+    msg = str(ei.value)
+    assert 'price > 0' in msg and 'CHECK' in msg, msg
+    assert 'products' not in dst.tables, '解析失败时不该建出表来'
+    print(f'  → ① 列级 CHECK 被删（哨兵仍在）: {type(ei.value).__name__}')
+    print(f'     {msg.splitlines()[0][:110]}')
+    dst.shutdown()
+
+    # ② 手改：连哨兵一起"一致地"删掉 → 解析能过（dump 内部自洽）。
+    #    这是**真正的静默失效形态**：文本自洽，只有和"原库"比对才能发现。
+    #    注意要删"整条约束"（含它占的名额）：本引擎的自动名 `表_chk_n` 按
+    #    出现顺序编号，只删表达式会让剩下那条改名，dump 就自相矛盾了
+    #    （那是①的形态，不是②要证明的形态）。
+    safe_rmtree(CHECK_DST_DIR)
+    os.makedirs(CHECK_DST_DIR, exist_ok=True)
+    tampered_consistent = os.path.join(CHECK_BAK_DIR, 'tampered_all.sql')
+    bad2 = '\n'.join(
+        l for l in text.splitlines()
+        if 'age >= 18' not in l)
+    bad2 = bad2.replace('-- lightdb:checks products 2',
+                        '-- lightdb:checks products 1')
+    # 删掉的是最后一条列定义 → 前一条的逗号要收掉（保持 SQL 语法合法）
+    bad2 = bad2.replace(',\n);', '\n);')
+    # 顺手清掉 products 的 INSERT（列数已变），做成一份"只结构、自洽"的 dump
+    bad2 = '\n'.join(
+        l for l in bad2.splitlines()
+        if not l.startswith('INSERT INTO products'))
+    bad2 = bad2.replace('-- lightdb:rows products 1', '-- lightdb:rows products 0')
+    bad2 = bad2.replace('-- table: products rows=1', '-- table: products rows=0')
+    assert 'age >= 18' not in bad2 and 'price > 0' in bad2
+    assert '-- lightdb:check products name=products_chk_1 expr=price > 0' in bad2
+    with open(tampered_consistent, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(bad2)
+    from lightdb.sql.logical_dump import parse_dump, restore_dump, verify_restore
+    plan_bad = parse_dump(bad2)
+    assert [c['expr'] for c in plan_bad.schemas['products'].check_specs()] == \
+        ['price > 0']
+    dst = open_db(CHECK_DST_DIR)
+    ok_n, fail_n, rep_n = restore_dump(
+        dst, content=bad2, strict=True, verify=True)
+    assert fail_n == 0 and rep_n.ok
+    print(f'  → ② 自洽的"删掉约束"dump 能通过它自己的校验 '
+          f'（products 只剩 {len(dst.get_table("products").check_constraints())} '
+          f'条约束，dump 内部完全自洽）')
+
+    # ③ 拿**原库**的 CHECK 哨兵再读回对账 → 立刻发现约束变少
+    orig_plan = parse_dump(text)
+    rep2 = verify_restore(dst, orig_plan)
+    assert not rep2.ok, rep2.checks
+    errs = [e for e in rep2.errors if 'CHECK' in e]
+    assert errs, rep2.errors
+    print(f'  → ③ 用原库哨兵读回对账发现缺失: {errs[0][:150]}')
+
+    # ③b 让恢复端"忘了"重建约束（模拟恢复路径缺失 CHECK 的缺陷本身）：
+    #     把约束从恢复目标里去掉，再用原库哨兵做严格读回校验 → RestoreError
+    dst.drop_table('products')
+    dst.create_table('products', [
+        col('id', 'INT', primary=True, notnull=True),
+        col('price', 'INT'),
+        col('age', 'INT'),
+    ])
+    rep3 = verify_restore(dst, orig_plan)
+    assert not rep3.ok, rep3.checks
+    errs3 = [e for e in rep3.errors if 'CHECK' in e]
+    assert errs3 and 'products' in errs3[0], rep3.errors
+    print(f'  → ③b 恢复结果缺约束 → 读回校验 FAIL: {errs3[0][:130]}')
+    # 与 `restore_dump(strict=True)` 同一份判据：不 ok 即 RestoreError
+    def _strict_check(report):
+        if not report.ok:
+            raise RestoreError(
+                f"恢复到测试目录后校验失败（{len(report.errors)} 项）:\n"
+                + '\n'.join(report.errors))
+    with pytest.raises(RestoreError) as ei3:
+        _strict_check(rep3)
+    assert 'CHECK' in str(ei3.value), ei3.value
+    dst.shutdown()
+
+    # ④ dump 里带 NOT ENFORCED → 解析期就显式报错（不放宽）
+    with pytest.raises(BackupError) as ei:
+        parse_dump("CREATE TABLE t (\n  id INT NOT NULL PRIMARY KEY,\n"
+                   "  v INT NULL CHECK (v > 0) NOT ENFORCED\n);\n")
+    assert 'NOT ENFORCED' in str(ei.value)
+    print(f'  → ④ NOT ENFORCED 仍被显式拒绝: {str(ei.value)[:60]}')
+
+    # ⑤ 表级写法同样拒绝
+    with pytest.raises(BackupError):
+        parse_dump("CREATE TABLE t (\n  id INT NOT NULL PRIMARY KEY,\n"
+                   "  CONSTRAINT ck CHECK (id > 0) NOT ENFORCED\n);\n")
+    print('  → ⑤ 表级 NOT ENFORCED 同样被拒')
+    _check_env_cleanup()
+
+
+def test_show_create_table_path_is_the_single_ddl_source():
+    """`SHOW CREATE TABLE` 与逻辑 dump 必须是同一份 DDL 生成路径
+
+    判据：对同一张表，`check_ddl()` 的输出与 dump 里 `CREATE TABLE ...;`
+    之间的 DDL 正文完全一致；且两者都含 CHECK。一旦有人另写一份 DDL
+    生成逻辑（CHECK 丢失正是这么发生的），这里会失败。
+    """
+    _check_env_reset()
+    from lightdb.backup.backup import BackupManager
+    from lightdb.sql.executor import Executor
+    from lightdb.sql.logical_dump import check_ddl, parse_dump
+
+    src = open_db(CHECK_SRC_DIR)
+    ex = Executor(src)
+    for name, ddl, _rows in CHECK_DDL:
+        assert ex.execute_sql(ddl, {})['type'] == 'ok'
+    dump_file = BackupManager(src, CHECK_BAK_DIR).dump()
+    with open(dump_file, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    for name in ('orders', 'products'):
+        direct = check_ddl(src, name)
+        assert direct in text, f'{name}: SHOW CREATE TABLE 的 DDL 不在 dump 里'
+        assert 'CHECK' in direct, direct
+        # 引擎结果集路径（Executor → _show_create_table）与直接调用逐字符一致
+        r = ex.execute_sql(f'SHOW CREATE TABLE {name}', {})
+        assert r['type'] == 'resultset', r
+        assert r['rows'][0][1] == direct, (r['rows'][0][1], direct)
+        print(f'  → {name}: SHOW CREATE TABLE 与 dump 共用同一份 DDL '
+              f'（{len(direct)} 字符，含 CHECK）')
+    # 约束顺序/命名：dump 侧与引擎侧逐条一致（列级在前、表级在后，
+    # 自动名 `表_chk_n` 按同一顺序编号）。顺序不一致会让读回校验误报。
+    for name in ('orders', 'products'):
+        dump_sig = [(c['name'], c['expr'])
+                    for c in parse_dump(text).schemas[name].check_specs()]
+        engine_sig = [(c['name'], c['expr'])
+                      for c in src.get_table(name).check_constraints()]
+        assert dump_sig == engine_sig, (name, dump_sig, engine_sig)
+        print(f'  → {name}: CHECK 顺序/命名 dump 与引擎一致: {dump_sig}')
+    src.shutdown()
+    _check_env_cleanup()
+

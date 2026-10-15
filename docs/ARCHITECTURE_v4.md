@@ -4,6 +4,19 @@
 
 > ⚠️ **数据可信度声明（2026-10 审计）**：本文档中的 QPS、加速比、压缩比、rows/s 等数字**并非由本仓库内的工具产出** —— `lightdb/benchmark/` 下没有任何基准运行产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录也不存在（`~/.lightdb_studio/` 下只有空的 `reports/`、`soak/`）。其中 12000 QPS / 80000 QPS 目标只出现在 `tests/regression_v4/test_performance_v4.py:13-18` 的 `PERF_TARGETS` 字典里，**从未被任何测试断言**。因此本文数字应视为**设计目标或估计值**，而非实测结果。正文表格保持原貌以便对照，完整审计结论见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。
 
+> ⚠️ **状态说明（2026-10 阶段 0 收尾补充）**：`lightdb/olap/**`（向量化引擎）、
+> `lightdb/columnar/**`（列存 `ColumnStore`）、`lightdb/parallel/**`（并行执行）
+> 在 SQL 执行路径（`Executor` / `plan_executor`）里**零引用** —— 也就是说
+> 「未接入 SQL 执行路径」；`lightdb/cython/*.pyx` 的编译产物（`.pyd`/`.so`/`.c`）
+> 在仓库里 **0 个**，`status()['any_accelerated'] == False`，即「**未编译验证**」。
+> 阶段 0 修好的向量化聚合/过滤**错值**（`int32` 溢出、批间条件失效）同样
+> **仍未接线**。因此全文的 OLAP / 列存 / 并行 / Cython 数字（含下文 7.3 与
+> 各对比表）都是**设计目标，不是实测**。本机可复现实测见
+> [review/01_engine.md](review/01_engine.md)：逐行 INSERT **1,501 rows/s**、
+> 批量 INSERT **1,356 rows/s**、点查 **888 q/s** 进程内 / **1,138 q/s** TCP、
+> 并发 1→8 客户端 1,163→**749 q/s（−36%）**、WAL **≈200 B/行**、
+> 10 轮 UPDATE 后 `.dat` **669 KB→16 MB**。
+>
 > 🔧 **多进程实现现状（2026-10 接线后）**：多进程模式已可用，但实际架构与本文描述的「多进程 + 共享内存突破 GIL」不同 —— **存储引擎只由 Master 进程持有并串行执行 SQL**，Worker 仅负责连接与协议处理（原因与实测见 [AUDIT_REPORT.md §15](AUDIT_REPORT.md)）。因此它带来的是连接层多核化与崩溃隔离，并非查询执行的 CPU 加速；本文的 8 核 QPS 数字与此无关。
 
 **版本**：4.0.0
@@ -494,6 +507,19 @@ Chunk 大小：4096 行
 | BitPack | max < 65535            | 小整数         |
 
 ### 7.3 向量化执行
+
+> ⚠️ **状态说明（2026-10 补充，原文保留未删）**：本节的
+> `VectorizedScan -> VectorizedFilter -> VectorizedAggregate` 流水线与
+> 表 7.2 的 **41x / 3.5M rows/s** **未接入 SQL 执行路径** ——
+> `lightdb/olap/**`、`lightdb/columnar/**`、`lightdb/parallel/**` 在
+> `Executor` / `plan_executor` 里**零引用**，因此这些数字在查询路径上
+> **没有落点**，属设计目标。已修但仍未接线的错值：向量化 `SUM` 因
+> `np.array` 默认 `int32` 溢出（阶段 0 修好算法）、`VectorizedFilter`
+> 批间条件传递失效（实测 50,000 行 vs 应 16,317）、列存 `GROUP BY`
+> 返回 0 行。实测替代数字见 [review/01_engine.md](review/01_engine.md)：
+> 逐行 INSERT **1,501 rows/s**、批量 INSERT **1,356 rows/s**、聚合/范围扫描
+> **11k / 4.8k rows/s**、点查 **888 q/s**（进程内）/ **1,138 q/s**（TCP）、
+> 并发 1→8 客户端 **−36%**。
 
 流程：
 

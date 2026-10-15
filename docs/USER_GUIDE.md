@@ -97,6 +97,17 @@ LightDB 兼容 MySQL Wire Protocol v10，可直接用任意 MySQL 客户端连�
 
 ## 4. v3.0 / v4.0 差异
 
+> ⚠️ **状态说明（2026-10 补充，表格原文保留未删）**：下表的
+> `12,000 / 92,000 QPS`、`3.5M rows/s`、`列式存储 / HTAP 混合表` **属设计目标**：
+> `lightdb/olap/**`、`lightdb/columnar/**`、`lightdb/parallel/**` 在
+> `Executor` / `plan_executor` 里**零引用**（未接入 SQL 执行路径），
+> `lightdb/cython/*.pyx` 编译产物为 **0 个**（从未编译验证）；列存 `GROUP BY`
+> 返回 0 行、并行只覆盖单表裸 `COUNT` 且实测负加速。可复现实测见
+> [review/01_engine.md](review/01_engine.md)：逐行 INSERT **1,501 rows/s**、
+> 批量 INSERT **1,356 rows/s**、点查 **888 q/s** 进程内 / **1,138 q/s** TCP、
+> 并发 1→8 客户端 **−36%**、WAL **≈200 B/行**、10 轮 UPDATE 后 `.dat`
+> **669 KB→16 MB**。
+
 | 维度 | v3.0 | v4.0 |
 |------|:----:|:----:|
 | 进程模型 | 单进程 | 多进程 |

@@ -4,6 +4,18 @@
 **数据来源**：[docs/AUDIT_REPORT.md](AUDIT_REPORT.md) 的同一次审计
 **重要说明**：本文档**只做清单与建议，不删除任何模块**。判定为「不可达」的模块仍可能被未来的功能接线使用，删除需由维护者决策。
 
+> ⚠️ **状态说明（2026-10 阶段 0 收尾补充）**：下表标注的
+> `lightdb.olap`（向量化/OLAP，未接入）、`lightdb.columnar`（列存，未接入
+> 查询路径）、`lightdb.parallel`（并行执行，未接入查询路径）、
+> `lightdb.performance`（整包未接线）正是白皮书里 **3.5M / 85M rows/s、
+> 41x、12.5x、3.15x** 这些数字的落点所在 —— 因为**未接入 SQL 执行路径**
+> （`Executor` / `plan_executor` 零引用），这些数字在查询路径上**没有落点**；
+> `lightdb/cython/*.pyx` 的编译产物为 **0 个**（**未编译验证**）。
+> 本机可复现实测见 [review/01_engine.md](review/01_engine.md)：逐行 INSERT
+> **1,501 rows/s**、批量 INSERT **1,356 rows/s**、点查 **888 q/s** 进程内 /
+> **1,138 q/s** TCP、并发 1→8 客户端 **−36%**、WAL **≈200 B/行**、
+> 10 轮 UPDATE 后 `.dat` **669 KB→16 MB**。
+
 ---
 
 ## 1. 判定方法

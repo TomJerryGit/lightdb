@@ -21,7 +21,7 @@ import sys
 import time
 
 from ..sql.logical_dump import (BackupError, TableSchema, normalize_type,
-                                render_dump)
+                                parse_create_table, render_dump)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,10 +43,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def read_schema(cur, tname: str) -> TableSchema:
-    """用 `SHOW COLUMNS` 读表结构 → TableSchema
+    """读表结构 → TableSchema（含 CHECK 约束）
 
-    `SHOW COLUMNS` 的 `Key` 列取值：`PRI` / `UNI` / `MUL` / ''。
-    只把 PRI/UNI 表达成列属性（与 `BackupManager` 的导出形态一致）。
+    结构主体来自 `SHOW COLUMNS`（`Key` 列取值 `PRI` / `UNI` / `MUL` / ''；
+    只把 PRI/UNI 表达成列属性，与 `BackupManager` 的导出形态一致）。
+
+    CHECK 约束**必须**另取：`SHOW COLUMNS` 的列集是
+    Field/Type/Null/Key/Default/Extra，**没有**约束那一列，只靠它导出的
+    dump 会静默丢掉全部 CHECK（"备份→恢复到新库，约束没了"）。这里再发
+    一条 `SHOW CREATE TABLE`（服务端由
+    `sql/logical_dump.py::check_ddl` 生成，与逻辑 dump 共用同一份 DDL
+    实现），把 CHECK **合并**进来：
+
+    * 服务端还没有 `SHOW CREATE TABLE`（老版本）→ 1064/1105：此时它不会
+      返回任何"有 CHECK"的信息，无法判断是否漏了约束，因此**明确打一行
+      警告**（stderr），不假装导出了约束；
+    * `SHOW CREATE TABLE` 成功但 CHECK 条数与 `SHOW COLUMNS` 推不出约束
+      信息之间不可能做交叉核对（列集里没有约束），所以这里只做"能读到
+      就合并、读不到就告警"，并且合并后由 `render_dump` → 
+      `TableSchema.canonical_ddl` 统一渲染 —— 不另写一份 DDL 生成逻辑。
     """
     cur.execute(f"SHOW COLUMNS FROM {tname}")
     cols = []
@@ -59,8 +74,64 @@ def read_schema(cur, tname: str) -> TableSchema:
             'notnull': c[2] == 'NO',
         })
     schema = TableSchema(name=tname, columns=cols)
+
+    ddl = _fetch_create_table(cur, tname)
+    if ddl:
+        try:
+            parsed = parse_create_table(ddl)
+        except BackupError as e:
+            # 服务端给的 DDL 解析不了 → 宁可失败也不导出"缺约束"的备份
+            raise BackupError(
+                f"表 {tname}: SHOW CREATE TABLE 的输出无法解析，拒绝导出"
+                f"（继续导出会丢掉 CHECK 约束等结构）：{e}") from e
+        if parsed.name != tname or parsed.col_names != schema.col_names:
+            raise BackupError(
+                f"表 {tname}: SHOW CREATE TABLE 与 SHOW COLUMNS 的列结构"
+                f"不一致（{parsed.col_names} != {schema.col_names}），"
+                f"拒绝导出（两份结构来源矛盾时无法保证备份完整）")
+        schema.table_checks = [dict(ck) for ck in parsed.table_checks]
+        by_name = {c['name']: c for c in parsed.columns}
+        for c in schema.columns:
+            src = by_name.get(c['name']) or {}
+            if (src.get('check') or {}).get('expr'):
+                c['check'] = dict(src['check'])
+
     schema.assert_supported()
     return schema
+
+
+def _fetch_create_table(cur, tname: str):
+    """尽力取一版真实 DDL；服务端不支持时返回 None（并告警，不静默）"""
+    try:
+        cur.execute(f"SHOW CREATE TABLE {tname}")
+    except Exception as e:                          # noqa: BLE001
+        if _looks_like_unsupported(e):
+            print(f"警告: 服务端不支持 SHOW CREATE TABLE（{e}）—— "
+                  f"本次导出的表 {tname} 不含 CHECK 约束，"
+                  f"恢复后约束会缺失（需升级服务端或手动补 DDL）",
+                  file=sys.stderr)
+            return None
+        raise
+    row = cur.fetchone()
+    if not row:
+        return None
+    # (Table, Create Table, ...) 或 (Create Table, ...)：取含 CREATE 的那一列
+    for v in row:
+        if isinstance(v, str) and v.lstrip().upper().startswith('CREATE'):
+            return v
+    return row[-1] if row else None
+
+
+def _looks_like_unsupported(exc) -> bool:
+    """1064 语法错误 / 1105 未知语句 —— "服务端不认识这条命令"的形态"""
+    code = None
+    args = getattr(exc, 'args', None)
+    if args:
+        code = args[0]
+    if isinstance(code, int) and code in (1064, 1105):
+        return True
+    text = str(exc).lower()
+    return 'syntax' in text or 'unsupported' in text or '不支持' in text
 
 
 def main(argv=None):

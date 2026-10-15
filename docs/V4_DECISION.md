@@ -1,5 +1,18 @@
 # LightDB v4.0 技术决策文档
 
+> ⚠️ **状态说明（2026-10 阶段 0 收尾补充；本文档**已被有意截断**，本文件
+> 不补写缺失内容）**：正文"目标"一节（`12,000 QPS` / `80,000 QPS` /
+> `1M rows/s`）以及"现状"里的 `6500 / 8200 QPS` **均无仓库内基准产物支撑，
+> 属设计目标/估计值**；`lightdb/olap/**`（向量化）、`lightdb/columnar/**`
+> （列存）、`lightdb/parallel/**` 在 `Executor` / `plan_executor` 里**零引用**
+> （未接入 SQL 执行路径），`lightdb/cython/*.pyx` 编译产物为 **0 个**
+> （**未编译验证**）。本机可复现实测见 [review/01_engine.md](review/01_engine.md)：
+> 逐行 INSERT **1,501 rows/s**、批量 INSERT **1,356 rows/s**、点查 **888 q/s**
+> 进程内 / **1,138 q/s** TCP（与 12,000 QPS 相差 **13.5 倍**）、并发 1→8
+> 客户端 **−36%**、WAL **≈200 B/行**、10 轮 UPDATE 后 `.dat` **669 KB→16 MB**。
+> 本文末尾（第 44 行）写明"原文档在此处截断，后续章节缺失"——**该截断是
+> 有意为之的既存状态，本文件不补写历史内容**。
+
 > ⚠️ **数据可信度声明（2026-10 审计）**：本文档中的 QPS、加速比、压缩比等数字**并非由本仓库内的工具产出** —— `lightdb/benchmark/` 下没有任何基准运行产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录也不存在（`~/.lightdb_studio/` 下只有空的 `reports/`、`soak/`）。其中 12000 QPS / 80000 QPS 目标只出现在 `tests/regression_v4/test_performance_v4.py:13-18` 的 `PERF_TARGETS` 字典里，**从未被任何测试断言**。因此本文数字应视为**设计目标或估计值**，而非实测结果。正文表格保持原貌以便对照，完整审计结论见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。
 
 **决策日期**：2025-02-15

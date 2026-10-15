@@ -266,6 +266,13 @@ class Parser:
         if pm:
             return self._show_result('PARTITIONS', table=pm.group(1))
 
+        # ---- SHOW CREATE TABLE（结果集回传；DDL 由 `sql/logical_dump.py`
+        #      的 `TableSchema.canonical_ddl` 统一生成，**含 CHECK 约束**）----
+        scm = re.match(r'SHOW\s+CREATE\s+TABLE\s+[`"]?(\w+)[`"]?\s*$',
+                       sql, re.IGNORECASE)
+        if scm:
+            return self._show_result('CREATE_TABLE', table=scm.group(1))
+
         # ---- 安全面 ----
         if upper in ('SHOW IP WHITELIST', 'SHOW IP WHITE LIST'):
             return self._show_result('IP_WHITELIST')

@@ -176,6 +176,26 @@ Go（database/sql）：
 
 ## 4. v4.0 新特性
 
+> ### ⚠️ 状态说明（2026-10 补充，原文保留未删）
+>
+> 下面 4.1 / 4.2 / 4.3 的性能数字（**92,000 QPS、Cython 自动加速、列存
+> 3–60x 压缩、3.5M rows/s**）**均未在查询路径上验证**，应视为设计目标：
+>
+> - **未接入 SQL 执行路径**：`lightdb/olap/**`（向量化）、`lightdb/columnar/**`
+>   （列存 `ColumnStore`）、`lightdb/parallel/**` 在 `Executor` / `plan_executor`
+>   里**零引用**；`lightdb/cython/*.pyx` 的编译产物（`.pyd`/`.so`/`.c`）为 **0 个**，
+>   `status()['any_accelerated'] == False`（"自动启用 Cython 加速"目前不成立，
+>   走的是纯 Python 回退，且本机无 Cython 与 C 编译器，**编译从未验证**）。
+> - **未验证 / 已知错值**：列存 `GROUP BY` 返回 0 行；向量化 `SUM` 曾因
+>   `np.array` 默认 `int32` 溢出返回错值（阶段 0 已修好算法，但**仍未接线**）；
+>   并行执行只覆盖单表裸 `COUNT`，实测 **0.49x 负加速**。
+> - **可复现实测**（见 [review/01_engine.md](review/01_engine.md)）：逐行 INSERT
+>   **1,501 rows/s**、批量 INSERT **1,356 rows/s**、点查 **888 q/s**（进程内）/
+>   **1,138 q/s**（TCP）、并发 1→8 客户端 1,163→**749 q/s（−36%）**、
+>   WAL **≈200 B/行**、10 轮 UPDATE 后 `.dat` **669 KB→16 MB**。
+> - 多进程的收益是**连接/协议层多核化 + 崩溃隔离**，不是查询执行加速；
+>   "8 核 8,200→92,000 QPS" 与它无关。
+
 ### 4.1 多进程架构（对用户透明）
 
 v4.0 默认启用多进程（Worker 数 = CPU 核数）。从用户角度：
@@ -267,6 +287,14 @@ OLAP 聚合（自动走列存）：
 
 大表聚合（3.5M rows/s）：
 
+> ⚠️ **状态说明（2026-10 补充，原文保留）**：`3.5M rows/s` 与下表的
+> `1x–50x` 压缩比**均未在 SQL 执行路径上验证**（属设计目标）：列存/OLAP/
+> 并行在 `Executor` / `plan_executor` 里**零引用**，列存 `GROUP BY` 实测
+> 返回 **0 行**、并行只覆盖单表裸 `COUNT` 且实测**负加速**（0.49x）。本机
+> 实测聚合/范围扫描为 **11k / 4.8k rows/s**（见
+> [review/01_engine.md](review/01_engine.md)）。下面这几段 SQL 在当前版本
+> 会走**普通行存路径**，结果正确，但没有向量化/列存加速。
+
     SELECT
         DATE_FORMAT(created_at, '%Y-%m') AS month,
         region,
@@ -284,6 +312,11 @@ OLAP 聚合（自动走列存）：
     SELECT COUNT(*) FROM orders WHERE amount > 1000;
 
 内部自动分片并行 COUNT。
+
+> ⚠️ **状态说明（2026-10 补充）**：并行**只**覆盖单表裸 `COUNT`（`_is_plain_count`
+> / `_parallel_count`），其它 SQL 仍串行；且实测并行 COUNT 为 **0.49x 负加速**
+> （`ThreadPoolExecutor` + GIL），因此 10,000 行阈值只是"会启用并行"，**不保证更快**。
+> 查询执行整体仍是**单线程**，8 客户端并发点查实测 1,163→**749 q/s（−36%）**。
 
 ---
 

@@ -5,6 +5,29 @@
 **审计方式**：静态代码审查（全量阅读 + AST 可达性分析）+ 只读运行验证（导入探测、原始 MySQL 协议直连、pytest 全量运行）
 **是否改动源码**：否。本报告只描述现状，未修改 `lightdb/`、`lightdb_studio/`、`web/` 下任何文件。
 
+> ⚠️ **状态说明（2026-10 阶段 0 收尾补充，本报告为审计时快照，正文一字未删）**：
+> 本报告结论中的三类性能宣称，此后**再次确认且未变化**：
+>
+> 1. **未接入 SQL 执行路径**：`lightdb/olap/**`（向量化）、`lightdb/columnar/**`
+>    （列存）、`lightdb/parallel/**`（并行）在 `Executor` / `plan_executor` 里
+>    **零引用** → **3.5M / 85M rows/s、41x** 在查询路径上没有落点；
+> 2. **未编译验证**：`lightdb/cython/*.pyx` 的编译产物（`.pyd`/`.so`/`.c`）为
+>    **0 个**，`status()['any_accelerated'] == False` → **12.5x / 3-4x** 属设计目标；
+> 3. **仍不成立**：`12,000 / 92,000 QPS` 无任何仓库内产物或断言支撑。
+>
+> 本机可复现实测（[review/01_engine.md](review/01_engine.md)，与
+> [review/04_ROADMAP.md](review/04_ROADMAP.md) 一致）：逐行 INSERT
+> **1,501 rows/s**、批量 INSERT **1,356 rows/s**（批量反而更慢）、点查
+> **888 q/s** 进程内 / **1,138 q/s** TCP、并发 1→4→8 客户端
+> 1,163→925→**749 q/s（−36%）**、WAL **≈200 B/行**、10 轮 UPDATE 后 `.dat`
+> **669 KB→16 MB**。
+>
+> 另注：本报告 §结论里"CHECK 约束无效"等**审计时**的缺陷，部分已在阶段 0
+> 修好（CHECK 现已生效、并已进入 `SHOW CREATE TABLE` 与逻辑 dump/恢复路径
+> 的导出与读回校验）；本报告保持审计时原貌，现状以
+> [review/01_engine.md](review/01_engine.md) 与 [review/04_ROADMAP.md](review/04_ROADMAP.md)
+> 为准。
+
 ---
 
 ## 1. 结论摘要
