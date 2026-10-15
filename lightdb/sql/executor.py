@@ -409,7 +409,23 @@ class Executor:
         except KeyError as e:
             # 失败的语句同样进审计（success=0 + 错误原文），
             # 否则"语句失败"这件事在审计里就是空白。
-            result = self._err(1146, f"表不存在: {e}")
+            #
+            # 语义码修正：此前一律报 1146「表不存在」，于是**未知列**也
+            # 被说成"表不存在"，排障会被误导。MySQL 把两者分开：
+            #   1146 = 表不存在；1054 = 未知的列。
+            # 这里用执行器已有的信息判别：KeyError 的键名与语句主表同名
+            # 才当"表不存在"，否则当"未知列"。
+            _missing = str(e).strip("'\"")
+            if '表' in _missing and '不存在' in _missing:
+                result = self._err(1146, _missing)
+            elif '列' in _missing:
+                result = self._err(1054, _missing)
+            else:
+                _tbl = parsed.get('table')
+                if _tbl and _missing == _tbl:
+                    result = self._err(1146, f"表不存在: {_missing}")
+                else:
+                    result = self._err(1054, f"未知的列: {_missing}")
             self._record_audit(parsed, session, result,
                                time.time() - start)
             return result
@@ -426,13 +442,16 @@ class Executor:
                                time.time() - start)
             return result
         except ValueError as e:
-            result = self._err(1062, str(e))
+            result = self._err(self._storage_errno(e), str(e))
             self._record_audit(parsed, session, result,
                                time.time() - start)
             return result
         except Exception as e:
             logger.error(f"执行错误: {e}")
-            result = self._err(1105, str(e))
+            # 语义码修正：此前一律 1105。存储层有些错误抛的是 TypeError
+            # 或自定义异常（例如 "无法把 'abc' 转成 INT"），落到这里就被
+            # 说成"通用错误"。同样按报文归类，**不再一律 1105**。
+            result = self._err(self._storage_errno(e), str(e))
             self._record_audit(parsed, session, result,
                                time.time() - start)
             return result
@@ -445,6 +464,35 @@ class Executor:
             return session
         active = getattr(self, '_active_session', None)
         return active if isinstance(active, dict) else {}
+
+    @staticmethod
+    def _storage_errno(e) -> int:
+        """把存储层异常归类成 MySQL 语义码
+
+        语义码修正（本会话）：此前 `ValueError` 一律 1062（主键/唯一冲突
+        专用码）、其它一律 1105，于是 NOT NULL 违反与类型转换失败都被
+        说成"主键重复"，排障方向完全错。现在按 MySQL 语义区分：
+            1048 = Column cannot be null
+            1062 = Duplicate entry（主键/唯一冲突）
+            1366 = Incorrect value（类型/取值不合法）
+            1105 = 其它（通用），**不再硬套 1062**
+
+        局限（已记录）：存储层目前只用内置异常与少数自定义异常，没有可
+        依赖的类型层级，因此这里靠报文判别。P1 应改为在存储层抛专用异常
+        （NotNullViolation / DuplicateKey / IncorrectValue），届时删掉本方法。
+        """
+        msg = str(e)
+        low = msg.lower()
+        if ('不允许为空' in msg or 'cannot be null' in low
+                or 'not null' in low):
+            return 1048
+        if ('重复' in msg or 'duplicate' in low
+                or '唯一' in msg or 'unique' in low):
+            return 1062
+        if ('转成' in msg or 'invalid literal' in low
+                or 'incorrect' in low or '取值范围' in msg):
+            return 1366
+        return 1105
 
     def _record_audit(self, parsed, session, result, elapsed):
         """把本条语句写入审计（`SHOW AUDIT LOG` 的数据源）
