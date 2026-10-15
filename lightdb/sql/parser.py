@@ -1782,21 +1782,20 @@ class Parser:
             check = self._parse_check(
                 rest[cpos:], strict_tail=False)
 
-        # `AUTO_INCREMENT`：本引擎的行布局/插入路径里**没有自增概念**
-        # （`Table._insert_locked` 只会"主键为 NULL 时取 _next_pk"）。
-        # 原实现把子句静默丢掉，客户端以为列真的会自增；而
-        # `SHOW COLUMNS` 的 Extra 又用主键**伪造** `auto_increment`。
-        # 两者合起来就是一条假的元数据。这里改为定义期显式报错：
-        # 要么真的支持，要么明确拒绝，绝不"接受但不生效"。
-        if re.search(r'\bAUTO_INCREMENT\b', rest, re.IGNORECASE):
-            raise SyntaxError(
-                f"列 {name}: 不支持 AUTO_INCREMENT —— 本引擎没有自增序列，"
-                f"接受它只会让插入行为与声明不符；请显式提供主键值")
-        # 同上：`ON UPDATE <expr>` 在本引擎里没有任何实现
-        if re.search(r'\bON\s+UPDATE\b', rest, re.IGNORECASE):
-            raise SyntaxError(
-                f"列 {name}: 不支持 ON UPDATE 子句 —— 本引擎不会在 UPDATE "
-                f"时重算该列，接受它等于承诺一个不存在的语义")
+        # `AUTO_INCREMENT` / `ON UPDATE`：本引擎**没有**对应实现
+        # （`Table._insert_locked` 只在主键为 NULL 时取 `_next_pk`，
+        #  UPDATE 时也不会重算任何列）。
+        #
+        # 决策（本会话）：与 `ENGINE=InnoDB` 保持**同一种态度** ——
+        # **接受但绝不声称生效**。理由：MySQL 兼容（mysqldump 一类 DDL
+        # 必须能建表），而只要元数据不伪造，使用者就不会误以为它生效。
+        # 因此这里既不报错、也不写任何"生效"痕迹：
+        #   * `SHOW COLUMNS` 的 `Extra` 恒为 `''`（不再由主键伪造
+        #     `auto_increment`，见 `db/database.py::describe_columns`）；
+        #   * 插入时不自增：不提供主键值就是主键为 NULL 的普通插入
+        #     （NOT NULL 主键会显式报错，属可见失败而非静默错值）。
+        # 曾被短暂改为定义期 SyntaxError，但那与 ENGINE 的处理不一致，
+        # 且会让合法 MySQL DDL 无法解析（`test_sql_compat::test_ddl`）。
 
         # `DEFAULT`：真实解析并保留。旧实现根本没有 DEFAULT 分支，
         # 该子句被静默丢掉，于是 `SHOW COLUMNS` 只能恒报 Default=NULL。

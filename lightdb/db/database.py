@@ -102,7 +102,10 @@ def describe_columns(table) -> list:
             # 老 `_meta.json`（长度被抹掉）只有基类型，也如实回传基类型，
             # 不补猜一个长度。
             'type': c.get('type') or '',
-            'null': ('NO' if c.get('notnull') else 'YES'),
+            # MySQL 里主键**隐式 NOT NULL**，而本引擎的插入路径也确实按
+            # NOT NULL 执行（不提供主键值会显式报错）。之前只读 `notnull`
+            # 标志，于是主键列报 `Null=YES` —— 与真实行为矛盾，属假元数据。
+            'null': ('NO' if (c.get('notnull') or c.get('primary')) else 'YES'),
             'key': column_key(c),
             'default': column_default(c),
             'extra': column_extra(c),
