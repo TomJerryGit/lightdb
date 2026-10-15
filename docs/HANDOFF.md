@@ -149,3 +149,21 @@ a63b6a3  (原始快照)
 2. **本项目最常见的缺陷形态是「结构对、语义假」**：列结构对齐了但值恒 0（`SHOW SLAVE STATUS`）、复制按 5 列解包而事件是 6 列（一行都同步不了）、快照返回 `ok:True` 但 0 个建表语句、策略被覆盖、CHECK 声明成功但不校验。**发现一个就沿同一条路再扫一遍**。
 3. **性能声明必须绑定可复现命令**：白皮书 12,000 QPS / 3.5M rows/s / 41x / 12.5x 在查询路径上都没有落点（OLAP/列存/Cython 未接入、源码 0 引用、编译产物 0 个）。实测是：逐行 1,501 rows/s、批量 1,356 rows/s（批量更慢）、点查 888 q/s（进程内）、8 客户端并发 −36%。
 4. **「先探针、再改、再验证」**：凡是登录握手、存储布局这类核心路径，**先写探针确认真实行为**再动手（本会话因坚持这一点避免了两次误改）。
+
+---
+
+## §8 更新（提交 `f2394db`）：阶段 1 第 4 项「元数据诚实化」**已完成，不要重做**
+
+§1 的内容仅作背景保留。已修：`SHOW DATABASES`（真实的 `[库名, information_schema]`，引擎是单库模型）、`SHOW COLUMNS.Default`（真解析，含 `DEFAULT CURRENT_TIMESTAMP`）、`Extra`（恒 `''`，不再由主键伪造）、`Type`（保留参数：`VARCHAR(20)`、`DECIMAL(10,2)`）、`USE <不存在库>`（1049）、`SHOW TABLES` 按库过滤。
+
+**`SELECT DATABASE()` 错值的真因（我交接时的怀疑是错的）**：不是 `mysql_protocol.py:274-278` 的解析（那段是对的），而是**服务端握手漏声明 `CLIENT_CONNECT_WITH_DB`** → pymysql 根本不发 database 字段 → 服务端按字段序读到的"库名"其实是插件名。子代理用**原始字节探针**证实（`root\x00\x00mysql_native_password\x00`，`find(b'default')==-1`）后补上 capability；**副作用修复：pymysql 终于能带 `database=` 连接**（修前连 `database='default'` 都报 `1049 Unknown database 'mysql_native_password'`）。
+
+顺带修的其它伪造：`SHOW PARTITIONS.Database` 写死 `'default'`、`SHOW STATUS.Bytes_received/sent` 写死 `'0'`（谎称零流量）、`Threads_running` 写死 `'1'`、`SHOW PROCESSLIST.Command/Time/Info` 陈旧、`COM_FIELD_LIST` 一律 `VAR_STRING+255`、`information_schema` 整条 SQL 路径不可达（parser 已支持 `schema.table`）。新增 `tests/test_metadata_honesty.py`（15 passed）；Lead 验收：核心 4 文件 164 passed。
+
+### 待决策（下一步先做）
+`AUTO_INCREMENT` 现为**显式拒绝**，而 `ENGINE=InnoDB` 仍是**接受但忽略**（`information_schema.TABLES.ENGINE` 仍写 `'InnoDB'`）——对"未实现子句"的态度不一致，并造成 **1 条净新增红灯**：`tests/regression/test_sql_compat.py::test_ddl`（该用例只断言 `parse(...) is not None`，编码了"静默接受"旧契约，未改）。**建议统一为「接受但绝不声称生效」**（`extra` 恒 `''`、停止伪造 `ENGINE`）：该用例自动恢复绿色，且保持 MySQL 兼容。
+
+### 阶段 1 剩余
+3. `KILL` / `COM_PROCESS_KILL` 仍是空实现（回 OK 但会话仍在）——`SHOW PROCESSLIST` 的 `Command/Time/Info` 已在本轮修好；
+5. 错误码语义修正（`executor.py:403-417`：NOT NULL/类型错都报 1062、未知列报 1146 且报文说"表不存在"）；
+6. 门禁清理（E 类 10 条 + 2 条 flaky + GUI 离屏冒烟），含上面那条 `AUTO_INCREMENT` 决策。
