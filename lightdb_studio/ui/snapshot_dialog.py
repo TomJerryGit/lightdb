@@ -154,18 +154,30 @@ class SnapshotDialog(QDialog):
             progress.setLabelText(f"处理表: {tname}")
 
         try:
-            snap = self.mgr.create_snapshot(
+            result = self.mgr.create_snapshot(
                 conn, name.strip(), progress_cb=cb)
             progress.close()
-            QMessageBox.information(
-                self, "完成",
-                f"快照已创建:\n{snap.file}\n"
-                f"大小: {snap.size / 1024:.1f} KB\n"
-                f"表数: {len(snap.tables)}")
-            self._refresh_list()
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, "失败", str(e))
+            return
+
+        # create_snapshot 现在返回 SnapshotResult：失败时绝不弹「完成」，
+        # 而是把失败清单（表名 / 语句 / 错误原文）完整展示出来。
+        if not getattr(result, 'ok', True):
+            QMessageBox.critical(
+                self, "快照失败",
+                f"快照未创建（未落盘、未进索引）：\n{result.error}\n\n"
+                + (result.summary() if hasattr(result, 'summary') else ''))
+            return
+
+        snap = result.snapshot
+        QMessageBox.information(
+            self, "完成",
+            f"快照已创建:\n{snap.file}\n"
+            f"大小: {snap.size / 1024:.1f} KB\n"
+            f"表数: {len(snap.tables)}")
+        self._refresh_list()
 
     def _restore(self):
         snap = self._get_selected_snapshot()
@@ -195,14 +207,20 @@ class SnapshotDialog(QDialog):
             result = self.mgr.restore_snapshot(
                 conn, snap, progress_cb=cb)
             progress.close()
-            msg = (f"执行 {result['executed']} 条 SQL\n"
-                   f"失败 {result['failed']} 条")
-            if result['errors']:
-                msg += '\n\n首个错误:\n' + result['errors'][0]
-            QMessageBox.information(self, "完成", msg)
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, "失败", str(e))
+            return
+
+        msg = (f"执行 {result['executed']} 条 SQL\n"
+               f"失败 {result['failed']} 条")
+        if result.get('errors'):
+            msg += '\n\n错误清单:\n' + '\n'.join(
+                f"  - {e}" for e in result['errors'][:20])
+        if result.get('ok'):
+            QMessageBox.information(self, "完成", msg)
+        else:
+            QMessageBox.critical(self, "恢复未全部成功", msg)
 
     def _delete(self):
         snap = self._get_selected_snapshot()
@@ -255,9 +273,16 @@ class SnapshotDialog(QDialog):
                 src, dst, drop_existing=self.drop_check.isChecked(),
                 progress_cb=cb)
             progress.close()
-            QMessageBox.information(
-                self, "完成",
-                f"克隆 {result['cloned']} 表，失败 {result['failed']}")
         except Exception as e:
             progress.close()
             QMessageBox.critical(self, "失败", str(e))
+            return
+
+        msg = f"克隆 {result['cloned']} 表，失败 {result['failed']}"
+        if result.get('errors'):
+            msg += '\n\n错误清单:\n' + '\n'.join(
+                f"  - {e}" for e in result['errors'][:20])
+        if result.get('ok'):
+            QMessageBox.information(self, "完成", msg)
+        else:
+            QMessageBox.critical(self, "克隆未全部成功", msg)

@@ -5,7 +5,7 @@ import time
 from PySide6.QtWidgets import (
     QMainWindow, QDockWidget, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QToolBar, QStatusBar, QMessageBox, QFileDialog,
-    QSplitter, QLabel, QInputDialog, QDialog,
+    QSplitter, QLabel, QInputDialog, QDialog, QLineEdit,
 )
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QAction, QKeySequence
@@ -39,6 +39,9 @@ from ..core.metrics import get_registry
 from ..utils.i18n import i18n
 from ..utils.history import QueryHistory
 
+# ---------- DB 错误字段（errno / sqlstate / message，绝不丢） ----------
+from ..db.connection import error_code, error_sqlstate
+
 # ---------- UI 面板 ----------
 from .ai_chat import AIChatPanel
 from .agent_chat import AgentChatPanel
@@ -54,7 +57,7 @@ from .snapshot_dialog import SnapshotDialog
 from .connection_dialog import ConnectionDialog
 from .object_tree import ObjectTree
 from .sql_editor import SQLEditor
-from .result_table import ResultTable
+from .result_table import ResultTable, parse_error_fields
 from .data_editor import DataEditor
 from .table_designer import TableDesigner
 from .query_history import QueryHistoryPanel
@@ -495,10 +498,27 @@ class MainWindow(QMainWindow):
     def _build_statusbar(self):
         sb = QStatusBar()
         self.setStatusBar(sb)
-        self.status_label = QLabel("就绪")
+        # 用只读 QLineEdit 而不是 QLabel：完整错误文本可以在状态栏里
+        # 直接选中复制（以前是 `any_error[:80]` 静默截断，后面的诊断信息
+        # 用户永远看不到）。用 QLineEdit 仍然保持单行高度与横向滚动。
+        self.status_label = QLineEdit("就绪")
+        self.status_label.setReadOnly(True)
+        self.status_label.setFrame(False)
+        self.status_label.setStyleSheet(
+            "QLineEdit { background: transparent; border: none; color: #cccccc; }")
         sb.addWidget(self.status_label)
         self.conn_label = QLabel("未连接")
         sb.addPermanentWidget(self.conn_label)
+
+    def _set_status(self, text: str, error: bool = False, tooltip: str = None):
+        """设置状态栏文本；**不截断**，全文同时放进 tooltip 方便悬停查看。"""
+        text = '' if text is None else str(text)
+        self.status_label.setText(text)
+        self.status_label.setCursorPosition(0)   # 从头显示，不看到尾巴
+        self.status_label.setToolTip(text if tooltip is None else tooltip)
+        self.status_label.setStyleSheet(
+            "QLineEdit { background: transparent; border: none; color: %s; }"
+            % ('#f48771' if error else '#cccccc'))
 
     # ==================== 标签页 ====================
 
@@ -689,6 +709,9 @@ class MainWindow(QMainWindow):
         last_cols, last_rows = [], []
         last_msg = ""
         any_error = None
+        err_code = None
+        err_state = None
+        failed_stmt = None
 
         # 记录血缘
         try:
@@ -711,6 +734,7 @@ class MainWindow(QMainWindow):
                     rowcount, err = conn.execute(stmt)
                     if err:
                         any_error = err
+                        failed_stmt = stmt
                         break
                     last_cols, last_rows = [], []
                     last_msg = f"影响 {rowcount} 行"
@@ -719,20 +743,31 @@ class MainWindow(QMainWindow):
                         self.object_tree.refresh_all()
             except Exception as e:
                 any_error = str(e)
+                err_code = error_code(e)
+                err_state = error_sqlstate(e)
+                failed_stmt = stmt
                 break
 
         elapsed = (time.time() - t0) * 1000
 
         if any_error:
-            result.show_error(any_error)
-            self.status_label.setText(f"错误: {any_error[:80]}")
+            # 错误码 / SQLSTATE / 完整报文一起交给结果区；状态栏不截断。
+            # `any_error` 已经是 format_db_error 的完整文本（含 SQL 行），
+            # 这里再解析出 errno/sqlstate 用于标题行，避免重复展示。
+            if err_code is None:
+                _c, _s = parse_error_fields(any_error)
+                err_code = _c if _c is not None else err_code
+                if not err_state:
+                    err_state = _s
+            result.show_error(any_error, errno=err_code, sqlstate=err_state)
+            self._set_status(f"错误: {any_error}", error=True)
             self.history.add(sql, conn.config.name, False, elapsed)
         else:
             if last_cols:
                 result.show_result(last_cols, last_rows, elapsed)
             else:
                 result.show_message(last_msg)
-            self.status_label.setText(f"完成 ({elapsed:.1f} ms)")
+            self._set_status(f"完成 ({elapsed:.1f} ms)")
             self.history.add(sql, conn.config.name, True, elapsed)
 
         self.history_panel.refresh()

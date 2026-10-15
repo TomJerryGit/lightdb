@@ -6,8 +6,140 @@ from typing import Optional, List, Tuple, Any
 try:
     import pymysql
     import pymysql.cursors
+    import pymysql.err
 except ImportError:
     pymysql = None
+
+# 让 DBQueryError 同时是 pymysql 的错误类型：上层若按 `pymysql.err.Error`
+# / `MySQLError` 捕获，行为不变（只是多带了 errno/sqlstate/message 字段）。
+_DBErrorBase = pymysql.err.MySQLError if pymysql is not None else Exception
+
+
+# ==================== 错误信息提取（不许丢字段） ====================
+# 背景：pymysql 把错误码放在 args[0]、报文放在 args[1]，只有部分异常带
+# sqlstate 属性。以前这里统一 `str(e)`，于是 `errno` / `sqlstate` 这两个
+# 诊断时最关键的字段在上层全部丢失（GUI 只能显示一句光秃秃的文本）。
+# 下面两个函数把 (errno, sqlstate, message) 完整抠出来，供 DBQueryError
+# 与 GUI 复用。
+
+def error_sqlstate(exc: BaseException) -> Optional[str]:
+    """取异常上的 SQLSTATE；取不到返回 None（不编造）。"""
+    if exc is None:
+        return None
+    st = getattr(exc, 'sqlstate', None)
+    if st:
+        return str(st)
+    return None
+
+
+def error_code(exc: BaseException) -> Optional[int]:
+    """取 MySQL 错误码（errno）。取不到返回 None。"""
+    if exc is None:
+        return None
+    en = getattr(exc, 'errno', None)
+    if isinstance(en, int):
+        return en
+    args = getattr(exc, 'args', None) or ()
+    if args and isinstance(args[0], int):
+        return args[0]
+    return None
+
+
+def error_message(exc: BaseException) -> str:
+    """取完整错误报文（不截断、不丢后续参数）。"""
+    if exc is None:
+        return ''
+    args = getattr(exc, 'args', None) or ()
+    if args and isinstance(args[0], int):
+        rest = [str(a) for a in args[1:]]
+        if rest:
+            return ' | '.join(rest) if len(rest) > 1 else rest[0]
+        # 只有错误码、没有报文：仍然把码报出来
+        return f'(错误码 {args[0]}，服务端未提供报文)'
+    return str(exc)
+
+
+def format_db_error(exc: BaseException, sql: str = None) -> str:
+    """把数据库错误格式化成可读、可复制的完整文本。
+
+    形如::
+
+        错误码  : 1064
+        SQLSTATE: 42000
+        报文    : You have an error in your SQL syntax ...
+        SQL     : SELCT bad syntax
+
+    字段缺失时写「(未提供)」，绝不静默省略，也绝不截断报文。
+    """
+    code = error_code(exc)
+    state = error_sqlstate(exc)
+    msg = error_message(exc)
+    lines = [
+        f"错误码  : {code if code is not None else '(未提供)'}",
+        f"SQLSTATE: {state if state else '(未提供)'}",
+        f"报文    : {msg}",
+    ]
+    if sql:
+        lines.append(f"SQL     : {sql}")
+    return '\n'.join(lines)
+
+
+class DBQueryError(_DBErrorBase):
+    """带完整诊断字段的数据库错误。
+
+    属性：
+        errno     MySQL 错误码（int 或 None）
+        sqlstate  SQLSTATE（str 或 None）
+        message   服务端完整报文（不截断）
+        sql       触发错误的 SQL（可为 None）
+
+    `str(exc)` 与 `format_db_error` 一致，因此任何只做 `str(e)` 的旧代码
+    也至少能看到错误码 + SQLSTATE + 完整报文。
+
+    `exc.args` 保持与 pymysql 原生异常同形 —— `(errno, message)`，
+    因此历史上写 `code, msg = e.args` 或 `code = e.args[0]` 的代码继续可用。
+    """
+
+    def __init__(self, errno=None, sqlstate=None, message='', sql=None,
+                 cause: BaseException = None):
+        self.errno = errno
+        self.sqlstate = sqlstate
+        self.message = message or ''
+        self.sql = sql
+        self.cause = cause
+        # 与 pymysql.err.MySQLError 同形：args = (errno, message)
+        super().__init__(errno, self.message)
+
+    def text(self) -> str:
+        return format_db_error(self, sql=self.sql)
+
+    def failure_record(self) -> dict:
+        """失败清单里的一条记录（结构稳定，便于断言/展示）。"""
+        return {
+            'errno': self.errno,
+            'sqlstate': self.sqlstate,
+            'message': self.message,
+            'sql': self.sql,
+            'text': self.text(),
+        }
+
+    def __iter__(self):
+        # 兼容 `code, msg = e` 写法
+        return iter(self.args)
+
+    def __str__(self):
+        return self.text()
+
+
+def _raise_db_error(exc: BaseException, sql: str = None):
+    """把底层异常包装成 DBQueryError 上抛——绝不吞掉，也绝不丢字段。"""
+    raise DBQueryError(
+        errno=error_code(exc),
+        sqlstate=error_sqlstate(exc),
+        message=error_message(exc),
+        sql=sql,
+        cause=exc,
+    ) from exc
 
 
 class DBConnection:
@@ -82,21 +214,31 @@ class DBConnection:
     # ============ 查询接口 ============
 
     def query(self, sql: str, params=None) -> Tuple[List[str], List[tuple]]:
-        """执行查询，返回 (列名, 行列表)"""
+        """执行查询，返回 (列名, 行列表)。
+
+        失败时抛 `DBQueryError`（**不吞错**），异常上带有
+        `errno` / `sqlstate` / `message` / `sql` 四个字段。
+        """
         with self.lock:
-            with self.cursor() as cur:
-                cur.execute(sql, params)
-                if cur.description:
-                    cols = [d[0] for d in cur.description]
-                    rows = cur.fetchall()
-                    return cols, list(rows)
-                # 非查询语句
-                return [], []
+            try:
+                with self.cursor() as cur:
+                    cur.execute(sql, params)
+                    if cur.description:
+                        cols = [d[0] for d in cur.description]
+                        rows = cur.fetchall()
+                        return cols, list(rows)
+                    # 非查询语句
+                    return [], []
+            except Exception as e:
+                _raise_db_error(e, sql)
 
     def execute(self, sql: str, params=None) -> Tuple[int, Optional[str]]:
         """
         执行非查询语句
         返回 (影响行数, 错误信息)
+
+        错误信息是 `format_db_error` 的完整文本（错误码 + SQLSTATE +
+        完整报文 + SQL），不再是一句 `str(e)`。成功时错误信息为 None。
         """
         try:
             with self.lock:
@@ -104,7 +246,7 @@ class DBConnection:
                     cur.execute(sql, params)
                     return cur.rowcount, None
         except Exception as e:
-            return 0, str(e)
+            return 0, format_db_error(e, sql=sql)
 
     def execute_many(self, sql: str, params_list) -> Tuple[int, Optional[str]]:
         try:
@@ -113,7 +255,8 @@ class DBConnection:
                     cur.executemany(sql, params_list)
                     return cur.rowcount, None
         except Exception as e:
-            return 0, str(e)
+            # executemany 的 sql 是模板（含 %s 占位），照原样带出来
+            return 0, format_db_error(e, sql=sql)
 
     def switch_database(self, db_name: str):
         with self.lock:
