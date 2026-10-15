@@ -37,6 +37,34 @@ from PySide6.QtCore import Qt, QTimer               # noqa: E402
 
 _mark('PySide6 导入完成（Qt 库加载）')
 
+# ---------- 字体目录（消除 QFontDatabase 告警 + 让离屏也有字体） ----------
+# Qt 6 起不再自带字体，`PySide6/lib/fonts` 是不存在的目录，于是启动时报
+#   QFontDatabase: Cannot find font directory .../PySide6/lib/fonts
+# 只设一个**存在**的目录（Windows 优先用 %WINDIR%\Fonts，其它平台试几个
+# 常见目录），不存在的目录一律不设 —— 设了反而更容易触发同一告警。
+# 必须在 QApplication 构造之前设置（Qt 在建 QApplication 时读这个变量）。
+def ensure_font_dir() -> str:
+    """幂等地把 QT_QPA_FONTDIR 指到一个**存在**的字体目录（返回该目录）。
+
+    必须在 `QApplication` 构造之前调用（Qt 在建 QApplication 时读该变量）。
+    已经显式设置过就不覆盖。"""
+    if os.environ.get('QT_QPA_FONTDIR'):
+        return os.environ['QT_QPA_FONTDIR']          # 用户显式指定，不覆盖
+    candidates = []
+    windir = os.environ.get('WINDIR') or os.environ.get('SystemRoot')
+    if windir:
+        candidates.append(os.path.join(windir, 'Fonts'))
+    candidates += ['/usr/share/fonts', '/usr/local/share/fonts']
+    for path in candidates:
+        if os.path.isdir(path):
+            os.environ['QT_QPA_FONTDIR'] = path
+            return path
+    return ''
+
+
+_FONT_DIR = ensure_font_dir()
+_mark('字体目录设置完成（QT_QPA_FONTDIR=%s）' % (_FONT_DIR or '未找到，跳过'))
+
 from .ui.main_window import MainWindow              # noqa: E402
 from .config import AppConfig                       # noqa: E402
 

@@ -1,4 +1,6 @@
 """主题管理 - 深色 / 浅色 / 高对比度"""
+import os
+
 from PySide6.QtGui import QColor
 
 
@@ -274,9 +276,29 @@ THEMES = {
     'highcontrast': HC_THEME,
 }
 
+# 仅供性能对照测量：置 1 时关掉本轮"幂等短路"，回到每个启动点都重设样式表
+# 的老行为（便于在同一个代码状态下做 before/after 计时）。
+_LEGACY = os.environ.get('LIGHTDB_STUDIO_LEGACY_STARTUP', '') \
+    .strip().lower() not in ('', '0', 'false', 'no', 'off') \
+    or os.environ.get('LIGHTDB_STUDIO_LEGACY_THEME', '') \
+    .strip().lower() not in ('', '0', 'false', 'no', 'off')
+
 
 def apply_theme(app, theme_name: str):
     theme = THEMES.get(theme_name, DARK_THEME)
+
+    # 幂等短路：`app.setStyleSheet()` 会让 Qt 重新 polish **应用下所有**
+    # 控件的样式表，实测每次 60~420ms（控件越多越贵）。启动路径上
+    # `app.py` 已经按 `config.settings.theme` 应用过一次，随后
+    # `MainWindow._apply_settings()` 又对同一个 app 应用**完全相同**的
+    # 主题，第二次是纯浪费（end state 一模一样）。
+    #
+    # 只有「请求的主题和当前已应用的主题一模一样」时才跳过；换主题、
+    # 极端情况下样式表被别处改掉（比对 `styleSheet()` 文本）都会照常应用，
+    # 所以显示结果与以前完全一致。
+    if not _LEGACY and getattr(app, '_lightdb_theme_name', None) == theme.name \
+            and app.styleSheet() == theme.qss():
+        return theme
     app.setStyleSheet(theme.qss())
     # 保留高亮风格
     from PySide6.QtGui import QPalette
@@ -286,4 +308,5 @@ def apply_theme(app, theme_name: str):
     pal.setColor(QPalette.Highlight, QColor(theme.colors['selection']))
     pal.setColor(QPalette.HighlightedText, QColor(theme.colors['selection_fg']))
     app.setPalette(pal)
+    app._lightdb_theme_name = theme.name
     return theme

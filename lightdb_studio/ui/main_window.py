@@ -1,13 +1,14 @@
 """主窗口"""
 import os
 import re
+import sys
 import time
 from PySide6.QtWidgets import (
     QMainWindow, QDockWidget, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QToolBar, QStatusBar, QMessageBox, QFileDialog,
     QSplitter, QLabel, QInputDialog, QDialog, QLineEdit,
 )
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 
 # ---------- 核心管理器 ----------
@@ -87,17 +88,40 @@ from .data_map_view import DataMapView
 from ..config import ConnectionInfo
 from ..db.connection import DBConnection
 
+# 仅供性能对照测量：置 1 时回到"全部管理器立即创建 / 右侧面板立即创建 /
+# 启动期恢复立即执行"的老行为，用于同一代码状态下的 before/after 计时。
+_LEGACY_STARTUP = os.environ.get('LIGHTDB_STUDIO_LEGACY_STARTUP', '') \
+    .strip().lower() not in ('', '0', 'false', 'no', 'off')
+# 只回退"启动期恢复延迟"一项（其余优化保留），用于分项计时。
+_LEGACY_RESTORE = _LEGACY_STARTUP or (
+    os.environ.get('LIGHTDB_STUDIO_LEGACY_RESTORE', '')
+    .strip().lower() not in ('', '0', 'false', 'no', 'off'))
+
 
 class MainWindow(QMainWindow):
     """LightDB Studio 主窗口"""
 
     def __init__(self, config):
+        # 兜底：如果调用方没走 `lightdb_studio.app`（测试/嵌入方直接建窗口），
+        # 字体目录变量还没设，Qt 会报 "Cannot find font directory"。
+        # 在 QApplication 已存在时设置无效但无害；正常入口在 app.py 里已经设过。
+        try:
+            from ..app import ensure_font_dir
+            ensure_font_dir()
+        except Exception as e:                        # noqa: BLE001
+            print('字体目录设置失败（不影响功能）: %s' % e, file=sys.stderr)
+
         super().__init__()
         self.config = config
         self.settings = config.settings
         self.history = QueryHistory()
 
         # ---------- 核心管理器 ----------
+        # 说明（实测）：30+ 个管理器**全部构造只占 ~9ms**（MainWindow 构造的
+        # 1% 不到），所以这里只把「首屏完全用不到」的 workflow_engine /
+        # ai_agent / alert_engine 做成惰性属性（见下方 `__getattr__` 与
+        # `_LAZY_MANAGERS`）：真正省时间的是 UI 面板的延迟构建与主题重复
+        # 应用的去重。
         self.env_mgr = EnvironmentManager()
         self.lineage_store = LineageStore()
         self.lineage_enhanced = EnhancedLineageStore()
@@ -112,28 +136,32 @@ class MainWindow(QMainWindow):
         self.collab_store = CollaborationStore()
         self.ai_store = AIConfigStore()
         self.catalog = CatalogEngine()
-        self.alert_engine = AlertEngine()
 
         # 调度
+        # scheduler 保持即时创建：构造函数末尾要 start()（后台线程/定时器），
+        # 延迟创建会把"调度器是否在跑"变成不确定状态。
         self.scheduler = Scheduler(
             connection_provider=self._get_conn_by_name,
             report_engine=self.report_engine)
-        self.workflow_engine = WorkflowEngine(
-            connection_provider=self._get_conn_by_name)
 
-        # AI Agent
-        self.ai_agent = AIAgent(
-            conn_getter=self._get_current_conn,
-            ai_config=self.ai_store.load(),
-            catalog=self.catalog,
-            lineage=self.lineage_store)
+        if _LEGACY_STARTUP:                 # 对照测量用：立即建（老行为）
+            self.workflow_engine = WorkflowEngine(
+                connection_provider=self._get_conn_by_name)
+            self.ai_agent = AIAgent(
+                conn_getter=self._get_current_conn,
+                ai_config=self.ai_store.load(),
+                catalog=self.catalog,
+                lineage=self.lineage_store)
+            self.alert_engine = AlertEngine()
 
-        # 插件系统
+        # 插件系统：延迟到首屏之后 load_all()（见 __init__ 末尾的
+        # `_defer_startup_work`），插件目录为空时几乎零成本，但插件多/慢时
+        # 它会把窗口卡在"白屏"。`plugin_mgr` 本身仍是即时创建的同名属性，
+        # 首屏之后由 load_all() 填充。
         plugins_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             '..', 'plugins')
         self.plugin_mgr = PluginManager(plugins_dir, self._plugin_context())
-        self.plugin_mgr.load_all()
 
         # i18n
         i18n.set_lang(self.settings.language)
@@ -155,8 +183,80 @@ class MainWindow(QMainWindow):
         # 启动后台服务
         self.scheduler.start()
 
-        # 自动连接
+        if _LEGACY_RESTORE:                 # 对照测量用：立即恢复（老行为）
+            try:
+                self.plugin_mgr.load_all()
+            except Exception as e:            # noqa: BLE001
+                print('插件加载失败: %s' % e, file=sys.stderr)
+            self._auto_restore()
+        else:
+            # 启动期恢复（插件扫描 / 自动连接 / 恢复上次打开的查询页）
+            # 推迟到首屏显示之后，见 `_defer_startup_work`。
+            self._defer_startup_work()
+
+    # ==================== 惰性管理器 / 惰性面板 ====================
+
+    # 名字 → 构造函数（在 `__getattr__` 里首次访问时才执行，主线程）。
+    #   * 管理器：首屏完全用不到的 workflow_engine / ai_agent / alert_engine；
+    #   * 右侧面板：ai_chat / agent_chat / collab_panel / catalog_panel
+    #     （它们对应的标签页首屏看不见，构造是纯浪费，实测 7~27ms/个）。
+    # `hasattr(win, 'catalog_panel')` 会照常构造 —— 所以对既有代码/测试来说
+    # 这些属性依然"存在"，只是构造被推迟到第一次真正访问。
+    _LAZY_MANAGERS = {
+        'workflow_engine': lambda self: WorkflowEngine(
+            connection_provider=self._get_conn_by_name),
+        'ai_agent': lambda self: AIAgent(
+            conn_getter=self._get_current_conn,
+            ai_config=self.ai_store.load(),
+            catalog=self.catalog,
+            lineage=self.lineage_store),
+        'alert_engine': lambda self: AlertEngine(),
+        'ai_chat': lambda self: self._make_ai_chat(),
+        'agent_chat': lambda self: self._make_agent_chat(),
+        'collab_panel': lambda self: self._make_collab_panel(),
+        'catalog_panel': lambda self: self._make_catalog_panel(),
+    }
+
+    def __getattr__(self, name):
+        """惰性管理器：首次访问才构造，构造后写回 `__dict__`。
+
+        写回后就是普通实例属性，`vars(win)` / `hasattr` / 赋值覆盖的行为与
+        惰性化之前完全一致。构造失败**不吞异常**（不会留下半初始化状态）。
+        """
+        if name in MainWindow._LAZY_MANAGERS:
+            obj = MainWindow._LAZY_MANAGERS[name](self)   # 抛错就抛错
+            self.__dict__[name] = obj
+            return obj
+        raise AttributeError('%s 对象没有属性 %r'
+                             % (type(self).__name__, name))
+
+    def _lazy_eager(self, name):
+        """若该惰性管理器**已经**被创建过就返回它，否则返回 None（不创建）。"""
+        return self.__dict__.get(name)
+
+    def _defer_startup_work(self):
+        """把「首屏不需要」的启动期恢复动作推迟到窗口显示之后。
+
+        这些动作最终**一定会发生**（`QTimer.singleShot(0, ...)` 在事件循环
+        第一个事件里跑，即窗口 show() 之后），只是不再挡在首屏前面：
+          * 插件扫描 load_all()（插件目录为空时 ~0.2ms，插件多时会白屏）；
+          * `_auto_restore()`：逐个 DBConnection.connect()（真实 TCP 握手，
+            慢网/不可达时每个连接都要等到超时）。`auto_connect=False` 时
+            仍按老逻辑不连。
+        """
+        QTimer.singleShot(0, self.do_startup_restore)
+
+    def do_startup_restore(self):
+        """首屏之后要做的启动期恢复（可被测试直接调用，不必等事件循环）。"""
+        if getattr(self, '_startup_restore_done', False):
+            return
+        self._startup_restore_done = True
+        try:
+            self.plugin_mgr.load_all()
+        except Exception as e:                        # noqa: BLE001
+            print('插件加载失败: %s' % e, file=sys.stderr)
         self._auto_restore()
+
 
     # ==================== 上下文 ====================
 
@@ -185,37 +285,31 @@ class MainWindow(QMainWindow):
         self.right_tabs = QTabWidget()
         self.right_tabs.setTabPosition(QTabWidget.North)
 
-        # 查询历史
+        # 首屏可见的右侧标签（右侧工具面板的第一个标签是"历史"）：
+        # 这两个面板很小（历史 0.7ms / 片段 ~1ms）且首屏就在前台，直接建。
         self.history_panel = QueryHistoryPanel(self.history)
         self.history_panel.sql_selected.connect(self._insert_history_sql)
         self.right_tabs.addTab(self.history_panel, "历史")
 
-        # SQL 片段
         self.snippet_panel = SnippetPanel(self.snippet_mgr)
         self.snippet_panel.snippet_activated.connect(self._insert_sql_to_editor)
         self.right_tabs.addTab(self.snippet_panel, "片段")
 
-        # AI 对话
-        self.ai_chat = AIChatPanel(
-            schema_provider=self._schema_provider,
-            conn_getter=self._get_current_conn)
-        self.ai_chat.sql_generated.connect(self._insert_sql_to_editor)
-        self.right_tabs.addTab(self.ai_chat, "AI")
-
-        # Agent 对话
-        self.agent_chat = AgentChatPanel(self.ai_agent)
-        self.agent_chat.sql_generated.connect(self._insert_sql_to_editor)
-        self.right_tabs.addTab(self.agent_chat, "Agent")
-
-        # 协作
-        self.collab_panel = CollaborationPanel(self.collab_store)
-        self.collab_panel.session_selected.connect(self._on_session_selected)
-        self.right_tabs.addTab(self.collab_panel, "协作")
-
-        # 数据目录
-        self.catalog_panel = CatalogPanel(self.catalog)
-        self.catalog_panel.table_selected.connect(self._on_catalog_selected)
-        self.right_tabs.addTab(self.catalog_panel, "目录")
+        # 其余四个面板首屏看不到（右侧面板当前停在"历史"），构造它们是纯浪费：
+        # 实测 AI 11ms + Agent(含 AIAgent) 19ms + 协作 7ms + 目录 27ms。
+        # 这里先占位，**首次切到该标签（或首次访问 `win.ai_chat` 等属性）时**
+        # 才真正构造，见 `_ensure_right_tab` / `__getattr__`。
+        self._right_tab_index = {}
+        for attr, title in (('ai_chat', 'AI'), ('agent_chat', 'Agent'),
+                            ('collab_panel', '协作'),
+                            ('catalog_panel', '目录')):
+            ph = QWidget()
+            self._right_tab_index[attr] = self.right_tabs.addTab(ph, title)
+        self.right_tabs.currentChanged.connect(self._on_right_tab_changed)
+        if _LEGACY_STARTUP:                 # 对照测量用：立即建（老行为）
+            for _attr in list(self._right_tab_index):
+                self._ensure_right_tab(_attr)
+            self.right_tabs.setCurrentIndex(0)
 
         self.right_dock = QDockWidget("工具面板", self)
         self.right_dock.setWidget(self.right_tabs)
@@ -239,6 +333,87 @@ class MainWindow(QMainWindow):
 
         # 添加一个空白查询标签
         self._add_new_query_tab(auto_switch=True)
+
+    # ---------- 右侧面板的延迟构建 ----------
+
+    def _make_ai_chat(self):
+        panel = AIChatPanel(schema_provider=self._schema_provider,
+                            conn_getter=self._get_current_conn)
+        panel.sql_generated.connect(self._insert_sql_to_editor)
+        return panel
+
+    def _make_agent_chat(self):
+        # self.ai_agent 是惰性管理器：真正需要 Agent 面板时才构造
+        panel = AgentChatPanel(self.ai_agent)
+        panel.sql_generated.connect(self._insert_sql_to_editor)
+        return panel
+
+    def _make_collab_panel(self):
+        panel = CollaborationPanel(self.collab_store)
+        panel.session_selected.connect(self._on_session_selected)
+        return panel
+
+    def _make_catalog_panel(self):
+        panel = CatalogPanel(self.catalog)
+        panel.table_selected.connect(self._on_catalog_selected)
+        return panel
+
+    def _ensure_right_tab(self, attr):
+        """保证 `attr` 对应的右侧标签页上挂着**真面板**（幂等）。
+
+        注意两个坑：
+          1. `removeTab`/`insertTab`/`setCurrentIndex` 都会再次发出
+             `currentChanged`，所以用 `_right_tab_building` 做重入保护，
+             否则无限递归；
+          2. 面板可能已经被 `win.catalog_panel` 这样的**属性访问**提前
+             构造了（建好但还没挂到标签页上），所以"已在 __dict__ 里"
+             也必须继续走挂载流程。
+        """
+        panel = self.__dict__.get(attr)
+        if panel is None:
+            panel = getattr(self, attr)             # 走 __getattr__ 惰性构造
+        if panel is None:
+            return None
+        idx = self._right_tab_index[attr]
+        if self.right_tabs.widget(idx) is panel:
+            return panel                            # 已经挂好了
+        if getattr(self, '_right_tab_building', False):
+            # 重入（信号是同步发的）：外层正在挂，这里不要动标签页，
+            # 直接把真面板交回去即可。
+            return panel
+        self._right_tab_building = True
+        try:
+            old = self.right_tabs.widget(idx)
+            self.right_tabs.removeTab(idx)
+            if old is not None and old is not panel:
+                old.setParent(None)
+                old.deleteLater()
+            self.right_tabs.insertTab(idx, panel, self._right_tab_titles[attr])
+            if self.right_tabs.widget(idx) is not panel:
+                for i in range(self.right_tabs.count()):
+                    if self.right_tabs.widget(i) is panel:
+                        idx = i
+                        break
+                else:
+                    raise RuntimeError('右侧面板 %s 未能挂到标签页上' % attr)
+            self._right_tab_index[attr] = idx
+            self.right_tabs.setCurrentIndex(idx)
+            return panel
+        finally:
+            self._right_tab_building = False
+
+    _right_tab_titles = {'ai_chat': 'AI', 'agent_chat': 'Agent',
+                         'collab_panel': '协作', 'catalog_panel': '目录'}
+
+    def _on_right_tab_changed(self, idx):
+        for attr, i in self._right_tab_index.items():
+            if i != idx:
+                continue
+            panel = self.__dict__.get(attr)
+            if panel is None or self.right_tabs.widget(i) is not panel:
+                # 用户真的要看这个面板了 —— 现在才值得花那 7~27ms
+                self._ensure_right_tab(attr)
+            return
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -381,13 +556,13 @@ class MainWindow(QMainWindow):
 
         a = QAction("🤖 AI 对话", self)
         a.setShortcut(QKeySequence("Ctrl+Shift+A"))
-        a.triggered.connect(
-            lambda: self._show_right_tab_by_widget(self.ai_chat))
+        # 传属性名而不是 `self.ai_chat`：后者会在 `_build_menu()` 里就把
+        # 面板建出来，延迟构建就白做了。
+        a.triggered.connect(lambda: self._show_right_tab('ai_chat'))
         m_tools.addAction(a)
 
         a = QAction("💬 协作会话", self)
-        a.triggered.connect(
-            lambda: self._show_right_tab_by_widget(self.collab_panel))
+        a.triggered.connect(lambda: self._show_right_tab('collab_panel'))
         m_tools.addAction(a)
 
         a = QAction("📊 性能监控", self)
@@ -961,7 +1136,16 @@ class MainWindow(QMainWindow):
 
     # ==================== 右键 Tab 切换 ====================
 
+    def _show_right_tab(self, attr):
+        """把右侧工具面板切到 `attr` 对应的标签（需要时才真正构造该面板）。"""
+        if not hasattr(self, 'right_dock') or self.right_dock is None:
+            return
+        widget = self._ensure_right_tab(attr)
+        self.right_dock.setVisible(True)
+        self.right_tabs.setCurrentWidget(widget)
+
     def _show_right_tab_by_widget(self, widget):
+        """兼容旧调用点：按控件反查右侧标签（面板没建过就返回，不隐式构造）。"""
         if not hasattr(self, 'right_dock') or self.right_dock is None:
             return
         self.right_dock.setVisible(True)
@@ -1278,10 +1462,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        try:
-            self.alert_engine.stop_monitoring()
-        except Exception:
-            pass
+        # 只在"真的被用过"时才去停它：alert_engine 是惰性管理器，
+        # 直接 `self.alert_engine` 会在关闭窗口时白白构造一个引擎。
+        _alerts = self._lazy_eager('alert_engine')
+        if _alerts is not None:
+            try:
+                _alerts.stop_monitoring()
+            except Exception:
+                pass
 
         try:
             self.plugin_mgr.unload_all()
