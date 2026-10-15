@@ -833,7 +833,10 @@ class PlanExecutor:
         result = []
         for col_expr in node.columns:
             result.append(self._eval_agg_expr(col_expr, cols, rows))
-        out_cols = [c.upper().strip() for c in node.columns]
+        # 输出列名保留 SELECT 列的**原文大小写**（MySQL 语义）。
+        # 曾用 `.upper()`，于是 `u.city` -> `U.CITY`、`cnt` -> `CNT`，
+        # 与 MySQL 的列标签行为不符。
+        out_cols = [str(c).strip() for c in node.columns]
         return out_cols, [result]
 
     def _check_group_by_columns(self, columns, group_cols, implicit=False,
@@ -907,7 +910,8 @@ class PlanExecutor:
         else:
             groups = {(): rows}
 
-        out_cols = [c.upper().strip() for c in agg_cols]
+        # 同上：保留原文大小写（聚合列标签不应被转成大写）
+        out_cols = [str(c).strip() for c in agg_cols]
         out_rows = []
         # HAVING 里的聚合表达式可能不在 SELECT 列表里（例如
         # `SELECT city FROM users GROUP BY city HAVING COUNT(*) > 5`），

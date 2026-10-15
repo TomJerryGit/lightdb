@@ -5147,8 +5147,10 @@ class Executor:
             return False        # 全部列都在，计划路径能解析任何列名
         has_agg = any(re.match(r'^\w+\s*\(', c.strip()) for c in columns)
         if p.get('group_by') or has_agg:
-            # GroupBy 的输出列名 = SELECT 列的**大写原文**（含 `AS 别名`）
-            out_names = [c.strip().upper() for c in columns]
+            # GroupBy 的输出列名 = SELECT 列的**原文**（含 `AS 别名`）。
+            # 曾把原文转成大写（`u.city` -> `U.CITY`、`cnt` -> `CNT`），
+            # 这不符合 MySQL：列标签应保留书写形式。
+            out_names = [c.strip() for c in columns]
         else:
             out_names = []
             for c in columns:
