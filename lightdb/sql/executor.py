@@ -5739,6 +5739,7 @@ class Executor:
             try:
                 reclaimed = tbl.vacuum(horizon)
                 tbl.flush()
+                freed = getattr(tbl, 'last_vacuum_freed_bytes', 0)
                 analyzed = ''
                 if self.stats_manager is not None:
                     try:
@@ -5752,7 +5753,8 @@ class Executor:
                 continue
             rows.append((name, 'optimize', 'status', 'OK'))
             rows.append((name, 'optimize', 'info',
-                         f'回收 {reclaimed} 个历史版本，脏页已刷盘{analyzed}'))
+                         f'回收 {reclaimed} 个历史版本，页内释放 {freed} '
+                         f'字节可复用空间，脏页已刷盘{analyzed}'))
         return self._rs(list(self._CHECK_COLUMNS), rows)
 
     def _show_create_table(self, p, s):

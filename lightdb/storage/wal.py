@@ -25,6 +25,18 @@ checkpoint 机制说明:
 - compact_before(lsn) 删除该 LSN 之前的已提交记录
 - 使用前提: 调用方需保证 lsn 之前的事务都已提交/回滚，且不再需要恢复
 
+WAL 有界（轮转）批次:
+- 新增 **体积/条数计量** (`size_bytes()` / `record_count()` /
+  `needs_checkpoint()`)，供 Table 侧按阈值触发 checkpoint。
+  计量不依赖每次 `os.path.getsize()`（每条语句一次 syscall），
+  而是在 `log()` 里累加写入字节数；`__init__` 扫已有文件时一并初始化，
+  `truncate()` / `compact_before()` 重算。
+- `truncate()` 现在**先把重写落到 OS 并 fsync**，再重开追加句柄：
+  checkpoint 的语义是"数据页已经 fsync，日志可以退休"，
+  截断动作本身必须真的落盘，否则掉电后可能读回半截日志。
+  LSN 仍然单调（`_base_lsn = self.lsn`），恢复侧不会因为轮转而
+  把新记录当成旧记录。
+
 已知限制:
 - 只保证"进程崩溃不丢"（flush 到 OS）与"COMMIT 后掉电不丢"（fsync）。
   未提交事务的页若被提前刷盘，靠恢复阶段的 loser-undo 撤销，
@@ -145,6 +157,10 @@ class WAL:
         # checkpoint 状态
         self._checkpoint_lsn = 0
 
+        # 体积/条数计量（避免每条语句都 getsize；见文件头说明）
+        self._size = 0
+        self._records = 0
+
         # 扫描已有 WAL
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
@@ -156,6 +172,8 @@ class WAL:
                         rec = WALRecord.from_json(line)
                         if rec.lsn > self.lsn:
                             self.lsn = rec.lsn
+                        self._records += 1
+                        self._size += len(line) + 1
                     except Exception:
                         pass
 
@@ -184,7 +202,10 @@ class WAL:
         with self.lock:
             self.lsn += 1
             rec = WALRecord(self.lsn, txn_id, rtype, data)
-            self.f.write(rec.to_json() + '\n')
+            line = rec.to_json()
+            self.f.write(line + '\n')
+            self._size += len(line) + 1
+            self._records += 1
             if sync:
                 self._flush_locked()
             return self.lsn
@@ -448,6 +469,8 @@ class WAL:
             # 重置缓存
             self._cached_records = list(kept)
             self._cached_offset = os.path.getsize(self.path)
+            self._records = len(kept)
+            self._size = self._cached_offset
 
             # 更新 base_lsn
             if kept:
@@ -457,25 +480,67 @@ class WAL:
 
     # ==================== 维护 ====================
 
-    def truncate(self):
+    def size_bytes(self) -> int:
+        """当前 WAL 段落的字节数（估算，用于阈值触发；见文件头说明）"""
+        with self.lock:
+            return self._size
+
+    def record_count(self) -> int:
+        """当前 WAL 段落的记录条数"""
+        with self.lock:
+            return self._records
+
+    def needs_checkpoint(self, max_bytes: int = 0,
+                         max_records: int = 0) -> bool:
         """
-        清空 WAL。LSN 保持单调。
+        是否达到 checkpoint 阈值（0 表示该维度不限制）。
+
+        只做判断，不做任何刷盘/截断动作——真正的 checkpoint 语义
+        （"页先 fsync、日志后退休"）由 Table.checkpoint() 负责，
+        它必须持有表锁并确认没有未提交事务。
         """
         with self.lock:
+            if max_bytes > 0 and self._size >= max_bytes:
+                return True
+            if max_records > 0 and self._records >= max_records:
+                return True
+            return False
+
+    def truncate(self, sync: bool = True):
+        """
+        清空 WAL（checkpoint 的第二步）。LSN 保持单调。
+
+        ★ 调用前提（由 Table.checkpoint 保证）: WAL 里所有记录对应的
+        数据页**已经 fsync 落盘**，且不存在未提交事务。否则截断就是
+        "日志先于数据退休"，崩溃后无法 redo/undo。
+
+        `sync=True`（周期 checkpoint）: 把"段落已退休"这件事本身落盘，
+        保证 WAL 的有界性在掉电后依然成立。
+        `sync=False`（进程收尾）: 数据页已经 fsync，截断丢失只会让下次
+        启动多幂等重放一批记录，不会丢已提交数据；省下一次 fsync。
+        """
+        with self.lock:
+            self._base_lsn = self.lsn
             try:
-                self.f.close()
+                self.f.flush()          # 缓冲交给 OS 后 close（不需要 fsync：
+                self.f.close()          # 这些记录马上要被截断掉）
             except Exception:
                 pass
 
-            self._base_lsn = self.lsn
-
-            with open(self.path, 'w', encoding='utf-8'):
-                pass
+            with open(self.path, 'w', encoding='utf-8') as f:
+                f.flush()
+                if sync:
+                    try:
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
 
             self.f = open(self.path, 'a', encoding='utf-8')
 
             self._cached_records = []
             self._cached_offset = 0
+            self._size = 0
+            self._records = 0
             self._checkpoint_lsn = self.lsn
 
     def close(self):

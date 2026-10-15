@@ -491,6 +491,12 @@ class Database:
 
         注意: 只回收已提交淘汰的版本；未提交事务写的版本 xmax 是
         活跃事务号（> horizon），不会被误删。返回回收的版本数。
+
+        ★ autocommit 的墓碑（xmax 是合成高位号）按"隐式提交"单独放行，
+        否则 autocommit 的 UPDATE/DELETE 旧版本一个也回收不掉
+        （合成号远大于 horizon，旧判定 `xmax <= horizon` 恒假）。
+        回收后相关页做页内紧凑化，空洞变成可复用的连续空闲区
+        （字节数见 tbl.last_vacuum_freed_bytes）。数据文件本身不变小。
         """
         if horizon is None:
             horizon = self.mvcc.oldest_active_txn()
@@ -501,6 +507,29 @@ class Database:
             except Exception as e:
                 logger.warn(f"vacuum {tbl.name} 失败: {e}")
         return total
+
+    # ==================== checkpoint（WAL 轮转）====================
+
+    def checkpoint(self, force: bool = False) -> int:
+        """
+        显式 checkpoint：把所有表的脏页安全落盘后退休 WAL 段落。
+
+        每张表独立处理（`Table.checkpoint`）：
+        - 无未提交事务 ⇒ 脏页 fsync → BTree 根 fsync → WAL 截断；
+        - 该表上有未提交的显式事务 ⇒ **跳过**（返回不计入），
+          因为它的脏页不能刷、它的 WAL 旧行镜像（undo 用）不能丢。
+
+        返回值 = 真正完成 checkpoint 的表数。幂等：重复调用不会报错，
+        也不会丢数据（WAL 已空时只是再刷一次页）。
+        """
+        n = 0
+        for tbl in self.tables.values():
+            try:
+                if tbl.checkpoint(force=force):
+                    n += 1
+            except Exception as e:
+                logger.warn(f"checkpoint {tbl.name} 失败: {e}")
+        return n
 
     def shutdown(self):
         for tbl in self.tables.values():

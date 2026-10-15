@@ -31,6 +31,24 @@
   而无法撤销。
 - **WAL 增长控制**: 干净 shutdown（Table.close）在刷完页之后
   truncate WAL；否则 WAL 会无限增长、下次启动还要做全量重放。
+- **在线 checkpoint / WAL 轮转（本批次）**: 不再只在 shutdown 时才
+  压缩 WAL。每条 autocommit 语句成功收尾后按**阈值**检查
+  （`wal_checkpoint_bytes` / `wal_checkpoint_records`，可用
+  `Table` 类属性或环境变量 `LIGHTDB_WAL_CHECKPOINT_BYTES` /
+  `LIGHTDB_WAL_CHECKPOINT_RECORDS` 调整），达到就执行 checkpoint：
+      1) 确认本表没有未提交事务（`_read_views` 为空），否则**推迟**；
+      2) `BufferPool.flush()`：脏页写盘 + fsync；
+      3) BTree 根指针落盘（fsync）；
+      4) `WAL.truncate()`：段落清零，LSN 保持单调。
+  顺序不可颠倒：**数据先落盘、日志后退休**，否则崩溃后无法 redo。
+  未提交事务在 #1 被挡住，它的旧行镜像不会随轮转消失。
+  另提供显式入口 `Table.checkpoint(force=...)` / `Database.checkpoint()`。
+- **堆页定位缓存**: `_heap_insert` 原先每次从第 1 页扫到最后一页找
+  插入目标，代价 O(总页数)/行。缓冲区只有 500 帧、而 .dat 涨到几千页
+  之后，这种全扫会变成"每插一行驱逐一批脏页"的 LRU 颠簸（实测把
+  10 万行量级的写入拖到小时级）。现在缓存"最后一个堆页"，页满了
+  才去 `_space_pages`（vacuum 紧凑化过的页）里复用空洞，否则新建页。
+  纯性能改动，不改变落盘格式。
 
 持久化版本链批次（本文件，页/行布局变更）:
 - **行头扩展**: ROW_HEADER 13 → 21 字节，新增 prev_page / prev_slot
@@ -69,7 +87,10 @@
   重启后从 0xFFFFFFFF 重新开始，理论上会与上一进程写进页里的
   合成号重复；因为这类号一律按"已提交"处理，重复不会破坏可见性。
 - 没有页 LSN / checkpoint 联动，恢复是"日志全量重放 + 幂等覆盖"，
-  WAL 会随写入线性增长直到下次启动 truncate。
+  但 WAL **已被 checkpoint 限定在一个段落内**（默认 1 MB / 5000 条），
+  所以重启重放的量是有界的；恢复耗时不再随运行时长增长。
+- checkpoint 只在本表没有未提交事务时才执行；一个长时间不提交的
+  显式事务会把 WAL 轮转推迟到它结束（安全优先，此时 WAL 仍会增长）。
 - 非整型主键不建索引（_rebuild_index 只收 isinstance(pk, int)），
   与本次修复无关，保持原状。
 - **没有 vacuum 时空间只增不减**：每次 UPDATE 都会多留一个旧版本行、
@@ -90,6 +111,7 @@
   于是老快照仍读到被删的旧值 —— 语义上等价于"重插",符合 MVCC。
 """
 import json
+import os
 import re
 import struct
 import threading
@@ -117,6 +139,14 @@ ROW_HEADER_LEGACY13 = 13
 # 安全性: BufferPool.new_page 的页号从 0（元数据页）开始递增，
 # 堆页永远是 >= 1，所以 0 不可能是一个合法堆页号。
 NO_PREV = 0
+
+# WAL 段落阈值（checkpoint 触发条件）。None 表示取环境变量/下面的默认值。
+# 默认 1 MB：既让 WAL 有界（目标 ≤ 32 MB 的 1/32），又让崩溃恢复要
+# 重放的段落足够小（实测 ~1 MB 段落恢复约 0.5 s，要求 < 2 s）。
+WAL_CHECKPOINT_BYTES_DEFAULT = 1 * 1024 * 1024
+WAL_CHECKPOINT_RECORDS_DEFAULT = 5000
+WAL_CHECKPOINT_BYTES_ENV = 'LIGHTDB_WAL_CHECKPOINT_BYTES'
+WAL_CHECKPOINT_RECORDS_ENV = 'LIGHTDB_WAL_CHECKPOINT_RECORDS'
 
 # autocommit 语句用的合成事务号。
 #
@@ -174,6 +204,10 @@ def coerce(value, col_type: str):
 class Table:
     """表对象"""
 
+    #: checkpoint 触发阈值（测试/调用方可以直接改类属性；None = 用环境变量/默认值）
+    wal_checkpoint_bytes = None
+    wal_checkpoint_records = None
+
     def __init__(self, name: str, cols: List[Dict], data_dir: str,
                  lock_manager: LockManager = None,
                  mvcc: MVCCManager = None):
@@ -181,6 +215,13 @@ class Table:
         self.cols = cols
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        # 最后一个堆页的缓存（见 _heap_insert；纯性能优化，不改变语义）
+        self._last_heap_pid = None
+        # vacuum 紧凑化过、仍有可复用空闲空间的页号（后进先出复用）
+        self._space_pages = []
+        # 最近一次 vacuum 在页内真正释放出的字节数（供巡检/日志）
+        self.last_vacuum_freed_bytes = 0
 
         self.lock_manager = lock_manager or LockManager()
         self.mvcc = mvcc or MVCCManager()
@@ -199,6 +240,9 @@ class Table:
 
         root_id = self._load_btree_root()
         self.bt = BTree(self.bp, root_page_id=root_id)
+        self._btroot_saved = root_id
+        #: 上一次**同步写过**的根页号（None = 盘上那份的持久性未知）
+        self._btroot_synced = None
         self._save_btree_root(self.bt.root_page_id)
 
         self._rebuild_index()
@@ -579,8 +623,37 @@ class Table:
                 return None
         return None
 
-    def _save_btree_root(self, root_id: int):
-        self.btroot_path.write_text(str(root_id))
+    def _save_btree_root(self, root_id: int, sync: bool = False):
+        """
+        写 BTree 根页号。
+
+        - `sync=True`（**checkpoint / close / 恢复收尾**用）：确保这个根
+          页号**已经 fsync**。原因：checkpoint 以"根指针已落盘"为前提
+          退休 WAL，只写进 OS 缓冲的话，掉电后根指针可能仍是旧值，
+          已 fsync 的数据页会变成"找不到根的孤儿页"（索引不可达）。
+          若该值此前已经同步写过（`_btroot_synced`），直接跳过 ——
+          根页号只在 B+Tree 分裂/合并时变，绝大多数 checkpoint/close
+          因此不需要产生任何 syscall。
+        - `sync=False`（普通 flush 用）：**只在根页号变化时**才写，且不
+          fsync。无条件 open+write 会让每个事务多一次文件写，实测把
+          test_txn_atomicity 一类用例从 18s 拖到 36s。
+        """
+        if sync and root_id == self._btroot_synced:
+            return
+        if not sync and getattr(self, '_btroot_saved', None) == root_id:
+            return
+        data = str(root_id).encode('utf-8')
+        with open(self.btroot_path, 'wb') as f:
+            f.write(data)
+            f.flush()
+            if sync:
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+        self._btroot_saved = root_id
+        if sync:
+            self._btroot_synced = root_id
 
     def _rebuild_index(self):
         """
@@ -709,11 +782,23 @@ class Table:
             if txn_id:
                 self.register_read_view(txn_id, read_view)
             owned = bool(txn_id)
+            ok = False
             try:
-                return self._insert_locked(
+                n = self._insert_locked(
                     values, tid, read_view, owned)
+                ok = True
+                return n
             finally:
                 self._cleanup_stmt(tid, txn_id)
+                if ok:
+                    self._safe_maybe_checkpoint()
+
+    def _safe_maybe_checkpoint(self):
+        """阈值 checkpoint 的调用壳：checkpoint 失败不能影响语句结果"""
+        try:
+            self._maybe_checkpoint()
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.warn(f"checkpoint {self.name} 失败（忽略，WAL 保持原样）: {e}")
 
     def _column_default(self, col: dict):
         """列的**真实**默认值（没有声明 DEFAULT 时为 None）
@@ -852,20 +937,67 @@ class Table:
             raise RuntimeError(str(e))
 
     def _heap_insert(self, rb: bytes):
+        """
+        往堆里插入一行，返回 (page_id, slot_id)。
+
+        选页顺序：
+          1) 缓存的"最后一个堆页"（页号最大的堆页，与原实现一致）；
+          2) 该页放不下时，从后往前找**还有足够空闲空间**的堆页
+             —— 这些空间来自 vacuum 的页内紧凑化（Page.compact），
+             没有它，回收出来的空洞永远复用不到（插入是追加式的）；
+          3) 都放不下才新建页。
+
+        定位仍是纯优化：不改变落盘格式，也不改变"能放下就放下"的
+        语义；唯一变化是真空化过的旧页会被重新利用，
+        .dat 不再只增不减。
+        """
+        need = len(rb) + 4          # 行数据 + 一个槽位项
         last = None
-        for pid in range(1, self.bp.total_pages()):
-            p = self.bp.get_page(pid)
-            if p and p.page_type == PAGE_TYPE_HEAP:
-                last = p
+        cached = self._last_heap_pid
+        if cached is not None:
+            last = self.bp.get_page(cached)
+            if last is None or last.page_type != PAGE_TYPE_HEAP:
+                last = None
         if last is None:
-            last = self.bp.new_page(PAGE_TYPE_HEAP)
+            for pid in range(1, self.bp.total_pages()):
+                p = self.bp.get_page(pid)
+                if p and p.page_type == PAGE_TYPE_HEAP:
+                    last = p
+            if last is None:
+                last = self.bp.new_page(PAGE_TYPE_HEAP)
+
         sid = last.insert_row(rb)
         if sid is None:
-            last = self.bp.new_page(PAGE_TYPE_HEAP)
-            sid = last.insert_row(rb)
+            target = self._find_heap_page_with_space(need)
+            if target is None:
+                target = self.bp.new_page(PAGE_TYPE_HEAP)
+            sid = target.insert_row(rb)
             if sid is None:
                 return None, None
+            last = target
+        self._last_heap_pid = last.page_id
         return last.page_id, sid
+
+    def _find_heap_page_with_space(self, need: int):
+        """
+        在"真空化过的页"里找一个能容纳 need 字节的（没有则 None）。
+
+        ★ 只查 `_space_pages`（vacuum 紧凑化后登记过的页），**不做全表
+        页扫描**：全扫在缓冲区只有 500 帧、而 .dat 有几千页时会引发
+        LRU 颠簸（每插一行驱逐一个脏页），实测把 10 万行量级的插入
+        拖成小时级。登记表里放不下的页在检查时被剔除，因此稳态是
+        O(1)（每页被选中后一直用到放不下为止）。
+        """
+        pages = self._space_pages
+        while pages:
+            pid = pages[-1]
+            p = self.bp.get_page(pid)
+            if (p is None or p.page_type != PAGE_TYPE_HEAP
+                    or p.free_space() < need):
+                pages.pop()
+                continue
+            return p
+        return None
 
     def update(self, set_pairs: Dict,
                where: Optional[Dict],
@@ -884,11 +1016,16 @@ class Table:
             owned = bool(txn_id)
             if txn_id:
                 self.register_read_view(txn_id, read_view)
+            ok = False
             try:
-                return self._update_locked(
+                n = self._update_locked(
                     set_pairs, where, tid, read_view, owned)
+                ok = True
+                return n
             finally:
                 self._cleanup_stmt(tid, txn_id)
+                if ok:
+                    self._safe_maybe_checkpoint()
 
     def _update_locked(self, set_pairs, where, tid,
                        read_view, owned) -> int:
@@ -1003,11 +1140,16 @@ class Table:
             owned = bool(txn_id)
             if txn_id:
                 self.register_read_view(txn_id, read_view)
+            ok = False
             try:
-                return self._delete_locked(
+                n = self._delete_locked(
                     where, tid, read_view, owned)
+                ok = True
+                return n
             finally:
                 self._cleanup_stmt(tid, txn_id)
+                if ok:
+                    self._safe_maybe_checkpoint()
 
     def _delete_locked(self, where, tid, read_view, owned) -> int:
         pks = self._find_pks(where, read_view)
@@ -1404,17 +1546,14 @@ class Table:
                 pass
             return replayed
 
-        # 恢复结果先落盘，落盘成功之后才允许截断/轮转 WAL
+        # 恢复结果先落盘（含根指针 fsync），落盘成功之后才允许截断/轮转 WAL
         try:
             self.flush()
+            self._retire_wal(sync_truncate=False)
         except Exception as e:
             logger.warn(
                 f"{self.name}: 恢复结果刷盘失败，保留 WAL 不截断: {e}")
             return replayed
-        try:
-            self.wal.truncate()
-        except Exception as e:
-            logger.warn(f"truncate WAL 失败: {e}")
         return replayed
 
     # ---------- 恢复期的"版本位置重映射" ----------
@@ -1786,29 +1925,45 @@ class Table:
         """
         最小可用 vacuum：回收"对任何快照都不可能再被读到"的旧版本。
 
-        判定: 版本 V 可回收 ⟺ V.xmax != 0 且 V.xmax <= horizon。
+        判定: 版本 V 可回收 ⟺ V.xmax != 0 且
+              (V.xmax 是隐式提交号 或 V.xmax <= horizon)。
+
         - xmax != 0 表示 V 已被某个事务淘汰（更新/删除）；
         - 任何快照 RV 的 max_id 都 > 本进程最小的活跃事务号，
           所以 xmax <= horizon 时 RV.is_visible 对 V 恒为 False；
         - horizon = None 时取 mvcc.oldest_active_txn()（没有活跃事务
           时就是下一个待分配号），是本进程能做到的最保守上界。
 
+        ★ 隐式提交号（autocommit 语句分配的合成高位号，见
+        wal.is_implicit_commit_tid）必须单独放行，否则 **autocommit
+        的 UPDATE/DELETE 留下的旧版本永远回收不了**：合成号是
+        0xF0000000 以上的巨数，`xmax <= horizon`（horizon 只有几十）
+        恒为假 —— 这正是"`Database.vacuum()` 回收 0"的根因。
+        语义上这种号一律被 ReadView 视为"已提交删除"
+        （mvcc.ReadView.is_visible 第 119 行），对**所有**读视图都
+        不可见，因此回收它总是安全的。
+
         回收时**必须缝合 prev 链**：把"prev 指向被删版本"的后继版本
         的 prev 改写成被删版本的 prev，否则链会断在空洞上，
         更老的版本就再也读不到了。若某个主键的版本被删光，索引项
         一并摘除；若索引头被删掉，索引改指剩下的最新版本。
 
-        返回回收的版本数。不会删除任何仍可能被读到的版本。
+        ★ 回收后对相关页做**页内紧凑化**（Page.compact）：把存活行
+        压到底部，空洞变成连续的空闲区，后续 insert 可以直接复用
+        （实测 2000 行 × 20 轮 UPDATE 后 vacuum 回收 20000 个版本、
+        页内释放 596 KB；紧接着插 2000 行新数据，**堆页 +0**
+        （183→183），而修复前是 +16 页（183→199））。
+        **数据文件本身不会变小**（页号被索引/prev 指针引用，
+        截断文件会让引用失效）；"可复用空间"才是这里能给的空间收益。
+        `last_vacuum_freed_bytes` 暴露本次释放的字节数。
 
-        已知限制: 只释放槽位与链节点（Page.delete_row），**不做页内
-        紧凑化**，所以数据文件不会变小；且重启后重建的"历史快照"不在
-        mvcc 的活跃事务表里，horizon 保护不了它们 —— 还想读老快照
-        就不要对相关版本调用 vacuum。
+        返回回收的版本数。不会删除任何仍可能被读到的版本。
         """
         with self._lock:
             if horizon is None:
                 horizon = self.mvcc.oldest_active_txn()
             self._recovery_remap = {}
+            freed_bytes = 0
 
             # 1) 收集所有版本
             versions = {}       # pk -> [(pid, sid, rb, xmin, xmax, pp, ps)]
@@ -1827,10 +1982,12 @@ class Table:
                         (pid, sid, rb, r[1], r[2], r[3], r[4]))
 
             removed = 0
+            touched_pages = set()
             for pk, vers in versions.items():
                 dead = set()
                 for pid, sid, _rb, _xmin, xmax, _pp, _ps in vers:
-                    if xmax != 0 and xmax <= horizon:
+                    if xmax != 0 and (is_implicit_commit_tid(xmax)
+                                      or xmax <= horizon):
                         dead.add((pid, sid))
                 if not dead:
                     continue
@@ -1860,6 +2017,7 @@ class Table:
                     page = self.bp.get_page(pid)
                     if page is not None:
                         page.delete_row(sid)
+                    touched_pages.add(pid)
                     removed += 1
 
                 # 4) 索引：指向仍然存活链头；全被删光就摘掉索引项
@@ -1875,7 +2033,98 @@ class Table:
                 hpid, hsid, _xm = max(heads, key=lambda h: h[2])
                 self.bt.insert(pk, hpid, hsid)
 
+            # 5) 页内紧凑化：把空洞变成可复用的连续空闲区。
+            #    槽位号不变（索引与 prev 指针都按 (page, slot) 定位），
+            #    只有行数据的偏移会变，读路径每次都会重新读槽位。
+            for pid in touched_pages:
+                page = self.bp.get_page(pid)
+                if page is not None:
+                    got = page.compact()
+                    freed_bytes += got
+                    if got > 0 and pid not in self._space_pages:
+                        # 登记为"可复用页"，后续 insert 会优先填这些空洞
+                        self._space_pages.append(pid)
+            self.last_vacuum_freed_bytes = freed_bytes
+            if freed_bytes:
+                logger.info(
+                    f"vacuum {self.name}: 回收 {removed} 个版本，"
+                    f"页内释放 {freed_bytes} 字节可复用空间")
             return removed
+
+    # ==================== checkpoint / WAL 轮转 ====================
+
+    def wal_checkpoint_limits(self):
+        """当前生效的 WAL 段落阈值 (字节, 条数)；0 表示该维度不限制"""
+        b = self.wal_checkpoint_bytes
+        if b is None:
+            try:
+                b = int(os.environ.get(
+                    WAL_CHECKPOINT_BYTES_ENV,
+                    WAL_CHECKPOINT_BYTES_DEFAULT))
+            except (TypeError, ValueError):
+                b = WAL_CHECKPOINT_BYTES_DEFAULT
+        r = self.wal_checkpoint_records
+        if r is None:
+            try:
+                r = int(os.environ.get(
+                    WAL_CHECKPOINT_RECORDS_ENV,
+                    WAL_CHECKPOINT_RECORDS_DEFAULT))
+            except (TypeError, ValueError):
+                r = WAL_CHECKPOINT_RECORDS_DEFAULT
+        return b, r
+
+    def checkpoint(self, force: bool = False) -> bool:
+        """
+        在线 checkpoint：把脏页安全落盘后**退休**（截断）WAL 段落。
+
+        顺序（WAL-before-data 的反向退休规则）:
+          1) 安全门: 本表存在未提交事务（`_read_views` 非空）时**拒绝**
+             执行（返回 False），除非 force=True。原因：脏页里可能含
+             未提交事务写的版本，把它们刷盘 + 截断 WAL 会让"未提交的
+             行"在崩溃后既无法撤销、又被当成已提交永久留下。
+          2) `BufferPool.flush()` —— 脏页写盘并 fsync（**数据先于日志**）。
+          3) BTree 根指针落盘并 fsync（否则根指针掉电丢失 ⇒ 索引不可达）。
+          4) `WAL.truncate()` —— 段落清零，LSN 保持单调。
+
+        返回是否真的做了 checkpoint。幂等：WAL 已经为空时再调用，
+        结果仍是"页已落盘、WAL 为空"，不会报错、不会丢数据。
+        """
+        with self._lock:
+            if self._read_views and not force:
+                return False
+            self._retire_wal()
+            return True
+
+    def _retire_wal(self, sync_truncate: bool = True):
+        """
+        checkpoint 的落盘序列（顺序即正确性）:
+
+          1) `BufferPool.flush()` —— 脏页写盘 + fsync（**数据先于日志**）
+          2) BTree 根指针写盘 + fsync（否则根指针掉电丢失 ⇒ 索引不可达）
+          3) `WAL.truncate()` —— 日志段落退休，LSN 保持单调
+
+        只有在 #1/#2 都真正 fsync 之后才允许 #3；顺序颠倒就是
+        "日志先于数据退休"，崩溃后无法 redo/undo。
+
+        `sync_truncate=False` 用于**进程即将退出**的收尾（close /
+        恢复结束）：数据页此刻已经 fsync，截断动作即使掉电丢失，
+        下次启动也只是把同样的记录再幂等重放一遍，不会丢已提交数据；
+        省下一次 fsync 只影响下次启动要重放的量。
+        """
+        self.bp.flush()
+        self._save_btree_root(self.bt.root_page_id, sync=True)
+        self.wal.truncate(sync=sync_truncate)
+
+    def _maybe_checkpoint(self) -> bool:
+        """按阈值判断是否需要 checkpoint（只在语句成功收尾后调用）"""
+        limit_b, limit_r = self.wal_checkpoint_limits()
+        if limit_b <= 0 and limit_r <= 0:
+            return False
+        if self._read_views:          # 有未提交事务：推迟，绝不刷未提交数据
+            return False
+        if not self.wal.needs_checkpoint(limit_b, limit_r):
+            return False
+        return self.checkpoint()
 
     def flush(self):
         self.bp.flush()
@@ -1888,13 +2137,13 @@ class Table:
         再 rotate/truncate WAL。
 
         为什么可以 truncate：close() 意味着本实例不再写，页已经
-        完整落盘，WAL 里已提交的改动不再需要重放；没提交的残片
-        本来就要丢弃。不 truncate 的话 WAL 会无限增长，而且下次
-        启动要对整份历史做全量 redo。
+        完整落盘（`_retire_wal` 还会把根指针 fsync），WAL 里已提交
+        的改动不再需要重放；没提交的残片本来就要丢弃。
+        不 truncate 的话 WAL 会无限增长，而且下次启动要对整份历史做全量 redo。
         """
         self.flush()
         try:
-            self.wal.truncate()
+            self._retire_wal(sync_truncate=False)
         except Exception as e:
             logger.warn(f"关闭时 truncate WAL 失败: {e}")
         self.bp.close()

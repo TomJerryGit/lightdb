@@ -147,6 +147,40 @@ class Page:
 
     def free_space(self) -> int:
         return self.next_row_ptr - PAGE_HEADER_SIZE - self.n_slots * 4
+
+    def compact(self) -> int:
+        """
+        页内紧凑化：把存活行压紧到页尾，槽位号与内容都不变。
+
+        为什么需要: `delete_row` 只把槽位置零，行数据仍占着原来的
+        偏移，`free_space()` 不会变大、`insert_row` 也复用不到那些
+        空洞 —— 页只增不减，这正是"vacuum 回收了版本但空间回收 0"
+        的另一半原因（另一半是 horizon 判定，见 Table.vacuum）。
+
+        安全性: 槽位号不变 ⇒ 索引/prev 指针里的 (page, slot) 依然有效，
+        只有槽位里的行偏移被改写；所有读路径都通过槽位取行
+        （`get_row`），不存在缓存偏移的调用方。
+        返回值 = 本次紧凑化后新增的可复用字节数（>= 0）。
+        """
+        before = self.free_space()
+        n = self.n_slots
+        live = []
+        for i in range(n):
+            off, ln = struct.unpack_from('<HH', self.data,
+                                         self._slot_off(i))
+            if off == 0 or ln == 0:
+                continue
+            live.append((i, bytes(self.data[off:off + ln])))
+
+        cursor = PAGE_SIZE
+        for i, rb in live:
+            cursor -= len(rb)
+            self.data[cursor:cursor + len(rb)] = rb
+            struct.pack_into('<HH', self.data, self._slot_off(i),
+                             cursor, len(rb))
+        self._set_next_row_ptr(cursor)
+        self.dirty = True
+        return self.free_space() - before
     
     def iter_rows(self):
         for i in range(self.n_slots):
