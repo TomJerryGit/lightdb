@@ -195,6 +195,10 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             'start': self.connected_at,
             'db': self.database,
             'command': 'Sleep',
+            # KILL 必须能真正触达目标连接：只登记元数据的话，
+            # `_handle_kill` 除了谎报"已终止"什么也做不了。
+            'sock': self.sock,
+            'handler': self,
         })
 
         try:
@@ -835,6 +839,16 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
     def _handle_kill(self, sql: str):
         import re
+        # `KILL QUERY <id>`：本引擎没有"只中止单条语句"的机制（语句在
+        # 执行器里同步跑完，没有可中断点）。**显式拒绝**，不要伪装成功。
+        mq = re.match(r'KILL\s+QUERY\s+(\d+)', sql, re.IGNORECASE)
+        if mq:
+            self._send_packet(mp.make_err_packet(
+                1105, "HY000",
+                f"KILL QUERY {mq.group(1)} 不支持：本引擎无法只中止单条语句，"
+                f"请用 KILL CONNECTION {mq.group(1)} 终止整个连接"))
+            return
+
         m = re.match(r'KILL\s+(?:CONNECTION\s+)?(\d+)',
                      sql, re.IGNORECASE)
         if not m:
@@ -849,16 +863,39 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 1064, "42000", "KILL 参数错误"))
             return
 
-        with _sessions_lock:
-            exists = target_sid in _sessions
-
-        if exists:
+        # 杀自己：MySQL 语义是"语句正常返回后连接结束"，因此先回 OK，
+        # 再把本连接标记为已关闭（外层 `while not self.closed` 会退出）。
+        if target_sid == self.server_id:
+            self.closed = True
             self._send_packet(mp.make_ok_packet(
                 message=f"Connection {target_sid} killed"))
-        else:
+            return
+
+        info = _get_sessions_snapshot().get(target_sid)
+        if info is None:
             self._send_packet(mp.make_err_packet(
                 1094, "HY000",
                 f"Unknown thread id: {target_sid}"))
+            return
+
+        # 真正终止：先置 `closed`（目标线程下一轮循环即退出），再关闭它的
+        # socket，使阻塞中的 recv 立刻失败 —— 而不是只回一个 OK 了事。
+        handler = info.get('handler')
+        if handler is not None:
+            handler.closed = True
+        sock = info.get('sock')
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        _remove_session(target_sid)
+        self._send_packet(mp.make_ok_packet(
+            message=f"Connection {target_sid} killed"))
 
     def _show_columns(self, sql: str):
         import re
