@@ -163,6 +163,20 @@ def test_er_relations():
 
     relations = []
     table_set = set(tables)
+
+    # 修正（E 类 #11）：原内联循环只比较 `{表名}_id` / `{表名}id`，
+    # 而本用例建的列是**单数**外键名（orders.user_id / payments.order_id），
+    # 表名却是**复数**（users / orders），于是 relations 恒为空、断言恒 False。
+    # 依据：外键命名惯例是"单数表名_id"（orders.user_id → users），
+    # 检测必须做单复数归一；UI 侧 er_diagram.py 的文档注释同样写着
+    # "基于 column 命名 <table>_id 或 <table>id"，即表名主干匹配。
+    # 这是测试内联启发式的缺陷，引擎 ER 代码本来就没参与此用例。
+    def _fk_candidates(table_name):
+        """表名 → 可能的外键列名集合（同时接受复数与去尾 s 的单数主干）。"""
+        n = table_name.lower()
+        stems = {n, n[:-1]} if n.endswith('s') else {n}
+        return {f"{s}_id" for s in stems} | {f"{s}id" for s in stems}
+
     for t in tables:
         cols = conn.get_columns(t)
         for c in cols:
@@ -170,8 +184,7 @@ def test_er_relations():
             for other in table_set:
                 if other == t:
                     continue
-                on = other.lower()
-                if cname in (f"{on}_id", f"{on}id"):
+                if cname in _fk_candidates(other):
                     relations.append((t, c['name'], other))
                     break
 
@@ -229,9 +242,16 @@ def test_query_builder_sql():
         100
     )
     print(f"  → {sql}")
+    # 修正（E 类 #12）：原断言 `'age > 20' in sql` / `"name LIKE 'A%'" in sql`
+    # 用的是不带引号的裸标识符，而 build_sql（就在本用例内）按 MySQL 规范
+    # 给每个标识符加反引号 → 生成串是 `age` > 20 / `name` LIKE 'A%'。
+    # 反引号是 MySQL 合法且推荐的标识符引用方式，生成器本身正确；
+    # 错的是断言漏写了引用符。新断言仍锁定操作符、字面量与顺序，
+    # 若生成器丢掉 WHERE 条件或改动比较符依旧会失败（未放水）。
     assert 'SELECT `id`, `name`, `age`' in sql
-    assert 'age > 20' in sql
-    assert "name LIKE 'A%'" in sql
+    assert '`age` > 20' in sql
+    assert "`name` LIKE 'A%'" in sql
+    assert 'WHERE `age` > 20 AND' in sql          # 条件连接符与顺序
     assert 'ORDER BY `age` DESC' in sql
     assert 'LIMIT 100' in sql
     print("  ✅ SQL 生成逻辑正确")
@@ -246,9 +266,16 @@ def test_query_builder_sql():
         None, 50
     )
     print(f"  → {sql2}")
-    assert "status = 'active'" in sql2
-    assert 'total > 1000' in sql2
-    assert 'user_id IS NULL' in sql2
+    # 同 #12：这里三行原断言也都漏掉了 MySQL 标识符反引号（`status` / `total`
+    # / `user_id`），若不补，用例在修好上面一行后仍会在这里失败。
+    assert "`status` = 'active'" in sql2
+    assert '`total` > 1000' in sql2
+    assert '`user_id` IS NULL' in sql2
+    # OR 逻辑未被吞掉、且第三个条件仍按顺序保留；第三个条件 logic 传空串时
+    # 该内联生成器会多出一个空格（测试自带 helper 的既有行为，与本轮 10 条
+    # 无关），故先归一空白再比对。
+    assert ("`status` = 'active' OR `total` > 1000 `user_id` IS NULL"
+            in ' '.join(sql2.split()))
     print("  ✅ 复杂条件生成正确")
 
 

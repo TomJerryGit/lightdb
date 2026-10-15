@@ -152,13 +152,35 @@ def test_explain_join():
     p = parser.parse(sql)
     r = ex.execute(p, {})
     for row in r['rows']:
-        print(f"  {row[0]}")
+        print(f"  {row}")
 
-    # 计划树里应该有 HashJoin
-    plan_lines = [row[0] for row in r['rows']]
+    # 修正（E 类 #13）：MySQL 的 EXPLAIN 返回的是**表格结果集**，列固定为
+    # id/select_type/table/type/key/rows/Extra（引擎同此契约，
+    # 见 lightdb/sql/optimizer.py:400-418），第 0 列 id 是 int。
+    # 原断言 `'HashJoin' in row[0]`（row[0] 是 int）既语义错又会 TypeError：
+    # 文本计划树根本不在 EXPLAIN 的结果列里。
+    # 正确契约分两层断言，两层都保留（不放水）：
+    #   (1) 结果集必须是 MySQL 形状的表，且覆盖 JOIN 两侧的表名；
+    #   (2) 连接算法取引擎计划树的文本（optimizer.explain 的第三个返回值
+    #       = print_plan 文本），等值 JOIN 必须仍是 HashJoin ——
+    #       删掉这层就抓不住"HashJoin 退化为 NestedLoop/笛卡尔积"的回归。
+    assert r['columns'] == ['id', 'select_type', 'table', 'type', 'key',
+                            'rows', 'Extra'], f"EXPLAIN 列结构变了: {r['columns']}"
+    tables_seen = [row[2] for row in r['rows']]
+    assert 'users' in tables_seen and 'orders' in tables_seen, tables_seen
+    # Extra 列必须是 str/None（原断言正是把 int 当字符串才崩的，这里显式钉住类型）
+    assert all(row[6] is None or isinstance(row[6], str) for row in r['rows'])
+    assert all(isinstance(row[0], int) for row in r['rows'])   # id 列是 int
+
+    inner = p.get('inner')
+    cols, rows, plan_text = ex.optimizer.explain(ex.optimizer.optimize(inner))
+    # print_plan 返回的是行列表（也兼容 str），与 executor._cmd_explain 的用法一致
+    plan_lines = (plan_text.splitlines() if isinstance(plan_text, str)
+                  else [str(x) for x in (plan_text or [])])
+    print("  → 计划树:\n" + '\n'.join(plan_lines))
     has_hashjoin = any('HashJoin' in l for l in plan_lines)
     print(f"  → 使用 HashJoin: {has_hashjoin}")
-    assert has_hashjoin
+    assert has_hashjoin, plan_lines
 
     db.shutdown()
 

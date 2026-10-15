@@ -39,12 +39,31 @@ def test_catalog_basic():
         print(f"  → 敏感度: {sens_map}")
         assert sens_map['phone'] == 'pii'
         assert sens_map['password'] == 'restricted'
-        assert sens_map['salary'] == 'confidential'
+        # 修正（E 类 #17）：原断言 salary == 'confidential' 与引擎既有行为矛盾。
+        # 引擎常量表 SENSITIVE_COL_PATTERNS 自首次提交起就把 salary 与
+        # credit_card/bank_card 同列 'restricted'（catalog.py:35-38），
+        # _infer_sensitivity 直接按该表返回；'confidential' 对应的是
+        # cost/price/amount/revenue（catalog.py:39-41）。
+        # 要给 salary 定"机密"口径，属于改引擎常量表（A 类产品决策），
+        # 不是把测试口径当成引擎事实。
+        assert sens_map['salary'] == 'restricted'
+        # 反向钉住口径来源：salary 必须在该常量表的 restricted 组内，
+        # 且该组正是引擎推断出的标签来源
+        assert 'salary' in cm.SENSITIVE_COL_PATTERNS['restricted']
+        assert 'salary' not in cm.SENSITIVE_COL_PATTERNS['confidential']
         assert sens_map['id'] == 'internal'
 
-        # 表级敏感度 = 最高
+        # 表级敏感度 = 最高（同 #17 的下游断言，一并按引擎口径修正）：
+        # 等级表 SENSITIVITY_LEVELS（catalog.py:20-26）为
+        # pii=4 > restricted=3 > confidential=2 > internal=1，
+        # 引擎取列级最大等级（catalog.py:158-162）。本表 phone/name 是 pii，
+        # 等级最高，故表级 = 'pii'；原断言 'restricted' 既与它自己把
+        # salary 说成 confidential 的口径互相打架，也漏算了 pii 才是顶层。
         print(f"  → 表级敏感度: {meta.sensitivity}")
-        assert meta.sensitivity == 'restricted'
+        expected_table_sens = max(
+            sens_map.values(),
+            key=lambda s: cm.SENSITIVITY_LEVELS[s]['level'])
+        assert meta.sensitivity == expected_table_sens == 'pii'
 
         # 更新元数据
         cat.update_table_meta(

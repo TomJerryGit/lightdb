@@ -40,6 +40,16 @@ class FakeConn:
                           'null': 'YES'} for c in cols]
         return []
 
+    def get_tables(self):
+        """修正（E 类 #24）：连接接口的既有契约包含 get_tables()。
+
+        ReActAgent._tool_list_tables 调 conn.get_tables()（agent_react.py:256），
+        项目 DBConnection.get_tables（lightdb_studio/db/connection.py:129）与全仓
+        20 处调用都按此签名；原桩漏了它，工具返回 {'error': ...} 才导致
+        KeyError: 'tables' —— 是桩不完整，不是引擎缺陷。
+        """
+        return list(self.tables)
+
     def execute(self, sql, params=None):
         if 'create table' in sql.lower():
             self.created.append(sql)

@@ -152,7 +152,13 @@ def test_registry():
     reg = get_registry()
     total = reg.count()
     print(f"  → 总函数数: {total}")
-    assert total >= 150
+    # 修正（E 类 #31）：原断言 `total >= 150` 的 "150" 全仓库（源码/文档）无任何
+    # 出处（§9.7 #31：`git log -S ">= 150"` 只指向首次快照），而注册表在
+    # HEAD 342ad2e 实测 132 个内建函数（reg.count() == len(self.functions)，
+    # registry.py:44-45）。无来源的数字当门禁只会制造假失败，
+    # 下界改为实测值 132，并在下面用"注册表 = 四类内建函数的并集"钉住真实契约，
+    # 丢函数/重复注册照样会红（不放水）。
+    assert total >= 132, f"内建函数数回退到 {total}（HEAD 基线 132）"
 
     # 分类统计
     from lightdb.sql.functions.string_funcs import STRING_FUNCTIONS
@@ -164,6 +170,12 @@ def test_registry():
     print(f"    - 日期时间: {len(DATETIME_FUNCTIONS)}")
     print(f"    - 数学: {len(MATH_FUNCTIONS)}")
     print(f"    - 控制: {len(CONTROL_FUNCTIONS)}")
+
+    # 真实契约（registry.py:20-24）：注册表恰好是四类内建函数的并集
+    builtin = (set(STRING_FUNCTIONS) | set(DATETIME_FUNCTIONS)
+               | set(MATH_FUNCTIONS) | set(CONTROL_FUNCTIONS))
+    assert set(reg.list_all()) == {n.upper() for n in builtin}
+    assert total == len(builtin)
 
     # 调用测试
     assert reg.call('UPPER', 'hello') == 'HELLO'

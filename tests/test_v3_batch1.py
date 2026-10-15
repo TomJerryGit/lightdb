@@ -238,7 +238,28 @@ def test_memory_analyzer_structure():
     print(f"  → 增长: {result['rss_growth_mb']:.1f} MB")
     print(f"  → 每分钟: {result['growth_per_min_mb']:.3f} MB/min")
     print(f"  → 状态: {result['status']}")
-    assert result['status'] == 'stable'
+    # 修正（E 类 #27）：样本 100.0→101.0→101.5MB/60s，最小二乘斜率
+    # = 1.5 MB/min，而引擎状态梯子（lightdb/benchmark/memory_analyzer.py:176-181）
+    # 是 `>5 → leak_suspected`、`>1 → watch`、否则 `stable`。
+    # 原断言 `'stable'` 与引擎既有（且设计合理的）判据矛盾：+1.5MB/min
+    # ≈ 2.16GB/天，判 watch 正是该阈值的用途；错的是断言，不是引擎。
+    # 新断言仍钉住数值本身，阈值被改动/回归会立即失败（未放水）。
+    assert abs(result['growth_per_min_mb'] - 1.5) < 1e-6
+    assert result['status'] == 'watch'
+
+    # 平缓样本（+0.04MB/min）必须仍是 stable：保住梯子低端的覆盖
+    samples_flat = [
+        {'elapsed_s': 0, 'rss_mb': 100.0, 'connections': 5,
+         'queries': 0, 'timestamp': 0},
+        {'elapsed_s': 30, 'rss_mb': 100.02, 'connections': 5,
+         'queries': 1000, 'timestamp': 30},
+        {'elapsed_s': 60, 'rss_mb': 100.04, 'connections': 5,
+         'queries': 2000, 'timestamp': 60},
+    ]
+    flat = m._analyze(samples_flat, 60)
+    print(f"  → 平缓样本: {flat['growth_per_min_mb']:.3f} MB/min "
+          f"→ {flat['status']}")
+    assert flat['status'] == 'stable'
 
     # 构造疑似泄漏
     samples2 = [

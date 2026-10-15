@@ -457,3 +457,50 @@
 - 2 条沙箱写权限（#26 HOME、#33 `dashboards/`）：不要在用例里绕过沙箱，走 ACL 或让工具尊重 `--output-dir`。
 - E 类 10 条（#11/12/13/17/24/27/31/34/35/36）是**测试侧**低成本清理，应尽快做以恢复信号；但其中 #13/#17 要先定口径，不要为了通过而扭曲引擎语义。
 - 不要为凑 #31 的 150 而堆函数，也不要为过 #34 把已移除的不可核实数据写回文档。
+
+## 10. C 类 flaky 的复核与处置（2026-10-15，本次修改，只追加）
+
+§9.6 登记的 2 条 C 类用例本轮逐条复核：**一条已在 `7e2eb79` 结构性修好**
+（无需再动），**一条改了断言**，都不再污染门禁。下面是处置与本次隔离复跑。
+
+### 10.1 处置与隔离复跑实测
+
+| 测试 ID | 处置 | 本次隔离复跑 | 结论 |
+|---|---|---|---|
+| `tests/test_v2_batch6.py::test_federated_governance` | **不改用例、不改断言**。根因是 `policy_id` 毫秒撞号导致策略被静默覆盖，已在 `7e2eb79` 把 `new_policy_id()` 改为 `uuid4`（`lightdb_studio/core/federated_gov.py:31`），与时钟刻度/调用频率/进程重启全部无关，碰撞概率结构性归零 | 5/5 通过（0.17 / 0.27 / 0.39 / 0.45 / 0.27 s） | 不再是 flaky；§9.6 里的 `F F F F F`、`F F P F F P F F F F` 都是修复前的旧证据，保留作历史 |
+| `tests/test_v3_batch2.py::test_row_format_performance` | **改进断言**（保留回归信号）：warmup 1 轮 → 5 轮背靠背采样（逐轮交换 JSON/Binary 先后顺序，抵消"后测者占便宜"）→ 用**逐轮配对比值的中位数**判定 → 编码门槛放宽到 `bin_enc < 1.3 × json_enc`。解码在该环境与 JSON 同量级（实测配对中位数比值 0.79~1.16，无判别力），只保留 `2.0 ×` 的灾难性回归兜底。计时不可靠时 `pytest.skip` 并写明原因（同一路径采样极差 >2.5x，或配对比值极差 >3x，或单轮 <1ms） | 修前（同代码）：5 次 `F F F P P`；修后：5/5 通过，另补跑 10/10 通过（其中前 2 次与另一 pytest 进程并发、机器满载） | 仍是"性能回归信号"（真回归会让比值 >1.3），但机器噪声不再被当成回归 |
+
+复跑命令（本机 Windows / Python 3.11.9 / pytest 9.1.1）：
+
+```
+python -m pytest tests/test_v2_batch6.py::test_federated_governance -q
+python -m pytest tests/test_v3_batch2.py::test_row_format_performance -q -s
+```
+
+### 10.2 `test_row_format_performance` 修前的噪声证据（`-s`，同代码同机器）
+
+| 轮次 | JSON 编码 | Binary 编码 | `bin_enc < json_enc` |
+|---|---|---|---|
+| 1 | 46.64 ms | 34.81 ms | 通过 |
+| 2 | 61.82 ms | 84.37 ms | **失败** |
+| 3 | 109.31 ms | 99.24 ms | 通过 |
+| 4 | 207.93 ms | 122.75 ms | 通过 |
+| 5 | 83.05 ms | 90.57 ms | **失败** |
+
+同一份代码上 JSON 编码单次采样在 46.6~207.9 ms（4.5x）之间摆动，而两者真实差距
+只有约 1.1x —— 单次墙钟对比必然翻转。修上下文（`tests/test_v3_batch2.py:57-78`）
+写明判据与全部阈值，`-s` 会打印 5 轮采样、逐轮比值与中位数，便于日后复盘。
+
+### 10.3 新增：GUI 离屏冒烟 `tests/test_studio_smoke.py`（本文件不属 flaky 登记）
+
+`lightdb_studio` 130 文件 / 约 3.7 万行此前零测试，本次新增 7 条离屏冒烟
+（6 passed + 1 xfailed，约 2s，无需真实 MySQL、不写真实主目录）：构造
+`MainWindow` 并断言关键控件、错误码/SQLSTATE/完整报文（>80 字符不截断）、
+结果表格 3 列×5 行、编辑器读写回。
+
+其中 xfail 记录了一个**尚未修的 GUI 缺陷**：`ResultTable.show_message()`
+（`lightdb_studio/ui/result_table.py:151`）漏调 `_hide_error_view()`，于是
+`show_result()`/`clear()` 都会收起错误视图，唯独无结果集语句（INSERT/UPDATE…）
+走 `show_message()` 时**上一次的错误仍留在结果区**（实测：`error_view.isHidden()`
+仍为 `False`、`table.isHidden()` 仍为 `True`，报文还是过期那条）。只登记，
+未改产品代码。
