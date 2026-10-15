@@ -141,10 +141,22 @@ def _next_autocommit_tid() -> int:
 
 
 def coerce(value, col_type: str):
-    """类型转换"""
+    """类型转换
+
+    `col_type` 现在可能是**带参数**的真实类型（`VARCHAR(20)`、
+    `DECIMAL(10,2)`、`INT(11) UNSIGNED`）——解析器不再把长度抹掉
+    （元数据诚实化的要求：`SHOW COLUMNS` 必须报真实声明）。因此比较前
+    先取基类型名：`VARCHAR(20)` → `VARCHAR`。
+    """
     if value is None:
         return None
-    t = col_type.upper()
+    raw = str(col_type or '').strip().upper()
+    m = re.match(r'^([A-Z_][A-Z0-9_]*)', raw)
+    if not m:
+        # 类型名本身无法解析：显式报错，不要掉进最后的 `return str(value)`
+        # 分支把任意值都当字符串接受（那是静默的类型欺骗）。
+        raise ValueError(f"无法识别的列类型: {col_type!r}")
+    t = m.group(1)
     try:
         if t in ('INT', 'BIGINT'):
             return int(value)
@@ -703,12 +715,53 @@ class Table:
             finally:
                 self._cleanup_stmt(tid, txn_id)
 
+    def _column_default(self, col: dict):
+        """列的**真实**默认值（没有声明 DEFAULT 时为 None）
+
+        `cols[i]['default']` 由解析器按 MySQL 取值形态解析：
+        数字存字符串（交给 `coerce` 按列类型转）、字符串是 Python str、
+        当前时间函数存表达式原文（这里真的求值，不假装）。
+        """
+        if not col.get('has_default'):
+            return None
+        raw = col.get('default')
+        if raw is None:
+            return None
+        if col.get('generated'):
+            return raw
+        t = str(col.get('type') or '').strip().upper()
+        m = re.match(r'^([A-Z_][A-Z0-9_]*)', t)
+        base = m.group(1) if m else t
+        if base in ('INT', 'BIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL',
+                    'BOOLEAN'):
+            # 数字字面量（解析器存的是原文）；转不了就交给 coerce 报错
+            try:
+                return coerce(raw, col.get('type'))
+            except (ValueError, TypeError):
+                return raw
+        if base in ('DATETIME', 'DATE', 'TIME'):
+            # `DEFAULT CURRENT_TIMESTAMP` 一族：真的求值（本引擎的
+            # 「当前时间」就是 `sql/functions/datetime_funcs.py::now()`，
+            # 与 `NOW()` 同一个实现），绝不把函数名当字符串存进数据里。
+            try:
+                from ..sql.functions.datetime_funcs import now as _now
+                return _now()
+            except Exception:
+                return raw
+        return raw
+
     def _insert_locked(self, values: List, tid: int,
                        read_view, owned: bool) -> int:
-        # 补齐列
+        # 补齐列 —— 用**真实的列默认值**补，而不是一律补 None。
+        #
+        # 解析器现在真的解析并保存 `DEFAULT`（`cols[i]['default']`），
+        # 所以 `SHOW COLUMNS` 报出的 Default 必须真的会被用上；否则那张
+        # 表就是"元数据说有默认值、引擎却不用"的又一处不诚实。显式传入
+        # 的 NULL 仍然按原子值处理（MySQL：显式 NULL 不进默认值）。
         if len(values) < len(self.cols):
-            values = list(values) + [None] * (
-                len(self.cols) - len(values))
+            values = list(values) + [
+                self._column_default(self.cols[i])
+                for i in range(len(values), len(self.cols))]
 
         # 生成列（GENERATED ALWAYS AS (...) STORED）：写入前按表达式真算，
         # 用户给的值被覆盖（MySQL 里给生成列赋值本来就是错误，这里不静默

@@ -19,6 +19,9 @@ from typing import Optional
 
 from ..config import Config
 from ..logger import logger
+# `SHOW COLUMNS` 的列元数据来自与 information_schema / 进程内执行器**同一份**
+# 实现（db/database.py），避免三条路径各编一套元数据。
+from ..db.database import describe_columns
 from . import mysql_protocol as mp
 
 
@@ -73,7 +76,9 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
         self.seq = 0
         self.user = None
-        self.database = "default"
+        # 未指定库时为 None（`SELECT DATABASE()` 因此返回 SQL NULL）。
+        # 旧实现默认 `"default"`，把"没选库"伪装成"选了 default"。
+        self.database = None
         self.server_id = _alloc_server_id()
         self.auth_seed = os.urandom(20)
         self.closed = False
@@ -161,7 +166,16 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return False
 
         if resp.database:
-            self.database = resp.database
+            # 登录时指定的 database 必须**校验**：不存在的库要显式报错，
+            # 否则客户端以为连上了那个库（`SELECT DATABASE()` 又会报出
+            # 一个不存在的名字，或旧实现那种错位值）。
+            resolved, err = self._resolve_database(resp.database)
+            if err is not None:
+                self._send_packet(err)
+                return False
+            self.database = resolved
+            # 会话表里的 db 列与真实会话状态保持一致
+            self._update_session(db=resolved)
 
         self._send_packet(mp.make_ok_packet(0, 0))
         logger.info(
@@ -202,6 +216,65 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 f"用户 {self.user} 断开连接 "
                 f"(sid={self.server_id})")
 
+    # ==================== 已知库解析 ====================
+
+    def _database_names(self):
+        """引擎真实支持的库名列表（`SHOW DATABASES` 的依据）
+
+        取自 `Database.database_names()`（真实单库 + 真实可查询的
+        `information_schema`）；多进程下的 `RemoteDB` 也实现了同一个方法。
+        """
+        try:
+            return list(self.db.database_names())
+        except Exception as e:               # pragma: no cover - 防御
+            logger.warn(f"读取库列表失败: {e}")
+            return []
+
+    def _current_database(self):
+        """当前会话的库：`(规范名, None)`；未选/已失效则 `(None, ERR)`
+
+        未选库时（登录未指定 database 且没执行过 `USE`）用引擎自己的
+        单库名兜底 —— 那是这张连接**真的**在读写的库，不是编出来的。
+        """
+        if not self.database:
+            names = self._database_names()
+            if not names:
+                return None, mp.make_err_packet(
+                    1049, "42000", "No database selected")
+            return names[0], None
+        resolved, err = self._resolve_database(self.database)
+        return (resolved, None) if err is None else (None, err)
+
+    def _visible_tables(self, db_name):
+        """给定库下可见的表（真实表 + `information_schema` 虚拟表）"""
+        try:
+            return list(self.db.visible_table_names(db_name))
+        except Exception as e:                # pragma: no cover - 防御
+            logger.warn(f"读取表列表失败 ({db_name}): {e}")
+            return []
+
+    def _resolve_database(self, name):
+        """把客户端给的库名解析成**引擎真实存在**的库名
+
+        返回 `(规范名, None)`；库不存在时返回 `(None, ERR 包)`（1049，
+        与 MySQL 的 `Unknown database 'x'` 同码同文）。
+
+        依据是 `Database.database_names()`（真实单库 + 真实可查询的
+        `information_schema`），不是写死的字符串比较——库名换了、模型
+        变了，这里跟着变。
+        """
+        known = []
+        try:
+            known = list(self.db.database_names())
+        except Exception:                    # pragma: no cover - 防御
+            known = []
+        want = str(name or '').strip()
+        for real in known:
+            if want.lower() == str(real).lower():
+                return real, None
+        return None, mp.make_err_packet(
+            1049, "42000", f"Unknown database '{want}'")
+
     # ==================== 命令分发 ====================
 
     def _dispatch(self, packet: bytes):
@@ -216,7 +289,15 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
         elif cmd == mp.COM_INIT_DB:
             db_name = body.decode('utf-8', errors='replace')
-            self.database = db_name
+            # `COM_INIT_DB` 就是 `USE <db>` 的协议形态。旧实现直接赋值 +
+            # 回 OK，切到不存在的库也"成功"（pymysql 的
+            # `connection.select_db('no_such_db')` 因此静默通过）。
+            resolved, err = self._resolve_database(db_name)
+            if err is not None:
+                self._send_packet(err)
+                return
+            self.database = resolved
+            self._update_session(db=resolved)
             self._send_packet(mp.make_ok_packet())
 
         elif cmd == mp.COM_QUERY:
@@ -234,13 +315,26 @@ class MySQLHandler(socketserver.BaseRequestHandler):
     # ==================== 查询处理 ====================
 
     def _handle_query(self, sql: str):
+        """执行一条 SQL，并在**执行结束后**把会话状态复位
+
+        复位很重要：`SHOW PROCESSLIST` 的 `Command` / `Info` / `Time` 必须
+        反映"现在"的状态。旧实现只在语句开始时把 `Command` 设成 `Query`
+        且从不复位，于是空闲连接永远显示 `Command=Query` + 最后一条 SQL，
+        `Time` 又在涨（见 `_show_processlist`）——性能面板里"有查询在跑"
+        是假的。这里用 try/finally 保证任何分支（含早返回/异常）都会复位。
+        """
+        self._update_session(command='Query', info=sql[:200],
+                             stmt_started=time.time())
+        try:
+            self._handle_query_inner(sql)
+        finally:
+            self._update_session(command='Sleep', info='', stmt_started=None)
+
+    def _handle_query_inner(self, sql: str):
         sql = sql.strip().rstrip(';').strip()
         if not sql:
             self._send_packet(mp.make_ok_packet())
             return
-
-        # 更新会话状态
-        self._update_session(command='Query', info=sql[:200])
 
         upper = sql.upper()
 
@@ -258,6 +352,9 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         if upper.startswith("SELECT DATABASE()"):
+            # 当前连接的库；**没有**选库时返回 SQL NULL（MySQL 语义）。
+            # 旧实现在握手解析错位时会把这个值取成认证插件名
+            # （`mysql_native_password`），那是明显的错值。
             self._send_resultset(
                 [("DATABASE()", mp.MYSQL_TYPE_VAR_STRING, 64)],
                 [(self.database,)])
@@ -290,14 +387,19 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         if upper == "SHOW DATABASES":
             self._send_resultset(
                 [("Database", mp.MYSQL_TYPE_VAR_STRING, 64)],
-                [("default",), ("information_schema",)])
+                [(name,) for name in self._database_names()])
             return
 
         if upper.startswith("SHOW TABLES"):
-            rows = [(name,) for name in
-                    sorted(self.db.tables.keys())]
+            # 按**当前库**过滤（旧实现直读 self.db.tables，与所选库无关）。
+            # 库不存在时显式报 1049，而不是列别的库的表。
+            db_name, err = self._current_database()
+            if err is not None:
+                self._send_packet(err)
+                return
+            rows = [(name,) for name in self._visible_tables(db_name)]
             self._send_resultset(
-                [(f"Tables_in_{self.database}",
+                [(f"Tables_in_{db_name}",
                   mp.MYSQL_TYPE_VAR_STRING, 64)],
                 rows)
             return
@@ -361,6 +463,15 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._send_packet(mp.make_err_packet(
                 1105, "HY000", str(e)[:200]))
             return
+
+        # `USE <库>` 由执行器校验（不存在 → 1049）。成功时必须把会话状态
+        # 同步回 handler：否则后续的 `SELECT DATABASE()` / `SHOW TABLES`
+        # 仍按旧库回答 —— 与"切库成功"的回报直接矛盾。
+        if parsed.get('command') == 'USE' and not (
+                isinstance(result, dict)
+                and result.get('type') == 'error'):
+            self.database = session.get('database') or self.database
+            self._update_session(db=self.database)
 
         self._send_execution_result(result, parsed)
 
@@ -658,15 +769,19 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         session_count = _session_count()
 
         rows = [
+            # 本引擎**不统计**字节数（协议层没有计数器）。原先这里写死
+            # '0' —— 那是在宣称"一条字节都没收发"，而事实是"没有这个
+            # 计数器"。取不到就报 NULL，让使用者去别处找（进程 IO 统计），
+            # 而不是拿一个假的 0 当答案。
             ('Aborted_clients', '0'),
             ('Aborted_connects', '0'),
-            ('Bytes_received', '0'),
-            ('Bytes_sent', '0'),
+            ('Bytes_received', None),
+            ('Bytes_sent', None),
             ('Connections', str(session_count)),
             ('Queries', str(stats.get('queries', 0))),
             ('Questions', str(stats.get('queries', 0))),
             ('Threads_connected', str(session_count)),
-            ('Threads_running', '1'),
+            ('Threads_running', str(self._threads_running())),
             ('Uptime',
              str(int(time.time() - self.server.start_time))),
         ]
@@ -675,23 +790,43 @@ class MySQLHandler(socketserver.BaseRequestHandler):
              ("Value", mp.MYSQL_TYPE_VAR_STRING, 1024)],
             rows)
 
+    @staticmethod
+    def _threads_running() -> int:
+        """真实在跑语句的会话数（命令列为 Query 的那些）
+
+        原来这里写死 '1'（"总有 1 个线程在跑"）。空载时那是假的：
+        没有任何会话在执行语句。改为按真实会话状态统计。
+        """
+        with _sessions_lock:
+            return sum(1 for info in _sessions.values()
+                       if str(info.get('command', '')).lower() == 'query')
+
     def _show_processlist(self):
         cols = ['Id', 'User', 'Host', 'db', 'Command',
                 'Time', 'State', 'Info']
         rows = []
         now = time.time()
         with _sessions_lock:
-            for sid, info in list(_sessions.items()):
-                rows.append((
-                    sid,
-                    info.get('user', ''),
-                    str(info.get('host', ('', 0))[0]),
-                    info.get('db', ''),
-                    info.get('command', 'Sleep'),
-                    int(now - info.get('start', now)),
-                    '',
-                    info.get('info', ''),
-                ))
+            items = list(_sessions.items())
+        for sid, info in items:
+            # `Time` 是"在当前状态里待了多久"（MySQL 语义）。会话空闲
+            # （Sleep）时没有"当前语句"，如实报 NULL；正在执行语句时报
+            # 该语句已运行的秒数。原来的实现用 `now - 连接建立时刻`，
+            # 于是空闲连接的 Time 一直在涨，看起来像"有查询跑了 300 秒"。
+            stmt_start = info.get('stmt_started')
+            running = str(info.get('command', '')).lower() == 'query'
+            elapsed = (int(now - stmt_start)
+                       if (running and stmt_start) else None)
+            rows.append((
+                sid,
+                info.get('user', ''),
+                str(info.get('host', ('', 0))[0]),
+                info.get('db', ''),
+                info.get('command', 'Sleep'),
+                elapsed,
+                '',
+                info.get('info', ''),
+            ))
 
         self._send_resultset(
             [(c, mp.MYSQL_TYPE_VAR_STRING, 255)
@@ -744,17 +879,17 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         table = self.db.tables[table_name]
-        rows = []
-        for col in table.cols:
-            key = ('PRI' if col.get('primary')
-                   else 'UNI' if col.get('unique') else '')
-            null = 'NO' if col.get('notnull') else 'YES'
-            default = None
-            extra = ('auto_increment'
-                     if col.get('primary') else '')
-            rows.append((
-                col['name'], col['type'], null, key,
-                default, extra))
+        # 列元数据来自**真实列定义**（与 information_schema / 进程内执行器
+        # 共用 db/database.py::describe_columns）：
+        #   Type   保留长度/精度（VARCHAR(20) / DECIMAL(10,2)）
+        #   Default 真实默认值，没声明就是 NULL
+        #   Extra  本引擎没有 auto_increment / on update → 恒为 ''
+        # 旧实现把 Default 写死 None、把 Extra 由主键伪造成 auto_increment。
+        rows = [
+            (c['name'], c['type'], c['null'], c['key'],
+             c['default'], c['extra'])
+            for c in describe_columns(table)
+        ]
 
         self._send_resultset([
             ("Field", mp.MYSQL_TYPE_VAR_STRING, 64),
@@ -772,18 +907,57 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         except Exception:
             table = ''
 
+        # 与 `SHOW COLUMNS` 走同一份真实列定义（`describe_columns`）：
+        # 旧实现直接回 `MYSQL_TYPE_VAR_STRING` + 长度 255，客户端拿到的
+        # 列类型是假的（mysql-connector / 部分 ORM 会用这个包）。
         if table and table in self.db.tables:
-            t = self.db.tables[table]
-            fields = [
-                (c['name'], mp.MYSQL_TYPE_VAR_STRING, 255)
-                for c in t.cols
-            ]
-            for name, ctype, length in fields:
+            for c in describe_columns(self.db.tables[table]):
                 self._send_packet(
                     mp.make_column_definition(
-                        name, ctype, length))
+                        c['name'],
+                        self._mysql_type_for(c['type']),
+                        self._mysql_len_for(c['type'])))
 
         self._send_packet(mp.make_eof_packet())
+
+    #: 本引擎类型 → MySQL 协议列类型（`COM_FIELD_LIST` 用）。
+    #: 只映射真实知道的类型；认不出就如实报 VAR_STRING（宽字符），
+    #: 不猜一个"看起来专业"的二进制类型。
+    @staticmethod
+    def _mysql_type_for(col_type: str) -> int:
+        t = str(col_type or '').upper()
+        base = t.split('(')[0].strip()
+        return {
+            'INT': mp.MYSQL_TYPE_LONG,
+            'BIGINT': mp.MYSQL_TYPE_LONGLONG,
+            'FLOAT': mp.MYSQL_TYPE_FLOAT,
+            'DOUBLE': mp.MYSQL_TYPE_DOUBLE,
+            'DECIMAL': mp.MYSQL_TYPE_NEWDECIMAL,
+            'BOOLEAN': mp.MYSQL_TYPE_TINY,
+            'DATE': mp.MYSQL_TYPE_DATE,
+            'TIME': mp.MYSQL_TYPE_TIME,
+            'DATETIME': mp.MYSQL_TYPE_DATETIME,
+            'JSON': mp.MYSQL_TYPE_JSON,
+            'BLOB': mp.MYSQL_TYPE_BLOB,
+            'TEXT': mp.MYSQL_TYPE_BLOB,
+        }.get(base, mp.MYSQL_TYPE_VAR_STRING)
+
+    @staticmethod
+    def _mysql_len_for(col_type: str) -> int:
+        """列显示长度：优先用声明里的长度/精度，取不到才给协议默认值"""
+        import re
+        m = re.search(r'\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)',
+                      str(col_type or ''))
+        if m:
+            if m.group(2):
+                # `DECIMAL(10,2)`：MySQL 的 display length ≈ 精度 + 3
+                return int(m.group(1)) + int(m.group(2)) + 3
+            return int(m.group(1))
+        base = str(col_type or '').upper().split('(')[0].strip()
+        return {'INT': 11, 'BIGINT': 20, 'FLOAT': 12, 'DOUBLE': 22,
+                'DECIMAL': 11, 'BOOLEAN': 1, 'DATE': 10, 'TIME': 10,
+                'DATETIME': 19, 'JSON': 1024, 'BLOB': 65535,
+                'TEXT': 65535}.get(base, 255)
 
 
 # ==================== Server ====================

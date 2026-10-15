@@ -27,10 +27,23 @@ CLIENT_PLUGIN_AUTH       = 0x00080000
 CLIENT_CONNECT_ATTRS     = 0x00100000
 
 # 服务端声明支持的能力
+#
+# ★ `CLIENT_CONNECT_WITH_DB` 原实现**漏了**：客户端（pymysql 2.2.8 实测）
+# 只有在服务端握手包声明了该位时才会把 `database=` 写进握手响应
+# （见 pymysql `_request_authentication`：
+# `if self.db and self.server_capabilities & CLIENT.CONNECT_WITH_DB`）。
+# 漏掉这一位造成的连锁后果是：
+#   1. 客户端**不发送** database 字段，于是服务端按字段顺序读到的
+#      "库名"其实是紧随其后的**认证插件名** ——
+#      `SELECT DATABASE()` 返回 `'mysql_native_password'`，
+#      `SHOW PROCESSLIST` 的 db 列同样错（这就是那个"明显错值"的根因）；
+#   2. 登录时指定一个不存在的库也不会报错（服务端根本没收到库名）。
+# 这里补上；`_resolve_database` 再把收到的库名**校验**一遍（不存在 → 1049）。
 SERVER_CAPABILITIES = (
     CLIENT_LONG_PASSWORD
     | CLIENT_FOUND_ROWS
     | CLIENT_LONG_FLAG
+    | CLIENT_CONNECT_WITH_DB
     | CLIENT_PROTOCOL_41
     | CLIENT_TRANSACTIONS
     | CLIENT_SECURE_CONNECTION

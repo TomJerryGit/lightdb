@@ -39,10 +39,88 @@ def hash_native_password(password: str) -> str:
     return s2.hex()
 
 
+#: 本引擎的默认库名（镜像 MySQL 的 `test`/`sys`：一个**真实存在**的名字，
+#: 所有无 schema 限定的表都住在它下面）。
+DEFAULT_DATABASE = 'default'
+
+#: 引擎真实提供、可查询的虚拟库。
+INFORMATION_SCHEMA_DB = 'information_schema'
+
+#: `information_schema` 里**真实可查询**的虚拟表（执行器的
+#: `information_schema.<name>` 分支接的就是这三个）。`SHOW TABLES` 在
+#: 这个库上只能列它们——不能把真实库的表也算进来。
+INFORMATION_SCHEMA_TABLES = ('COLUMNS', 'SCHEMATA', 'TABLES')
+
+
+def column_key(col: dict) -> str:
+    """`SHOW COLUMNS` / `information_schema` 的 Key 列（真实约束，不推断）"""
+    if col.get('primary'):
+        return 'PRI'
+    if col.get('unique'):
+        return 'UNI'
+    return ''
+
+
+def column_default(col: dict):
+    """列的**真实**默认值；没声明 `DEFAULT` 时返回 None（= SQL NULL）
+
+    依据：解析器 `_parse_column_default` 只在文本里真的出现 `DEFAULT`
+    子句时才置 `has_default=True`，并把取值存进 `default`。这里不做任何
+    推断——尤其不能用"是否 NOT NULL / 是否主键"去猜一个默认值。
+    """
+    if not col.get('has_default'):
+        return None
+    return col.get('default')
+
+
+def column_extra(col: dict) -> str:
+    """Extra 列：本引擎**没有** `auto_increment` / `on update` 概念，
+    因此恒为空字符串。
+
+    旧实现把 `Extra` 写成 `'auto_increment' if col['primary'] else ''`
+    —— 那是一条凭空捏造的元数据：本引擎既没有自增序列（`parser._column_def`
+    现在对 `AUTO_INCREMENT` 显式报错），主键也不等于自增。宁可留空，
+    也不给客户端一个它据此会做错的结论。
+    """
+    return ''
+
+
+def describe_columns(table) -> list:
+    """列元数据（`SHOW COLUMNS` / `information_schema.COLUMNS` 的**唯一**
+    数据源）
+
+    放在 `db/` 而不是 `sql/` 或 `net/`：`db` 是最底层包（不 import
+    sql/net），所以进程内执行器、`information_schema` 虚拟表、
+    MySQL 协议服务端三条路径可以共用同一份实现，不会再各自"编"一套。
+    `table` 只需要有 `.cols`（`RemoteTable` 在 multiprocess 下也满足）。
+    """
+    out = []
+    for c in getattr(table, 'cols', None) or []:
+        out.append({
+            'name': c.get('name', ''),
+            # 解析器保留长度/精度：`VARCHAR(20)` / `DECIMAL(10,2)`。
+            # 老 `_meta.json`（长度被抹掉）只有基类型，也如实回传基类型，
+            # 不补猜一个长度。
+            'type': c.get('type') or '',
+            'null': ('NO' if c.get('notnull') else 'YES'),
+            'key': column_key(c),
+            'default': column_default(c),
+            'extra': column_extra(c),
+        })
+    return out
+
+
 class Database:
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, name: str = DEFAULT_DATABASE):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        #: 本引擎是**单库模型**：一个 `Database` 实例 = 一个数据目录 =
+        #: 一个库，所有表都在这个库下面（没有 `CREATE DATABASE`，
+        #: `_meta.json` 里也没有 schema 维度）。`name` 是这个库**真实**
+        #: 的名字，`SHOW DATABASES` / `SELECT DATABASE()` / `USE` 的校验
+        #: 全部以它为依据，而不是写死一个字面量列表。
+        self.name = name or DEFAULT_DATABASE
 
         self.txn_manager = TxnManager()
         self.lock_manager = LockManager()
@@ -187,6 +265,48 @@ class Database:
         tmp.replace(p)
 
     # ==================== 表管理 ====================
+
+    def database_names(self) -> List[str]:
+        """引擎**真实**支持的库集合（`SHOW DATABASES` 的唯一依据）
+
+        依据（不是"照着老硬编码列表抄"）：
+
+        1. `self.name` —— 本实例那个真实的单库（所有表都在它下面，
+           见 `__init__` 的说明）；
+        2. `information_schema` —— **真的可查询**：执行器把
+           `information_schema.TABLES/COLUMNS/SCHEMATA` 路由到
+           `db/information_schema.py::InformationSchema`（`executor.py`
+           的 `_cmd_select` 分支），它本身也是一个真实实现的虚拟库。
+
+        本引擎**没有** `CREATE DATABASE`，也没有第二份数据目录，所以
+        这个列表就是全部；`mysql` / `performance_schema` / `sys` 在这里
+        并不存在，绝不列出来。
+        """
+        return [self.name, INFORMATION_SCHEMA_DB]
+
+    def is_known_database(self, name) -> bool:
+        """库名是否存在（大小写不敏感，与 MySQL 的 schema 名一致）"""
+        if name is None:
+            return False
+        want = str(name).strip().lower()
+        return any(want == n.lower() for n in self.database_names())
+
+    def visible_table_names(self, database=None) -> List[str]:
+        """给定库下**可见**的表名；库不存在时返回空列表
+
+        单库模型下这张库的表就是 `self.tables`；`information_schema` 里
+        只有它**真的**认识的虚拟表（`INFORMATION_SCHEMA_TABLES`），
+        真实表不会因为"切到了这个库"就跑进来。旧实现完全不看库名，
+        任何库上 `SHOW TABLES` 都返回全部表——切库不生效却回 OK，
+        属于假元数据。
+        """
+        want = (str(database).strip().lower()
+                if database is not None else self.name.lower())
+        if want == INFORMATION_SCHEMA_DB.lower():
+            return sorted(INFORMATION_SCHEMA_TABLES)
+        if want == self.name.lower():
+            return sorted(self.tables.keys())
+        return []
 
     def create_table(self, name: str,
                      cols: List[dict],

@@ -16,6 +16,9 @@ from typing import Dict
 
 from ..logger import logger
 from ..db.information_schema import InformationSchema
+# `SHOW COLUMNS` 的列元数据构造（与 information_schema 共用一份实现，
+# 见 db/database.py 的说明）
+from ..db.database import describe_columns
 from ..db.table import Table as _StorageTable
 # CHECK 约束违规（MySQL ERROR 3819 / SQLSTATE HY000）：`Table.insert` /
 # `Table.update` 抛它，`execute` 在这里把它渲染成错误结果而不是 1062。
@@ -470,7 +473,16 @@ class Executor:
     def execute_sql(self, sql: str, session: Dict = None) -> Dict:
         """便捷方法：直接执行 SQL 字符串"""
         from .parser import parser
-        parsed = parser.parse(sql)
+        try:
+            parsed = parser.parse(sql)
+        except (SyntaxError, ValueError) as e:
+            # **定义期拒绝**的语句（例如 `AUTO_INCREMENT` / 不支持的
+            # `DEFAULT` 形态，见 `parser._column_def`）必须变成"显式错误
+            # 结果"，而不是把解析异常抛给调用方：抛出去的话（a）调用方
+            # 拿不到 errno/报文，（b）会绕过 `_record_audit` 的失败记录。
+            # 服务端那条路径（`net/server.py`）本来就是这么处理的，这里
+            # 让进程内路径与它行为一致：要么真实，要么显式报错。
+            return self._err(1064, f"SQL 解析错误: {str(e)[:200]}")
         if parsed is None:
             head = (str(sql).strip().split(None, 1) or [''])[0].upper()
             if head == 'ALTER':
@@ -605,7 +617,11 @@ class Executor:
                     return self._err(
                         1136, f"列数不匹配: 语句给了 {len(v)} 个值，"
                               f"列清单有 {len(p['columns'])} 列")
-                row = [None] * len(tbl.cols)
+                # 未出现在列清单里的列不填 None，而是填**真实的列默认值**
+                # （`Table._column_default`），与 `SHOW COLUMNS` 报出的
+                # Default 一致。旧实现一律填 None，于是"表声明了 DEFAULT、
+                # 引擎却不用"——一条看得见却无效的元数据。
+                row = [tbl._column_default(c) for c in tbl.cols]
                 for i, cn in enumerate(p['columns']):
                     row[col_map[cn]] = v[i]
                 expanded.append(row)
@@ -699,7 +715,11 @@ class Executor:
             _, name = table.split('.', 1)
             cols, rows = self.info_schema.query(name)
             return self._rs(cols, rows)
-        if table.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA'):
+        # 裸 `TABLES` / `COLUMNS` / `SCHEMATA`：只有在真实表里不存在时才
+        # 当成 information_schema 的虚拟表，避免遮蔽用户自己的同名表
+        # （原实现无条件优先虚拟表，与 `TABLES` 同名的真实表就查不到了）。
+        if (table.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA')
+                and table not in self.db.tables):
             cols, rows = self.info_schema.query(table)
             return self._rs(cols, rows)
 
@@ -5732,7 +5752,7 @@ class Executor:
                 desc = f'HASH({pm.pk_col}) % {part.value} = {part._hash_index}'
             else:
                 desc = f'VALUES IN ({part.value})'
-            rows.append(('default', name, part.name, part.ptype,
+            rows.append((self.db.name, name, part.name, part.ptype,
                          pm.pk_col, desc))
         return self._rs(cols, rows)
 
@@ -7462,31 +7482,43 @@ class Executor:
     # ==================== SHOW ====================
 
     def _cmd_show_tables(self, p, s):
-        cols = [f"Tables_in_{s.get('database', 'default')}"]
-        rows = [
-            (name,) for name in sorted(self.db.tables.keys())
-        ]
+        db_name = s.get('database') or self.db.name
+        if not self.db.is_known_database(db_name):
+            # 不存在的库上 `SHOW TABLES` 必须报错（MySQL 1049），
+            # 而不是把别的库的表列出来冒充。
+            return self._err(
+                1049, f"Unknown database '{db_name}'", sqlstate='42000')
+        cols = [f"Tables_in_{db_name}"]
+        rows = [(name,) for name in self.db.visible_table_names(db_name)]
         return self._rs(cols, rows)
 
     def _cmd_show_databases(self, p, s):
+        """`SHOW DATABASES` —— 引擎**真实**支持的库集合
+
+        依据见 `Database.database_names()`：一个真实的单库 + 真实可查询的
+        `information_schema` 虚拟库。旧实现返回写死的
+        `[('default',), ('information_schema',)]`：它与实现无关，改数据
+        目录、改库名、加/减虚拟库都不会变，属于纯装饰性元数据。
+        """
         return self._rs(
             ['Database'],
-            [('default',), ('information_schema',)])
+            [(name,) for name in self.db.database_names()])
 
     def _cmd_show_columns(self, p, s):
+        """`SHOW COLUMNS` / `DESC` / `DESCRIBE` —— 来自真实列定义
+
+        Type（保留长度/精度）、Default（真实默认值或 NULL）、Extra（没有
+        对应概念就留空，**不**由主键推断）三者与 `information_schema`
+        共用 `db/database.py::describe_columns`，不会再各写一份。
+        """
         tbl = self.db.get_table(p['table'])
         cols = ['Field', 'Type', 'Null', 'Key',
                 'Default', 'Extra']
-        rows = []
-        for c in tbl.cols:
-            key = ('PRI' if c.get('primary')
-                   else 'UNI' if c.get('unique') else '')
-            null = 'NO' if c.get('notnull') else 'YES'
-            extra = ('auto_increment'
-                     if c.get('primary') else '')
-            rows.append((
-                c['name'], c['type'], null, key,
-                None, extra))
+        rows = [
+            (c['name'], c['type'], c['null'], c['key'],
+             c['default'], c['extra'])
+            for c in describe_columns(tbl)
+        ]
         return self._rs(cols, rows)
 
     def _cmd_show_stats(self, p, s):
@@ -7526,9 +7558,22 @@ class Executor:
         return self._ok(message="Rolled back")
 
     def _cmd_use(self, p, s):
-        s['database'] = p['database']
+        """`USE <库>` —— **校验**后切换（不存在 → 1049）
+
+        旧实现无条件 `s['database'] = p['database']` 然后回 OK：切到
+        `no_such_db` 也"成功"，而 `SHOW TABLES` 又完全不看库名，于是
+        使用者得到一个"切库成功了"的假象 + 一份与所选库无关的表清单。
+        本引擎是单库模型，因此这里只接受**真实存在**的库
+        （`Database.database_names()`：真实单库 + `information_schema`），
+        其余一律显式报错——不静默忽略。
+        """
+        name = p['database']
+        if not self.db.is_known_database(name):
+            return self._err(
+                1049, f"Unknown database '{name}'", sqlstate='42000')
+        s['database'] = name
         return self._ok(
-            message=f"Database changed to {p['database']}")
+            message=f"Database changed to {name}")
 
     def _cmd_select_variables(self, p, s):
         """`SELECT @var[, @var]` —— 读**用户变量**（MySQL 13.7.6.2）

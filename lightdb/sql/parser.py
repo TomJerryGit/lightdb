@@ -955,10 +955,20 @@ class Parser:
             # （原实现直接置 rest=''，外层子句被整段静默丢弃）
             rest = tail
         else:
-            tm = re.match(r'[`"]?(\w+)[`"]?', from_rest)
+            # 表名：支持 `db.table` 限定形态。
+            #
+            # 原来只认裸 `(\w+)`，于是 `SELECT * FROM information_schema.TABLES`
+            # 会把 `information_schema` 当表名、把 `TABLES` 当成它的别名
+            # —— 执行器里那条 `information_schema.*` 分支**永远走不到**
+            # （实测报 1146「表 information_schema 不存在」，与"元数据虚拟库"
+            # 的声明直接矛盾）。这里把 `schema.` 前缀一起吃进来。
+            tm = re.match(r'[`"]?(\w+)[`"]?(?:\s*\.\s*[`"]?(\w+)[`"]?)?',
+                          from_rest)
             if not tm:
                 raise SyntaxError("表名缺失")
             main_table = tm.group(1)
+            if tm.group(2):
+                main_table = f"{tm.group(1)}.{tm.group(2)}"
             rest = from_rest[tm.end():]
             # 表别名：`FROM users u JOIN ...` —— 不识别别名的话下面
             # 的 JOIN 正则会在 ' u JOIN' 处匹配失败，整个 JOIN 被静默丢弃
@@ -1772,18 +1782,106 @@ class Parser:
             check = self._parse_check(
                 rest[cpos:], strict_tail=False)
 
+        # `AUTO_INCREMENT`：本引擎的行布局/插入路径里**没有自增概念**
+        # （`Table._insert_locked` 只会"主键为 NULL 时取 _next_pk"）。
+        # 原实现把子句静默丢掉，客户端以为列真的会自增；而
+        # `SHOW COLUMNS` 的 Extra 又用主键**伪造** `auto_increment`。
+        # 两者合起来就是一条假的元数据。这里改为定义期显式报错：
+        # 要么真的支持，要么明确拒绝，绝不"接受但不生效"。
+        if re.search(r'\bAUTO_INCREMENT\b', rest, re.IGNORECASE):
+            raise SyntaxError(
+                f"列 {name}: 不支持 AUTO_INCREMENT —— 本引擎没有自增序列，"
+                f"接受它只会让插入行为与声明不符；请显式提供主键值")
+        # 同上：`ON UPDATE <expr>` 在本引擎里没有任何实现
+        if re.search(r'\bON\s+UPDATE\b', rest, re.IGNORECASE):
+            raise SyntaxError(
+                f"列 {name}: 不支持 ON UPDATE 子句 —— 本引擎不会在 UPDATE "
+                f"时重算该列，接受它等于承诺一个不存在的语义")
+
+        # `DEFAULT`：真实解析并保留。旧实现根本没有 DEFAULT 分支，
+        # 该子句被静默丢掉，于是 `SHOW COLUMNS` 只能恒报 Default=NULL。
+        # 现在按 MySQL 的取值形态解析（NULL / 数字 / 字符串 / 函数或表达式），
+        # 存进 `cols[i]['default']`；`has_default` 区分"声明了 DEFAULT"
+        # 与"没声明"（两者在本引擎里都是"不写入时补 NULL"，但元数据必须
+        # 如实区分，见 `db/database.py::describe_columns`）。
+        default, has_default = self._parse_column_default(rest)
+
         return {
             'name': name,
             'type': self._normalize_type(col_type),
             'primary': 'PRIMARY KEY' in rest.upper(),
             'notnull': 'NOT NULL' in rest.upper(),
             'unique': 'UNIQUE' in rest.upper(),
+            'default': default,
+            'has_default': has_default,
             'generated': generated,
             'check': check,
         }
 
+    #: 无引号 DEFAULT 值里的函数调用（`CURRENT_TIMESTAMP` / `NOW()` /
+    #: `CURRENT_TIMESTAMP(3)`）。MySQL 8.0 只允许 CURRENT_TIMESTAMP 一族
+    #: 作为"表达式默认值"；本引擎存下**表达式原文**，写入时交给求值器，
+    #: 绝不假装它是常量。
+    _DEFAULT_FUNC_RE = re.compile(
+        r'^(?:CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|NOW|LOCALTIME|'
+        r'LOCALTIMESTAMP|UUID|CURDATE|CURTIME)\s*(?:\(\s*\d*\s*\))?$',
+        re.IGNORECASE)
+
+    def _parse_column_default(self, rest: str):
+        """从列定义尾部解析 `DEFAULT <值>`；返回 `(值, 是否声明了 DEFAULT)`"""
+        m = re.search(r'\bDEFAULT\b', rest, re.IGNORECASE)
+        if not m:
+            return None, False
+        tail = rest[m.end():].lstrip()
+        if not tail:
+            raise SyntaxError("DEFAULT 后面缺少取值")
+        if re.match(r'NULL\b', tail, re.IGNORECASE):
+            return None, True
+        if tail[0] in ("'", '"'):
+            q = tail[0]
+            i, n = 1, len(tail)
+            while i < n:
+                if tail[i] == q:
+                    if i + 1 < n and tail[i + 1] == q:   # `''` 转义
+                        i += 2
+                        continue
+                    return tail[1:i], True
+                i += 1
+            raise SyntaxError(f"DEFAULT 字符串字面量未闭合: {tail[:40]!r}")
+        tok = tail.split()[0]
+        num = re.match(r'^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$', tok)
+        if num:
+            return tok, True
+        if self._DEFAULT_FUNC_RE.match(tok):
+            return tok.upper(), True
+        # 其余形态（布尔字面量、其它表达式）一律显式报错：宁可拒绝，
+        # 也不把看不懂的文本当成"默认值"存进元数据。
+        raise SyntaxError(
+            f"不支持的 DEFAULT 取值 {tok[:40]!r} —— 本引擎只接受 "
+            f"NULL / 数字 / 字符串 / 当前时间函数；其它表达式不会被执行，"
+            f"因此不会假装接受")
+
     def _normalize_type(self, t: str) -> str:
-        t = re.sub(r'\(.*?\)', '', t).strip().upper()
+        """类型归一化：**保留**长度/精度，只归一别名与大小写。
+
+        旧实现 `re.sub(r'\\(.*?\\)', '', t)` 把参数整段抹掉，于是
+        `SHOW COLUMNS` / `information_schema` 里的 `VARCHAR(20)`、
+        `DECIMAL(10,2)` 都变成 `VARCHAR`、`DECIMAL`：GUI 的结构对比
+        （`lightdb_studio/db/schema_diff.py` 按 `VARCHAR(n)` 解析长度）
+        因此把每一列都判成"已变更"。元数据必须与声明一致，所以这里
+        保留参数原文（含修饰符），只做别名归一：
+
+            VARCHAR(20)          -> VARCHAR(20)
+            INTEGER(11) UNSIGNED -> INT(11) UNSIGNED
+            DECIMAL(10, 2)       -> DECIMAL(10, 2)
+            numeric(8,2)         -> DECIMAL(8,2)
+        """
+        raw = str(t or '').strip().upper()
+        m = re.match(r'^([A-Z_][A-Z0-9_]*)\s*(\(.*\))?\s*(.*)$', raw)
+        if not m:
+            # 完全认不出的形态：原样回传（不编造、不猜测）
+            return raw
+        base, params, suffix = m.group(1), m.group(2) or '', m.group(3) or ''
         mapping = {
             'INTEGER': 'INT', 'SMALLINT': 'INT',
             'TINYINT': 'INT', 'MEDIUMINT': 'INT',
@@ -1795,7 +1893,10 @@ class Parser:
             'TINYTEXT': 'TEXT',
             'BOOL': 'BOOLEAN', 'TIMESTAMP': 'DATETIME',
         }
-        return mapping.get(t, t)
+        out = mapping.get(base, base) + params
+        if suffix:
+            out = f"{out} {suffix}"
+        return out
 
     def _drop_table(self, sql: str) -> Dict:
         m = re.match(
