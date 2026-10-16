@@ -154,6 +154,11 @@ class Database:
         # Database 都平白多一个常驻句柄（Windows 上会让数据目录删不掉）。
         self._binlog = None
 
+        # 挂在库上的审计器（`sql/executor.py::_AuditSink`）。审计批量落盘后，
+        # `shutdown()` 是"正常停机 → 待落盘批一定写出去"的确定性落盘点：
+        # 执行器与库同生共死，但库不知道执行器，所以由执行器反向注册进来。
+        self._audit_sinks = []
+
         self._load()
         self._advance_mvcc_epoch()
         self._recover()
@@ -386,6 +391,37 @@ class Database:
         for tbl in self.tables.values():
             tbl._read_views.pop(tid, None)
 
+    def commit_statement(self, txn):
+        """**语句级内部事务**的提交（autocommit 档持久性）
+
+        给 `executor._cmd_insert` 的多值 INSERT 用：没有用户显式事务时，
+        整条语句跑在一个引擎内部事务里，成功才走到这里。与
+        `commit(txn)` 的差别，两处，都是有意的：
+
+        1) 只写 COMMIT 记录并 flush 到 OS（`wal.commit_autocommit`），
+           **不 fsync**。理由：逐行 autocommit 路径的持久性档位就是
+           "flush 到 OS、不 fsync"（`Table._cleanup_stmt` →
+           `wal.commit_async`，见 Stage 2.1 的说明：每条 autocommit
+           INSERT 都 fsync 一次，3000 行要 200s+）。语句级提交若改 fsync，
+           等于**单方面加强**多值 INSERT 的持久性、同时把批量收益吃掉：
+           实测 `Database.commit` 占多值 INSERT 总耗时的 31%（500 行/语句，
+           `Table.flush` 0.25s + `WAL.commit` fsync 0.28s / 1.78s）。
+        2) **不刷脏页**（不调 `tbl.flush()`）：页落盘交给阈值 checkpoint /
+           `close()` / 显式 COMMIT 这三条既有路径。WAL-before-data 不受影响
+           —— 每条行记录在改页之前就已经 `flush_to_os`，崩溃恢复能按 WAL
+           重放或撤销。
+        """
+        tid = txn['txn_id']
+        for tbl in self.tables.values():
+            try:
+                tbl.wal.commit_autocommit(tid)
+            except Exception as e:
+                logger.warn(f"语句级 COMMIT 写入失败 {tbl.name}: {e}")
+        self.mvcc.release(tid, committed=True)
+        self.lock_manager.release(tid)
+        for tbl in self.tables.values():
+            tbl._read_views.pop(tid, None)
+
     def abort(self, txn):
         """回滚事务：真正把数据改回去，再写 ABORT、放锁"""
         tid = txn['txn_id']
@@ -532,6 +568,13 @@ class Database:
         return n
 
     def shutdown(self):
+        # 审计器的待落盘批：正常停机路径上**先刷盘**（审计批量 flush 的
+        # 确定性落盘点），失败只告警，绝不影响停机的其它动作。
+        for sink in list(getattr(self, '_audit_sinks', ()) or ()):
+            try:
+                sink.close()
+            except Exception as e:                # pragma: no cover - 防御
+                logger.warn(f"停机时审计落盘失败: {e}")
         for tbl in self.tables.values():
             try:
                 tbl.close()
@@ -542,6 +585,16 @@ class Database:
                 self._binlog.close()
             except Exception:
                 pass
+
+    def attach_audit_sink(self, sink):
+        """登记一个审计器：`shutdown()` 时保证它的待落盘批被写出去"""
+        if sink is None:
+            return sink
+        if not hasattr(self, '_audit_sinks') or self._audit_sinks is None:
+            self._audit_sinks = []
+        if sink not in self._audit_sinks:
+            self._audit_sinks.append(sink)
+        return sink
 
     def stats(self) -> dict:
         return {

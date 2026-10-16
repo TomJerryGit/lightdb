@@ -1382,6 +1382,65 @@ class Table:
                 logger.warn(f"回滚 {act.op} pk={act.pk} 失败: {e}")
         return restored
 
+    def rollback_statement(self, tid, marks) -> int:
+        """**语句级回滚**：只撤销保存点之后追加的物理 undo 镜像
+
+        用在「用户显式事务里的多值 INSERT 中途失败」：不写 ABORT、不释放
+        锁 / 读视图、不动事务状态（用户仍可继续执行，或整体 ROLLBACK），
+        只让**这一条语句**失效。
+
+        为什么还要写补偿 WAL：显式事务提交时 `wal.commit(tid)` 之前的所有
+        INSERT 记录都会被崩溃恢复的 redo 重放，于是在进程内被撤销掉的行会
+        在重启后"复活"。这里为每条被撤销的 INSERT 追加一条与
+        `Table.delete` **完全同形**的 DELETE 记录（LSN 在 INSERT 之后）：
+        redo 按 LSN 顺序 INSERT→DELETE 后该行被墓碑化 → 对所有读视图不可见。
+        若该事务后来整体 ROLLBACK，恢复侧按逆 LSN 先撤销 DELETE（复活）
+        再撤销 INSERT（删除），净效果仍然是"没有这一行"。
+
+        代价（如实记录）：进程内被撤销的行是**物理删除**（槽位释放、索引项
+        退回被复用的旧版本），而崩溃后 redo 出来的是**墓碑**——两者对外都
+        不可见，但物理形态不同；`_next_pk` 在进程内按 `_calc_next_pk()`
+        重算（不留下"已消耗"的空洞）。
+        """
+        actions = self.mvcc.pop_undo_after(tid, marks)
+        restored = 0
+        for act in actions:
+            try:
+                if act.op == 'INSERT':
+                    self._log_statement_undo_delete(tid, act)
+                if self._undo_one(act):
+                    restored += 1
+            except Exception as e:
+                logger.warn(f"语句级回滚 {act.op} pk={act.pk} 失败: {e}")
+        if actions:
+            logger.info(
+                f"语句级回滚 {self.name}: 撤销 {restored}/{len(actions)} 条"
+                f"（事务 {tid} 保持打开）")
+        return restored
+
+    def _log_statement_undo_delete(self, tid, act) -> bool:
+        """给"语句级回滚掉的 INSERT"补一条 DELETE WAL 记录（见上）"""
+        page = (self.bp.get_page(act.page_id)
+                if act.page_id is not None else None)
+        rb = page.get_row(act.slot_id) if page is not None else None
+        r = self._decode_row_ver(rb)
+        if r is None:
+            return False
+        values, xmin, _xmax, pp, ps = r
+        self.wal.log(tid, 'DELETE', {
+            'table': self.name, 'pk': act.pk,
+            'old': values,
+            'old_b': self._encode_row(
+                values, xmin=xmin, xmax=0,
+                prev_page=pp, prev_slot=ps).hex(),
+            'tomb_b': self._encode_row(
+                values, xmin=xmin, xmax=tid,
+                prev_page=pp, prev_slot=ps).hex(),
+            'old_loc': [act.page_id, act.slot_id],
+        })
+        self.wal.flush_to_os()          # WAL 先于数据（与 _delete_locked 一致）
+        return True
+
     def _undo_one(self, act) -> bool:
         if act.op == 'INSERT':
             # 事务插入的行 -> 删除。

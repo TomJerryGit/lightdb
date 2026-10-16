@@ -64,6 +64,76 @@ class BTree:
         off = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
         return struct.unpack_from('<III', page.data, off)
 
+    def _leaf_lower_bound(self, page, key) -> int:
+        """叶子内**二分**定位第一个 key' >= key 的下标（等价于原来的线性扫描）
+
+        为什么需要（实测，阶段 2 第 2 项）: 原实现在 `search()` /
+        `_insert_rec()` / `_delete_impl()` 里都是 `for i in range(n)` 线性
+        扫描叶子。叶子容量 LEAF_CAPACITY=337，而**顺序主键**（自增、
+        批量生成的 (1..N)）每次都命中叶子末尾 —— 于是每插一行都要解码
+        整片叶子两次。4000 行多值插入的 cProfile 里 `_leaf_entry` 被调用
+        143 万次、tottime 占比 ~2/3（2.04s/3.11s），这才是批量插入
+        「比逐行还慢」之外的真正吞吐瓶颈。
+
+        叶子条目按 key 升序存放（insert/_insert_rec/_split_leaf/delete
+        都维持有序），且 key 唯一，所以二分与原线性扫描**返回同一个下标**，
+        语义完全等价（只是把 O(n) 降到 O(log n)）。
+        """
+        lo, hi = 0, self._leaf_n(page)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._leaf_entry(page, mid)[0] < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def _internal_child(self, page, key):
+        """内部节点下降：返回 key 应该走的那棵子树（二分）
+
+        等价于原来的
+            child = first
+            for i in range(n):
+                k, c = entry(i)
+                if key < k: break
+                child = c
+        即「最后一个 keys[i] <= key 对应的子节点」，一个都没有时取 first。
+        """
+        n = self._internal_n(page)
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._internal_entry(page, mid)[0] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == 0:
+            return self._internal_first(page)
+        return self._internal_entry(page, lo - 1)[1]
+
+    def _internal_slot(self, page, key):
+        """内部节点下降 + 新分隔键的插入位置，二分版
+
+        等价于原来的
+            idx = 0; child = first
+            for i in range(n):
+                k, c = entry(i)
+                if key < k: idx = i; break
+                child = c; idx = i + 1
+        返回 (idx, child)。
+        """
+        n = self._internal_n(page)
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._internal_entry(page, mid)[0] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == 0:
+            return 0, self._internal_first(page)
+        return lo, self._internal_entry(page, lo - 1)[1]
+
     def _leaf_set_entry(self, page, i, k, pid, sid):
         off = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
         struct.pack_into('<III', page.data, off, k, pid, sid)
@@ -107,27 +177,17 @@ class BTree:
                 return None
             if page.page_type == PAGE_TYPE_BTREE_LEAF:
                 return page
-
-            n = self._internal_n(page)
-            child = self._internal_first(page)
-            for i in range(n):
-                k, c = self._internal_entry(page, i)
-                if key < k:
-                    break
-                child = c
-            pid = child
+            pid = self._internal_child(page, key)
 
     def search(self, key):
         page = self._find_leaf(key)
         if page is None:
             return None
-        n = self._leaf_n(page)
-        for i in range(n):
+        i = self._leaf_lower_bound(page, key)
+        if i < self._leaf_n(page):
             k, pid, sid = self._leaf_entry(page, i)
             if k == key:
                 return (pid, sid)
-            if k > key:
-                return None
         return None
 
     # ==================== 插入 ====================
@@ -162,9 +222,7 @@ class BTree:
         # ---------- 叶子 ----------
         if page.page_type == PAGE_TYPE_BTREE_LEAF:
             n = self._leaf_n(page)
-            i = 0
-            while i < n and self._leaf_entry(page, i)[0] < key:
-                i += 1
+            i = self._leaf_lower_bound(page, key)
 
             if i < n and self._leaf_entry(page, i)[0] == key:
                 self._leaf_set_entry(page, i, key, page_id, slot_id)
@@ -184,15 +242,7 @@ class BTree:
 
         # ---------- 内部 ----------
         n = self._internal_n(page)
-        idx = 0
-        child = self._internal_first(page)
-        for i in range(n):
-            k, c = self._internal_entry(page, i)
-            if key < k:
-                idx = i
-                break
-            child = c
-            idx = i + 1
+        idx, child = self._internal_slot(page, key)
 
         sub = self._insert_rec(child, key, page_id, slot_id)
         if sub is None:
@@ -217,8 +267,14 @@ class BTree:
         entries = [self._leaf_entry(leaf, i) for i in range(n)]
 
         idx = 0
-        while idx < len(entries) and entries[idx][0] < new_key:
-            idx += 1
+        lo, hi = 0, len(entries)
+        while lo < hi:                       # 二分找新键插入位置
+            mid = (lo + hi) // 2
+            if entries[mid][0] < new_key:
+                lo = mid + 1
+            else:
+                hi = mid
+        idx = lo
         entries.insert(idx, (new_key, new_pid, new_sid))
 
         mid = len(entries) // 2
@@ -297,17 +353,14 @@ class BTree:
             return False
 
         n = self._leaf_n(page)
-        for i in range(n):
-            k, _, _ = self._leaf_entry(page, i)
-            if k == key:
-                for j in range(i, n - 1):
-                    k2, p2, s2 = self._leaf_entry(page, j + 1)
-                    self._leaf_set_entry(page, j, k2, p2, s2)
-                self._leaf_set_n(page, n - 1)
-                page.dirty = True
-                return True
-            if k > key:
-                return False
+        i = self._leaf_lower_bound(page, key)
+        if i < n and self._leaf_entry(page, i)[0] == key:
+            for j in range(i, n - 1):
+                k2, p2, s2 = self._leaf_entry(page, j + 1)
+                self._leaf_set_entry(page, j, k2, p2, s2)
+            self._leaf_set_n(page, n - 1)
+            page.dirty = True
+            return True
         return False
 
     def _maybe_collapse_root(self):
@@ -338,15 +391,9 @@ class BTree:
             if page.page_type == PAGE_TYPE_BTREE_LEAF:
                 break
 
-            n = self._internal_n(page)
-            child = self._internal_first(page)
-            if start is not None:
-                for i in range(n):
-                    k, c = self._internal_entry(page, i)
-                    if start < k:
-                        break
-                    child = c
-            pid = child
+            # start=None 时走最左叶子（与原实现一致）
+            pid = (self._internal_first(page) if start is None
+                   else self._internal_child(page, start))
 
         page = self.bp.get_page(pid)
         while page is not None:

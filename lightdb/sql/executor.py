@@ -6,11 +6,13 @@ SQL 执行器 - 结构化结果（修复版）
 - 加 start_event_scheduler / stop_event_scheduler
 - 加 stats_manager
 """
+import atexit
 import json
 import os
 import re
 import threading
 import time
+import weakref
 from collections import deque
 from typing import Dict
 
@@ -106,6 +108,24 @@ class _CTERelation:
         raise KeyError(f"列 {name} 不存在")
 
 
+# 存活的审计器（弱引用）：解释器正常退出时统一把待落盘批刷掉。
+# 用 WeakSet 而不是 atexit 里逐个强引用，是为了不让审计器（及其
+# 2000 条环形缓冲）因为"注册了 atexit"而永远无法回收。
+_LIVE_AUDIT_SINKS = weakref.WeakSet()
+
+
+def _flush_all_audit_sinks():
+    """atexit 钩子：进程正常退出时刷掉所有审计器的待落盘批"""
+    for sink in list(_LIVE_AUDIT_SINKS):
+        try:
+            sink.close()
+        except Exception:                        # pragma: no cover - 防御
+            pass
+
+
+atexit.register(_flush_all_audit_sinks)
+
+
 class _AuditSink:
     """语句级审计（`SHOW AUDIT LOG` 的**唯一**数据源）
 
@@ -117,20 +137,61 @@ class _AuditSink:
     复用 `AuditLogger._classify`，两边不会漂移。
 
     两处有意的差别（都在这里注释说明，绝不静默）：
-    * 落盘用「每条记录 append + close」，**不持有常驻文件句柄**：审计器比
-      `Database` 活得久，常驻句柄会让 Windows 上的数据目录删除失败
+    * 落盘用「批量攒 + 一次性 append + close」，**不持有常驻文件句柄**：
+      审计器比 `Database` 活得久，常驻句柄会让 Windows 上的数据目录删除失败
       （PermissionError winerror=32，见 docs/FAILURE_TRIAGE.md §8 的级联簇）；
     * 级别默认取环境变量 `LIGHTDB_AUDIT_LEVEL`，未设置时用 `DML`。
       `net/server.py` 不会把 `MySQLServer(cfg, ...)` 里的 `cfg.audit_level`
       传给执行器（net/** 不在本次可改范围），因此用例里
       `start_server(port, audit_level='DML')` 传进来的级别到不了这里；
       默认 DML 保证 DCL / DDL / DML 语句都被审计到。
+
+    ★ 阶段 2 第 2 项：**批量 flush**。
+    原实现每条语句 `open(path,'a') + write + close`（3 次系统调用 × 每条
+    语句）。逐语句路径（executemany / 逐行 INSERT）下这是纯粹的开销，
+    而且批量语句省下的解析收益会被审计里"每条语句一次 open/close"吃掉。
+    现在改为：记录先进内存 (`recent` 环形缓冲 + `_pending` 待落盘批)，
+    在下面任一条件成立时**一次性** append 落盘：
+      1) 攒够 `AUDIT_BATCH`(32) 条；
+      2) 距本批第一条已经超过 `AUDIT_FLUSH_INTERVAL`(0.5s)（在 record()
+         里机会式检查，不需要后台线程）；
+      3) **失败语句立即落盘**（success=0 是审计里最要紧的记录，
+         不参与延迟 —— 报错路径本来就稀少，不构成性能负担）；
+      4) 显式 `flush()` / `close()`：`Database.shutdown()` 会关闭挂在
+         自己身上的审计器，`net/server.py` 关服务时会走到；
+         另外模块级 `atexit` 钩子在**解释器正常退出**时统一关闭所有
+         存活审计器（WeakSet，不会把审计器钉在内存里）。
+    不丢记录的保证：
+      * 落盘失败（磁盘满/权限）时 **`_pending` 原样保留**并告警，
+        下次 flush 重试 —— 不会"失败了还把记录当已落盘丢掉"；
+      * `SHOW AUDIT LOG` 读的是内存环形缓冲，与是否已落盘无关，
+        因此"落盘延迟"不会让审计查询看不到记录；
+      * 未落盘记录的上界是显式的（`len(_pending) <= AUDIT_PENDING_MAX`），
+        超过上限时丢弃**最旧**的记录并告警（防磁盘永久故障导致内存
+        无限增长），丢弃这件事本身有日志，不是静默丢失。
+      残余风险（如实说明）：进程被 `os._exit()`/SIGKILL 硬杀时，内存里
+      尚未攒到落盘条件的那 ≤31 条记录会丢 —— 这是"批量"与"每进程崩溃
+      零丢失"之间的取舍；既有实现（每条 close）在硬杀下确实一条不丢。
+      正常退出、`Database.shutdown()`、显式 `close()` 三条路径都保证落盘。
     """
+
+    #: 攒够多少条审计记录就落盘（一次 append 写多条）
+    AUDIT_BATCH = 32
+    #: 攒了多久（秒）就机会式落盘；不引入后台线程
+    AUDIT_FLUSH_INTERVAL = 0.5
+    #: `_pending` 的内存上限：磁盘长期故障时丢弃最旧记录并告警
+    AUDIT_PENDING_MAX = 4096
 
     def __init__(self, data_dir: str, level: str = None):
         self.path = os.path.join(str(data_dir), 'audit.log')
         self.recent = deque(maxlen=2000)
         self._lock = threading.RLock()
+        # 待落盘批（内存）——不是常驻文件句柄，Windows 删除数据目录不受影响
+        self._pending = []
+        self._pending_since = None
+        self._closed = False
+        self.flushed_records = 0
+        self.dropped_records = 0
         try:
             from ..security.audit import AuditLogger
             self._levels = dict(AuditLogger.LEVELS)
@@ -148,6 +209,7 @@ class _AuditSink:
         self.level_name = name if name in self._levels else 'DML'
         self.level = self._levels.get(self.level_name, 3)
         self._load()
+        _LIVE_AUDIT_SINKS.add(self)
 
     def _load(self):
         """启动时把已落盘的审计记录载入内存环形缓冲（重启后仍可查询）"""
@@ -194,11 +256,72 @@ class _AuditSink:
         }
         with self._lock:
             self.recent.append(entry)
-            try:
-                with open(self.path, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-            except Exception as e:               # pragma: no cover
-                logger.warn(f"审计记录落盘失败: {e}")
+            self._pending.append(entry)
+            if self._pending_since is None:
+                self._pending_since = time.time()
+            # 触发条件见类注释：失败记录 / 攒够一批 / 攒够一段时间
+            if (not success
+                    or len(self._pending) >= self.AUDIT_BATCH
+                    or (time.time() - self._pending_since)
+                    >= self.AUDIT_FLUSH_INTERVAL):
+                self._flush_locked()
+
+    def flush(self):
+        """把待落盘的审计记录立刻写盘（显式关闭/停机路径调用）"""
+        with self._lock:
+            self._flush_locked()
+
+    def close(self):
+        """关闭审计器：**先把待落盘批刷掉**再标记关闭（幂等）
+
+        与旧实现一样不持有常驻句柄，因此这里的"关闭"只是落盘 + 标记；
+        这样 Windows 上删除数据目录不会遇到句柄占用。
+        """
+        with self._lock:
+            self._closed = True
+            self._flush_locked()
+        try:
+            _LIVE_AUDIT_SINKS.discard(self)
+        except Exception:                        # pragma: no cover
+            pass
+
+    @property
+    def pending(self) -> int:
+        """当前待落盘（仍在内存里）的记录条数"""
+        with self._lock:
+            return len(self._pending)
+
+    def _flush_locked(self):
+        """一次 append 把所有待落盘记录写出去；**失败不丢记录**
+
+        注意：这里不 fsync。旧实现（每条 open/write/close）也只把数据交给
+        OS（close 不做 fsync），因此持久性语义不变；批量只是把 N 次
+        open/close 合并成一次。
+        """
+        n = len(self._pending)
+        if not n:
+            self._pending_since = None
+            return
+        try:
+            data = ''.join(
+                json.dumps(e, ensure_ascii=False) + '\n'
+                for e in self._pending)
+            with open(self.path, 'a', encoding='utf-8') as f:
+                f.write(data)
+                f.flush()
+        except Exception as e:                   # pragma: no cover - 磁盘故障
+            logger.warn(f"审计记录落盘失败（保留待落盘批，下次重试）: {e}")
+            # 保留 _pending：绝不能把"没写成功"的记录当成已落盘丢掉
+            if len(self._pending) > self.AUDIT_PENDING_MAX * 4:
+                dropped = len(self._pending) - self.AUDIT_PENDING_MAX
+                del self._pending[:dropped]
+                self.dropped_records += dropped
+                logger.error(
+                    f"审计待落盘积压超过上限，丢弃最旧的 {dropped} 条记录")
+            return
+        self._pending = []
+        self._pending_since = None
+        self.flushed_records += n
 
     def rows(self, limit: int = None) -> list:
         """按时间顺序返回 (ts, user, cmd, success, elapsed_ms, sql)"""
@@ -266,6 +389,10 @@ class Executor:
         # ★ 语句审计（`SHOW AUDIT LOG` 的数据源）
         try:
             self.audit = _AuditSink(str(db.data_dir))
+            # 让 `Database.shutdown()` 成为审计待落盘批的确定性落盘点
+            attach = getattr(db, 'attach_audit_sink', None)
+            if callable(attach):
+                attach(self.audit)
         except Exception as e:                   # pragma: no cover
             logger.warn(f"初始化审计日志失败: {e}")
             self.audit = None
@@ -690,20 +817,115 @@ class Executor:
         txn = s.get('txn')
         tid = txn['txn_id'] if txn else 0
         rv = txn['read_view'] if txn else None
-        for row in values_list:
-            row = list(row)
-            # BEFORE INSERT 触发器可以改 NEW 列（`SET NEW.x = ...`），
-            # 因此必须在真正写入之前触发；AFTER INSERT 在写入之后触发。
-            self._fire_triggers('BEFORE', 'INSERT', p['table'],
-                                new_row=row, session=s)
-            tbl.insert(row, txn_id=tid, read_view=rv)
-            n += 1
-            self._fire_triggers('AFTER', 'INSERT', p['table'],
-                                new_row=row, session=s)
+
+        # ★ 阶段 2 第 2 项：**语句级原子性**。
+        #
+        # 一条 `INSERT ... VALUES (...),(...),(...)` 在 MySQL 里是原子的：
+        # 要么全部生效，要么一行都不留。原实现对 values_list **逐行**
+        # 调 `tbl.insert()`，每行各自 autocommit —— 第 3 行主键冲突/CHECK
+        # 违规时前 2 行已经提交留下（实测），且每行一次 WAL COMMIT 记录 +
+        # 行锁 + 合成事务号，把批量省下的解析/审计收益全吃光。
+        #
+        # 修法：**没有用户显式事务**时，为整条语句开一个引擎内部事务
+        # （`db.begin()`，拿到真实事务号 + 读视图）。全部行成功后一次性
+        # COMMIT（只写一条 COMMIT 记录，autocommit 档持久性）；任一行失败
+        # 则整体 ABORT，由物理 undo 把已写入的行逐条撤销 —— 0 行落地。
+        #
+        # 有用户显式事务时**完全不碰**事务边界（不替用户提交/回滚）：
+        # 行写入照旧挂在用户事务号上，语句失败只是让外层事务里的这条语句
+        # 无效，用户仍可继续执行或 ROLLBACK（既有语义，见 _cmd_rollback）。
+        implicit = None
+        marks = None
+        if txn is None and len(values_list) > 1:
+            implicit = self.db.begin()
+            tid = implicit['txn_id']
+            rv = implicit['read_view']
+            if isinstance(s, dict):
+                # 把内部事务挂到会话上：触发器体里的 DML 与 SELECT 于是
+                # （a）和主语句同属一个事务（一起提交/一起回滚），
+                # （b）读得到本语句已写入的行（read-your-writes）。
+                # 语句结束后原样恢复（用户会话本来没有事务）。
+                s['txn'] = implicit
+        elif txn is not None and len(values_list) > 1:
+            # 用户显式事务：**绝不**提交/回滚用户事务，但这条语句本身仍然
+            # 必须是原子的 —— 记一个"语句级保存点"（各表物理 undo 栈深度），
+            # 失败时只撤销本语句追加的那一段（见 Table.rollback_statement）。
+            marks = self.db.mvcc.undo_marks(tid)
+
+        try:
+            for row in values_list:
+                row = list(row)
+                # BEFORE INSERT 触发器可以改 NEW 列（`SET NEW.x = ...`），
+                # 因此必须在真正写入之前触发；AFTER INSERT 在写入之后触发。
+                self._fire_triggers('BEFORE', 'INSERT', p['table'],
+                                    new_row=row, session=s)
+                tbl.insert(row, txn_id=tid, read_view=rv)
+                n += 1
+                self._fire_triggers('AFTER', 'INSERT', p['table'],
+                                    new_row=row, session=s)
+        except BaseException:
+            # 任一行失败（主键/唯一冲突、CHECK、NOT NULL、类型错、
+            # 触发器体报错、空间不足…）→ 整条语句回滚。
+            if implicit is not None:
+                self._restore_session_txn(s, implicit)
+                try:
+                    self.db.abort(implicit)
+                except Exception as e:           # pragma: no cover - 防御
+                    logger.error(f"多值 INSERT 回滚失败: {e}")
+            elif marks is not None:
+                self._rollback_statement(tbl, tid, marks)
+            raise
+
+        if implicit is not None:
+            self._restore_session_txn(s, implicit)
+            # 语句级提交：COMMIT 记录 flush 到 OS（不 fsync、不刷脏页），
+            # 持久性档位与逐行 autocommit 路径一致（见 Database.commit_statement）
+            self.db.commit_statement(implicit)
+            # ★ 与 2.1 的 checkpoint 协同：`Table.insert` 里那次阈值检查
+            # 被"内部事务尚未提交"挡掉了（`_maybe_checkpoint` 见
+            # `_read_views` 非空一律推迟），提交后必须补一次 —— 否则纯
+            # 批量写入路径的 WAL 永远不轮转，崩溃恢复要重放整个历史。
+            for t in list(self.db.tables.values()):
+                t._safe_maybe_checkpoint()
 
         self.stats['rows'] += n
         return self._ok(
             affected=n, message=f"{n} row(s) inserted")
+
+    @staticmethod
+    def _restore_session_txn(s, implicit):
+        """把会话上的内部事务摘掉（只在它仍是当前事务时）"""
+        if isinstance(s, dict) and s.get('txn') is implicit:
+            s.pop('txn', None)
+
+    def _rollback_statement(self, tbl, tid, marks):
+        """显式事务里的"语句级回滚"（不碰用户事务边界）
+
+        安全边界（如实记录）：只在本语句追加的物理 undo 全部是**目标表上的
+        INSERT** 时才回滚。如果触发器在别的表上写了行、或做了 UPDATE/DELETE，
+        补偿 WAL 的形态就不再是"INSERT→墓碑"那一套，硬回滚会让"进程内状态"
+        与"崩溃恢复后状态"不一致 —— 这时宁可保持旧行为（已写入的行留在事务
+        里，由用户 ROLLBACK 撤销）并显式告警，也不做半吊子的回滚。
+        """
+        try:
+            pending = self.db.mvcc.peek_undo_after(tid, marks)
+        except Exception as e:                   # pragma: no cover - 防御
+            logger.error(f"语句级回滚检查失败: {e}")
+            return 0
+        foreign = [a for a in pending
+                   if a.op != 'INSERT' or a.table != tbl.name]
+        if foreign:
+            logger.warn(
+                f"多值 INSERT 失败但语句级回滚被跳过：本语句在显式事务里产生了"
+                f" {len(foreign)} 条非目标表-INSERT 的副作用"
+                f"（触发器写别的表 / UPDATE / DELETE），已写入的行仍留在事务里，"
+                f"需要 ROLLBACK 才能撤销")
+            return 0
+        try:
+            return tbl.rollback_statement(tid, marks)
+        except Exception as e:
+            logger.error(f"语句级回滚失败: {e}")
+            return 0
 
     def _cmd_select(self, p, s):
         # `SHOW MASTER STATUS` / `CHECK TABLE` / `SHOW ENGINE ...` 等以结果集

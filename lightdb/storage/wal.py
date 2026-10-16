@@ -237,6 +237,33 @@ class WAL:
     def abort(self, txn_id: int):
         self.log(txn_id, 'ABORT', {}, sync=True)
 
+    def commit_autocommit(self, txn_id: int):
+        """语句级 autocommit 提交：数据 + COMMIT 记录都交给 OS（**不 fsync**）
+
+        与 `commit_async` 的差别只有一处：COMMIT 记录本身也 flush 到 OS。
+        `commit_async` 把 COMMIT 留在 Python 缓冲里（靠下一条语句的
+        `flush_to_os` 顺带带出去），对"逐行 autocommit"没有影响；但语句级
+        COMMIT 是**整条语句**的判定点 —— 一条 500 行的多值 INSERT 若被硬杀
+        时 COMMIT 还在 Python 缓冲里，恢复会把这几百行已提交的行当 loser
+        全部撤销。因此这里在写 COMMIT 之后再 flush 一次。
+
+        持久性档位与逐行 autocommit 完全一致（Stage 2.1 的既有设计）:
+        进程被硬杀不丢（数据在 OS 缓冲里），掉电可能丢最后几条；
+        真正的掉电级持久化点仍然只有显式 COMMIT（`commit` / fsync）、
+        checkpoint 与 close。
+        """
+        with self.lock:
+            try:
+                self.f.flush()
+            except Exception:
+                pass
+        self.log(txn_id, 'COMMIT', {}, sync=False)
+        with self.lock:
+            try:
+                self.f.flush()
+            except Exception:
+                pass
+
     def flush_to_os(self):
         """
         log-before-data 用：把缓冲交给 OS（不做 fsync）。

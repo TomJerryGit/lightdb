@@ -287,6 +287,50 @@ class MVCCManager:
                 n += len(v)
             return n
 
+    # ---------- 语句级保存点（显式事务里的"该语句无效"）----------
+    #
+    # 一条多值 INSERT 在**用户显式事务**里失败时，不能提交/回滚用户事务
+    # （那会破坏 BEGIN...COMMIT 语义），但这条语句本身必须无效。做法就是
+    # 语句级保存点：记下进入语句时各表物理 undo 栈的深度，失败后只把
+    # 这一句追加的那一段倒序回放。
+
+    def undo_marks(self, txn_id: int) -> dict:
+        """记录某个事务当前的物理 undo 栈深度（语句级保存点）"""
+        with self.lock:
+            return {k: len(v) for k, v in self.physical_undo.items()
+                    if k[0] == txn_id}
+
+    def peek_undo_after(self, txn_id: int, marks: dict) -> list:
+        """**查看**保存点之后追加的 undo 镜像（不取出），按发生顺序"""
+        with self.lock:
+            out = []
+            for key in list(self.physical_undo.keys()):
+                if key[0] != txn_id:
+                    continue
+                depth = (marks or {}).get(key, 0)
+                out.extend(self.physical_undo[key][depth:])
+            return out
+
+    def pop_undo_after(self, txn_id: int, marks: dict) -> list:
+        """取出并清空保存点之后追加的 undo 镜像，**倒序**返回
+
+        倒序是必须的（与 `pop_undo` 同理）：同一行被改多次时只有逆序
+        回放才能回到语句前的状态。跨表时按 (事务,表) 分组拼接后再整体
+        倒序 —— 单表语句（多值 INSERT 的常规形态）因此是严格 LIFO。
+        """
+        with self.lock:
+            out = []
+            for key in list(self.physical_undo.keys()):
+                if key[0] != txn_id:
+                    continue
+                depth = (marks or {}).get(key, 0)
+                stack = self.physical_undo[key]
+                if len(stack) <= depth:
+                    continue
+                out.extend(stack[depth:])
+                del stack[depth:]
+            return list(reversed(out))
+
     def oldest_active_txn(self) -> int:
         """最小活跃事务号（没有活跃事务时返回下一个待分配号），供 GC 使用"""
         with self.lock:
