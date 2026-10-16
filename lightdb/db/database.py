@@ -19,6 +19,8 @@
 """
 import hashlib
 import json
+import os
+import re
 import threading
 from pathlib import Path
 from typing import Dict, List
@@ -27,7 +29,8 @@ from ..logger import logger
 from ..storage.txn import TxnManager
 from ..storage.lock_manager import LockManager
 from ..storage.mvcc import MVCCManager
-from .table import Table
+from .errors import DdlError
+from .table import Table, coerce
 
 
 def hash_native_password(password: str) -> str:
@@ -159,9 +162,21 @@ class Database:
         # 执行器与库同生共死，但库不知道执行器，所以由执行器反向注册进来。
         self._audit_sinks = []
 
+        #: **进行中的结构变更**（ALTER / TRUNCATE / RENAME）。
+        #:
+        #: 为什么必须持久化：改行载荷的列数（ADD/DROP COLUMN）要遍历
+        #: 所有堆页，中途崩溃必然可能只改了一部分行。恢复时需要一个
+        #: "这次变更到底算不算数"的权威来源 —— 就是这里。它随 `_meta.json`
+        #: 原子落盘，因此"结构变更生效"这件事有唯一的原子提交点：
+        #: `save_meta()`。见 `_recover_pending_ddl`。
+        self._pending_ddl = None
+
         self._load()
         self._advance_mvcc_epoch()
         self._recover()
+        # 恢复"未完成的结构变更"必须排在 WAL 重放之后：WAL 里可能还有
+        # 旧列数的行记录，先让它重放完，再按 pending 记录把列数补到位。
+        self._recover_pending_ddl()
 
     # ==================== 事务号单调性 ====================
 
@@ -240,6 +255,7 @@ class Database:
                     self.tables[tname].set_checks(tinfo['checks'])
             if 'users' in meta:
                 self.users = meta['users']
+            self._pending_ddl = meta.get('pending_ddl')
         except Exception as e:
             logger.error(f"加载元数据失败: {e}")
 
@@ -265,6 +281,13 @@ class Database:
                 for n, t in self.tables.items()
             },
             'users': self.users,
+            # ★ 进行中的结构变更（崩溃恢复的唯一依据）。它有值 = "结构变更
+            #   还没提交"：重启后按它把剩余的行补完（见 `_recover_pending_ddl`）。
+            #   写在**同一份** `_meta.json` 里，是为了让"新列定义"与
+            #   "pending 标记清除"成为同一个原子替换 —— 两者分开写就会出现
+            #   "结构已换、标记还在"（重启后重复改一次）或"标记没了、结构
+            #   还是旧的"（重启后表结构永远停在半套）这两种半套状态。
+            'pending_ddl': self._pending_ddl,
         }
         p = self._meta_path()
         tmp = p.with_suffix('.tmp')
@@ -359,6 +382,381 @@ class Database:
         if name not in self.tables:
             raise KeyError(f"表 {name} 不存在")
         return self.tables[name]
+
+    # ==================== DDL：结构变更（ALTER / TRUNCATE） ====================
+    #
+    # 设计要点（每一条都对应一种"看起来成功、其实没生效"）:
+    #
+    # 1) 行载荷是**按列位置**编码的 JSON 数组，所以 ADD/DROP COLUMN 必须
+    #    真的改写每一个行版本，而不是只改 `cols` 元数据；
+    # 2) `_meta.json` 用 tmp + `os.replace` 原子替换，"结构变更生效"因此
+    #    有唯一的原子提交点；进行中的变更写进同一份文件（`pending_ddl`），
+    #    崩溃后据此把剩余的行补完 —— 结果只会是"完整生效"或"完全没生效"，
+    #    不会停在半套；
+    # 3) 每次结构变更的执行序列固定为
+    #        guard（表上无未提交事务）
+    #     →  退休 WAL（清掉旧列数的行记录）
+    #     →  写 pending 意图（原子）
+    #     →  改写所有行版本 + 换列定义
+    #     →  checkpoint 落盘 + 清 pending + 原子换元数据（提交点）
+    #    整段持有**表级锁**（`Table._lock`），等价于 MySQL 的元数据锁：
+    #    并发写入不会插进"行已改写、列定义还没换"的窗口里；
+    # 4) 事务/并发：MySQL 的 DDL 隐式提交，本引擎同样在 ALTER/TRUNCATE 前
+    #    隐式提交本会话的事务（见 `Executor._implicit_commit_ddl`）；表上
+    #    还有**别的**未提交事务时**显式报错**（`_ddl_guard`），不做
+    #    "尽力而为"（本引擎没有元数据锁，硬做会刷出未提交数据并退休 WAL）。
+
+    def _ddl_guard(self, tbl, what: str):
+        """结构变更前置检查：表上存在未提交事务 → 显式报错（不硬做）"""
+        if getattr(tbl, '_read_views', None):
+            raise DdlError(
+                f"表 {tbl.name} 上存在未提交事务，无法执行 {what}：请先 "
+                f"COMMIT / ROLLBACK（本引擎没有元数据锁，DDL 会在未提交"
+                f"数据上刷页并退休 WAL，因此显式拒绝而不是尽力而为）",
+                errno=1105)
+
+    def _ddl_begin(self, entry: dict):
+        """登记"进行中的结构变更"并原子落盘（崩溃恢复的意图记录）"""
+        self._pending_ddl = entry
+        self.save_meta()
+
+    def _ddl_retire_wal(self, tbl, what: str):
+        """结构变更前先退休（截断）WAL —— 失败即**放弃本次变更**
+
+        为什么必须排在 `_ddl_begin` 之前：这一步失败时我们要能"干净地什么都
+        不做"（客户端看到报错、盘上什么都没变）。若先把 pending 记录写下去
+        再失败，恢复端会照着 pending 把这条**已经报错**的变更补完 ——
+        那就成了"报错却生效"。
+
+        为什么必须成功：WAL 里可能还有**旧列数**的行记录，列定义换掉之后
+        一次崩溃重放就会插回一行旧结构（与 `Table.rewrite_row_payloads`
+        的幂等判据冲突）。`Table.checkpoint` 在本表存在未提交事务时返回
+        False（拒绝在未提交数据上刷页 + 退休日志），这里把它变成显式错误。
+        """
+        try:
+            if not tbl.checkpoint():
+                raise DdlError(
+                    f"表 {tbl.name} 上出现了未提交事务，{what} 中止"
+                    f"（先 COMMIT / ROLLBACK 重试）", errno=1105)
+        except DdlError:
+            raise
+        except Exception as e:
+            raise DdlError(
+                f"{what} 前退休 WAL 失败（{tbl.name}）: {e}", errno=1105)
+
+    def _ddl_commit(self, tbl):
+        """结构变更的**提交点**：落盘 + 退休 WAL → 清标记并原子换元数据
+
+        顺序即正确性：先 `checkpoint()`（脏页 fsync + 根指针 fsync +
+        截断 WAL），再原子替换 `_meta.json`（新列定义 + `pending_ddl=None`
+        在同一次写入里）。崩溃发生在两者之间时，盘上是"旧元数据 + 新行"，
+        重启后 `_recover_pending_ddl` 按 pending 记录把结构补到位。
+        """
+        try:
+            tbl.checkpoint(force=True)
+        except Exception as e:                       # pragma: no cover - 防御
+            logger.warn(f"结构变更落盘失败 {tbl.name}: {e}")
+        self._pending_ddl = None
+        self.save_meta()
+
+    def _get_table_for_ddl(self, name) -> Table:
+        if name not in self.tables:
+            raise DdlError(f"Table '{name}' doesn't exist", errno=1146)
+        return self.tables[name]
+
+    def alter_add_column(self, name: str, col: dict) -> dict:
+        """`ALTER TABLE t ADD COLUMN c <type> [DEFAULT ..] [NOT NULL]`
+
+        对**已有行**按 MySQL 语义回填：
+
+        * 声明了 `DEFAULT` → 用该默认值（写入前按列类型转换一次，
+          之后所有老行拿到的是同一个具体值，而不是"每次读的时候再求值"）；
+        * 没声明 `DEFAULT` 且允许 NULL → NULL；
+        * `NOT NULL` 且没有 `DEFAULT` 且表非空 → **显式报错 1138**
+          （MySQL 8.0 严格模式的 `Invalid use of NULL value`），
+          **绝不**静默填 0 / '' / NULL —— 那是"看起来加上了、数据却是编的"。
+        """
+        tbl = self._get_table_for_ddl(name)
+        col = dict(col or {})
+        cname = str(col.get('name') or '')
+        if not cname:
+            raise DdlError("ADD COLUMN 缺少列名", errno=1064)
+        if any(c.get('name') == cname for c in tbl.cols):
+            raise DdlError(f"Duplicate column name '{cname}'", errno=1060)
+        if col.get('primary'):
+            # MySQL 1068：一张表只能有一个主键。`ADD COLUMN c INT PRIMARY KEY`
+            # 在 MySQL 里就是这条错误（不是静默忽略 PRIMARY KEY 子句）。
+            raise DdlError("Multiple primary key defined", errno=1068)
+
+        notnull = bool(col.get('notnull'))
+        if col.get('has_default'):
+            fill = tbl._column_default(col)
+            if fill is None and notnull:
+                raise DdlError(
+                    f"列 '{cname}' 声明了 NOT NULL 但 DEFAULT 是 NULL："
+                    f"定义本身矛盾", errno=1138, sqlstate='22004')
+        elif notnull:
+            if tbl.row_count:
+                raise DdlError(
+                    f"列 '{cname}' 声明了 NOT NULL 却没有 DEFAULT，表 "
+                    f"{name} 中已有 {tbl.row_count} 行：无法确定这些行该"
+                    f"填什么（MySQL 严格模式同样拒绝），本引擎不会静默填 "
+                    f"0/''/NULL。请给出 DEFAULT 或允许 NULL 后重试",
+                    errno=1138, sqlstate='22004')
+            fill = None
+        else:
+            fill = None
+        if fill is not None:
+            try:
+                fill = coerce(fill, col.get('type'))
+            except (ValueError, TypeError) as e:
+                raise DdlError(
+                    f"DEFAULT 取值 {fill!r} 无法转换为 {col.get('type')}: {e}",
+                    errno=1366, sqlstate='22007')
+
+        old_cols = [dict(c) for c in tbl.cols]
+        new_cols = old_cols + [col]
+        entry = {'op': 'ADD COLUMN', 'table': name,
+                 'old_cols': old_cols, 'new_cols': new_cols,
+                 'fill': fill}
+        # ★ 全程持有**表级锁**：`insert/update/delete` 都在这个锁里写行，
+        #   因此"检查未提交事务 → 退休 WAL → 改写所有行 → 换列定义"这一段
+        #   不会被并发的写入插进来（插进来就会写下一行**旧列数**的数据，
+        #   与刚换上的新列定义错位）。语义上等价于 MySQL 的元数据锁把 DDL
+        #   挡在后面；代价是 DDL 期间该表的写入被阻塞。
+        with tbl._lock:
+            self._ddl_guard(tbl, 'ALTER TABLE ... ADD COLUMN')
+            # 先把 WAL 退休（里头的行记录是**旧列数**的，不能留到列定义换掉
+            # 之后；否则一次崩溃重放就会插回一行旧结构）。这一步必须在
+            # `_ddl_begin` **之前**：checkpoint 失败时我们要能"干净地什么都不
+            # 做"，一旦先写了 pending 记录，恢复端就会把这条被报错的 DDL 补完。
+            self._ddl_retire_wal(tbl, 'ADD COLUMN')
+            self._ddl_begin(entry)
+            stats = tbl.rewrite_row_payloads(
+                lambda values: list(values) + [fill],
+                len(old_cols), len(new_cols))
+            tbl.cols = new_cols
+            tbl.refresh_schema_meta()
+            self._ddl_commit(tbl)
+        return {'rows_backfilled': stats['rows'], 'backfill': fill, **stats}
+
+    def alter_drop_column(self, name: str, colname: str) -> dict:
+        """`ALTER TABLE t DROP COLUMN c`
+
+        * 被删列的数据必须**真的不可再读到**：所有行版本（含墓碑与老版本）
+          的载荷都去掉该字段，被腾空的槽位与行尾残字节一律**清零**
+          （直接读 `.dat` 也读不回来）；
+        * 主键 / `UNIQUE` 列、被 CHECK 引用的列、分区列、全文索引列
+          **一律显式报错**（MySQL 会连带删索引，本引擎不做连带操作，
+          因此拒绝而不是静默破坏索引）。
+        """
+        tbl = self._get_table_for_ddl(name)
+        names = [c.get('name') for c in tbl.cols]
+        if colname not in names:
+            raise DdlError(f"Unknown column '{colname}' in '{name}'",
+                           errno=1054, sqlstate='42S22')
+        if len(tbl.cols) <= 1:
+            raise DdlError(
+                f"Can't remove all the columns from table '{name}'",
+                errno=1090)
+        idx = names.index(colname)
+        col = tbl.cols[idx]
+        if col.get('primary'):
+            raise DdlError(
+                f"Can't DROP '{colname}'; 该列是表 {name} 的主键，"
+                f"删除它会破坏主键索引（本引擎不支持连带删除主键）",
+                errno=1091, sqlstate='42000')
+        if col.get('unique'):
+            raise DdlError(
+                f"Can't DROP '{colname}'; 该列声明了 UNIQUE，"
+                f"删除它会破坏唯一性约束（本引擎不支持连带删除约束）",
+                errno=1091, sqlstate='42000')
+        # 被 CHECK 引用的列（MySQL 的 3959 就是这个场景）
+        from ..sql.checks import check_columns, parse_check_predicate
+        for spec in tbl.check_constraints():
+            try:
+                used = check_columns(parse_check_predicate(spec['expr']))
+            except Exception:                        # pragma: no cover
+                used = []
+            if colname in used:
+                raise DdlError(
+                    f"Check constraint '{spec.get('name') or ''}' uses "
+                    f"column '{colname}', hence column cannot be dropped "
+                    f"or renamed.", errno=3959, sqlstate='HY000')
+        spec = getattr(tbl, '_partition_spec', None) or {}
+        if spec.get('col') == colname:
+            raise DdlError(
+                f"Can't DROP '{colname}'; 该列是表 {name} 的分区列"
+                f"（分区定义会因此失效）", errno=1091, sqlstate='42000')
+        if tbl.has_fulltext_index(colname):
+            raise DdlError(
+                f"Can't DROP '{colname}'; 该列上有全文索引，删除列会让"
+                f"倒排索引引用一个不存在的列（请先重建全文索引）",
+                errno=1091, sqlstate='42000')
+
+        old_cols = [dict(c) for c in tbl.cols]
+        new_cols = [dict(c) for c in tbl.cols if c.get('name') != colname]
+        entry = {'op': 'DROP COLUMN', 'table': name, 'at': idx,
+                 'old_cols': old_cols, 'new_cols': new_cols}
+        with tbl._lock:                      # 与 ADD COLUMN 同一套并发边界
+            self._ddl_guard(tbl, 'ALTER TABLE ... DROP COLUMN')
+            self._ddl_retire_wal(tbl, 'DROP COLUMN')
+            self._ddl_begin(entry)
+            stats = tbl.rewrite_row_payloads(
+                lambda values: list(values)[:idx] + list(values)[idx + 1:],
+                len(old_cols), len(new_cols), zero_removed=True)
+            tbl.cols = new_cols
+            tbl.refresh_schema_meta()
+            self._ddl_commit(tbl)
+        return {'column': colname, 'rows_rewritten': stats['rows'], **stats}
+
+    def truncate_table(self, name: str) -> dict:
+        """`TRUNCATE TABLE t` —— 清空所有行，**保留表定义**
+
+        与 `DELETE FROM t` 的区别（MySQL 语义）：TRUNCATE 是 DDL
+        （隐式提交、不可回滚、重置自增、清空全部行而不逐行写 undo），
+        DELETE 是 DML（可回滚、逐行删除、不重置自增）。本引擎的
+        `Table.truncate_all` 真的把每个行槽位清零、丢弃索引项并复位
+        `_next_pk`，不是"标个标记"。
+        """
+        tbl = self._get_table_for_ddl(name)
+        cols = [dict(c) for c in tbl.cols]
+        entry = {'op': 'TRUNCATE', 'table': name,
+                 'old_cols': cols, 'new_cols': cols}
+        with tbl._lock:
+            self._ddl_guard(tbl, 'TRUNCATE TABLE')
+            self._ddl_retire_wal(tbl, 'TRUNCATE')
+            self._ddl_begin(entry)
+            stats = tbl.truncate_all()
+            self._ddl_commit(tbl)
+        return stats
+
+    def rename_table(self, old: str, new: str) -> dict:
+        """`ALTER TABLE t RENAME TO t2`
+
+        只改数据文件名与 `_meta.json` 里的键，**不动**任何行数据：
+        `.dat` / `.btroot` / `.wal` / `.free` 四个文件一起 `os.replace`
+        （同目录内改名是原子的），元数据最后原子替换。中途崩溃时
+        `pending_ddl` 里记着这次改名，重启后把还没改的文件补改完。
+        """
+        if old not in self.tables:
+            raise DdlError(f"Table '{old}' doesn't exist", errno=1146)
+        if new in self.tables:
+            raise DdlError(f"Table '{new}' already exists", errno=1050)
+        if not re.match(r'^[A-Za-z_]\w*$', str(new or '')):
+            raise DdlError(
+                f"Incorrect table name '{new}'（只支持 [A-Za-z_]\\w*）",
+                errno=1103, sqlstate='42000')
+        tbl = self.tables[old]
+        self._ddl_guard(tbl, 'ALTER TABLE ... RENAME')
+        cols = [dict(c) for c in tbl.cols]
+        entry = {'op': 'RENAME', 'table': old, 'new_name': new,
+                 'old_cols': cols, 'new_cols': cols,
+                 'partition': getattr(tbl, '_partition_spec', None),
+                 'checks': [dict(c) for c in getattr(tbl, '_checks', [])]}
+        self._ddl_begin(entry)
+        self._finish_rename(entry)
+        return {'from': old, 'to': new}
+
+    def _finish_rename(self, entry: dict):
+        """完成（或补完）一次改名；幂等，崩溃恢复直接复用这一份实现"""
+        old = entry.get('table')
+        new = entry.get('new_name')
+        if not old or not new:
+            self._pending_ddl = None
+            self.save_meta()
+            return
+        if new in self.tables or old not in self.tables:
+            # 已经把元数据换过去了（或表已不存在）→ 只清标记
+            self._pending_ddl = None
+            self.save_meta()
+            return
+        tbl = self.tables.pop(old)
+        try:
+            tbl.close()
+        except Exception as e:                       # pragma: no cover
+            logger.warn(f"改名时关闭表 {old} 失败: {e}")
+        for suffix in ('.dat', '.btroot', '.wal', '.free'):
+            src = self.data_dir / f"{old}{suffix}"
+            dst = self.data_dir / f"{new}{suffix}"
+            try:
+                if src.exists():
+                    os.replace(str(src), str(dst))
+            except OSError as e:
+                logger.warn(f"改名 {src.name} -> {dst.name} 失败: {e}")
+                raise DdlError(
+                    f"表 {old} 改名为 {new} 时文件改名失败: {e}", errno=1105)
+        newtbl = Table(new, entry.get('new_cols') or tbl.cols,
+                       str(self.data_dir), self.lock_manager, self.mvcc)
+        if entry.get('partition'):
+            newtbl.set_partition(entry['partition'])
+        if entry.get('checks'):
+            newtbl.set_checks(entry['checks'])
+        self.tables[new] = newtbl
+        self._pending_ddl = None
+        self.save_meta()
+
+    def _recover_pending_ddl(self):
+        """补完崩溃前**未完成**的结构变更（幂等；见 `__init__` 的说明）
+
+        判据只有一条：`_meta.json` 里还有 `pending_ddl`。有它就说明上次的
+        结构变更没有走到原子提交点，因此这里把它**做完**（roll forward）：
+
+        * 行载荷的改写按"长度"幂等 —— 已经是新列数的行原样保留，
+          还是旧列数的行补改，所以重复执行/执行到一半再崩都安全；
+        * 完成后同样走 `_ddl_commit`（落盘 + 清标记 + 原子换元数据），
+          于是重启后的状态与"执行成功"逐字一致。
+
+        任何异常都**不**吞掉：只记 error 并保留 pending 记录（下次启动
+        再试），绝不把"没补完"当成"补完了"。
+        """
+        entry = self._pending_ddl
+        if not entry:
+            return
+        op = str(entry.get('op') or '')
+        tname = entry.get('table')
+        try:
+            if op == 'RENAME':
+                logger.warn(f"崩溃恢复：补完未完成的 RENAME {tname} -> "
+                            f"{entry.get('new_name')}")
+                self._finish_rename(entry)
+                return
+            if tname not in self.tables:
+                logger.error(
+                    f"pending DDL 指向不存在的表 {tname}（op={op}）—— "
+                    f"丢弃该记录（表本身已不存在，没有可补的结构）")
+                self._pending_ddl = None
+                self.save_meta()
+                return
+            tbl = self.tables[tname]
+            old_cols = entry.get('old_cols') or []
+            new_cols = entry.get('new_cols') or []
+            if op == 'ADD COLUMN':
+                fill = entry.get('fill')
+                tbl.rewrite_row_payloads(
+                    lambda values: list(values) + [fill],
+                    len(old_cols), len(new_cols))
+            elif op == 'DROP COLUMN':
+                at = int(entry.get('at'))
+                tbl.rewrite_row_payloads(
+                    lambda values: list(values)[:at] + list(values)[at + 1:],
+                    len(old_cols), len(new_cols), zero_removed=True)
+            elif op == 'TRUNCATE':
+                tbl.truncate_all()
+            else:
+                logger.error(f"无法识别的 pending DDL {op!r} —— 丢弃该记录")
+                self._pending_ddl = None
+                self.save_meta()
+                return
+            if new_cols:
+                tbl.cols = new_cols
+            tbl.refresh_schema_meta()
+            logger.warn(f"崩溃恢复：补完未完成的结构变更 {op} on {tname}")
+            self._ddl_commit(tbl)
+        except Exception as e:
+            logger.error(
+                f"补完未完成的结构变更失败（保留 pending 记录，"
+                f"下次启动重试）: {op} on {tname}: {e}")
 
     # ==================== 事务 ====================
 

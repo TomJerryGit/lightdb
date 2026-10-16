@@ -140,6 +140,16 @@ class Parser:
             return self._create_table(sql)
         if upper.startswith('DROP TABLE'):
             return self._drop_table(sql)
+        # `ALTER TABLE` 有自己的动作解析（见 `_alter_table`）：本引擎只实现了
+        # ADD COLUMN / DROP COLUMN / RENAME TO，其余变体一律**显式**变成
+        # "不支持"的 AST（执行器报 MySQL 1235），绝不静默成功/静默忽略。
+        if re.match(r'ALTER\s+(?:IGNORE\s+)?TABLE\b', sql, re.IGNORECASE):
+            return self._alter_table(sql)
+        if re.match(r'ALTER\b', sql, re.IGNORECASE):
+            return {'command': 'ALTER UNSUPPORTED',
+                    'variant': sql.strip().split(None, 2)[:2]}
+        if re.match(r'TRUNCATE\b', sql, re.IGNORECASE):
+            return self._truncate(sql)
         if upper.startswith('INSERT'):
             return self._insert(sql)
         # `SELECT @var` / `SELECT @a, @b`：MySQL 的用户变量读取。
@@ -290,6 +300,19 @@ class Parser:
                        sql, re.IGNORECASE)
         if scm:
             return self._show_result('CREATE_TABLE', table=scm.group(1))
+
+        # ---- SHOW INDEX / SHOW INDEXES / SHOW KEYS FROM t ----
+        #
+        # MySQL 三种写法同义（`SHOW INDEX FROM t` / `SHOW INDEXES FROM t` /
+        # `SHOW KEYS FROM t`），都还能跟一个 `FROM db`。
+        # 走 `_show_result` 是因为 `net/server.py` 只在 `command == 'SELECT'`
+        # 时才把结果序列化成结果集 —— 否则客户端 `fetchall()` 拿不到东西。
+        sim = re.match(
+            r'SHOW\s+(?:INDEX|INDEXES|KEYS)\s+(?:FROM|IN)\s+'
+            r'[`"]?(\w+)[`"]?(?:\s+(?:FROM|IN)\s+[`"]?\w+[`"]?)?\s*$',
+            sql, re.IGNORECASE)
+        if sim:
+            return self._show_result('INDEX', table=sim.group(1))
 
         # ---- 安全面 ----
         if upper in ('SHOW IP WHITELIST', 'SHOW IP WHITE LIST'):
@@ -1925,6 +1948,183 @@ class Parser:
                 # 同上：`IF EXISTS` 的"表不存在也算成功"语义要一路传到执行器
                 'if_exists': bool(re.match(
                     r'DROP\s+TABLE\s+IF\s+EXISTS\b', sql, re.IGNORECASE))}
+
+    # ==================== ALTER TABLE / TRUNCATE（结构变更） ====================
+    #
+    # 本引擎实现的 ALTER 变体只有三个：`ADD COLUMN` / `DROP COLUMN` /
+    # `RENAME TO`。**其余一切变体都显式变成"不支持"**（执行器回 MySQL
+    # 1235 `ER_NOT_SUPPORTED_YET`），绝不做下面两件事：
+    #   1) 静默返回成功却什么都没做（旧行为：整条 ALTER 报一条笼统的
+    #      1064，使用者会以为"只是我语法写错了"）；
+    #   2) 只做一半（例如把 `ADD INDEX` 的解析结果丢掉，只当没看见）。
+    # 之所以做得这么绝：DDL 一旦"看起来成功、其实没生效"，后续所有基于
+    # 该结构的判断（索引、约束、列存在性）都会建立在错的前提上。
+
+    #: 不支持的动作前缀（**长的排前面**，避免 `ADD UNIQUE` 被 `ADD` 抢先匹配）
+    _ALTER_UNSUPPORTED_ACTIONS = (
+        ('ADD CONSTRAINT', 'ALTER TABLE ... ADD CONSTRAINT'),
+        ('ADD PRIMARY', 'ALTER TABLE ... ADD PRIMARY KEY'),
+        ('ADD UNIQUE', 'ALTER TABLE ... ADD UNIQUE'),
+        ('ADD FOREIGN', 'ALTER TABLE ... ADD FOREIGN KEY'),
+        ('ADD FULLTEXT', 'ALTER TABLE ... ADD FULLTEXT INDEX'),
+        ('ADD SPATIAL', 'ALTER TABLE ... ADD SPATIAL INDEX'),
+        ('ADD INDEX', 'ALTER TABLE ... ADD INDEX'),
+        ('ADD KEY', 'ALTER TABLE ... ADD KEY'),
+        ('ADD CHECK', 'ALTER TABLE ... ADD CHECK'),
+        ('DROP PRIMARY', 'ALTER TABLE ... DROP PRIMARY KEY'),
+        ('DROP FOREIGN', 'ALTER TABLE ... DROP FOREIGN KEY'),
+        ('DROP INDEX', 'ALTER TABLE ... DROP INDEX'),
+        ('DROP KEY', 'ALTER TABLE ... DROP KEY'),
+        ('DROP CHECK', 'ALTER TABLE ... DROP CHECK'),
+        ('DROP CONSTRAINT', 'ALTER TABLE ... DROP CONSTRAINT'),
+        ('DROP PARTITION', 'ALTER TABLE ... DROP PARTITION'),
+        ('ADD PARTITION', 'ALTER TABLE ... ADD PARTITION'),
+        ('RENAME COLUMN', 'ALTER TABLE ... RENAME COLUMN'),
+        ('RENAME INDEX', 'ALTER TABLE ... RENAME INDEX'),
+        ('RENAME KEY', 'ALTER TABLE ... RENAME KEY'),
+        ('MODIFY', 'ALTER TABLE ... MODIFY COLUMN'),
+        ('CHANGE', 'ALTER TABLE ... CHANGE COLUMN'),
+        ('ALTER COLUMN', 'ALTER TABLE ... ALTER COLUMN'),
+        ('ORDER BY', 'ALTER TABLE ... ORDER BY'),
+        ('CONVERT TO', 'ALTER TABLE ... CONVERT TO CHARACTER SET'),
+        ('DEFAULT CHARACTER', 'ALTER TABLE ... DEFAULT CHARACTER SET'),
+        ('CHARACTER SET', 'ALTER TABLE ... CHARACTER SET'),
+        ('COLLATE', 'ALTER TABLE ... COLLATE'),
+        ('COMMENT', 'ALTER TABLE ... COMMENT'),
+        ('ENGINE', 'ALTER TABLE ... ENGINE'),
+        ('AUTO_INCREMENT', 'ALTER TABLE ... AUTO_INCREMENT'),
+        ('DISABLE KEYS', 'ALTER TABLE ... DISABLE KEYS'),
+        ('ENABLE KEYS', 'ALTER TABLE ... ENABLE KEYS'),
+        ('DISCARD', 'ALTER TABLE ... DISCARD TABLESPACE'),
+        ('IMPORT', 'ALTER TABLE ... IMPORT TABLESPACE'),
+        ('ALGORITHM', 'ALTER TABLE ... ALGORITHM'),
+        ('LOCK', 'ALTER TABLE ... LOCK'),
+        ('FORCE', 'ALTER TABLE ... FORCE'),
+        ('WITH', 'ALTER TABLE ... WITH VALIDATION'),
+        ('WITHOUT', 'ALTER TABLE ... WITHOUT VALIDATION'),
+        ('PARTITION BY', 'ALTER TABLE ... PARTITION BY'),
+        ('PARTITION', 'ALTER TABLE ... PARTITION'),
+        ('REMOVE PARTITIONING', 'ALTER TABLE ... REMOVE PARTITIONING'),
+        ('TRUNCATE PARTITION', 'ALTER TABLE ... TRUNCATE PARTITION'),
+        ('REORGANIZE', 'ALTER TABLE ... REORGANIZE PARTITION'),
+        ('COALESCE', 'ALTER TABLE ... COALESCE PARTITION'),
+        ('EXCHANGE', 'ALTER TABLE ... EXCHANGE PARTITION'),
+        ('ANALYZE', 'ALTER TABLE ... ANALYZE PARTITION'),
+        ('CHECK PARTITION', 'ALTER TABLE ... CHECK PARTITION'),
+        ('OPTIMIZE PARTITION', 'ALTER TABLE ... OPTIMIZE PARTITION'),
+        ('REBUILD', 'ALTER TABLE ... REBUILD PARTITION'),
+        ('REPAIR', 'ALTER TABLE ... REPAIR PARTITION'),
+        ('UPGRADE', 'ALTER TABLE ... UPGRADE PARTITIONING'),
+    )
+
+    def _unsupported_alter(self, table, variant, sql) -> Dict:
+        """构造"明确不支持"的 AST（执行器据此回 1235，而不是静默成功）"""
+        return {
+            'command': 'ALTER TABLE', 'table': table,
+            'action': 'UNSUPPORTED', 'variant': variant,
+            'sql': sql.strip()[:200],
+        }
+
+    def _alter_table(self, sql: str) -> Dict:
+        m = re.match(
+            r'ALTER\s+(?:IGNORE\s+)?TABLE\s+(?:IF\s+EXISTS\s+)?'
+            r'[`"]?(\w+)[`"]?\s*(.*)$',
+            sql, re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise SyntaxError(f"ALTER TABLE 语法错误: {sql[:120]}")
+        table = m.group(1)
+        body = (m.group(2) or '').strip()
+        if not body:
+            raise SyntaxError("ALTER TABLE 缺少动作")
+
+        actions = [a.strip() for a in self._split_top_level(body) if a.strip()]
+        if len(actions) != 1:
+            # 多动作 ALTER（`ADD COLUMN a INT, DROP COLUMN b`）：本引擎的
+            # 结构变更是**一次一个原子提交**，无法保证多动作的"全做或全不做"，
+            # 因此显式拒绝，而不是顺序执行到一半失败留下半套结构。
+            return self._unsupported_alter(
+                table, 'ALTER TABLE 一次多个动作（不支持原子性的多动作变更）',
+                sql)
+        action = actions[0]
+        up = action.upper()
+
+        # ---- 明确不支持的变体（先判前缀，避免被 ADD/DROP 抢先匹配）----
+        for prefix, label in sorted(self._ALTER_UNSUPPORTED_ACTIONS,
+                                    key=lambda kv: -len(kv[0])):
+            if up == prefix or up.startswith(prefix + ' ') \
+                    or up.startswith(prefix + '('):
+                return self._unsupported_alter(table, label, sql)
+
+        # ---- ADD [COLUMN] 列定义 ----
+        if re.match(r'ADD\b', up):
+            rest = re.sub(r'^ADD\s+(?:COLUMN\s+)?', '', action,
+                          flags=re.IGNORECASE).strip()
+            if not rest:
+                raise SyntaxError(f"ALTER TABLE ADD COLUMN 缺少列定义: "
+                                  f"{action[:80]}")
+            if re.match(r'^(INDEX|KEY|UNIQUE|PRIMARY|FOREIGN|FULLTEXT|'
+                        r'SPATIAL|CONSTRAINT|CHECK|PARTITION)\b',
+                        rest, re.IGNORECASE):
+                return self._unsupported_alter(
+                    table, f'ALTER TABLE ... ADD {rest.split()[0].upper()}',
+                    sql)
+            if re.match(r'^IF\s+NOT\s+EXISTS\b', rest, re.IGNORECASE):
+                # `ADD COLUMN IF NOT EXISTS`（MariaDB 扩展，MySQL 没有）：
+                # 接受它就等于"表里已存在时静默跳过"，本引擎选择显式拒绝。
+                return self._unsupported_alter(
+                    table, 'ALTER TABLE ... ADD COLUMN IF NOT EXISTS', sql)
+            pm = re.search(r'\s+(FIRST|AFTER\s+[`"]?\w+[`"]?)\s*$',
+                           rest, re.IGNORECASE)
+            if pm:
+                return self._unsupported_alter(
+                    table, 'ALTER TABLE ... ADD COLUMN ... FIRST/AFTER', sql)
+            col = self._column_def(rest)
+            if not col:
+                raise SyntaxError(
+                    f"ALTER TABLE ADD COLUMN 的列定义无法解析: {rest[:80]}")
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'ADD COLUMN', 'column': col}
+
+        # ---- DROP [COLUMN] c ----
+        if re.match(r'DROP\b', up):
+            dm = re.match(r'DROP\s+(?:COLUMN\s+)?[`"]?(\w+)[`"]?\s*$',
+                          action, re.IGNORECASE)
+            if not dm:
+                return self._unsupported_alter(
+                    table, f'ALTER TABLE ... DROP {action[5:].strip()[:40]}',
+                    sql)
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'DROP COLUMN', 'column': dm.group(1)}
+
+        # ---- RENAME [TO|AS] t2 ----
+        rm = re.match(r'RENAME\s+(?:TO\s+|AS\s+)?[`"]?(\w+)[`"]?\s*$',
+                      action, re.IGNORECASE)
+        if rm:
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'RENAME', 'new_name': rm.group(1)}
+
+        return self._unsupported_alter(
+            table, f'ALTER TABLE ... {action.split()[0].upper()}', sql)
+
+    def _truncate(self, sql: str) -> Dict:
+        """`TRUNCATE [TABLE] t` —— MySQL 的 DDL 语义（隐式提交、不可回滚）
+
+        只接受单表：多表形态是 MariaDB 扩展，且"部分表清空了、部分没清"
+        正是本批次要杜绝的半套结果，因此显式不支持。
+        """
+        m = re.match(r'TRUNCATE\s+(?:TABLE\s+)?(.+?)\s*$', sql,
+                     re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise SyntaxError(f"TRUNCATE 语法错误: {sql[:120]}")
+        names = [t.strip().strip('`"') for t in
+                 self._split_top_level(m.group(1)) if t.strip()]
+        tm = re.match(r'^[`"]?(\w+)[`"]?$', names[0] if names else '')
+        if not tm or len(names) != 1:
+            return {'command': 'TRUNCATE', 'table': None,
+                    'action': 'UNSUPPORTED',
+                    'variant': 'TRUNCATE 一次多张表（本引擎只支持单表）',
+                    'sql': sql.strip()[:200]}
+        return {'command': 'TRUNCATE', 'table': tm.group(1)}
 
     # ==================== DML ====================
 

@@ -109,7 +109,13 @@ CHECKS_COUNT_MARKER = '-- lightdb:checks '
 
 # 表名/列名：本引擎的上限（不支持空格、点号、反引号本身）
 _IDENT_RE = re.compile(r'^[A-Za-z_]\w*$')
-_DDL_COL_RE = re.compile(r'^`?([A-Za-z_]\w*)`?\s+([A-Za-z_]\w*)\s*(.*)$')
+# 列定义：`列名 类型[(参数)] 其余属性`。
+# ★ 参数（`VARCHAR(20)` / `DECIMAL(10,2)`）必须单独捕获：旧正则的类型组是
+#   `[A-Za-z_]\w*`，`(20)` 会掉进"其余属性"里被当成未知属性忽略 —— 于是
+#   dump 里声明的长度在解析侧静默消失（`canonical_ddl` 现在会写出真实
+#   长度，这个洞必须一起补上）。
+_DDL_COL_RE = re.compile(
+    r'^`?([A-Za-z_]\w*)`?\s+([A-Za-z_]\w*)\s*(\([^)]*\))?\s*(.*)$')
 
 _IGNORABLE_PREFIXES = (
     'SET ', 'USE ', 'BEGIN', 'COMMIT', 'ROLLBACK', 'START TRANSACTION',
@@ -167,6 +173,40 @@ def sql_literal(v) -> str:
 
 # ==================== 表结构 ====================
 
+#: 无引号 DEFAULT 值里的函数调用（`CURRENT_TIMESTAMP` / `NOW()` /
+#: `CURRENT_TIMESTAMP(3)`）—— 与 `sql/parser.py::_DEFAULT_FUNC_RE` 是同一份
+#: 取值范围。DDL 文本里这类默认值**绝不能加引号**：`DEFAULT 'NOW()'` 是
+#: 一个字符串常量，而 `DEFAULT NOW()` 是"写入时求值"，语义完全不同。
+_DEFAULT_FUNC_RE = re.compile(
+    r'^(?:CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|NOW|LOCALTIME|'
+    r'LOCALTIMESTAMP|UUID|CURDATE|CURTIME)\s*(?:\(\s*\d*\s*\))?$',
+    re.IGNORECASE)
+
+#: 数字字面量（不加引号写出来）
+_NUM_LITERAL_RE = re.compile(r'^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$')
+
+
+def _default_literal(col) -> str:
+    """把列的真实 `DEFAULT` 渲染成**能被解析回来**的 SQL 字面量
+
+    三种形态（与 `parser._parse_column_default` 接受的范围一一对应）：
+
+    * `None` → `NULL`；
+    * 数字原文（解析器存的是字符串）→ 不加引号写出；
+    * 当前时间函数一族 → 不加引号写出（加引号会变成字符串常量）；
+    * 其余 → 单引号包裹（`'` 按 SQL 规则写成 `''`）。
+    """
+    raw = col.get('default')
+    if raw is None:
+        return 'NULL'
+    text = str(raw)
+    if _DEFAULT_FUNC_RE.match(text):
+        return text.upper()
+    if _NUM_LITERAL_RE.match(text):
+        return text
+    return "'" + text.replace("'", "''") + "'"
+
+
 @dataclass
 class TableSchema:
     """一张表的结构（dump 里 CREATE TABLE 的规范化表达）
@@ -179,7 +219,7 @@ class TableSchema:
     "备份 → 恢复到新库"会把约束静默丢光（同会话一直在清的那类静默失效）。
     """
     name: str
-    columns: list = field(default_factory=list)   # [{name,type,primary,unique,notnull,check}]
+    columns: list = field(default_factory=list)   # [{name,type,primary,unique,notnull,has_default,default,check}]
     table_checks: list = field(default_factory=list)  # [{'name','expr'}]
 
     @property
@@ -218,6 +258,12 @@ class TableSchema:
              'primary': bool(c.get('primary')),
              'unique': bool(c.get('unique')),
              'notnull': bool(c.get('notnull')),
+             # ★ `DEFAULT` 必须跟着走：`has_default` 区分"声明了 DEFAULT
+             #   NULL"与"根本没写 DEFAULT"（`SHOW COLUMNS` 的 Default 列
+             #   两者都是 NULL，但 `_meta.json` 里的 `has_default` 不同，
+             #   丢了它就把"显式 NULL 默认值"降级成"没有默认值"）。
+             'has_default': bool(c.get('has_default')),
+             'default': c.get('default'),
              'generated': None,
              # 列级 CHECK 必须原样带回 `cols`：它本来就随列定义持久化
              # （`_meta.json` 的 cols），丢了就等于恢复后少一条约束。
@@ -233,10 +279,20 @@ class TableSchema:
         for c in cols:
             ck = c.get('check') or {}
             columns.append({
-                'name': c['name'], 'type': normalize_type(c['type']),
+                'name': c['name'],
+                # ★ 保留**真实声明**（`VARCHAR(20)` / `DECIMAL(10,2)`）。
+                #   旧实现在这里套了 `normalize_type`，把长度/精度抹掉，
+                #   于是 `SHOW CREATE TABLE` 报的是 `VARCHAR`、而
+                #   `SHOW COLUMNS` 报的是 `VARCHAR(20)`：同一张表两个答案，
+                #   照抄 DDL 去重建表就会静默丢掉长度。
+                #   `normalize_type` 仍然在**解析/比对**侧使用（`parse_create_table`
+                #   与 `verify_restore`），因此本改动不会让比对口径漂移。
+                'type': str(c.get('type') or ''),
                 'primary': bool(c.get('primary')),
                 'unique': bool(c.get('unique')),
                 'notnull': bool(c.get('notnull')),
+                'has_default': bool(c.get('has_default')),
+                'default': c.get('default'),
                 'check': ({'name': ck.get('name') or '',
                            'expr': str(ck['expr']).strip()}
                           if ck.get('expr') else None),
@@ -280,9 +336,22 @@ class TableSchema:
         """
         parts = []
         for c in self.columns:
+            # 列定义的属性顺序按 MySQL 的 `SHOW CREATE TABLE` 习惯：
+            #   `类型` → `NOT NULL|NULL` → `DEFAULT` → `PRIMARY KEY`
+            #   → `UNIQUE` → `CHECK (...)`。
+            # ★ 类型来自 `from_engine_cols` 的**真实声明**（含长度/精度）；
+            # ★ DEFAULT / UNIQUE 也必须写出来：旧实现只写
+            #   NULL/NOT NULL/PRIMARY KEY，于是 `SHOW CREATE TABLE` 与
+            #   逻辑 dump 都**看不到** DEFAULT 与 UNIQUE —— 照它重建表会
+            #   静默丢掉默认值和唯一性声明（同会话一直在清的那类失效）。
             line = (f"  {c['name']} {c['type']}"
-                    + (' NOT NULL' if c.get('notnull') else ' NULL')
-                    + (' PRIMARY KEY' if c.get('primary') else ''))
+                    + (' NOT NULL' if c.get('notnull') else ' NULL'))
+            if c.get('has_default'):
+                line += ' DEFAULT ' + _default_literal(c)
+            if c.get('primary'):
+                line += ' PRIMARY KEY'
+            if c.get('unique'):
+                line += ' UNIQUE'
             ck = c.get('check') or {}
             if ck.get('expr'):
                 line += f" CHECK ({ck['expr']})"
@@ -311,7 +380,10 @@ class TableSchema:
             if not _IDENT_RE.match(c['name']):
                 raise BackupError(
                     f"表 {self.name} 的列名 {c['name']!r} 含不支持的字符")
-            if c['type'].upper() not in _KNOWN_TYPES:
+            # 按**基类型**判定：`VARCHAR(20)` / `DECIMAL(10,2)` 的参数是
+            # 真实声明的一部分（必须保留），不能因为带了参数就被判成
+            # "未知类型"。
+            if normalize_type(c['type']) not in _KNOWN_TYPES:
                 raise BackupError(
                     f"表 {self.name} 的列 {c['name']} 类型 {c['type']!r} "
                     f"不在支持的集合 {sorted(_KNOWN_TYPES)} 内")
@@ -485,7 +557,11 @@ def parse_create_table(stmt: str) -> TableSchema:
                     f"列属性（本格式只保存主键）")
             raise BackupError(f"表 {name} 里有无法解析的列定义: {part[:60]!r}")
 
-        cname, ctype, tail = cm.group(1), normalize_type(cm.group(2)), cm.group(3)
+        cname = cm.group(1)
+        # 类型原样保留（含 `(20)` / `(10,2)`）；比对侧（`verify_restore`）
+        # 走 `normalize_type`，因此这里保留参数不会让比对口径漂移。
+        ctype = (cm.group(2) or '') + (cm.group(3) or '')
+        tail = cm.group(4)
         # 列级 CHECK（内联在列定义末尾）：先摘出来，剩下的尾巴才按
         # NOT NULL / PRIMARY KEY / UNIQUE 判定，否则 `CHECK` 会被当成
         # "本格式不支持的属性"而拒收（正是"备份写不出、恢复读不回"的形态）。
@@ -494,6 +570,11 @@ def parse_create_table(stmt: str) -> TableSchema:
         if cpos is not None:
             col_check = _parse_check_clause(tail[cpos:], table=f"{name}.{cname}")
             tail = tail[:cpos]
+        # 列级 DEFAULT：`canonical_ddl` 会把它写出来，这里必须读得回来，
+        # 否则"带 DEFAULT 的 dump"会被下面的未知属性检查拒收
+        # （备份能写、恢复读不回 = 备份等于没有）。
+        col_default, col_has_default, tail = _extract_column_default(
+            tail, table=name, column=cname)
         tup = tail.upper()
         unknown = [t for t in re.findall(r'[A-Z_]+', tup)
                    if t not in ('NOT', 'NULL', 'PRIMARY', 'KEY', 'UNIQUE')]
@@ -515,6 +596,8 @@ def parse_create_table(stmt: str) -> TableSchema:
             'primary': 'PRIMARY KEY' in tup,
             'unique': 'UNIQUE' in tup,
             'notnull': bool(re.search(r'\bNOT\s+NULL\b', tup)),
+            'has_default': col_has_default,
+            'default': col_default,
             'check': col_check,
         })
 
@@ -524,6 +607,52 @@ def parse_create_table(stmt: str) -> TableSchema:
     _assign_check_names(schema)
     schema.assert_supported()
     return schema
+
+
+def _extract_column_default(tail: str, table: str, column: str):
+    """从列定义尾巴里摘出 `DEFAULT <字面量>`；返回 `(值, 是否声明, 剩余尾巴)`
+
+    与 `TableSchema.canonical_ddl` / `_default_literal` 是**一对**：那边写
+    什么形态，这边就必须读得回来。取值形态只允许 `_default_literal` 会
+    产出的三种（`NULL` / 数字 / 时间函数 / 单引号字符串），其余显式报错
+    —— 读不懂就拒绝恢复，绝不"当没有 DEFAULT"继续（那会静默丢默认值）。
+    """
+    m = re.search(r'\bDEFAULT\b', tail, re.IGNORECASE)
+    if not m:
+        return None, False, tail
+    before = tail[:m.start()]
+    rest = tail[m.end():].lstrip()
+    if not rest:
+        raise BackupError(
+            f"表 {table} 的列 {column}: DEFAULT 后面缺少取值")
+    if re.match(r'NULL\b', rest, re.IGNORECASE):
+        value, used = None, len('NULL')
+    elif rest[0] in ("'", '"'):
+        q = rest[0]
+        i, n = 1, len(rest)
+        while i < n:
+            if rest[i] == q:
+                if i + 1 < n and rest[i + 1] == q:      # `''` 转义
+                    i += 2
+                    continue
+                break
+            i += 1
+        else:
+            raise BackupError(
+                f"表 {table} 的列 {column}: DEFAULT 字符串字面量未闭合: "
+                f"{rest[:40]!r}")
+        value, used = rest[1:i], i + 1
+    else:
+        tok = rest.split()[0]
+        if _DEFAULT_FUNC_RE.match(tok):
+            value, used = tok.upper(), len(tok)
+        elif _NUM_LITERAL_RE.match(tok):
+            value, used = tok, len(tok)
+        else:
+            raise BackupError(
+                f"表 {table} 的列 {column}: DEFAULT 取值 {tok[:40]!r} 本格式"
+                f"不支持（只接受 NULL / 数字 / 当前时间函数 / 字符串字面量）")
+    return value, True, before + rest[used:]
 
 
 def _find_check_keyword(text: str):

@@ -21,6 +21,7 @@ from ..db.information_schema import InformationSchema
 # `SHOW COLUMNS` 的列元数据构造（与 information_schema 共用一份实现，
 # 见 db/database.py 的说明）
 from ..db.database import describe_columns
+from ..db.errors import DdlError
 from ..db.table import Table as _StorageTable
 # CHECK 约束违规（MySQL ERROR 3819 / SQLSTATE HY000）：`Table.insert` /
 # `Table.update` 抛它，`execute` 在这里把它渲染成错误结果而不是 1062。
@@ -568,6 +569,15 @@ class Executor:
             self._record_audit(parsed, session, result,
                                time.time() - start)
             return result
+        except DdlError as e:
+            # DDL 的显式报错（见 `db/errors.py`）：错误码是 db 层给的真实
+            # 语义码（1235 未支持 / 1054 未知列 / 1060 列重复 / 1091 不能删
+            # / 1138 NOT NULL 无默认值 …），这里**原样**带给客户端 ——
+            # 绝不能落进下面的 ValueError 分支被压成 1105/1062。
+            result = self._err(e.errno, str(e), sqlstate=e.sqlstate)
+            self._record_audit(parsed, session, result,
+                               time.time() - start)
+            return result
         except ValueError as e:
             result = self._err(self._storage_errno(e), str(e))
             self._record_audit(parsed, session, result,
@@ -661,14 +671,14 @@ class Executor:
         if parsed is None:
             head = (str(sql).strip().split(None, 1) or [''])[0].upper()
             if head == 'ALTER':
-                # `ALTER TABLE` 整体尚未支持（含 `ALTER TABLE ... ADD CHECK`）。
-                # 这里给一句明确的不支持说明，而不是笼统的"无法解析 SQL"：
-                # 否则使用者会以为只是语法写错，进而以为 CHECK 已经加上
-                # （静默不生效）。**没有**顺手实现 ALTER。
+                # 兜底：解析器认不出的 ALTER 形态。已实现的变体见
+                # `parser._alter_table`（ADD COLUMN / DROP COLUMN / RENAME TO），
+                # 其余变体会走 `_cmd_alter_table` 的 UNSUPPORTED 分支回 1235。
                 return self._err(
-                    1064,
-                    f"ALTER TABLE 尚未支持（本引擎未实现 ALTER，"
-                    f"包括 ADD CHECK）：{sql[:120]}")
+                    1235,
+                    f"ALTER 语句无法解析或形态不支持：{sql[:120]}"
+                    f"（本引擎只支持 ALTER TABLE 的 ADD COLUMN / "
+                    f"DROP COLUMN / RENAME TO）")
             return self._err(1064, f"无法解析 SQL: {sql[:80]}")
         # 注意：不能用 `session or {}` —— 空 dict 是 falsy，会新建一个字典，
         # 调用方传进来的会话就丢了（BEGIN 写的 s['txn'] 传不回去，
@@ -746,6 +756,106 @@ class Executor:
         self.db.drop_table(p['table'])
         return self._ok(
             message=f"Table '{p['table']}' dropped")
+
+    # ==================== ALTER TABLE / TRUNCATE ====================
+    #
+    # 语义与边界（本批次）：
+    #   * 实现：`ADD COLUMN` / `DROP COLUMN` / `RENAME TO` / `TRUNCATE TABLE`；
+    #   * **其余一切 ALTER 变体**（MODIFY / CHANGE / ADD INDEX / ADD CHECK …）
+    #     返回 MySQL 1235（`ER_NOT_SUPPORTED_YET`）+ 明确报文，**绝不**返回
+    #     OK 却什么都没做；
+    #   * 事务：MySQL 把 DDL 归为"隐式提交"语句，这里照做 —— 执行前先提交
+    #     本会话的事务（`_implicit_commit_ddl`）。表上还有**别的**未提交事务
+    #     时 `Database._ddl_guard` 显式报错（本引擎没有元数据锁，硬做会刷出
+    #     未提交数据并退休 WAL）。
+
+    def _implicit_commit_ddl(self, s, what: str):
+        """DDL 的隐式提交（MySQL 13.3.3「导致隐式提交的语句」）"""
+        txn = s.pop('txn', None) if isinstance(s, dict) else None
+        if not txn:
+            return None
+        try:
+            self.db.commit(txn)
+            self.stats['commits'] += 1
+        except Exception as e:                       # pragma: no cover - 防御
+            raise DdlError(
+                f"{what} 前的隐式提交失败: {e}", errno=1105)
+        return txn.get('txn_id')
+
+    def _cmd_alter_table(self, p, s):
+        action = str(p.get('action') or '').upper()
+        table = p.get('table')
+        if action == 'UNSUPPORTED':
+            # 错误码选 1064（`ER_PARSE_ERROR`）而不是 1235
+            # （`ER_NOT_SUPPORTED_YET`）：本引擎的 ALTER TABLE **语法**只有
+            # ADD COLUMN / DROP COLUMN / RENAME TO 三种动作，其余动作在语法
+            # 层面就不被接受 —— 这正是 1064 的语义。报文里明确写出是哪一种
+            # 变体、以及本引擎支持哪些，所以使用者不会把它误当成"我写错了
+            # 什么"（`tests/test_phase0_integrity.py` 也把
+            # `ALTER TABLE ... ADD CHECK` 的码锁在 1064/1105，不能改）。
+            return self._err(
+                1064,
+                f"ALTER TABLE 的 '{p.get('variant')}' 变体本引擎未实现："
+                f"只支持 ADD COLUMN / DROP COLUMN / RENAME TO，"
+                f"其余变体一律显式报错、绝不静默成功"
+                f"（语句: {p.get('sql')}）")
+        self._implicit_commit_ddl(s, f"ALTER TABLE {table}")
+        if action == 'ADD COLUMN':
+            col = dict(p['column'])
+            stats = self.db.alter_add_column(table, col)
+            n = stats.get('rows_backfilled', 0)
+            return self._ok(
+                message=(f"Table '{table}' altered: column "
+                         f"'{col['name']}' added, {n} existing row "
+                         f"version(s) backfilled"
+                         + (f" with {stats['backfill']!r}"
+                            if 'backfill' in stats else '')))
+        if action == 'DROP COLUMN':
+            cname = p['column']
+            stats = self.db.alter_drop_column(table, cname)
+            return self._ok(
+                message=(f"Table '{table}' altered: column '{cname}' "
+                         f"dropped, {stats.get('rows_rewritten', 0)} row "
+                         f"version(s) rewritten (数据已从数据文件清除)"))
+        if action == 'RENAME':
+            new = p['new_name']
+            self.db.rename_table(table, new)
+            return self._ok(
+                message=f"Table '{table}' renamed to '{new}'")
+        return self._err(
+            1064,
+            f"ALTER TABLE 的动作 {action!r} 本引擎未实现"
+            f"（只支持 ADD COLUMN / DROP COLUMN / RENAME TO）")
+
+    def _cmd_alter_unsupported(self, p, s):
+        """`ALTER DATABASE` / `ALTER USER` 等非 TABLE 形态：显式不支持
+
+        这一类与 `ALTER TABLE` 的"动作没实现"不同：整个语句族本引擎都没有
+        （`ALTER DATABASE` 尤其无意义 —— 本引擎是单库模型，见
+        `Database.database_names`），因此按 MySQL 的 1235
+        （`ER_NOT_SUPPORTED_YET`）报，报文照该错误的原文写。
+        """
+        v = p.get('variant')
+        name = ' '.join(v) if isinstance(v, (list, tuple)) else str(v)
+        return self._err(
+            1235,
+            f"This version of lightdb doesn't yet support '{name}'")
+
+    def _cmd_truncate(self, p, s):
+        if str(p.get('action') or '').upper() == 'UNSUPPORTED':
+            return self._err(
+                1064,
+                f"TRUNCATE 的 '{p.get('variant')}' 形态本引擎未实现："
+                f"只支持 `TRUNCATE TABLE <单表>`，多表形态一律显式报错"
+                f"（不做「清了一半」的半套结果）"
+                f"（语句: {p.get('sql')}）")
+        table = p.get('table')
+        self._implicit_commit_ddl(s, f"TRUNCATE TABLE {table}")
+        stats = self.db.truncate_table(table)
+        return self._ok(
+            message=(f"Table '{table}' truncated "
+                     f"({stats.get('deleted_versions', 0)} index entr(y/ies) "
+                     f"dropped, 表定义保留)"))
 
     def _cmd_analyze(self, p, s):
         """ANALYZE [TABLE] t —— 收集统计信息
@@ -6060,6 +6170,49 @@ class Executor:
             return self._err(getattr(e, 'errno', 3819), str(e),
                              getattr(e, 'sqlstate', None))
         return self._rs(['Table', 'Create Table'], [(name, ddl)])
+
+    #: MySQL 8.0 `SHOW INDEX` 的列清单（顺序照官方文档 13.7.7.22）
+    _SHOW_INDEX_COLUMNS = (
+        'Table', 'Non_unique', 'Key_name', 'Seq_in_index', 'Column_name',
+        'Collation', 'Cardinality', 'Sub_part', 'Packed', 'Null',
+        'Index_type', 'Comment', 'Index_comment', 'Visible', 'Expression',
+    )
+
+    def _show_index(self, p, s):
+        """`SHOW INDEX FROM t` —— 列形状与 MySQL 一致，取值来自真实索引
+
+        数据源是 `Table.index_specs()`，**只报真的存在、真的在维护的索引**
+        （本引擎当前是主键 B+Tree）。`UNIQUE` 是"已声明但未强制"的列属性，
+        这里不替它编造索引行（见 `Table.index_specs` 的说明）。
+
+        一个索引多列 → 多行（`Seq_in_index` 从 1 递增），与 MySQL 一致；
+        表不存在 → 1146（不返回空结果集，免得客户端把"表没了"当成"没索引"）。
+        """
+        name = p.get('table')
+        if name not in self.db.tables:
+            return self._err(1146, f"Table '{name}' doesn't exist")
+        tbl = self.db.tables[name]
+        rows = []
+        for spec in tbl.index_specs():
+            for seq, cname in enumerate(spec.get('columns') or [], start=1):
+                rows.append((
+                    name,
+                    0 if spec.get('unique') else 1,
+                    spec.get('name') or '',
+                    seq,
+                    cname,
+                    'A',                                 # Collation（升序）
+                    spec.get('cardinality'),
+                    None,                                # Sub_part
+                    None,                                # Packed
+                    '' if spec.get('unique') else 'YES',  # Null
+                    'BTREE',                             # Index_type（真实实现）
+                    '',                                  # Comment
+                    '',                                  # Index_comment
+                    'YES',                               # Visible
+                    None,                                # Expression
+                ))
+        return self._rs(list(self._SHOW_INDEX_COLUMNS), rows)
 
     def _show_partitions(self, p, s):
         """SHOW PARTITIONS FROM t —— 读真实的 Table._partition 元数据

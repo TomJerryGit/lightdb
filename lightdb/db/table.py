@@ -130,6 +130,7 @@ from ..storage.lock_manager import (
     LockManager, LockType, DeadlockError)
 from ..storage.mvcc import MVCCManager, UndoAction
 from ..logger import logger
+from .errors import DdlError
 
 
 # 行头布局（见文件头说明）：
@@ -812,6 +813,322 @@ class Table:
             if isinstance(k, int) and k > max_pk:
                 max_pk = k
         return max_pk + 1
+
+    # ==================== 结构变更（ALTER TABLE：ADD / DROP COLUMN） ====================
+    #
+    # 行载荷是**按列位置编码的 JSON 数组**（见 `_encode_row`）。因此
+    # "加一列 / 删一列"在存储层的真实动作就是"把每个行版本的数组改长度"
+    # —— 只改 `self.cols` 元数据的话，`SHOW COLUMNS` 会说有这一列，
+    # 而 `SELECT` 拿到的行仍然少/多一个字段（静默错位），这正是本批次
+    # 要清掉的那类"看起来成功、其实没生效"。
+    #
+    # 下面两个方法把这件事做成**一次规划 + 一次执行**：
+    #   * 规划阶段只读页、算好每一行"原地写"还是"搬到哪一页哪一个槽位"；
+    #   * 执行阶段先搬（新位置写入成功后才清零老槽位），再原地改写，
+    #     最后逐条改写索引项与 prev 指针。
+    # `Page.insert_row` 的容量判据与 `free_space()` 完全等价
+    # （`next_row_ptr - len >= PAGE_HEADER_SIZE + (n+1)*4`），所以规划出来
+    # 的位置在执行阶段必然拿得到；拿不到就是页内容被别的东西改过，
+    # 此时抛 `DdlError` 让整个 DDL 失败（不允许半套）。
+
+    def iter_all_row_versions(self):
+        """堆里**全部**行版本：[(pid, sid, values, xmin, xmax, pp, ps)]
+
+        与 `_visible_pks`（只取索引可达、且对某读视图可见的版本）不同：
+        这里把页上每个槽位都读出来。结构变更改的是**行载荷的列数**，
+        墓碑与老版本也必须一起改 —— 否则重启后老快照沿 prev 链回溯时
+        会拿到少一列/多一列的行（`row[pk_idx]` 错位甚至越界）。
+        """
+        out = []
+        for pid in range(1, self.bp.total_pages()):
+            page = self.bp.get_page(pid)
+            if page is None or page.page_type != PAGE_TYPE_HEAP:
+                continue
+            for sid, rb in list(page.iter_rows()):
+                r = self._decode_row_ver(rb)
+                if r is None:
+                    continue
+                values, xmin, xmax, pp, ps = r
+                out.append((pid, sid, values, xmin, xmax, pp, ps))
+        return out
+
+    def rewrite_row_payloads(self, transform, old_len: int, new_len: int,
+                            zero_removed: bool = False) -> dict:
+        """把所有行版本的载荷按 `transform(values) -> new_values` 重写
+
+        保证与语义：
+
+        * **按行载荷长度幂等**：长度已是 `new_len` 的行原样保留；长度是
+          `old_len` 的行走 `transform`；其它长度 → 显式 `DdlError`
+          （列数对不上的行是损坏，绝不猜测补齐，那会掩盖数据问题）。
+          崩溃恢复会再次调用同一份 transform，靠这条判据判断"改过没有"。
+        * 原地放不下的行搬到**本页的空闲区**（优先）、别的堆页，或新页；
+          搬迁后索引项（pk → 链头位置）与版本链的 prev 指针**逐条改写**，
+          Scheme A「索引指向最新版本」的语义不变。
+        * `zero_removed=True` 时，被腾空的槽位与行尾残字节一律**清零**
+          （`DROP COLUMN` 用：数据必须真的不可再从数据文件里读到）。
+        * 页号/槽位只增不改：`self._next_pk`、`pk_idx` 都不受影响。
+
+        返回统计 dict；表为空（一行都没有）时不做任何事。
+        """
+        snap = self.iter_all_row_versions()
+        stats = {'rows': len(snap), 'in_place': 0, 'relocated': 0,
+                 'new_pages': 0}
+        if not snap:
+            return stats
+
+        # ---- 1) 算新载荷 + 新字节长度，并判"原地够不够" ----
+        plans = []          # [pid, sid, nv, xmin, xmax, pp, ps, need]
+        for pid, sid, values, xmin, xmax, pp, ps in snap:
+            n = len(values)
+            if n == new_len:
+                nv = values
+            elif n == old_len:
+                nv = transform(values)
+            else:
+                raise DdlError(
+                    f"表 {self.name}：主键取值 {values[0]!r} 的行有 {n} 个"
+                    f"字段，既不是变更前的 {old_len} 也不是变更后的 "
+                    f"{new_len}；拒绝在列数不一致的表上做结构变更",
+                    errno=1105)
+            if len(nv) != new_len:      # transform 自己写错了 → 显式失败
+                raise DdlError(
+                    f"表 {self.name}：结构变更后的行有 {len(nv)} 个字段，"
+                    f"期望 {new_len}", errno=1105)
+            # prev 指针是定长 8 字节，因此这里算出的长度与最终写入的长度一致
+            need = len(self._encode_row(nv)) + 4
+            plans.append([pid, sid, nv, xmin, xmax, pp, ps, need])
+
+        heap_pages = []
+        for pid in range(1, self.bp.total_pages()):
+            page = self.bp.get_page(pid)
+            if page is not None and page.page_type == PAGE_TYPE_HEAP:
+                heap_pages.append(pid)
+
+        sim_free = {}
+        sim_slots = {}
+
+        def _sim(pid):
+            if pid not in sim_free:
+                p = self.bp.get_page(pid)
+                if p is None or p.page_type != PAGE_TYPE_HEAP:
+                    sim_free[pid] = -1
+                    sim_slots[pid] = 0
+                else:
+                    sim_free[pid] = p.free_space()
+                    sim_slots[pid] = p.n_slots
+            return sim_free[pid]
+
+        # ---- 2) 规划搬迁（动手之前一次算完） ----
+        moves = {}          # (pid, sid) -> (npid, nsid)
+        new_page_used = []
+        new_page_slots = []
+        for item in plans:
+            pid, sid, need = item[0], item[1], item[7]
+            page = self.bp.get_page(pid)
+            cur = page.get_row(sid) if page is not None else None
+            if cur is None:
+                raise DdlError(
+                    f"表 {self.name}：索引/槽位指向不存在的行 "
+                    f"(page={pid}, slot={sid})，拒绝在其上做结构变更",
+                    errno=1105)
+            if len(cur) >= need - 4:
+                continue                       # 原地写得下
+            target = None
+            for cand in [pid] + [x for x in heap_pages if x != pid]:
+                if _sim(cand) >= need:
+                    target = (cand, sim_slots[cand])
+                    sim_slots[cand] += 1
+                    sim_free[cand] -= need
+                    break
+            if target is None:
+                cap = PAGE_SIZE - PAGE_HEADER_SIZE
+                if not new_page_used or new_page_used[-1] + need > cap:
+                    new_page_used.append(0)
+                    new_page_slots.append(0)
+                k = len(new_page_used) - 1
+                target = ('NEW', k, new_page_slots[k])
+                new_page_slots[k] += 1
+                new_page_used[k] += need
+            moves[(pid, sid)] = target
+
+        # 新页在这里就真正分配出来：prev 指针要写**真实页号**，
+        # 而"别的新页"可能就是本行前驱的落点。提前分配只会多出几个
+        # 空堆页（合法、可复用），不会留下半套结构。
+        allocated = {}
+        for key, target in list(moves.items()):
+            if target[0] != 'NEW':
+                continue
+            k = target[1]
+            if k not in allocated:
+                pg = self.bp.new_page(PAGE_TYPE_HEAP)
+                if pg is None:                       # pragma: no cover
+                    raise DdlError(
+                        f"表 {self.name}：无法为新行分配堆页", errno=1105)
+                allocated[k] = pg.page_id
+                stats['new_pages'] += 1
+            moves[key] = (allocated[k], target[2])
+
+        def _remap_prev(pp, ps):
+            if not pp or pp == NO_PREV:
+                return NO_PREV, 0
+            t = moves.get((pp, ps))
+            return (pp, ps) if t is None else t
+
+        # ---- 3) 执行：先搬（插新位置 → 成功后才清零老槽位），再原地改写 ----
+        for item in plans:
+            key = (item[0], item[1])
+            target = moves.get(key)
+            if target is None:
+                continue
+            npp, nps = _remap_prev(item[5], item[6])
+            nrb = self._encode_row(
+                item[2], xmin=item[3], xmax=item[4],
+                prev_page=npp, prev_slot=nps)
+            dst = self.bp.get_page(target[0])
+            if dst is None or dst.page_type != PAGE_TYPE_HEAP:
+                raise DdlError(
+                    f"表 {self.name}：搬迁目标页 {target[0]} 不可用",
+                    errno=1105)
+            got = dst.insert_row(nrb)
+            if got is None or got != target[1]:
+                # 计划与实际判据等价；走到这里说明页内容在规划之后被改过
+                raise DdlError(
+                    f"表 {self.name}：搬迁到页 {target[0]} 槽位 "
+                    f"{target[1]} 失败（实际 {got}）—— 结构变更中止",
+                    errno=1105)
+            src = self.bp.get_page(key[0])
+            if src is not None:
+                if zero_removed:
+                    src.zero_slot(key[1])
+                else:
+                    src.delete_row(key[1])
+            stats['relocated'] += 1
+
+        for item in plans:
+            key = (item[0], item[1])
+            if key in moves:
+                continue
+            npp, nps = _remap_prev(item[5], item[6])
+            nrb = self._encode_row(item[2], xmin=item[3], xmax=item[4],
+                                   prev_page=npp, prev_slot=nps)
+            page = self.bp.get_page(key[0])
+            if page is None:
+                raise DdlError(
+                    f"表 {self.name}：页 {key[0]} 不可用", errno=1105)
+            ok = (page.update_row_shrink(key[1], nrb) if zero_removed
+                  else page.update_row_inplace(key[1], nrb))
+            if not ok:                               # pragma: no cover - 防御
+                raise DdlError(
+                    f"表 {self.name}：原地改写 (page={key[0]}, "
+                    f"slot={key[1]}) 失败 —— 结构变更中止", errno=1105)
+            stats['in_place'] += 1
+
+        # ---- 4) 索引项指向搬走了的链头 → 改指新位置 ----
+        if moves:
+            for pk, pid, sid in list(self.bt.scan()):
+                t = moves.get((pid, sid))
+                if t is not None:
+                    self.bt.insert(pk, t[0], t[1])
+        # 搬迁后有些页的登记项可能不再有空间（或页号已越界）→ 校验一遍。
+        # 这里**不**主动 `_register_space_page`：那些页上还压着活跃行，
+        # 登记成"可复用空闲页"会让 `integrity_scan` 的
+        # `rows_on_free_pages` 出现假告警；这些空隙交给一次 VACUUM 回收。
+        self._validate_free_pages()
+        return stats
+
+    def truncate_all(self) -> dict:
+        """清空全部行，**保留表定义**（列 / CHECK / 分区 / 主键索引结构）
+
+        MySQL 的 `TRUNCATE TABLE` 是 DDL：清数据 + 重置自增 + 不可回滚，
+        与 `DELETE FROM t`（DML、逐行删除、可回滚、不重置自增）不同。
+        本引擎的实现是：
+
+        * 每个堆页的行槽位**清零**（`Page.zero_slot`，数据真的没了）；
+        * 空页 `compact()` → `n_slots` 复位、行游标归位（页回到"全新页"）；
+        * 主键 B+Tree 的键**逐条删除**（不是新建空树：新建会把树页追加到
+          文件尾，文件白白变大，而"逐条删"留下的是可复用的空页）；
+        * `_next_pk` 复位（MySQL 的 AUTO_INCREMENT 重置语义）。
+
+        **不**删除/重建 `.dat`/`.wal` 文件：换文件句柄会让任何还持有本
+        `Table` 对象的调用方（同一个 Executor / 统计管理器）读到旧文件。
+        """
+        with self._lock:
+            for pid in range(1, self.bp.total_pages()):
+                page = self.bp.get_page(pid)
+                if page is None or page.page_type != PAGE_TYPE_HEAP:
+                    continue
+                n = 0
+                for sid, _rb in list(page.iter_rows()):
+                    page.zero_slot(sid)
+                    n += 1
+                page.compact()
+            dropped = 0
+            for pk, _pid, _sid in list(self.bt.scan()):
+                if self.bt.delete(pk):
+                    dropped += 1
+            self._next_pk = 1
+            self._last_heap_pid = None
+            # 全文索引是**派生**数据（不持久化），清空表就必须一起清空，
+            # 否则 MATCH ... AGAINST 还能搜到已经删掉的行。这里保留索引
+            # **定义**（列名），只把倒排表清空：清成 None 会让
+            # `has_fulltext_index()` 变 False，之后 `MATCH` 会报"该列上没有
+            # 全文索引" —— 那是把"表被清空"误报成"索引没了"。
+            if self._fulltext is not None:
+                from ..sql.fulltext import FullTextManager
+                mgr = FullTextManager()
+                for cname in list(self._fulltext.indexes):
+                    mgr.create_index(cname)
+                self._fulltext = mgr
+            for pid in range(1, self.bp.total_pages()):
+                page = self.bp.get_page(pid)
+                if page is not None and page.page_type == PAGE_TYPE_HEAP:
+                    self._register_space_page(pid)
+            return {'deleted_versions': dropped}
+
+    def index_specs(self):
+        """本表**真实存在**的索引（`SHOW INDEX` 的唯一数据源）
+
+        现状必须如实说明（宁可少报，也不"看起来有、其实没有"）：
+
+        * 本引擎真做出来的索引只有**主键 B+Tree**（Scheme A：key = 主键取值，
+          value = 该主键最新版本的 `(page, slot)`），插入时的主键重复检测
+          也是它做的；
+        * `UNIQUE` 目前只是**已声明、未强制**的列属性（`SHOW COLUMNS` 的
+          `Key` 报 `UNI`，见 `db/database.py::column_key`）：既没有独立索引
+          结构，插入/更新时也不查重。因此这里**不**为它编造一条索引行 ——
+          报一条 `Non_unique=0` 的 UNIQUE 索引等于宣称一个不存在的约束
+          已经生效。
+
+        返回 `[{'name','unique','columns','cardinality'}]`；多列索引会给出
+        多个列名（`SHOW INDEX` 侧按 `Seq_in_index` 展开成多行）。
+        """
+        out = []
+        pk_cols = [c['name'] for c in self.cols if c.get('primary')]
+        if pk_cols:
+            out.append({'name': 'PRIMARY', 'unique': True,
+                        'columns': pk_cols,
+                        'cardinality': self.bt.count()})
+        return out
+
+    def refresh_schema_meta(self):
+        """结构变更后刷新派生元数据（主键位置 / CHECK 缓存 / 分区列下标）
+
+        `cols` 被换掉之后，`pk_idx` / `pk_col` / `pk_type` 可能指向错列
+        （DROP COLUMN 删掉了主键**前面**的列时下标会整体前移），
+        `_has_checks` 也要重算 —— 这些缓存不刷新就会出现"元数据说列 A
+        是主键、实际按列 B 做主键"这种最隐蔽的错位。
+        """
+        idx = next((i for i, c in enumerate(self.cols)
+                    if c.get('primary')), 0)
+        self.pk_idx = idx
+        self.pk_col = self.cols[idx]['name']
+        self.pk_type = self.cols[idx]['type']
+        self._refresh_check_flag()
+        names = [c['name'] for c in self.cols]
+        spec = getattr(self, '_partition_spec', None) or {}
+        col = spec.get('col')
+        self._partition_col_idx = names.index(col) if col in names else None
 
     def _col_idx(self, name: str) -> int:
         for i, c in enumerate(self.cols):

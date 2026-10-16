@@ -114,6 +114,48 @@ class Page:
         self.dirty = True
         return True
 
+    def update_row_shrink(self, slot_id: int, row_bytes: bytes) -> bool:
+        """原地写入**更短**的行，并把腾出来的尾部字节清零。
+
+        与 `update_row_inplace` 的唯一差别是"清零尾部"这一步。为什么必须
+        清（`ALTER TABLE ... DROP COLUMN` 用到）：槽位记录的只是长度，
+        旧字节仍留在页里的原偏移上 —— 只把长度改小的话，被删掉的列值
+        依旧能直接从 `.dat` 里读回来，那是"看起来删了、其实还在"。
+        清零之后，该列的数据在数据文件里**真的不存在**了。
+
+        返回 False 表示该槽位放不下（新行更长 / 槽位不存在），调用方需
+        改走搬迁路径 —— 与 `update_row_inplace` 的返回约定一致。
+        """
+        if slot_id >= self.n_slots:
+            return False
+        off, ln = struct.unpack_from('<HH', self.data, self._slot_off(slot_id))
+        if off == 0 or ln < len(row_bytes):
+            return False
+        self.data[off:off + len(row_bytes)] = row_bytes
+        if ln > len(row_bytes):
+            self.data[off + len(row_bytes):off + ln] = \
+                b'\x00' * (ln - len(row_bytes))
+        struct.pack_into('<HH', self.data, self._slot_off(slot_id),
+                         off, len(row_bytes))
+        self.dirty = True
+        return True
+
+    def zero_slot(self, slot_id: int) -> bool:
+        """把槽位里的行字节**清零**后撤销槽位（行被搬走 / 被彻底删除）
+
+        与 `delete_row` 的区别：`delete_row` 只把槽位的 offset/length 置零，
+        行数据原封不动留在页里（vacuum 之后才可能被覆盖）。DDL 的列删除
+        语义要求"数据不可再读到"，因此搬迁/丢弃一律走这里。
+        """
+        if slot_id >= self.n_slots:
+            return False
+        off, ln = struct.unpack_from('<HH', self.data, self._slot_off(slot_id))
+        if off and ln:
+            self.data[off:off + ln] = b'\x00' * ln
+        struct.pack_into('<HH', self.data, self._slot_off(slot_id), 0, 0)
+        self.dirty = True
+        return True
+
     def restore_row(self, slot_id: int, row_bytes: bytes) -> bool:
         """
         把 row_bytes 恢复到**指定槽位**（事务回滚 / 崩溃恢复 undo 用）。
