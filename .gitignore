@@ -72,3 +72,20 @@ Thumbs.db
 # ---------- 日志与诊断产物 ----------
 _*.log
 _*_test.log
+
+# ---------- 临时脚本 / 探测产物（防止再次被误提交）----------
+# 本会话曾误跟踪过 _diag_auth.py / _diag_scan.py / _smoke_db.py 等 scratch 文件；
+# 这些是排查用的临时物，不属于软件本体。
+_*.py
+_*.json
+_base*/
+_wt_*/
+.wt_*/
+_probe*
+_smoke*
+_diag*
+_gate*
+_repro*
+_sweep*
+_bench_*_pairs.json
+_acl_recovery/
