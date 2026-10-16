@@ -38,7 +38,10 @@
   它们只出现在设计文档与 `PERF_TARGETS` 常量里，**没有任何仓库内产物或
   断言支撑**。
 - **可复现的实测数字**（来源 [docs/review/01_engine.md](docs/review/01_engine.md)，
-  与 [docs/review/04_ROADMAP.md](docs/review/04_ROADMAP.md) 一致）：
+  与 [docs/review/04_ROADMAP.md](docs/review/04_ROADMAP.md) 一致）。
+  这些数字现在有**可复跑的门禁**：[benchmarks/README.md](benchmarks/README.md)
+  （`python -m benchmarks.run --suite quick --gate`，未达标退出码 1；
+  目标表、实测基线、白皮书对照与 CI 开关都在那一页）：
 
   | 项 | 实测 | 与文档声明的关系 |
   |---|---|---|
