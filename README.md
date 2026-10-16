@@ -11,6 +11,8 @@
 ## ⚠️ 当前实测状态（2026-10）
 
 > 本节是 2026-10 代码审计的**审计时**实测结论，**优先于下方所有功能与性能描述**。完整报告见 [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md)，死代码清单见 [docs/DEAD_CODE.md](docs/DEAD_CODE.md)。其中若干 P0 缺陷已在同一次会话中修复，见本节末尾「本次会话已修复」。
+>
+> **接线口径（阶段 2 第 6 项）**：`lightdb/olap/**`（向量化）、`lightdb/columnar/**`（列存）与 Cython 加速层是**实验性**实现，**未接入 SQL 执行路径**（`Executor` / `plan_executor` 零引用），因此**不计入任何性能声明**；全部实测数字与白皮书对照表见 [benchmarks/README.md](benchmarks/README.md)。
 
 - **服务端单进程模式**（`python -m lightdb.main --mode single`）可以监听端口并发出标准 MySQL v10 握手包（server version `5.7.30-LightDB`），但**认证校验存在缺陷，没有任何客户端能登录成功**：`lightdb/net/mysql_protocol.py:293` 的长度守卫排在空密码分支之前，`:304` 的比较少做一次 SHA1 —— 空密码与非空密码实测均被拒绝。
 - **建表必然失败**：`lightdb/storage/buffer_pool.py:15` 用 `open(path, 'r+b')` 打开尚不存在的 `.dat` 文件，抛 `FileNotFoundError`。
@@ -20,10 +22,20 @@
 - **Web 版可运行**（17 个 API 端点，JWT 校验有效），但存在硬编码签名密钥与默认口令等问题，详见审计报告。
 - **文档中的性能数字未经仓库自身工具验证**：仓库内没有任何基准产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录不存在；`tests/regression_v4/test_performance_v4.py:13-18` 中的 12000 / 80000 QPS 目标**从未被任何测试断言**。这些数字应视为设计目标，而非实测结果。
 
-### ⚠️ 性能声明状态说明（2026-10 阶段 0 收尾，**必读**）
+### ⚠️ 性能声明状态说明（2026-10 阶段 0 收尾 + 阶段 2 第 6 项「摘牌」，**必读**）
 
 > 本节覆盖 `README` / `docs/**` 里全部 OLAP / 列存 / 并行 / Cython 性能数字，
 > 逐条给出**当前真实状态**。原始文档**不删除**，其段落内保留原文以便对照。
+>
+> **统一口径（阶段 2 第 6 项，方案 A）**：OLAP（`lightdb/olap/**` 向量化）与
+> 列存（`lightdb/columnar/**`）是**实验性**实现，**未接入 SQL 路径**
+> （`Executor` / `plan_executor` 零引用），因此**不计入任何性能声明**；
+> 全部可复现实测数字与白皮书对照表在 [benchmarks/README.md](benchmarks/README.md)。
+> 本阶段已删掉生产代码里唯一一条「悄悄走到向量化引擎」的分派
+> （[`lightdb/parallel/executor.py`](lightdb/parallel/executor.py) 的
+> `_serial_group_by` 分解回退），并给保留的实验性入口加了显式状态检查点
+> （[`lightdb/olap/status.py`](lightdb/olap/status.py)）；锁测试见
+> [`tests/test_olap_not_wired.py`](tests/test_olap_not_wired.py)。
 
 - **未接入 SQL 执行路径**：`lightdb/olap/**`（向量化引擎）、`lightdb/columnar/**`
   （列存 `ColumnStore`）、`lightdb/parallel/**`（并行执行）在 `Executor` /
@@ -32,11 +44,12 @@
   回退包装，`status()['any_accelerated']` 为 `False`）。因此阶段 0 已修好的
   向量化聚合/过滤错值**仍未接线**——错值目前不会在生产查询路径上出现，
   但这只是"没接线"，不是"已修复"。
-- **以下数字是设计目标，不是实测**：`12,000 QPS`（单线程点查）、
+- **以下数字是设计目标，不是实测**（对应能力均为**实验性、未接入 SQL 路径、
+  不计入性能声明**）：`12,000 QPS`（单线程点查）、
   `92,000 QPS`（8 核）、`3.5M rows/s`（OLAP 扫描）、`85M rows/s`（大表聚合）、
   `41x`（列存加速比）、`12.5x`（Cython B+Tree）、`3.15x`（向量化过滤）——
   它们只出现在设计文档与 `PERF_TARGETS` 常量里，**没有任何仓库内产物或
-  断言支撑**。
+  断言支撑**；逐条对照见 [benchmarks/README.md](benchmarks/README.md)。
 - **可复现的实测数字**（来源 [docs/review/01_engine.md](docs/review/01_engine.md)，
   与 [docs/review/04_ROADMAP.md](docs/review/04_ROADMAP.md) 一致）。
   这些数字现在有**可复跑的门禁**：[benchmarks/README.md](benchmarks/README.md)

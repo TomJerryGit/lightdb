@@ -3,6 +3,21 @@
 - 分片级并行
 - 支持聚合/扫描/过滤/分组
 - 结果合并
+
+接线状态（阶段 2 第 6 项，方案 A「摘牌 + 显式化」）：
+
+* 本模块**不再引用 `lightdb.olap` / `lightdb.columnar`**。原
+  `_serial_group_by` 回退路径里有一句
+  `from ..olap.vectorized_engine import VectorizedScan, VectorizedGroupBy`，
+  于是「并行分组在 workers<=1 或全部分片失败时」会悄悄走到实验性的
+  向量化引擎上 —— 这是本项目禁止的**静默改道**。现在串行回退是
+  本模块自己的逐行实现（`_serial_group_by`），不依赖任何 olap/列存代码。
+* 分片接口（`row_count` + `scan_range`）由调用方提供的**只读列式视图**
+  满足：SQL 路径用的是 `lightdb/parallel/table_view.py::TableColumnView`
+  （行式 `Table` 的适配器，走 BTree 逐行解码），**不是**列存
+  `lightdb/columnar/ColumnStore`。
+* 因此 OLAP / 列存在 SQL 执行路径上依旧零引用，也不计入任何性能声明；
+  实测对照见 `benchmarks/README.md`。
 """
 import threading
 import time
@@ -11,6 +26,8 @@ from concurrent.futures import (
 from typing import Any, Callable, Dict, List, Optional
 
 from ..logger import logger
+from ..olap.status import (
+    ensure_not_requested_via_sql, WIRED_TO_SQL_PATH as _OLAP_WIRED_TO_SQL)
 from .fragment import (
     Fragment, FragmentResult, FragmentSplitter)
 from .adaptive import AdaptiveParallelism
@@ -40,7 +57,15 @@ def _required_columns(group_cols, aggs) -> List[str]:
 class ParallelExecutor:
     """
     并行执行器
+
+    `WIRED_TO_SQL_PATH`：本并行执行器接的是**调用方给的只读列式视图**，
+    与实验性的 `lightdb/olap/**` / `lightdb/columnar/**` 没有代码依赖
+    （见模块 docstring），因此 OLAP/列存层未接入 SQL 路径这一状态不受
+    本模块影响。
     """
+
+    #: OLAP / 列存层是否接入 SQL 路径（阶段 2 第 6 项摘牌依据，恒为 False）
+    WIRED_TO_SQL_PATH = False
 
     def __init__(self, max_workers: int = None):
         self.max_workers = max_workers or 8
@@ -192,8 +217,11 @@ class ParallelExecutor:
         for future in as_completed(futures):
             try:
                 partials.append(future.result())
-            except Exception:
-                pass
+            except Exception as e:
+                # 绝不静默：丢掉一个分片会让聚合**少算**，而调用方只会看到
+                # 一个看起来合法的数字。至少留下 ERROR 级日志（分片内部
+                # 自己捕获的异常由 `FragmentResult.error` 记，下面统一报）。
+                logger.error(f"并行聚合分片失败（该分片结果被丢弃）: {e}")
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -416,14 +444,88 @@ class ParallelExecutor:
         return result
 
     def _serial_group_by(self, column_store, group_cols, aggs):
-        """串行回退"""
-        from ..olap.vectorized_engine import (
-            VectorizedScan, VectorizedGroupBy)
-        scan = VectorizedScan(column_store, list(set(
-            group_cols + [a['column'] for a in aggs
-                            if a.get('column')])))
-        gb = VectorizedGroupBy(scan, group_cols, aggs)
-        return gb.execute()
+        """串行分组聚合（**不依赖 olap / 列存**）
+
+        改前（阶段 2 第 6 项之前）：
+
+            from ..olap.vectorized_engine import (
+                VectorizedScan, VectorizedGroupBy)
+            scan = VectorizedScan(column_store, list(set(
+                group_cols + [a['column'] for a in aggs
+                                if a.get('column')])))
+            gb = VectorizedGroupBy(scan, group_cols, aggs)
+            return gb.execute()
+
+        问题有两个，都属于「静默改道 / 静默错值」：
+
+        1. **静默改道**：`workers <= 1`（或全部并行分片失败）时，串行回退
+           悄悄把查询交给实验性的 `lightdb/olap` 向量化引擎 —— 这条路径
+           `Executor` / `plan_executor` 零引用、未接入 SQL 路径，却在这里
+           被真实调用；
+        2. **静默错值**：`VectorizedScan` 只取回被请求的列，`COUNT(*)` 的
+           `'*'` 不在其中，于是 `VectorizedGroupBy` 对非 * 聚合走
+           `isinstance(..., list)` 分支时拿到的是**单元素列表**
+           （`[v]` / `[total]`），与并行路径（`merge_group_bys`）返回的
+           标量形状不一致。
+
+        现在改为逐行实现：语义与 `_group_by_fragment` + `merge_group_bys`
+        完全一致（同样的 NULL 语义、同样的 `COUNT(*)` 计行、同样的
+        `[分组键..., 聚合值...]` 行形状），只是不分片、不换引擎。
+
+        最后再走一次状态检查点 `ensure_not_requested_via_sql`：如果哪天
+        有人把 OLAP/列存真接进 SQL 路径，这里会**显式报错**并指向
+        `benchmarks/README.md`，而不是让这条回退路径悄悄改变语义。
+        """
+        ensure_not_requested_via_sql('ParallelExecutor._serial_group_by')
+        # 状态一致性：本文件已不引用 olap/列存实现，若状态常量被改成
+        # 「已接线」，说明有人改了接线却没改这里 —— 显式失败，不静默。
+        assert _OLAP_WIRED_TO_SQL is False, (
+            'lightdb/olap/status.py 声称 OLAP 已接入 SQL 路径，但 '
+            'lightdb/parallel/executor.py 已不引用 olap/列存实现；'
+            '请同步两者（口径见 benchmarks/README.md）')
+
+        needed = _required_columns(group_cols, aggs)
+        data = column_store.scan(needed) if needed else {}
+        total = getattr(column_store, 'row_count', 0)
+
+        groups = {}
+        for i in range(total):
+            key = tuple(
+                data[col][i] if col in data and i < len(data[col]) else None
+                for col in group_cols
+            )
+            if key not in groups:
+                init = {}
+                for a in aggs:
+                    init[a['alias']] = 0 if a['func'] == 'COUNT' else None
+                groups[key] = init
+
+            for a in aggs:
+                col = a.get('column')
+                func = a['func']
+                alias = a['alias']
+                if func == 'COUNT' and (col is None or col == '*'):
+                    groups[key][alias] += 1
+                    continue
+                if col is None or col not in data or i >= len(data[col]):
+                    continue
+                v = data[col][i]
+                if v is None:
+                    continue
+                if func == 'COUNT':
+                    groups[key][alias] += 1
+                elif func == 'SUM':
+                    cur = groups[key][alias]
+                    groups[key][alias] = v if cur is None else cur + v
+                elif func == 'MIN':
+                    cur = groups[key][alias]
+                    groups[key][alias] = v if cur is None else min(cur, v)
+                elif func == 'MAX':
+                    cur = groups[key][alias]
+                    groups[key][alias] = v if cur is None else max(cur, v)
+
+        return [list(key) + [vals[a['alias']] for a in aggs]
+                for key, vals in groups.items()]
 
     # ==================== 统计 ====================
 

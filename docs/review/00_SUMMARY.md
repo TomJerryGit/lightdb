@@ -1,5 +1,10 @@
 # LightDB 全面评估总报告（引擎 / 图形客户端 / 配合度）
 
+> ⚠️ **接线口径（2026-10 阶段 2 第 6 项）**：本报告引用的 OLAP / 列存 / Cython
+> 性能数字（`3.5M / 85M rows/s`、`41x`、`12.5x` 等）对应的能力属**实验性、
+> 未接入 SQL 执行路径、不计入性能声明**；实测对照表见
+> [../../benchmarks/README.md](../../benchmarks/README.md)。
+
 评估日期：2026-10-13 · 方法：三路并行独立评估（引擎、GUI、配合度+Web），每份都标【实测】/【文档】/【推断】来源
 分报告：[01_engine.md](01_engine.md)（200 行）· [02_studio.md](02_studio.md)（116 行）· [03_integration_and_perf.md](03_integration_and_perf.md)（245 行）
 既有材料：[../AUDIT_REPORT.md](../AUDIT_REPORT.md) §1–§25 · [../FAILURE_TRIAGE.md](../FAILURE_TRIAGE.md) §4/§8/§9 · [../../README.md](../../README.md)

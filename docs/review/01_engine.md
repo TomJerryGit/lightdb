@@ -1,5 +1,9 @@
 # LightDB 引擎现状评估（功能 / 性能 / 可信度）
 
+> ⚠️ **接线口径（2026-10 阶段 2 第 6 项）**：本报告引用的 OLAP / 列存 / Cython
+> 性能数字对应的能力属**实验性、未接入 SQL 执行路径、不计入性能声明**；
+> 实测对照表见 [../../benchmarks/README.md](../../benchmarks/README.md)。
+
 **评估时间**：2026-10-14 · **对象**：`D:\lightdb_project` 的 `lightdb/` 引擎本体（不含 `lightdb_studio/`、`web/`）
 **方法**：静态阅读 + 隔离运行（本机实测） + 复用既有已验证文档。全程**未改动任何源码或测试**；临时脚本与临时数据目录已删除。
 **环境**：Windows 10/11 · Python 3.11.9 · numpy 1.26.4 · pymysql 2.2.8 · DSH 沙箱 workspace-write（禁工作区外写、禁多进程命名管道）

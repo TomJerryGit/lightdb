@@ -215,14 +215,14 @@ insert_rowwise_table_2000: 采用第 2 次尝试
 
 | 白皮书声明 | 出处（指针） | 实测 / 现状 | 结论 |
 |---|---|---|---|
-| 单线程点查 **12,000 QPS** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:62`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/V4_RELEASE_NOTES.md:29`](../docs/V4_RELEASE_NOTES.md) | **1,299–2,069 q/s**（2,000 行表，本包）/ 1,140 q/s（历史 5,000 行表） | **差 6–9 倍**；未实现，不作目标 |
-| 8 核 **92,000 QPS** | [`README.md:35-37`](../README.md)、[`docs/USER_GUIDE.md:101`](../docs/USER_GUIDE.md) | 进程内多线程**不扩展**：8 客户端总吞吐低于单客户端 | **未实现**；GIL + 表级锁 |
-| OLAP 扫描 **3.5M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:66`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 向量化/列存链路在 `Executor` / `plan_executor` 里**零引用**，本包查询路径实测是逐行量级（范围/聚合 ~5k–11k rows/s） | **没有落点**；未接入 |
-| 大表聚合 **85M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:719`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 同上；`lightdb/olap/**` 在 SQL 执行路径**零引用**，本包实测聚合是逐行量级（~5k–11k rows/s） | **没有落点**；未接入 |
-| 列存加速比 **41x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:87`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/ARCHITECTURE_v4.md:513`](../docs/ARCHITECTURE_v4.md) | `lightdb/columnar/**` 未接线 | **未实现**；无对照基线 |
-| Cython B+Tree **12.5x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:86`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/DEAD_CODE.md:10`](../docs/DEAD_CODE.md) | `lightdb/cython/` 编译产物 **0 个**，`status()['any_accelerated'] == False`（无回退实现） | **未编译、未验证**；未实现 |
+| 单线程点查 **12,000 QPS** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:68`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/V4_RELEASE_NOTES.md:42`](../docs/V4_RELEASE_NOTES.md) | **1,299–2,069 q/s**（2,000 行表，本包）/ 1,140 q/s（历史 5,000 行表） | **差 6–9 倍**；未实现，不作目标 |
+| 8 核 **92,000 QPS** | [`README.md:49`](../README.md)、[`docs/USER_GUIDE.md:106`](../docs/USER_GUIDE.md) | 进程内多线程**不扩展**：8 客户端总吞吐低于单客户端 | **未实现**；GIL + 表级锁 |
+| OLAP 扫描 **3.5M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:72`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 向量化/列存链路在 `Executor` / `plan_executor` 里**零引用**，本包查询路径实测是逐行量级（范围/聚合 ~5k–11k rows/s） | **没有落点**；未接入 |
+| 大表聚合 **85M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:768`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 同上；`lightdb/olap/**` 在 SQL 执行路径**零引用**，本包实测聚合是逐行量级（~5k–11k rows/s） | **没有落点**；未接入 |
+| 列存加速比 **41x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:93`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/ARCHITECTURE_v4.md:560`](../docs/ARCHITECTURE_v4.md) | `lightdb/columnar/**` 未接线 | **未实现**；无对照基线 |
+| Cython B+Tree **12.5x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:92`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/DEAD_CODE.md:11`](../docs/DEAD_CODE.md) | `lightdb/cython/` 编译产物 **0 个**，`status()['any_accelerated'] == False`（无回退实现） | **未编译、未验证**；未实现 |
 | 逐行 INSERT 的"批量更快"印象 | 历史脚本报告口径 | **顺序对照下批量并不更快**（实测 0.91–1.05x）；**同窗成对**下才是 1.44–1.72x | 用比值，不用顺序对照 |
-| 并发"1→4→8 提升" | 阶段 0 摘要 | 1,163 → 925 → **749 q/s（−36%）**（[`README.md:49`](../README.md)） | **回退而非扩展**；如实报告 |
+| 并发"1→4→8 提升" | 阶段 0 摘要 | 1,163 → 925 → **749 q/s（−36%）**（[`README.md:65`](../README.md)） | **回退而非扩展**；如实报告 |
 
 **权威指针**（本包不复制其结论，只指路）：
 
@@ -230,10 +230,11 @@ insert_rowwise_table_2000: 采用第 2 次尝试
   （含"12000 QPS 从未被任何测试断言"的定位）。
 * [`docs/review/00_SUMMARY.md`](../docs/review/00_SUMMARY.md)、
   [`docs/review/01_engine.md`](../docs/review/01_engine.md) —— 实测数字与判读。
-* [`docs/review/04_ROADMAP.md:50`](../docs/review/04_ROADMAP.md) —— "先定可辩护
+* [`docs/review/04_ROADMAP.md:56`](../docs/review/04_ROADMAP.md) —— "先定可辩护
   的目标并写进基准门禁"这条要求的原始出处。
 * [`docs/DEAD_CODE.md`](../docs/DEAD_CODE.md) —— 未接线链路清单。
-* [`README.md:23-63`](../README.md) —— 阶段 0 加的"性能声明状态说明"。
+* [`README.md:23-70`](../README.md) —— 阶段 0 加的"性能声明状态说明"
+  （阶段 2 第 6 项补充了「实验性 / 未接入 SQL 路径 / 不计入性能声明」的统一口径）。
 
 ---
 

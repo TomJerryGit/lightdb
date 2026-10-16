@@ -1,5 +1,11 @@
 # LightDB 优化路线图（基于 2026-10-13 全面评估）
 
+> ⚠️ **接线口径（2026-10 阶段 2 第 6 项）**：本文引用的白皮书数字
+> （12,000 QPS、3.5M rows/s、41x、12.5x）**未接入 SQL 执行路径、不计入
+> 性能声明**；第 2.6 项「OLAP 决策点」已按**方案 A（摘牌 + 显式化）**执行：
+> 删掉生产代码里唯一的分派、实验性入口显式报错/留痕、文档统一口径，
+> 实测对照表见 [../../benchmarks/README.md](../../benchmarks/README.md)。
+
 依据：[00_SUMMARY.md](00_SUMMARY.md)、[01_engine.md](01_engine.md)、[02_studio.md](02_studio.md)、[03_integration_and_perf.md](03_integration_and_perf.md)、[../FAILURE_TRIAGE.md](../FAILURE_TRIAGE.md) §9
 
 ## 0. 指导原则（本会话验证有效的三条）

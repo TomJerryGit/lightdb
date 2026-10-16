@@ -1,5 +1,10 @@
 # LightDB 用户指南
 
+> ⚠️ **状态说明（2026-10 阶段 2 第 6 项）**：本文提到的 OLAP / 列存 / Cython /
+> 并行性能数字（`12,000 / 92,000 QPS`、`3.5M / 85M rows/s`、`41x`、`12.5x`）
+> 属**实验性、未接入 SQL 执行路径、不计入性能声明**；可复现实测与白皮书对照表见
+> [benchmarks/README.md](../benchmarks/README.md)。
+
 **适用版本**：v3.0 / v4.0
 **更新日期**：2025-08-01
 
@@ -107,6 +112,11 @@ LightDB 兼容 MySQL Wire Protocol v10，可直接用任意 MySQL 客户端连�
 > 批量 INSERT **1,356 rows/s**、点查 **888 q/s** 进程内 / **1,138 q/s** TCP、
 > 并发 1→8 客户端 **−36%**、WAL **≈200 B/行**、10 轮 UPDATE 后 `.dat`
 > **669 KB→16 MB**。
+>
+> 🔻 **阶段 2 第 6 项补充**：下表 `OLAP 扫描 3.5M rows/s`、`列式存储`、
+> `HTAP 混合表` 三行对应的能力均为**实验性、未接入 SQL 路径、不计入性能
+> 声明**（`CREATE TABLE` 只会建行式 `Table`）。对照见
+> [benchmarks/README.md](../benchmarks/README.md)。
 
 | 维度 | v3.0 | v4.0 |
 |------|:----:|:----:|

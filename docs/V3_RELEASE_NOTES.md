@@ -1,5 +1,9 @@
 # LightDB v3.0.0 发布说明
 
+> ⚠️ **接线口径（2026-10 阶段 2 第 6 项）**：本文提到的 `3.15x`（向量化过滤）、
+> 列存 / OLAP 与 Cython 加速层属**实验性、未接入 SQL 执行路径、不计入性能
+> 声明**；实测对照表见 [../benchmarks/README.md](../benchmarks/README.md)。
+
 **发布日期**：2025-02-01
 **版本代号**：Production Ready
 **对标目标**：MySQL 5.7（兼容度 92%）

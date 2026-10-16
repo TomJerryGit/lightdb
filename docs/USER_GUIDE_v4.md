@@ -2,6 +2,11 @@
 
 # LightDB v4.0 用户指南
 
+> ⚠️ **状态说明（2026-10 阶段 2 第 6 项）**：本文提到的 OLAP / 列存 / Cython
+> 性能数字（`3.5M / 85M rows/s`、`41x`、`12.5x`、`92,000 QPS` 等）对应的能力
+> 属**实验性、未接入 SQL 执行路径、不计入性能声明**；可复现实测与白皮书对照表见
+> [benchmarks/README.md](../benchmarks/README.md)。
+
 **版本**：4.0.0
 **更新日期**：2025-08-01
 **适用对象**：应用开发者、数据分析师、SQL 使用者
@@ -195,6 +200,11 @@ Go（database/sql）：
 >   WAL **≈200 B/行**、10 轮 UPDATE 后 `.dat` **669 KB→16 MB**。
 > - 多进程的收益是**连接/协议层多核化 + 崩溃隔离**，不是查询执行加速；
 >   "8 核 8,200→92,000 QPS" 与它无关。
+>
+> 🔻 **阶段 2 第 6 项补充**：OLAP / 列存层已登记为「**实验性、未接入 SQL
+> 路径、不计入性能声明**」（`lightdb/olap/status.py`）；生产代码里唯一一条会
+> 悄悄走到向量化引擎的分派（`lightdb/parallel/executor.py::_serial_group_by`）
+> 已删除。实测对照见 [benchmarks/README.md](../benchmarks/README.md)。
 
 ### 4.1 多进程架构（对用户透明）
 

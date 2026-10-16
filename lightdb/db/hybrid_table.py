@@ -3,6 +3,21 @@ HTAP 混合表
 - 行存：OLTP 事务
 - 列存：OLAP 分析
 - 双写，自动同步
+
+接线状态（阶段 2 第 6 项，方案 A「摘牌 + 显式化」）——**必读**：
+
+* 本模块是**实验性**的「行存 + 列存」混合表原型，`lightdb/olap/**`（向量化）
+  与 `lightdb/columnar/**`（列存 `ColumnStore`）只在这里被直接构造 ——
+  也就是说整个 OLAP / 列存层的**唯一 import 落点**就是本模块，而本模块
+  在 SQL 执行路径（`Executor` / `plan_executor`）上**零引用**：SQL 的
+  `CREATE TABLE` 只创建行式 `lightdb/db/table.py::Table`
+  （见 `docs/DEAD_CODE.md` 把本模块判为不可达）。
+* 因此 `olap_scan()` / `olap_aggregate()` **未接入 SQL 路径**、
+  **不计入任何性能声明**（白皮书的 3.5M / 85M rows/s、列存 41x 与本模块
+  无关；可复现实测见 `benchmarks/README.md`）。
+* 本模块**保留**（删包会打破 `tests/test_vectorized_correctness.py` 一类
+  既有测试），但两个对外分析入口在被触达时会走
+  `lightdb/olap/status.py` 的显式报错检查点，绝不静默返回结果。
 """
 import threading
 import time
@@ -12,14 +27,57 @@ from typing import Any, Dict, List, Optional
 from ..storage.btree import BTree
 from ..storage.buffer_pool import BufferPool
 from ..storage.row_format import BinaryRowFormat
+from ..logger import logger
 from ..columnar.column_store import ColumnStore
 from ..olap.olap_optimizer import OLAPOptimizer
+from ..olap.status import (
+    ensure_not_requested_via_sql, raise_experimental_unwired,
+    STATUS_LABEL, WIRED_TO_SQL_PATH, BENCH_REFERENCE)
+
+
+def _entrypoint_status(what: str, hint: str = '') -> None:
+    """对外分析入口的统一状态检查。
+
+    * 正常情况下（`WIRED_TO_SQL_PATH is False`）：**显式报错**，报文含
+      「实验性 / 未接入 SQL 路径 / 不计入性能声明」，让调用方无法把
+      「走通了但没接线」误读成「已支持」；
+    * 若哪天有人真把它接进 SQL 路径（常量被改成 True），这里改为放行，
+      但 `ensure_not_requested_via_sql` 会先要求同步文档与基准口径。
+    """
+    ensure_not_requested_via_sql(what, hint=hint)
+    if not WIRED_TO_SQL_PATH:
+        raise_experimental_unwired(
+            f'HybridTable.{what}', hint=hint or f'（状态：{STATUS_LABEL}）')
+
+
+def _entrypoint_notice(what: str) -> None:
+    """已**有既有测试调用**的实验性入口：不抛异常，但每次都显式留痕。
+
+    `HybridTable.olap_aggregate` 是唯一这种情况 ——
+    `tests/test_v4_batch4.py::test_hybrid_table` 直接调它（既有断言不得
+    改动）。因此这里按「显式化」的另一半处理：**每次调用都打一条带状态
+    标签的告警日志**，让「走通了但未接线」不可能被当成「已支持」；
+    真正接入 SQL 路径之前，它依旧不计入性能声明。
+    """
+    if not WIRED_TO_SQL_PATH:
+        logger.warn(
+            f'HybridTable.{what} 被调用：实验性接口，未接入 SQL 路径，'
+            f'不计入性能声明（实测对照见 {BENCH_REFERENCE}）。'
+            f'请勿在生产查询路径使用。')
 
 
 class HybridTable:
     """
     混合表：行存 + 列存
+
+    **实验性**：`olap_scan` / `olap_aggregate` 未接入 SQL 路径，不计入性能
+    声明；`olap_scan` 触达即**显式报错**，`olap_aggregate` 有既有测试调用
+    故改为**每次调用显式留痕**（告警日志），两者都不静默（口径见
+    `lightdb/olap/status.py` 与 `benchmarks/README.md`）。
     """
+
+    #: OLAP / 列存层是否接入 SQL 路径（恒为 False，见 `lightdb/olap/status.py`）
+    WIRED_TO_SQL_PATH = WIRED_TO_SQL_PATH
 
     def __init__(self, name: str, cols: List[dict],
                  data_dir: str):
@@ -101,17 +159,28 @@ class HybridTable:
         self.column_store.append_rows(rows)
         self._last_sync = time.time()
 
-    # ==================== 查询（OLAP）====================
+    # ==================== 查询（OLAP，实验性）====================
 
     def olap_scan(self, columns: List[str] = None) -> Dict[str, List]:
-        """列扫描"""
+        """列扫描（**实验性：未接入 SQL 路径，触达即显式报错**）"""
+        _entrypoint_status(
+            'olap_scan',
+            hint='SQL 路径请用普通 SELECT（行存 lightdb/db/table.py::Table）；'
+                 '该接口既不参与性能声明，也不保证 SQL 语义兼容。')
         # 先同步待处理的行
         self.sync_now()
         return self.column_store.scan(columns)
 
     def olap_aggregate(self, query: Dict) -> List:
         """
-        执行分析查询
+        执行分析查询（**实验性：未接入 SQL 路径，每次调用显式留痕**）
+
+        为什么不直接抛异常：`tests/test_v4_batch4.py::test_hybrid_table`
+        直接调用本方法（既有断言不得改动），因此这里采取「显式留痕 +
+        状态常量」而不是抛错；抛错的入口是 `olap_scan`（无既有调用方）。
+        两者都在 `lightdb/olap/status.py` 登记为未接线；本方法**不**计入
+        任何性能声明。
+
         query: {
             'columns': [...],
             'where': {...},
@@ -119,6 +188,7 @@ class HybridTable:
             'aggregations': [...]
         }
         """
+        _entrypoint_notice('olap_aggregate')
         self.sync_now()
 
         # 优化器生成计划

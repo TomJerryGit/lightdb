@@ -83,6 +83,13 @@ class ResourceGroupManager:
     """资源组管理器"""
 
     # 预定义组
+    #
+    # 注意（阶段 2 第 6 项）：这里的组名 `'olap'` 只是**准入控制的名字**
+    # （并发上限 / 优先级 / worker 上限），与本仓库实验性的
+    # `lightdb/olap/**`（向量化）或 `lightdb/columnar/**`（列存）**没有
+    # 任何代码关系** —— 提交到 'olap' 组的任务要么是普通 SQL，要么是
+    # 调用方自己的函数，不会因此改走列存/向量化路径（`Executor` /
+    # `plan_executor` 对两者零引用，见 `benchmarks/README.md`）。
     DEFAULT_GROUPS = {
         'system': ResourceLimits(
             max_workers=16, max_memory_mb=2048,
