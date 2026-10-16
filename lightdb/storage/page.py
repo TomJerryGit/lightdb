@@ -161,6 +161,14 @@ class Page:
         只有槽位里的行偏移被改写；所有读路径都通过槽位取行
         （`get_row`），不存在缓存偏移的调用方。
         返回值 = 本次紧凑化后新增的可复用字节数（>= 0）。
+
+        ★ 阶段 2 第 3 项补充: 一页**一行不剩**时额外把槽位数组也清空
+        （`n_slots = 0`），页回到"全新页"状态。理由: 页级回收要把高
+        页号的活行搬到这种空页里，而 `insert_row` 是从 `n_slots` 往后
+        追加槽位的 —— 不重置的话，一个曾有 107 个槽位的空页再插入
+        100 行会占掉 207 个槽位（828 字节），可容纳的行数明显变少。
+        这一步是安全的: 没有任何存活行，就不存在指向本页槽位的
+        **活**引用（历史 prev 指针由调用方在搬页时一并改写）。
         """
         before = self.free_space()
         n = self.n_slots
@@ -171,6 +179,13 @@ class Page:
             if off == 0 or ln == 0:
                 continue
             live.append((i, bytes(self.data[off:off + ln])))
+
+        if not live:
+            # 空页: 重置槽位数组与行游标（见 docstring 的说明）
+            self._set_n_slots(0)
+            self._set_next_row_ptr(PAGE_SIZE)
+            self.dirty = True
+            return self.free_space() - before
 
         cursor = PAGE_SIZE
         for i, rb in live:

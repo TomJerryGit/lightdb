@@ -27,19 +27,53 @@ INTERNAL_CAPACITY = (4096 - PAGE_HEADER_SIZE - INTERNAL_HEADER) // INTERNAL_ENTR
 
 class BTree:
 
-    def __init__(self, bp, root_page_id=None):
+    def __init__(self, bp, root_page_id=None, page_limit=None):
         self.bp = bp
         self._count = None       # None = 未初始化；懒加载
+        #: 页级回收专用: 新树只准落在 `(lo, hi)` 这段**已有页号**里，
+        #: 使重建不追加到文件末尾（见 `BufferPool.new_page(limit=...)`）。
+        #: None = 普通分配（追加到文件尾）。
+        self._alloc_lo = 1
+        self._alloc_next = 1
+        if page_limit is not None:
+            lo, hi = page_limit
+            self._alloc_lo = max(1, lo)
+            self._alloc_next = max(1, lo)
+            self.page_limit = hi
+        else:
+            self.page_limit = None
 
         if root_page_id is None:
-            root = bp.new_page(PAGE_TYPE_BTREE_LEAF)
+            root = self._alloc_page(PAGE_TYPE_BTREE_LEAF)
             self._init_leaf(root)
             self.root_page_id = root.page_id
             self._count = 0
         else:
             self.root_page_id = root_page_id
 
-    # ==================== 叶子节点操作 ====================
+    def _alloc_page(self, page_type):
+        """
+        取一个新页；`page_limit` 生效时只在已有页号的空洞里取。
+
+        找不到空洞（页号都被占）时退回追加分配 —— 正确性优先于空间收益。
+        """
+        if self.page_limit is None:
+            return self.bp.new_page(page_type)
+        while self._alloc_next < self.page_limit:
+            pid = self._alloc_next
+            self._alloc_next += 1
+            blob = self.bp.read_page_bytes(pid)
+            if blob is not None and blob[:4] == b'LDBP':
+                continue                  # 已有内容
+            page = self.bp.new_page(page_type, exact=pid)
+            if page is not None:
+                return page
+        return self.bp.new_page(page_type)
+
+    def _new_tree_page(self, page_type):
+        """树结构页分配（走 `_alloc_page`，受 `page_limit` 约束）"""
+        return self._alloc_page(page_type)
+
 
     def _init_leaf(self, page):
         base = PAGE_HEADER_SIZE
@@ -201,7 +235,7 @@ class BTree:
 
         if split:
             mid_key, new_right_pid = split
-            new_root = self.bp.new_page(PAGE_TYPE_BTREE_INTERNAL)
+            new_root = self._alloc_page(PAGE_TYPE_BTREE_INTERNAL)
             self._init_internal(new_root)
             self._internal_set_first(new_root, self.root_page_id)
             self._internal_set_entry(new_root, 0, mid_key, new_right_pid)
@@ -283,7 +317,7 @@ class BTree:
             self._leaf_set_entry(leaf, i, *entries[i])
         self._leaf_set_n(leaf, mid)
 
-        new_leaf = self.bp.new_page(PAGE_TYPE_BTREE_LEAF)
+        new_leaf = self._alloc_page(PAGE_TYPE_BTREE_LEAF)
         self._init_leaf(new_leaf)
         for i in range(mid, len(entries)):
             self._leaf_set_entry(new_leaf, i - mid, *entries[i])
@@ -325,7 +359,7 @@ class BTree:
         self._internal_set_n(node, mid)
         node.dirty = True
 
-        new_node = self.bp.new_page(PAGE_TYPE_BTREE_INTERNAL)
+        new_node = self._alloc_page(PAGE_TYPE_BTREE_INTERNAL)
         self._init_internal(new_node)
         self._internal_set_first(new_node, children[mid + 1])
         for i in range(mid + 1, total):
@@ -427,3 +461,40 @@ class BTree:
                 return h
             h += 1
             pid = self._internal_first(page)
+
+    # ==================== 页级回收（vacuum）辅助 ====================
+
+    def live_pages(self) -> set:
+        """
+        从根**可达**的 B+Tree 页集合（内部节点 + 叶子）。
+
+        用途: `vacuum` 的页级回收要判断"哪些页还能不能截断"。
+        B+Tree 页是 `.dat` 里跟堆页混排的，回收器必须能区分：
+        * 可达的树页 —— 绝不能丢；
+        * 树的**孤儿页**（分裂后父指针被改掉的旧页、或崩溃残页）
+          —— 无人可达，是回收候选。
+
+        与 `height()` 同样是"按 first 子指针下降"的同一套指针，
+        只多做一层集合登记。根不可读（None）时返回空集 —— 调用方
+        必须把空集当成"不可信"，退回不截断。
+        """
+        out = set()
+        root = self.bp.get_page(self.root_page_id)
+        if root is None:
+            return out
+        stack = [self.root_page_id]
+        while stack:
+            pid = stack.pop()
+            if pid in out:
+                continue
+            page = self.bp.get_page(pid)
+            if page is None:
+                continue
+            out.add(pid)
+            if page.page_type == PAGE_TYPE_BTREE_LEAF:
+                continue
+            n = self._internal_n(page)
+            stack.append(self._internal_first(page))
+            for i in range(n):
+                stack.append(self._internal_entry(page, i)[1])
+        return out

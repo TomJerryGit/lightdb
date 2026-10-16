@@ -240,7 +240,7 @@ class Parser:
                 'AUDIT_LOG',
                 limit=int(am.group(1)) if am.group(1) else None)
 
-        # ---- 表检查 / 优化（可带多个表，MySQL 语法） ----
+        # ---- 表检查 / 优化 / 页级回收（可带多个表，MySQL 语法） ----
         for kw, tag in (('CHECK', 'CHECK_TABLE'),
                         ('OPTIMIZE', 'OPTIMIZE_TABLE')):
             tm = re.match(
@@ -259,6 +259,24 @@ class Parser:
                 if not names:
                     raise SyntaxError(f"{kw} TABLE 缺少表名: {sql}")
                 return self._show_result(tag, tables=names)
+
+        # ---- 页级回收（VACUUM / VACUUM TABLE t1[, t2]）----
+        #
+        # 为什么单独给一条语句而不是复用 `OPTIMIZE TABLE`: OPTIMIZE 的
+        # 语义（MySQL）是"整理碎片 + 刷新统计"，而本引擎的页级回收会
+        # **真的截断数据文件**、重建索引 —— 这类破坏性/耗时操作需要一个
+        # 显式入口，让调用方明确知道"我要回收磁盘空间"。
+        # 表名可省略（= 全库所有表）；一次可给多张表。
+        vm = re.match(
+            r'VACUUM(?:\s+(?:TABLE|TABLES))?\s*(.*)$',
+            sql, re.IGNORECASE | re.DOTALL)
+        if vm:
+            rest = (vm.group(1) or '').strip()
+            names = [t.strip().strip('`"')
+                     for t in self._split_top_level(rest) if t.strip()]
+            names = [n for n in names
+                     if n.upper() not in ('FULL', 'ANALYZE', 'VERBOSE')]
+            return self._show_result('VACUUM', tables=names or None)
 
         # ---- 分区 ----
         pm = re.match(r'SHOW\s+PARTITIONS\s+FROM\s+[`"]?(\w+)[`"]?\s*$',

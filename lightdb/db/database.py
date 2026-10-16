@@ -349,7 +349,7 @@ class Database:
             raise ValueError(f"表 {name} 不存在")
         tbl = self.tables.pop(name)
         tbl.close()
-        for suffix in ('.dat', '.btroot', '.wal'):
+        for suffix in ('.dat', '.btroot', '.wal', '.free'):
             p = self.data_dir / f"{name}{suffix}"
             if p.exists():
                 p.unlink()
@@ -518,24 +518,42 @@ class Database:
 
     def vacuum(self, horizon: int = None) -> int:
         """
-        版本回收入口：删除"对所有活跃快照都不可见"的旧版本/墓碑。
+        版本回收入口：删除"对所有活跃快照都不可见"的旧版本/墓碑，
+        ★ 并做**页级回收**（阶段 2 第 3 项）：截断 `.dat` 尾部完全空置的页、
+        把剩余空闲页登记到**持久化**的 `<name>.free`（重启后仍复用）。
 
-        horizon 取**最小的活跃事务号**（mvcc.oldest_active_txn()）：
-        任何活跃读视图的 max_id 都 > 它，所以 xmax <= horizon 的
-        被淘汰版本对它们恒不可见；horizon = None 时没有活跃事务，
-        oldest_active_txn() 返回下一个待分配的事务号，安全。
+        horizon 取"所有表的活跃快照边界"的下界
+        （`Table.vacuum_horizon()`：最小活跃事务号 ∩ 各活跃读视图 max_id）：
+        对任何活跃读视图都成立的判据只有"xmax 严格小于它的 max_id"，
+        所以这里把**跨表**的最小值传下去 —— 单表各自算的话，
+        后面那张表的 vacuum 会把还在被前面表快照依赖的版本判成可回收。
 
         注意: 只回收已提交淘汰的版本；未提交事务写的版本 xmax 是
-        活跃事务号（> horizon），不会被误删。返回回收的版本数。
+        活跃事务号（>= horizon），不会被误删（判定是严格小于）。
+        返回回收的版本数。页级统计见 `vacuum_stats()`。
 
-        ★ autocommit 的墓碑（xmax 是合成高位号）按"隐式提交"单独放行，
-        否则 autocommit 的 UPDATE/DELETE 旧版本一个也回收不掉
-        （合成号远大于 horizon，旧判定 `xmax <= horizon` 恒假）。
-        回收后相关页做页内紧凑化，空洞变成可复用的连续空闲区
-        （字节数见 tbl.last_vacuum_freed_bytes）。数据文件本身不变小。
+        ★ autocommit 的墓碑（xmax 是合成高位号）不受 `horizon` 约束
+        （合成号与真实事务号不可比），但**同样**必须过一个不可被调用方
+        覆盖的"活跃读视图还看得见吗"的上界 —— 否则 `max_id <= xmax` 的
+        老快照会从"读到被删的旧值"变成"行不存在"（实测: 插 200 行 →
+        老快照 → autocommit 全删 → vacuum → 老快照读到 0/200）。
+        详见 `Table.vacuum` 的判定、`Table._vacuum_bounds()` 与
+        `Table._min_active_view_max_id()`。
+
+        ★★ 阶段 2.3 第①步: 页级回收只保留**确定性收益**
+        （版本回收 + 槽位置零 + 尾部纯空段截断 + 空闲页持久化）；
+        `ENABLE_PAGE_RELOCATION` / `ENABLE_BTREE_REBUILD` 仍为 False，
+        本步**不宣称** `.dat` 缩小（`compacted_bytes` 不是 `bytes_freed`）。
         """
         if horizon is None:
             horizon = self.mvcc.oldest_active_txn()
+            for tbl in self.tables.values():
+                try:
+                    h = tbl._vacuum_horizon()
+                    if h < horizon:
+                        horizon = h
+                except Exception:
+                    pass
         total = 0
         for tbl in self.tables.values():
             try:
@@ -543,6 +561,16 @@ class Database:
             except Exception as e:
                 logger.warn(f"vacuum {tbl.name} 失败: {e}")
         return total
+
+    def vacuum_stats(self) -> dict:
+        """所有表最近一次 vacuum 的页级统计汇总（供 `VACUUM` 结果集/巡检）"""
+        out = {}
+        for name, tbl in self.tables.items():
+            try:
+                out[name] = tbl.vacuum_stats()
+            except Exception:
+                out[name] = {}
+        return out
 
     # ==================== checkpoint（WAL 轮转）====================
 

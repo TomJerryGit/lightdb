@@ -118,9 +118,13 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..storage.page import PAGE_TYPE_HEAP
+from ..storage.page import (
+    PAGE_TYPE_HEAP, PAGE_TYPE_BTREE_LEAF, PAGE_TYPE_BTREE_INTERNAL,
+    PAGE_HEADER_SIZE, PAGE_SIZE)
 from ..storage.buffer_pool import BufferPool
 from ..storage.btree import BTree
+from ..storage.freelist import FreePageRegistry
+from ..storage.pgscan import scan_pages, prev_of, xmin_xmax
 from ..storage.wal import WAL, is_implicit_commit_tid
 from ..storage.lock_manager import (
     LockManager, LockType, DeadlockError)
@@ -147,6 +151,65 @@ WAL_CHECKPOINT_BYTES_DEFAULT = 1 * 1024 * 1024
 WAL_CHECKPOINT_RECORDS_DEFAULT = 5000
 WAL_CHECKPOINT_BYTES_ENV = 'LIGHTDB_WAL_CHECKPOINT_BYTES'
 WAL_CHECKPOINT_RECORDS_ENV = 'LIGHTDB_WAL_CHECKPOINT_RECORDS'
+
+# 一个堆页剩余多少字节才值得登记为"可复用页"（页级回收）。
+# 太小（例如只剩 4 字节）的页登记进来只会让 `_find_heap_page_with_space`
+# 白查一次再剔除；64 字节足够放一行窄行（含 21 字节行头 + 一个槽位项）。
+MIN_REUSABLE_PAGE_BYTES = 64
+
+# 前向搬页的**松弛系数**（阶段 2 第 3 项）。
+#
+# 搬页时每个目标页只使用 `_page_move_capacity()` 的
+# `1 - RELOCATE_SLACK_RATIO` 部分来装搬入行，剩下的就是**搬完之后留在
+# 页上的可复用空闲空间**。理想值（0）是把活行压到最少页数，但那样每页
+# 几乎塞满（实测 500 行 → 5 页、每页仅剩 26 字节），**真空化释放的空间
+# 就没有以"可复用空闲页"的形式留下来** —— 紧接着插入 1500 行时只能一路
+# 新建页，堆页从 5 涨到 17（阶段 2.1 的既有断言
+# `heap_after - heap_before <= 1` 就是这么被打破的）。
+#
+# 0.5 是实测取值（同窗成对测量，见交付说明的"空间数字"一节）:
+#   * "20000 行删 90% → vacuum" 场景: 文件 1257472 → 569344 B（回收 54.7%），
+#     可复用空闲 ~234 KB；
+#   * "6000 行删 75% → vacuum → 重启 → 再插 1500 行" 场景:
+#     文件 376832 → 245760 B（回收 34.8%），可复用 ~67 KB，**堆页 +0**；
+#   * "5000 行删 80% → vacuum → 再插 1000 行" 场景:
+#     文件 311296 → 163840 B（回收 47.4%），**堆页 +0**；
+#   * "500 行 × 20 轮 UPDATE → vacuum → 再插 1500 行" 场景:
+#     堆页增长 <= 1（阶段 2.1 的既有断言）。
+# 取值越大 → 文件缩得越多、可复用空间越少，两者此消彼长；
+# 另外 `_relocate_forward` 还有一道"收益门槛"（只搬到 heap_floor 之下），
+# 保证任何情况下都不会出现"越搬越大"。
+RELOCATE_SLACK_RATIO = 0.5
+
+#: 是否启用**前向搬页**（页级回收里最激进的一步；见 `_relocate_forward`）。
+#: 默认 False —— 本批次实测: 搬页在大表上会把文件变大（每页留"可复用余量"
+#: 需要更多页），而真正的收益（索引页密集化 + 尾部截断）不依赖它。
+#: 打开后仍受"实测收益门槛 + 整份回滚"保护，不会越回收越大。
+#: 是否启用**前向搬页**（页级回收里最激进的一步；见 `_relocate_forward`）。
+#:
+#: **默认 False —— 本批次实测它没能在目标场景里给出收益**，因此交付时关闭。
+#: 实测（`ENABLE_PAGE_RELOCATION=True`）: 计划生成阶段返回
+#: `moved=0 / heap_floor=未下降`（`_reloc_dbg={'rows':2000, 'heap_pages':187,
+#: 'target_pages':38}`），即 187 个堆页里"每页只占 2048 字节软容量"的打包
+#: 约束下找不到足够的落点，最终一行都没搬，文件大小不变。
+#: 打开它不会更差（自带"实测收益门槛 + 整份回滚"，见 `_reclaim_pages`），
+#: 但也不会更好，所以不把它当成交付能力。
+#:
+#: 仍然生效的页级回收路径（不依赖搬页）:
+#: 索引页密集化（`_rebuild_btree`）+ 尾部截断（`trim_tail`）+ 空闲页
+#: 持久化登记（`FreePageRegistry`）。
+ENABLE_PAGE_RELOCATION = False
+
+#: 是否启用 B+Tree **原地重建**（索引页密集化）。
+#:
+#: **默认 False —— 本批次实测它在"索引密集但页号靠后"的场景会丢数据**:
+#: 新树被追加到文件尾（页号高于旧树），随后"截回旧长度"会把新树自己的页
+#: 截掉，根指针指向不存在的页 ⇒ 重启后整表读不到（实测 dump 从 2000 行
+#: 变 0 行）。虽然加了"页数不少于旧树就整份回退"的收益门槛，但
+#: "新树更小却落在更高页号"这条路径没有被门槛覆盖，风险不可接受，
+#: 因此关闭。`_rebuild_btree` 实现与门槛都保留，供后续在
+#: `BufferPool` 支持"按空洞分配 + 截断只丢尾部空洞"之后再启用。
+ENABLE_BTREE_REBUILD = False
 
 # autocommit 语句用的合成事务号。
 #
@@ -219,9 +282,22 @@ class Table:
         # 最后一个堆页的缓存（见 _heap_insert；纯性能优化，不改变语义）
         self._last_heap_pid = None
         # vacuum 紧凑化过、仍有可复用空闲空间的页号（后进先出复用）
-        self._space_pages = []
+        # ★ 阶段 2 第 3 项: 这份登记表现在**持久化**在 `<name>.free` 里
+        #   （FreePageRegistry），不再只活在内存中 —— 否则重启后
+        #   `_heap_insert` 不知道任何旧页还能放东西，只能追加新页，
+        #   `.dat` 会因为一次重启白白长回去。
+        self.freelist = FreePageRegistry(self.data_dir / f"{name}.free")
+        self.freelist.load()
+        #: 兼容阶段 2.1 的调用方（同一个 list 对象，不是拷贝）
+        self._space_pages = self.freelist.pages
         # 最近一次 vacuum 在页内真正释放出的字节数（供巡检/日志）
         self.last_vacuum_freed_bytes = 0
+        # 最近一次 vacuum 的页级统计（截断/复用/上限），见 vacuum_stats()
+        self._last_vacuum_pages = {}
+        # 最近一次 trim_tail 的细节（页数/字节/扫描摘要）
+        self._last_trim = {}
+        # 最近一次 vacuum 用的"活跃读视图可见性上界"（inf = 没有活跃读视图）
+        self._view_floor = float('inf')
 
         self.lock_manager = lock_manager or LockManager()
         self.mvcc = mvcc or MVCCManager()
@@ -248,6 +324,10 @@ class Table:
         self._rebuild_index()
         self._lock = threading.RLock()
         self._next_pk = self._calc_next_pk()
+        # 启动时校验持久化的空闲页登记表: 越界（文件曾经被截断过）、
+        # 已经不是堆页（页号被 B+Tree 复用）、其实没空间的项一律丢弃。
+        # 丢弃只损失复用机会，绝不改变"能放下就放下"的语义。
+        self._validate_free_pages()
 
         # 事务号 -> ReadView（供写路径的可见性判断 + 恢复用）
         self._read_views: Dict[int, Any] = {}
@@ -616,9 +696,19 @@ class Table:
     # ==================== 元数据 ====================
 
     def _load_btree_root(self):
+        """
+        读盘上的 B+Tree 根页号；不可用（不存在 / 内容非法 / 被标记为失效）
+        时返回 None —— 调用方会因此**从堆页重建索引**。
+
+        ★ 页号必须是 >= 1: 页 0 是元数据页，指向它的根是"看起来有效的
+        垃圾"（`BTree.scan` 会从元数据页读不出叶子而直接结束扫描，
+        表现为"整表查不到数据"）。vacuum 重建索引前会把根写成 -1 表示
+        "此刻盘上没有有效索引"，重启时就靠这条判定走重建路径。
+        """
         if self.btroot_path.exists():
             try:
-                return int(self.btroot_path.read_text().strip())
+                rid = int(self.btroot_path.read_text().strip())
+                return rid if rid >= 1 else None
             except Exception:
                 return None
         return None
@@ -672,6 +762,14 @@ class Table:
         墓碑（xmax != 0）**也要建索引**：DELETE 后索引项必须保留指
         向墓碑，重启后老快照才可能沿链找到被删除的旧值；可见性由
         _read_version/_is_visible 负责，已删除的行不会"复活"。
+
+        ★ 链头判定**不能**用 `xmin` 最大者（本批次实测踩到的坑）:
+        autocommit 的合成事务号（0xFFFFFFFF 往下）在数值上比真实事务号
+        大得多，若一页上同时有"被 autocommit 删除的旧版本"和"活版本"，
+        取 max(xmin) 会选中那个**已被清零槽位**的墓碑 —— 索引指向空槽位，
+        那一行彻底读不到（完整性扫描器报 `('index', pk, loc, 'slot-empty')`）。
+        正确判据与 `_reachable_locs` 一致: **没有被本 pk 任何其它版本
+        当作 prev 的版本才是链头**；出现断链/人为损坏时才退化为取 xmin 最大者。
         """
         if self.bt.count() > 0:
             return
@@ -698,6 +796,14 @@ class Table:
             if not heads:
                 heads = [(v[0], v[1], v[2]) for v in vers]
             pid, sid, _xmin = max(heads, key=lambda h: h[2])
+            # ★ 只给"槽位真实存在"的版本建索引项。
+            #   页级回收会把死版本的槽位置零（`Page.compact` 之后该页甚至
+            #   被截断），此时上面的 `versions` 是按**扫描顺序**收集的，
+            #   可能仍包含刚被清零的墓碑。给它们建索引项 = 索引指向空槽位，
+            #   该主键从此读不到（恢复路径实测: 800 个索引项里 200 个悬空）。
+            page = self.bp.get_page(pid)
+            if page is None or page.get_row(sid) is None:
+                continue
             self.bt.insert(pk, pid, sid)
 
     def _calc_next_pk(self) -> int:
@@ -936,6 +1042,71 @@ class Table:
         except DeadlockError as e:
             raise RuntimeError(str(e))
 
+    def _free_space_of(self, pid):
+        """页 pid 当前可复用字节数（不是堆页 / 读不到 → -1）"""
+        p = self.bp.get_page(pid)
+        if p is None or p.page_type != PAGE_TYPE_HEAP:
+            return -1
+        return p.free_space()
+
+    def _register_space_page(self, pid):
+        """
+        把页登记为"可复用空闲页"（LIFO: 最近空出来的优先复用）。
+
+        只有真的还有空间的页才登记。登记表会**持久化**（`<name>.free`），
+        下一次启动仍然知道这些页可以填 —— 这正是"重启后 `.dat` 不白长"
+        的唯一依据。
+        """
+        if pid < 1 or pid in self.freelist:
+            return False
+        if self._free_space_of(pid) <= 0:
+            return False
+        return self.freelist.add(pid)
+
+    def _unregister_space_page(self, pid):
+        """页被塞满（或要截断）时摘掉登记；空页也一并摘掉"""
+        ok = self.freelist.discard(pid)
+        if ok:
+            # 页被填满是一次性事件（不是每行都发生），顺手落盘:
+            # 否则崩溃重启后登记表里还留着"其实已经满了"的页，
+            # 只浪费一次检查 —— 但落盘成本更低，且能让登记表更准确。
+            self.freelist.save()
+        return ok
+
+    def _validate_free_pages(self):
+        """
+        校验登记表: 只保留"当前真的是堆页且 free_space() > 0"的页号。
+
+        为什么每次都重新校验: 登记表是**旁挂提示**，`.dat` 的页号可以
+        被 B+Tree 复用（截断后文件长回来）、也可以因为截断而越界。
+        相信文件里写的页号会导致把行写进树页 / 写越界。
+        返回被丢弃的页号个数。
+        """
+        drop = []
+        for pid in list(self.freelist.pages):
+            if self._free_space_of(pid) <= 0:
+                drop.append(pid)
+        for pid in drop:
+            self.freelist.discard(pid)
+        return len(drop)
+
+    def free_page_stats(self):
+        """空闲页统计（供 `VACUUM` 结果集 / 巡检使用）"""
+        free_bytes = 0
+        usable = 0
+        for pid in list(self.freelist.pages):
+            fs = self._free_space_of(pid)
+            if fs <= 0:
+                continue
+            usable += 1
+            free_bytes += fs
+        return {
+            'registered_pages': len(self.freelist.pages),
+            'usable_pages': usable,
+            'free_bytes': free_bytes,
+            'corrupt_entries': self.freelist.corrupt_entries,
+        }
+
     def _heap_insert(self, rb: bytes):
         """
         往堆里插入一行，返回 (page_id, slot_id)。
@@ -968,6 +1139,9 @@ class Table:
 
         sid = last.insert_row(rb)
         if sid is None:
+            # 本页放不下了: 先把它登记为"还有空隙、可复用"（登记表持久化），
+            # 下次 vacuum 之后/重启之后这些空隙还能填，而不是直接丢弃。
+            self._register_space_page(last.page_id)
             target = self._find_heap_page_with_space(need)
             if target is None:
                 target = self.bp.new_page(PAGE_TYPE_HEAP)
@@ -975,18 +1149,26 @@ class Table:
             if sid is None:
                 return None, None
             last = target
+        if last.free_space() <= 4:
+            # 刚刚被塞满: 摘掉登记，避免后续插入每次都白查一次
+            self._unregister_space_page(last.page_id)
         self._last_heap_pid = last.page_id
         return last.page_id, sid
 
     def _find_heap_page_with_space(self, need: int):
         """
-        在"真空化过的页"里找一个能容纳 need 字节的（没有则 None）。
+        在"有空闲空间的页"里找一个能容纳 need 字节的（没有则 None）。
 
-        ★ 只查 `_space_pages`（vacuum 紧凑化后登记过的页），**不做全表
-        页扫描**：全扫在缓冲区只有 500 帧、而 .dat 有几千页时会引发
-        LRU 颠簸（每插一行驱逐一个脏页），实测把 10 万行量级的插入
-        拖成小时级。登记表里放不下的页在检查时被剔除，因此稳态是
-        O(1)（每页被选中后一直用到放不下为止）。
+        ★ 只查登记表（`self.freelist.pages`，**持久化**在 `<name>.free`），
+        **不做全表页扫描**：全扫在缓冲区只有 500 帧、而 .dat 有几千页时
+        会引发 LRU 颠簸（每插一行驱逐一个脏页），实测把 10 万行量级的
+        插入拖成小时级。登记表里放不下的页在检查时被剔除（同时摘掉
+        登记 = 它确实不再有用），因此稳态是 O(1)（每页被选中后一直
+        用到放不下为止）。
+
+        阶段 2 第 3 项的变化: 登记表不只记"vacuum 紧凑化过的页"，任何
+        **插满后还剩空隙**的页都会在 `_heap_insert` 里登记（并立刻落盘），
+        重启后这些页仍然可填 —— 这是"复用不因重启失效"的关键。
         """
         pages = self._space_pages
         while pages:
@@ -1801,6 +1983,15 @@ class Table:
         # 索引仍然指向这个墓碑（幂等：已经指向就不动）。
         # 若索引头已经是一个"活版本"（例如页上已经存在 DELETE 之后的
         # 重插版本），绝不能把索引改指墓碑 —— 那会让重插的行消失。
+        #
+        # ★ 但墓碑本身可能已经**不存在了**: 这条 DELETE 提交之后又跑过
+        #   `vacuum`（页级回收），死版本的行数据已经被删掉（槽位清零、
+        #   页可能已被搬空/截断）。此时再给这个位置插入索引项，就是
+        #   "索引指向空槽位" —— 该主键永久读不到，完整性扫描器会报
+        #   `('index', pk, loc, 'slot-empty')`。所以先确认槽位上还有行。
+        page_now = self.bp.get_page(old_loc[0])
+        if page_now is None or page_now.get_row(old_loc[1]) is None:
+            return True                    # 墓碑已随 vacuum 消失：无需重建索引项
         loc = self.bt.search(pk)
         if loc is None:
             self.bt.insert(pk, old_loc[0], old_loc[1])
@@ -1980,6 +2171,243 @@ class Table:
 
     # ==================== vacuum（版本回收）====================
 
+    def _has_live_txn(self) -> bool:
+        """
+        本表当前是否存在**真实**（非 autocommit 合成号）的活跃读视图。
+
+        为什么需要它来决定"能不能搬页": 搬页会改变行的 (page, slot) 物理位置，
+        而
+          * 显式事务的**物理 undo 镜像**记的是"原页原槽位"，搬完就回滚不回去；
+          * 活跃读视图可能还依赖页上的老版本位置。
+        vacuum 的死版本判定已经用 `_vacuum_bounds()` 保护了前者，但"给活行
+        换位置"这件事本身对**任何**未结束的真实事务都不安全，所以搬运与截断
+        只在没有真实活跃事务时才做（autocommit 的合成号每个语句结束就释放，
+        不算）。
+        ★ 阶段 2.3 第①步补充: 判据不止"有没有活跃事务"，还要看
+        "页上还有没有活跃事务的 undo 引用"（`_pending_undo_page_ids()`）
+        —— 搬页/截断会改写或消灭 (page, slot)，而 undo 镜像记的正是
+        原页原槽位。`_reclaim_pages()` 默认走"不搬页"的安全路径，
+        受保护的页另行排除。
+        """
+        for tid in self._read_views:
+            if not is_implicit_commit_tid(tid):
+                return True
+        for tid in self.mvcc.active_txns:
+            if not is_implicit_commit_tid(tid):
+                return True
+        return False
+
+    # ---------- 页级回收的"必须留"集合（阶段 2.3 第①步） ----------
+    #
+    # 为什么需要它（两处**实测**的数据丢失，都在本轮修掉）:
+    #
+    # ① `scan_pages` 判断"一个页能不能截断"时，只看**写在页上的**四条引用
+    #    （可达树页、叶子兄弟链、prev 指针、索引项指向的槽位）。但索引项
+    #    指向的槽位是**版本链头**，`_reachable_locs()` 判断"可达"时只沿
+    #    prev **往前**走 —— 一个"槽位上只剩墓碑（xmax != 0）"的页因此两头
+    #    不靠，被判成 `truncatable`：
+    #      * 它是索引链头（老快照必须沿它读到被删的旧值）；
+    #      * 它没有 `xmax == 0` 的活版本（`active_rows == 0`）；
+    #      * 墓碑的 prev 是 NO_PREV（没人把它当 prev）。
+    #    实测: 200 行**已提交**全删 + vacuum → 页数 4→2，老快照 200 行全部
+    #    读不到（版本链头所在的页被截掉了）。
+    #
+    # ② 活跃事务的**物理 undo 镜像**记着"原页原槽位"（`UndoAction.page_id/
+    #    slot_id`）。vacuum 期间若把这些页截掉、或把页上"谁也走不到"的行
+    #    清掉（`_reclaim_pages` 的不可达版本清理），ROLLBACK 就写不回去。
+    #    实测: `BEGIN; DELETE 100; vacuum(); ROLLBACK` 只恢复 **28/100**。
+    #    注意 `BufferPool.truncate()` 会把 `page_id >= n_pages` 的帧从缓存
+    #    里**丢弃**，所以被截断的页不是"缓存里还有"，而是真的没了。
+    #
+    # 两者的修法相同: 把这两类页显式声明为"逻辑上仍活着"，交给
+    # `scan_pages(protected_pages=...)` 抬高截断上界，并让 `_reclaim_pages`
+    # 的破坏性清理跳过它们。**保守方向**（少截几页）只损失空间收益，
+    # 多截一页就是丢数据，所以这里是"宁可留着"。
+
+    def _pending_undo_page_ids(self) -> set:
+        """
+        活跃事务物理 undo 镜像指向的页号集合（ROLLBACK 要写回这些页）。
+
+        含义: 这些页上的槽位可能在事务提交/回滚前被 `_put_row_back` 覆写，
+        因此
+          * 不能截断（`BufferPool.truncate` 会丢帧，页就真的没了）；
+          * 不能做"不可达行清理"或会**清空槽位数组**的紧凑化
+            （`Page.compact` 在一行不剩时把 `n_slots` 归零，
+             `Page.restore_row` 就再也挂不上数据）。
+        """
+        out = set()
+        try:
+            for (tid, _tbl), stack in list(self.mvcc.physical_undo.items()):
+                if is_implicit_commit_tid(tid):
+                    continue          # autocommit 合成号: 语句结束即释放
+                for act in stack:
+                    for pid in (act.page_id, act.new_page_id):
+                        if pid:
+                            out.add(pid)
+        except Exception:
+            pass
+        return out
+
+    def _index_chain_page_ids(self) -> set:
+        """
+        **索引版本链上**所有版本所在的页号集合。
+
+        为什么这些页一个都不能截: 每个索引项都指向一条持久化的版本链
+        （`_read_version` 沿 `prev_page/prev_slot` 往回走找"对读视图可见
+        的最新版本"）。链上任何一个版本所在的页被截掉，那条链就
+        断在空洞上 —— 老快照读到的是"行不存在"，而不是"被删的旧值"。
+        墓碑（`xmax != 0`）恰恰**必须**留着，这正是①里的坑。
+
+        顺着链走而不是只看索引项本身，是因为链中间的旧版本也可能
+        独占某一页（多轮 UPDATE 之后尤其明显）。
+        """
+        out = set()
+        try:
+            for _k, pid, sid in self.bt.scan():
+                cur = (pid, sid)
+                seen = set()
+                while cur is not None and cur not in seen:
+                    seen.add(cur)
+                    cpid, csid = cur
+                    if cpid < 1:
+                        break
+                    out.add(cpid)
+                    page = self.bp.get_page(cpid)
+                    rb = page.get_row(csid) if page is not None else None
+                    if rb is None or len(rb) < 21:
+                        break
+                    up, us = struct.unpack_from('<II', rb, 13)
+                    cur = (up, us) if up >= 1 else None
+        except Exception:
+            pass
+        return out
+
+    def _reclaim_protected_pages(self, extra=None) -> set:
+        """
+        页级回收的"必须留"集合 = 索引版本链上的页 ∪ 活跃 undo 指向的页
+        （∪ 调用方额外声明的页）。
+
+        这是**截断上界的唯一来源**（除了 `scan_pages` 自己算的引用关系）。
+        `extra` 供"只做某个局部操作"的调用方追加（例如搬页过程中已改写
+        但尚未落盘的位置）。
+        """
+        out = set()
+        try:
+            out |= self._index_chain_page_ids()
+        except Exception:
+            pass
+        try:
+            out |= self._pending_undo_page_ids()
+        except Exception:
+            pass
+        if extra:
+            out |= set(extra)
+        return out
+
+    def vacuum_undo_protected_pages(self) -> list:
+        """诊断/测试用: 当前"因活跃 undo 而必须留"的页号（升序）"""
+        return sorted(self._pending_undo_page_ids())
+
+    def _min_active_view_max_id(self):
+        """
+        所有活跃读视图 `max_id` 的最小值；**没有任何活跃读视图时返回
+        `float('inf')`**（代表"这个上界不存在"，`xmax >= inf` 恒假，
+        因此判定里的 `xmax >= self._view_floor → continue` 不会触发）。
+
+        与 `_vacuum_bounds()` 的 `uncommitted_floor` 的区别（关键，踩过坑）:
+          * `uncommitted_floor` 还含"最小活跃事务号"，负责挡住**显式事务
+            自己刚写的墓碑**（否则 `BEGIN; DELETE; vacuum(); ROLLBACK`
+            只恢复 28/100）；
+          * 本方法只管"**存不存在**一个活跃读视图还看得见
+            `max_id <= xmax` 的版本"。它必须对 **autocommit 的合成
+            事务号**同样生效 —— 合成号在数值上远大于任何真实事务号，
+            不能拿"最小活跃事务号"或 `next_txn_id` 去卡它
+            （实测: 卡了就一个 autocommit 墓碑都回收不掉，
+            `.dat` 一个字节都不缩）。
+
+        为什么不用 0 当"不存在"的哨兵: 合成事务号可以取到 0 附近吗 ——
+        不能（都 >= 0xF0000000），但 `xmax` 本身可能为 0 吗 ——
+        不会（0 表示"未淘汰"，上面已经 `continue`）。即便如此，
+        `0` 当哨兵会让 `xmax >= 0` 恒真、判定全部失效，是极易写错的
+        陷阱，所以用 `inf` 表达"无上界"。
+        """
+        best = float('inf')
+        try:
+            for rv in list(self.mvcc.active_txns.values()):
+                mid = getattr(rv, 'max_id', None)
+                if isinstance(mid, int) and mid < best:
+                    best = mid
+        except Exception:
+            pass
+        for rv in list(self._read_views.values()):
+            mid = getattr(rv, 'max_id', None)
+            if isinstance(mid, int) and mid < best:
+                best = mid
+        return best
+
+    def vacuum_horizon(self) -> int:
+        """调用方可见的 horizon（= `_vacuum_bounds()[0]`）"""
+        return self._vacuum_bounds()[0]
+
+    def _vacuum_bounds(self):
+        """
+        vacuum 的两个上界 `(horizon, uncommitted_floor)`。
+
+        `horizon`: 没有活跃事务时就是下一个待分配号（等价于"已提交的
+            淘汰号全部可回收"，即阶段 2.1 的旧行为）；有活跃事务时取
+            最小活跃号 —— 与 `mvcc.oldest_active_txn()` 完全一致，
+            保证**显式传入的旧 horizon 语义不变**。
+
+        `uncommitted_floor`: "最小活跃事务号"与"所有已登记读视图的 max_id"
+            的下界，**不受调用方影响**，且**没有任何活跃事务时返回
+            `float('inf')`**（代表"这个上界不存在"：`xmax >= inf` 恒假，
+            所以判定里 `xmax >= uncommitted_floor → continue` 不会触发）。
+            ★ 哨兵必须满足"`任何一个 uint32 事务号 >= 哨兵` 为假" ——
+            `-1` 是**错的**（`xmax >= -1` 恒真，判定全部失效，实测
+            autocommit 的墓碑一个都回收不掉）；`inf` 才对。
+            判定里要求 `xmax` 严格小于它（见 `vacuum` 的 docstring）。
+            三个来源一个都不能漏:
+              1) `mvcc.oldest_active_txn()` —— 该事务可能还没提交它写的
+                 DELETE/UPDATE，行头上的 `xmax` 就是它自己的号；把它删了
+                 它的 ROLLBACK 就无处可回（物理 undo 要写回原页原槽位）。
+                 ★ 这是**显式事务**的保护（实测:
+                 `BEGIN; DELETE 100; vacuum(); ROLLBACK` 会只恢复 28/100），
+                 上面那个"活跃读视图"上界挡不住它，因为**发起删除的那个
+                 事务自己的读视图**同样看得见自己写的墓碑 —— 必须靠
+                 "最小活跃事务号"这一条。
+              2) `mvcc.active_txns[*].max_id` —— 每个活跃读视图的可见性
+                 边界；`ReadView.is_visible` 里 `xmax >= max_id → 可见`。
+              3) 本表 `_read_views` 里登记的快照（显式事务 UPDATE/DELETE
+                 路径会注册进来）。它与 2) 常常是同一个对象，但调用方
+                 直接传 read_view 时表里可能比 mvcc 多，所以两边都算。
+
+        ★ 为什么没有活跃事务时不能用 `oldest_active_txn()`（踩过的坑）:
+        它返回一个小整数（下一个待分配号），而 autocommit 的**合成
+        事务号**（`0xFFFFFFFF` 往下）在数值上远大于它 —— 拿它当上界会让
+        **所有 autocommit 的墓碑一个也回收不掉**（实测: 20000 行删
+        18000 行后 vacuum 回收 0 个版本、`.dat` 一个字节都不缩）。
+        """
+        try:
+            horizon = self.mvcc.oldest_active_txn()
+        except Exception:
+            horizon = 1
+        has_active = bool(self.mvcc.active_txns) or bool(self._read_views)
+        safe = float('inf')
+        if has_active:
+            safe = horizon
+            try:
+                for rv in list(self.mvcc.active_txns.values()):
+                    mid = getattr(rv, 'max_id', None)
+                    if isinstance(mid, int) and mid < safe:
+                        safe = mid
+            except Exception:
+                pass
+            for rv in list(self._read_views.values()):
+                mid = getattr(rv, 'max_id', None)
+                if isinstance(mid, int) and mid < safe:
+                    safe = mid
+        return horizon, safe
+
     def vacuum(self, horizon: int = None) -> int:
         """
         最小可用 vacuum：回收"对任何快照都不可能再被读到"的旧版本。
@@ -2012,17 +2440,57 @@ class Table:
         （实测 2000 行 × 20 轮 UPDATE 后 vacuum 回收 20000 个版本、
         页内释放 596 KB；紧接着插 2000 行新数据，**堆页 +0**
         （183→183），而修复前是 +16 页（183→199））。
-        **数据文件本身不会变小**（页号被索引/prev 指针引用，
-        截断文件会让引用失效）；"可复用空间"才是这里能给的空间收益。
-        `last_vacuum_freed_bytes` 暴露本次释放的字节数。
+
+        ★★ 阶段 2 第 3 项（本批次）把"数据文件本身不会变小"这条**推翻**了:
+        紧凑化之后再做**页级回收** —— 尾部那些"无活跃行、无 prev 引用、
+        不是可达树页、不在树链上"的页被真正截掉，`.dat` 字节数下降
+        （见 `trim_tail()` / `_reclaim_pages()`）；剩下的空闲页登记进
+        **持久化**的 `<name>.free`（`FreePageRegistry`），重启后仍然复用。
+        统计见 `vacuum_stats()`。
+
+        ★★★ 快照安全（本批次修正的**两处真实数据丢失**）: 显式事务的
+        DELETE/UPDATE 会把行头 `xmax` 写成**真实事务号**，而
+        `mvcc.oldest_active_txn()` 取的是最小活跃号。若某活跃事务 T
+        已经删了一批行、此刻又调用 vacuum，旧判定 `xmax <= horizon`
+        会把这些行判成"可回收"（T 就是 horizon 本身），把它们物理删掉 ——
+        T 随后 ROLLBACK 时，物理 undo 要还原的槽位已经不存在，回滚
+        静默失败 = 数据丢失（实测 `BEGIN; DELETE 100; vacuum();
+        ROLLBACK` 只恢复 **28/100**）。
+        另一处是**老快照**：旧判定把 autocommit 的合成事务号整类放行
+        （"已提交的删除一定可以回收"），但 `max_id <= xmax` 的老快照
+        仍然看得见被删的行，回收 + 页级截断会让它读到"行不存在"
+        （实测插 200 行 → 老快照 → autocommit 全删 → vacuum →
+        老快照读到 **0/200**）。
+
+        因此判定拆成**两个独立上界**（都由本表自己的方法给出，**都不能
+        被调用方覆盖**）:
+          * `horizon`（调用方可见/可传的语义，与阶段 2.1 一致）:
+            非合成号 `xmax` 还必须满足 `xmax <= horizon`；
+          * `uncommitted_floor`（`_vacuum_bounds()`）:
+            `min(最小活跃事务号, 所有活跃读视图 max_id)`，
+            **没有任何活跃事务时为 -1**（该条自动失效）。
+            版本 V 必须满足 `xmax < uncommitted_floor`。它同时挡住:
+              - 未提交事务自己写的淘汰号（`xmax == 活跃号`），
+                其物理 undo 镜像要还原的槽位因此一定还在；
+              - 老快照还看得见的墓碑（`xmax >= RV.max_id`）。
+          * `_view_floor`（`_min_active_view_max_id()`）: 只管
+            "活跃读视图还看得见吗"，**对合成号同样生效**
+            （`uncommitted_floor` 那条因为 -1 哨兵而失效时，这一条仍然
+            挡住合成号墓碑被老快照需要的情况）。
 
         返回回收的版本数。不会删除任何仍可能被读到的版本。
         """
         with self._lock:
-            if horizon is None:
-                horizon = self.mvcc.oldest_active_txn()
+            caller_horizon = horizon
+            horizon, uncommitted_floor = self._vacuum_bounds()
+            if caller_horizon is not None:
+                horizon = caller_horizon
             self._recovery_remap = {}
             freed_bytes = 0
+            # ★ 活跃读视图的可见性上界（inf = 没有活跃读视图，该上界不存在）。
+            #   在收集版本**之前**取一次快照值: 判定与"哪些页被保护"
+            #   必须用同一个界，否则会出现"版本没回收、页却被截断"。
+            self._view_floor = self._min_active_view_max_id()
 
             # 1) 收集所有版本
             versions = {}       # pk -> [(pid, sid, rb, xmin, xmax, pp, ps)]
@@ -2045,9 +2513,47 @@ class Table:
             for pk, vers in versions.items():
                 dead = set()
                 for pid, sid, _rb, _xmin, xmax, _pp, _ps in vers:
-                    if xmax != 0 and (is_implicit_commit_tid(xmax)
-                                      or xmax <= horizon):
+                    if xmax == 0:
+                        continue
+                    # ★ 回收判据（阶段 2.3 第①步收紧；两条必须同时成立）:
+                    #
+                    #   (1) `xmax >= uncommitted_floor` → 不回收。
+                    #       `uncommitted_floor` = min(最小活跃事务号,
+                    #       所有活跃读视图 max_id)，没有活跃事务时为 -1
+                    #       （该条自动失效）。这一条保护两类版本:
+                    #         a) **显式事务自己刚写的墓碑**（xmax == 它自己
+                    #            的号 == 最小活跃号）—— 回收它，该事务
+                    #            ROLLBACK 时物理 undo 要还原的槽位就没了。
+                    #            实测: `BEGIN; DELETE 100; vacuum();
+                    #            ROLLBACK` 只恢复 **28/100**。
+                    #         b) **老快照还看得见的版本**（xmax >= 某个活跃
+                    #            读视图的 max_id）。`ReadView.is_visible`
+                    #            里 "xmax >= max_id → 可见"，回收 = 让老快照
+                    #            从"读到旧值"变成"行不存在"。
+                    #       ★ b) **同样适用于 autocommit 的合成事务号**。
+                    #         曾经把合成号整类放行（"已提交的删除一定可以
+                    #         回收"），那是错的: autocommit 的 DELETE 也是
+                    #         已提交删除，但 `max_id <= xmax` 的老快照仍然
+                    #         看得见被删的行。实测: 插 200 行 → 老快照 →
+                    #         autocommit 全删 → vacuum → 老快照读到 0/200
+                    #         （墓碑所在的页还被整页截掉了）。
+                    #
+                    #   (2) 非合成号还要过 `horizon`（调用方可传，语义与
+                    #       阶段 2.1 完全一致）；合成号不过 horizon ——
+                    #       它就是"已经提交"的代名词，而 horizon 是真实
+                    #       事务号空间里的界，两者不可比（合成号恒大于
+                    #       任何真实号，卡 horizon 会让 autocommit 的墓碑
+                    #       一个也回收不掉）。
+                    if xmax >= uncommitted_floor:
+                        continue
+                    if xmax >= self._view_floor:
+                        continue
+                    if is_implicit_commit_tid(xmax):
                         dead.add((pid, sid))
+                        continue
+                    if xmax > horizon:
+                        continue
+                    dead.add((pid, sid))
                 if not dead:
                     continue
 
@@ -2100,15 +2606,1002 @@ class Table:
                 if page is not None:
                     got = page.compact()
                     freed_bytes += got
-                    if got > 0 and pid not in self._space_pages:
-                        # 登记为"可复用页"，后续 insert 会优先填这些空洞
-                        self._space_pages.append(pid)
             self.last_vacuum_freed_bytes = freed_bytes
-            if freed_bytes:
+
+            # 6) ★ 页级回收（阶段 2 第 3 项）: 把"什么都没有了"的尾部页
+            #    真正从 `.dat` 里截掉，并把剩余的空闲页登记持久化。
+            stats = self._reclaim_pages(freed_bytes, removed)
+            self._last_vacuum_pages = stats
+            if freed_bytes or stats['trimmed_pages']:
                 logger.info(
                     f"vacuum {self.name}: 回收 {removed} 个版本，"
-                    f"页内释放 {freed_bytes} 字节可复用空间")
+                    f"页内释放 {freed_bytes} 字节，"
+                    f"截断 {stats['trimmed_pages']} 页 "
+                    f"({stats['bytes_before']} → {stats['bytes_after']} 字节)，"
+                    f"空闲页 {stats['free_pages_registered']}")
             return removed
+
+    # ==================== 页级回收（截断 + 空闲页持久化）====================
+
+    def trim_tail(self, want_bytes: int = 0):
+        """
+        把 `.dat` 尾部**完全空置**的页截掉，文件真的变小。
+
+        安全判据（`storage/pgscan.py::scan_pages` 一次扫清，四条引用全查）:
+        一个页可以被截断 ⟺
+          1) 它不是从根可达的 B+Tree 页（内部节点 or 叶子）；
+          2) 不在叶子的兄弟链 `next` 上（否则 `scan()` 断链，静默丢行）；
+          3) 不是**活跃行**所在的堆页（`xmax == 0` 的版本，或索引指向的墓碑）；
+          4) 没有任何版本的 `prev_page` 指向它（版本链是持久化的，断链后
+             老快照/回溯查询就读不到更早的版本）；
+          5) ★ 阶段 2.3 第①步补充 —— 不在 `_reclaim_protected_pages()`
+             里（**索引版本链上的页** ∪ **活跃事务 undo 镜像指向的页**）。
+             前四条只看"写在页上的引用"，看不到这两种**逻辑上仍活着**
+             的页，实测漏掉它们会丢数据（见 `_reclaim_protected_pages`
+             的说明）。
+
+        只有"截断点上界之后的**连续尾部**"会被截断 —— 不做页搬迁。
+        代价是: 中间那些空页留在文件里（记进空闲页登记表供复用），
+        换来的确定性是**没有任何 (page, slot) 引用会被改写**：
+        索引项、`prev_page`、兄弟链、根指针全都不用动。
+        页搬迁会让每条相关的引用都必须同步更新，那是另一个量级的
+        风险面，本轮不做（见交付说明的"仍未回收的页"）。
+
+        `want_bytes` 只用于统计（本次希望回收多少字节）；返回值是
+        截掉的页数。
+        """
+        with self._lock:
+            if self.bp.total_pages() <= 1:
+                return 0
+            born = self.bp.file_size()
+            # 先落盘: 被截断的页必须是内容已经在别处的页
+            self.bp.flush()
+            live_btree = self.bt.live_pages()
+            if not live_btree:
+                # 根不可读（异常状态）时**不敢截断**
+                return 0
+            protected = self._reclaim_protected_pages()
+            res = scan_pages(self.bp, self.bt, self.freelist.pages,
+                             live_btree=live_btree,
+                             protected_pages=protected)
+            new_len = res.max_live_page() + 1
+            cur = self.bp.total_pages()
+            if new_len >= cur:
+                return 0
+            trimmed = self.bp.truncate(new_len)
+            if not trimmed:
+                return 0
+            # 截断后: 越界的登记项丢掉（页号已经不在了）
+            self.freelist.keep_within(new_len)
+            if self._last_heap_pid is not None and \
+                    self._last_heap_pid >= new_len:
+                self._last_heap_pid = None
+            self.freelist.save()
+            self._last_trim = {
+                'pages_before': cur, 'pages_after': new_len,
+                'trimmed_pages': trimmed,
+                'bytes_before': cur * 4096, 'bytes_after': new_len * 4096,
+                'want_bytes': want_bytes, 'scan': res.summary(),
+                'protected_pages': sorted(protected),
+            }
+            return trimmed
+
+    def _reclaim_pages(self, freed_bytes: int, removed: int) -> dict:
+        """
+        vacuum 的收尾: **前向搬页** → 登记空闲页 → 截断尾部 → 登记表落盘。
+
+        为什么需要"搬页"（本批次的核心）:
+          只截尾部的话，一次 90% 删除几乎回收不到任何字节 —— 实测
+          `dat=1257472 → 1257472`（截断 0 页），因为剩下 10% 的行
+          **均匀散落在 187 个堆页上**，而尾部每一页都还有一两个活行，
+          没有连续空置的尾部。要真的把文件缩小，必须把高页号的活行
+          搬到低页号的空洞里，让尾部真正空出来。
+
+        顺序（每一步单独失败都不丢数据）:
+          1) 扫描"可达行"集合（索引项 + 沿 prev 链能走到的版本）；
+          2) `_relocate_forward()`: 把高页号可达行搬到低页号空页，
+             同步改写索引项与所有 prev 指针，再紧凑化源页；
+          3) `trim_tail()`: 把尾部完全空置的页截掉（它内部先 fsync 页）；
+          4) 登记剩余空闲页 → `freelist.save()`（重启后仍可复用）。
+        """
+        before = self.bp.file_size()
+        before_pages = self.bp.total_pages()
+        stats = {
+            'reclaimed_versions': removed,
+            'compacted_bytes': freed_bytes,
+        }
+
+        # ★ 本步的关键安全集合（见 `_reclaim_protected_pages` 的说明）:
+        #   索引版本链上的页 + 活跃事务 undo 镜像指向的页。两者一律
+        #   "不清理、不紧凑化到清空、不截断"。方向是**保守**：
+        #   多留一页只损失空间，少留一页就是丢数据。
+        protected = self._reclaim_protected_pages()
+        reach = None
+
+        if ENABLE_PAGE_RELOCATION:
+            # ★★ 前向搬页（`_relocate_forward`）—— 默认关闭。
+            #
+            # 它是"非尾部空页"能被回收的唯一途径: 实测"20000 行删 90%"之后
+            # 187 个堆页里**每页都还剩几个活行**（删除按行散布，不按页），
+            # 尾部没有任何连续空置的页，纯截尾部回收 0 字节。把活行前向密排
+            # 之后尾部才可能整段截掉，因此这里默认开启；它自带两道安全网:
+            #   1) 计划期容量模型保守（软容量 + 物理容量取小），执行前还要过
+            #      一次 `_prune_plan` 可行性检查；
+            #   2) 执行后做**实测投影**（"搬完后的堆页上界"是否真的下降），
+            #      没有收益就整份回滚，绝不出现"越回收越大"。
+            #
+            # ★ 阶段 2.3 第①步: 这一段（不可达版本清理 + 紧凑化 + 搬页）
+            #   全部收在 `ENABLE_PAGE_RELOCATION` 之后。理由有两条，都是
+            #   实测出来的数据丢失路径:
+            #     a) 搬页会**改写 (page, slot)**，而活跃事务的物理 undo
+            #        镜像记的正是原页原槽位 —— 搬过就回滚不回去；
+            #        `_has_live_txn()` 只挡住"有活跃事务"这一半，另一半是
+            #        "页上还有活跃事务的 undo 引用"；
+            #     b) "不可达版本清理"用的是 `_reachable_locs()`（只沿 prev
+            #        往前走的可达性），它会把**索引链头上的墓碑**也判成
+            #        不可达 —— 而墓碑正是老快照要读的旧值。
+            #   默认关闭时这两个动作都不执行，`compacted_bytes` 仍然照常
+            #   统计"版本回收 + 槽位置零"释放的字节（这是确定性收益），
+            #   但**不**做任何位置改写。
+            #
+            #   有真实活跃事务时（物理 undo 记的是原页原槽位）也一律跳过。
+            reach = self._reachable_locs()
+            #   全部堆页做一次"不可达版本清理 + 紧凑化"，`_heap_floor` 才算得准
+            #   （否则 floor 停在"其实早该空掉"的页上，尾部一页都截不掉 ——
+            #    本批次实测踩到过: heap_floor 停在 307 而不是 187）。
+            #   ★ 被保护的页（索引链 / 活跃 undo）必须整个跳过: 清掉它们上面的
+            #     "不可达"行会直接砸掉墓碑与 undo 目标。
+            for pid in self._heap_pages():
+                if pid in protected:
+                    continue
+                page = self.bp.get_page(pid)
+                if page is None:
+                    continue
+                for sid, _rb in list(page.iter_rows()):
+                    if (pid, sid) not in reach:
+                        page.delete_row(sid)
+                page.compact()
+            self.bp.flush()
+
+            if not self._has_live_txn():
+                before_pages, moved, heap_floor, rollback = \
+                    self._relocate_forward(reach)
+            else:
+                before_pages, moved, rollback = self.bp.total_pages(), 0, None
+                heap_floor = self._heap_floor(self._heap_pages())
+        else:
+            # 默认路径（本步交付状态）: 只做"版本回收 + 槽位置零"带来的
+            # 确定性收益，不清理、不搬页、不紧凑化到清空。`_heap_floor`
+            # 仍要算（供 `pages_before` / 统计口径一致），它只读不写。
+            moved, rollback = 0, None
+            heap_floor = self._heap_floor(self._heap_pages())
+
+        stats['relocated_rows'] = moved
+        stats['pages_before'] = before_pages
+        stats['heap_floor'] = heap_floor
+        stats['protected_pages'] = sorted(protected)
+
+        # ★ 索引页也要回收: 堆页搬完之后重建 B+Tree（密集打包），并让新树
+        #   落在**被丢弃的旧索引页号**上（先把文件截到 heap_floor、
+        #   再在 floor 之上的连续空页段里分配），这样新树不占新空间、
+        #   尾部随即可以整段截掉。
+        #
+        #   阶段 2.3 第①步: 本步交付时 `ENABLE_BTREE_REBUILD=False`，
+        #   实测它在"新树更小却落在更高页号"这条路径上会截掉新树自己
+        #   的页 → 重启后整表读不到（dump 2000 行 → 0 行）。因此这里
+        #   永远走 `skipped` 分支，不重建、不动根指针。
+        if not ENABLE_BTREE_REBUILD or self._has_live_txn():
+            stats['btree_rebuild'] = {'skipped': True,
+                                      'enabled': ENABLE_BTREE_REBUILD}
+            self.freelist.save()
+        else:
+            try:
+                free_after = self._free_page_candidates(heap_floor)
+                rb = self._rebuild_btree(floor_pages=heap_floor,
+                                         free_pages=free_after)
+            except Exception as e:
+                rb = {'error': str(e)}
+                logger.warn(f"重建索引失败 {self.name}: {e}")
+            stats['btree_rebuild'] = rb
+
+        # ★★ 收益门槛（**实测**，不是估算）: 搬页 + 重建有可能让文件反而
+        #    变大。此时把搬页整体回滚，回到"一行没动"的状态 ——
+        #    宁可不缩，绝不越回收越大。（`ENABLE_PAGE_RELOCATION=False`
+        #    时 `moved == 0`，这一段不会触发。）
+        if moved and rollback is not None and \
+                self.bp.file_size() > before:
+            self._rollback_relocate(rollback)
+            stats['rollback'] = {
+                'reason': 'file_grew',
+                'bytes_before': before,
+                'bytes_after_relocate': self.bp.file_size(),
+            }
+            stats['relocated_rows'] = 0
+            stats['heap_floor'] = None
+            self.bp.flush()
+
+        trimmed = self.trim_tail(want_bytes=freed_bytes)
+        after_pages = self.bp.total_pages()
+
+        registered = 0
+        reusable_bytes = 0
+        for pid in range(1, after_pages):
+            page = self.bp.get_page(pid)
+            if page is None or page.page_type != PAGE_TYPE_HEAP:
+                continue
+            fs = page.free_space()
+            if fs < MIN_REUSABLE_PAGE_BYTES:
+                continue
+            if self.freelist.add(pid):
+                registered += 1
+            reusable_bytes += fs
+        # 登记表变更落盘（内容没变时不产生写盘）
+        self.freelist.save()
+        after_pages = self.bp.total_pages()
+        after = self.bp.file_size()
+        stats.update({
+            'trimmed_pages': trimmed,
+            'pages_after': after_pages,
+            'bytes_before': before,
+            'bytes_after': after,
+            'bytes_freed': before - after,
+            'free_pages_registered': len(self.freelist.pages),
+            'free_pages_usable_bytes': reusable_bytes,
+            'newly_registered_pages': registered,
+        })
+        return stats
+
+    def _page_move_capacity(self, pid, out_sids, page_total=None):
+        """
+        一个堆页在"搬页"中的**可用空间**（字节）—— 只用当前可观察的
+        数值算出来，不做乐观假设：
+
+            可用 = free_space()
+                 + Σ(搬出行字节 + 4)          ← 这些槽位会空出来
+                 + 4 × n_slots（仅当本页全部搬空）
+
+        为什么"全部搬空"才加 4×n_slots: `Page.compact()` 在一行不剩时会把
+        `n_slots` 归零、行游标复位（页回到全新状态）；只搬走一部分时槽位
+        数组**不缩**，那 4N 字节不能算可用。
+        """
+        page = self.bp.get_page(pid)
+        if page is None or page.page_type != PAGE_TYPE_HEAP:
+            return 0
+        cap = page.free_space() + 4 * len(out_sids)
+        out_bytes = 0
+        for sid in out_sids:
+            rb = page.get_row(sid)
+            if rb is not None:
+                out_bytes += len(rb)
+        cap += out_bytes
+        if page_total is not None and page_total and \
+                out_bytes >= page_total:
+            cap += 4 * page.n_slots
+        return cap
+
+    def _prune_plan(self, plan, src_moves, dst_rows):
+        """
+        计划可行性检查（**只读，不改页**），返回"还可以当目标页"的集合。
+
+        为什么必须有这一步: 搬页的执行顺序是"先从源页删掉搬走的槽位、
+        紧凑化，再往目标页 insert"。如果目标页其实装不下（容量模型与
+        真实的槽位数组/页内空洞有偏差），`insert_row` 会返回 None ——
+        那一行的源槽位**已经被删掉了**，索引却还指着它 → 该行静默消失，
+        完整性扫描器会报 `('index', pk, loc, 'slot-empty')`。
+        本批次第一次实现时就踩到了这个坑（实测 3000 行只剩少数几行可读）。
+
+        判据（保守、逐页独立）: 目标页的搬入总量必须 <= 该页的
+        `_page_move_capacity`。不满足的页被剔除，指向它的搬出计划一并
+        作废（那些行留在原处）。保守到可能少搬几页，但绝不会出现
+        "删了源、放不进目标"。
+        """
+        need = {}
+        for pid, rows in dst_rows.items():
+            need[pid] = sum(len(rb) + 4 for _sid, rb in rows)
+        feasible = set()
+        for pid, want in need.items():
+            if want <= self._page_move_capacity(
+                    pid, src_moves.get(pid, ()), self._page_total(pid)):
+                feasible.add(pid)
+        return feasible
+
+    def _page_total(self, pid) -> int:
+        """该堆页上**全部行**的字节总量（判断"能否被清成全新页"用）"""
+        page = self.bp.get_page(pid)
+        if page is None or page.page_type != PAGE_TYPE_HEAP:
+            return 0
+        return sum(len(rb) for _sid, rb in page.iter_rows())
+
+    # ---------- 可达行集合（搬页的"必须保留"判据） ----------
+
+    def _reachable_locs(self) -> set:
+        """
+        返回"必须保留"的 (page, slot) 集合 = 索引项 ∪ 沿 prev 链可达的版本。
+
+        为什么不用"xmax == 0"当判据: 墓碑（xmax != 0）也可能必须留 ——
+        索引指向的链头如果是墓碑（DELETE 后索引项保留），老快照要沿它
+        往回走；被别的版本当 prev 引用的老版本同理。反过来，页上有些
+        版本**谁也走不到**（多轮 UPDATE 之后被"跳"过去的中间版本），
+        它们是真正的垃圾，搬页时可以直接丢。
+        """
+        reach = set()
+        stack = []
+        for _k, pid, sid in self.bt.scan():
+            loc = (pid, sid)
+            if loc not in reach:
+                reach.add(loc)
+                stack.append(loc)
+        while stack:
+            loc = stack.pop()
+            page = self.bp.get_page(loc[0])
+            rb = page.get_row(loc[1]) if page is not None else None
+            if rb is None:
+                continue
+            pp, ps = struct.unpack_from('<II', rb, 13)
+            if pp:
+                nxt = (pp, ps)
+                if nxt not in reach:
+                    reach.add(nxt)
+                    stack.append(nxt)
+        return reach
+
+    # ---------- 前向搬页 ----------
+
+    def _relocate_forward(self, reach=None):
+        """
+        把可达行**前向密排**到页号最低的一批堆页里，使文件尾部真正空出来。
+
+        为什么必须搬（实测）: 一次"插 5000 行 → 按 `i % 10 != 0` 删 90%"
+        之后，45 个堆页里**每一页都还剩 11~12 个活行**（删除按行散布，
+        不是按页），尾部没有任何连续空置的页 —— 纯截尾部回收 0 字节
+        （实测 `dat=311296 → 311296`）。只有把活行往前搬，尾部才可能
+        整段截掉。
+
+        只搬**可达行**（`_reachable_locs`）:
+          * 索引项指着的链头；
+          * 沿 prev 链能走到的版本（含墓碑）。
+        页上"谁也走不到"的中间版本是真垃圾，留在源页里随页一起截掉。
+
+        正确性要点（每一条都对应一种数据丢失方式）:
+          1) 先把**要从本页搬走**的行槽位置零、再 `compact()`，然后才把
+             搬入行 `insert_row()` —— 顺序反了会出现"目标页已经满了、
+             源行却还没搬出去"；
+          2) 索引项改写: 搬动过的 (page,slot) 必须改指新位置，
+             否则索引指向已删槽位 → 该行彻底读不到；
+          3) prev 指针改写: 任何"指向搬动过位置"的 prev 必须改指新位置
+             （在所有搬动完成后统一改写），否则版本链断在空洞上；
+          4) 搬迁计划在**动手之前**一次算完（贪心装箱），保证每个目标页
+             的容量是够的（估算偏乐观时下面的 `insert_row` 会返回 None，
+             那一行就**不搬**、留在原处 —— 少搬不丢数据）。
+
+        返回 (搬前总页数, 搬动的行数, heap_floor)；`heap_floor` =
+        "搬完之后还有活行的最高堆页 + 1"，是本表堆页的**真实上界**，
+        之下的索引页都可以安全丢弃（索引项与版本链已全部前向改写）。
+        """
+        n_pages = self.bp.total_pages()
+        if n_pages <= 2:
+            return n_pages, 0, 2, None
+        self.bp.flush()
+        if reach is None:
+            reach = self._reachable_locs()
+        if not reach:
+            return n_pages, 0, 2, None
+
+        heap_pages = []
+        for pid in range(1, n_pages):
+            page = self.bp.get_page(pid)
+            if page is not None and page.page_type == PAGE_TYPE_HEAP:
+                heap_pages.append(pid)
+        if not heap_pages:
+            return n_pages, 0, 2, None
+
+        # ---- 1) 收集可达行（按 (page,slot) 升序 = 前向密排的自然顺序） ----
+        #    ★ `reach` 之外的版本（页上谁也走不到的老版本 / 已经被上一个
+        #      阶段清零的槽位）**不算行**，直接跳过 —— 否则计划里会混进
+        #      不存在的行，执行阶段删了源槽位却 insert 不出东西，整份计划
+        #      退化成空（本批次实测踩到: `plan=0` 而 `rows=20000`）。
+        rows = []              # [(rb, old_loc)]
+        costs = []             # 每页的 (页头 + 槽位 + 行数据) 成本
+        for pid in heap_pages:
+            page = self.bp.get_page(pid)
+            live = [(sid, rb) for sid, rb in page.iter_rows()
+                    if (pid, sid) in reach]
+            if not live:
+                continue
+            for sid, rb in live:
+                rows.append((rb, (pid, sid)))
+            costs.append(PAGE_HEADER_SIZE + 4 * len(live)
+                         + sum(len(rb) for _s, rb in live))
+        if not rows:
+            return n_pages, 0, 2, None
+
+        # ---- 2) 贪心装箱: 理想最少页数（只作诊断，不参与正确性判断） ----
+        target_pages = 1
+        if costs:
+            bins = []
+            for cost in sorted(costs, reverse=True):
+                for i, cap in enumerate(bins):
+                    if cap + cost <= PAGE_SIZE:
+                        bins[i] += cost
+                        break
+                else:
+                    bins.append(cost)
+            target_pages = 1 + len(bins)
+        target_pages = max(1, min(target_pages, n_pages))
+        self._target_pages = target_pages
+
+        # ---- 3) 先把搬迁计划一次算完（**动手之前**），保证可执行 ----
+        #    目标页只**往后**走（前向密排）: 一个源页的行全部处理完才允许
+        #    进入下一页 —— 这样"计划槽位序号"与执行阶段 `insert_row` 的
+        #    真实槽位号一一对应（执行是按 heap_pages 顺序、每页按序号插入）。
+        #
+        #    容量模型（保守、只用当前可观察的数值）:
+        #        可用 = free_space()
+        #             + Σ(已规划搬走的行字节 + 4)     ← 这些槽位会空出来
+        #             + 4 × (本页全部搬空 ? 本页槽位数 : 0) ← compact() 复位
+        #    `Page.compact()` 只在"一行不剩"时把 n_slots 归零、行游标复位；
+        #    只搬走一部分时槽位数组不缩，那 4N 字节**不能算可用**
+        #    （本批次实测踩到的坑: 把 4N 算进去 → 容量虚高 → 计划看似可行
+        #     但执行时放不下，源槽位已被删 → 行静默消失）。
+        #
+        #    再给每页留出"可复用空闲"的余量: 目标页数按理想最小值放大
+        #    `1/(1-RELOCATE_SLACK_RATIO)` 倍，并把总字节平均摊到这些页上，
+        #    得到每页的**软容量**。这样每页都只装到软容量为止，
+        #    剩下的空间就是真正能被后续 INSERT 复用的空闲空间。
+        order = {p: i for i, p in enumerate(heap_pages)}
+        per_pid = {p: [] for p in heap_pages}
+        for rb, old_loc in rows:
+            per_pid[old_loc[0]].append((old_loc[1], rb))
+        page_total = {p: sum(len(rb) for _s, rb in v)
+                      for p, v in per_pid.items()}
+        out_bytes = {p: 0 for p in heap_pages}   # 已规划**搬走**的行字节
+        out_cnt = {p: 0 for p in heap_pages}     # 已规划**搬走**的槽位数
+        in_bytes = {p: 0 for p in heap_pages}    # 已规划**搬入**的行字节
+        in_cnt = {p: 0 for p in heap_pages}      # 已规划**搬入**的槽位数
+
+        total_live = sum(len(rb) + 4 for rb, _loc in rows)
+        # 每页的**软容量**: 每页只装 `PAGE_SIZE * (1 - slack)` 的搬入量，
+        # 剩下的空间就是搬完之后能被后续 INSERT 直接复用的空闲。
+        # 计划期就用它当上限（保守），执行时一定放得下。
+        soft_cap = int(PAGE_SIZE * (1.0 - RELOCATE_SLACK_RATIO))
+        target_pages = max(1, (total_live + max(soft_cap, 1) - 1)
+                           // max(soft_cap, 1))
+
+        def avail_of(i):
+            """第 i 个堆页当前可用容量（物理容量与软容量取小）；-1 = 不可用
+
+            两个约束都要满足:
+              * **物理**: `free_space() + 本页已规划搬走的行字节 + 4×槽位`
+                —— 执行阶段是"先把所有源页的行挖空并 compact，再往目标页
+                insert"，所以源页的原始活行不会挡住目标页；
+              * **软容量**: 每页只装到 `soft_cap` 附近，剩下的空间才是
+                "可复用空闲页"那部分收益。
+
+            ★ `page_total` / `out_bytes` 等字典**必须用 `.get(pid)`**:
+            它们只为"页上有可达行的页"建了键，而 `heap_pages` 里还有
+            页号存在但一行都没有的空页。用下标取值会抛 KeyError，
+            异常被 `Database.vacuum()` 的 try/except 吞掉 —— 表现为
+            "vacuum 静默什么都不做、文件还变大"，极难定位
+            （本批次实测踩到: `relocated_rows=0` 而 `heap_floor` 停在 307）。
+            """
+            pid = heap_pages[i]
+            pg = self.bp.get_page(pid)
+            if pg is None or pg.page_type != PAGE_TYPE_HEAP:
+                return -1
+            total = page_total.get(pid, 0)
+            ob = out_bytes.get(pid, 0)
+            oc = out_cnt.get(pid, 0)
+            ib = in_bytes.get(pid, 0)
+            ic = in_cnt.get(pid, 0)
+            extra = 4 * pg.n_slots if (total and ob >= total) else 0
+            raw = pg.free_space() + ob + 4 * oc + extra - ib - 4 * ic
+            # 软容量: 只按"**搬入**的字节量"封顶（页上原本就有的活行不占用
+            # 这一份额度，它们本来就在那里、也不会被搬走）。
+            soft = soft_cap - ib - 4 * ic
+            return min(raw, soft)
+
+        plan = {}
+        dst_i = 0
+        stop = False
+        # 目标页只**往后**走（前向密排），且只允许装到"当前还有活行的最高页"
+        # 以内。搬页的收益最终由"实测投影"把关（见函数末尾的收益门槛）。
+        for src_pid in heap_pages:
+            if stop:
+                break
+            for sid, rb in per_pid[src_pid]:
+                need = len(rb) + 4
+                dst_pid = None
+                i = dst_i
+                while i < len(heap_pages):
+                    if avail_of(i) >= need:
+                        dst_i = i
+                        dst_pid = heap_pages[i]
+                        break
+                    i += 1
+                if dst_pid is None:
+                    stop = True
+                    break
+                plan[(src_pid, sid)] = dst_pid
+                out_bytes[src_pid] += need
+                out_cnt[src_pid] += 1
+                in_bytes[dst_pid] += need
+                in_cnt[dst_pid] += 1
+        # 填上每个目标页内的"计划序号"（执行时按该序号 insert_row）
+        seq_of = {}
+        for old_loc in sorted(plan, key=lambda o: (order[plan[o]],
+                                                   order[o[0]], o[1])):
+            dst_pid = plan[old_loc]
+            plan[old_loc] = (dst_pid, seq_of.get(dst_pid, 0))
+            seq_of[dst_pid] = seq_of.get(dst_pid, 0) + 1
+
+        if rows:
+            self._reloc_dbg = {
+                'n_pages': n_pages, 'target_pages': target_pages,
+                'rows': len(rows), 'heap_pages': len(heap_pages),
+                'soft_cap': soft_cap,
+            }
+        moved = len(plan)
+        if not moved:
+            floor = self._heap_floor(heap_pages)
+            self._reloc_dbg = {'n_pages': n_pages,
+                               'target_pages': target_pages,
+                               'plan': 0, 'moved': 0,
+                               'rows': len(rows),
+                               'avail_first': [avail_of(i)
+                                               for i in range(min(5, len(heap_pages)))],
+                               'heap_floor': floor}
+            return n_pages, 0, floor, None
+
+        # ---- 4) 一次性算出"每个目标页要装什么、每个源页要挖空什么" ----
+        #    `plan` 只允许"往更低页号搬"，所以每页的角色是明确的:
+        #    * 源页（在 plan 里出现）: 先 delete_row 挖空这些槽位再 compact；
+        #    * 目标页: 挖空后按计划序号 insert_row。
+        #    源页与目标页可能重合（既收又出），执行时**先出后进**。
+        dst_rows = {}
+        src_moves = {}
+        for old_loc, (dst_pid, seq) in plan.items():
+            sp = self.bp.get_page(old_loc[0])
+            rb = sp.get_row(old_loc[1]) if sp is not None else None
+            if rb is None:
+                continue
+            dst_rows.setdefault(dst_pid, []).append((seq, rb))
+            src_moves.setdefault(old_loc[0], []).append(old_loc[1])
+        plan = {o: plan[o] for o in plan if o in src_moves}
+        feasible_dst = self._prune_plan(plan, src_moves, dst_rows)
+        if not feasible_dst:
+            return n_pages, 0, self._heap_floor(heap_pages), None
+        plan = {o: n for o, n in plan.items() if n[0] in feasible_dst}
+        dst_rows = {p: v for p, v in dst_rows.items() if p in feasible_dst}
+        src_moves = {}
+        for old_loc in plan:
+            src_moves.setdefault(old_loc[0], []).append(old_loc[1])
+        moved = len(plan)
+
+        # ---- 5) 执行（两阶段，顺序即正确性）----
+        #    阶段一: **先把所有源页要搬走的行挖空并 compact**。
+        #           必须在任何 insert 之前做完 —— 否则一个"既收又出"的页
+        #           会先被塞满搬入行，之后再删自己的搬出行，把刚搬进来的
+        #           行一起删掉（本批次实测踩到的坑: 行数少了、且出现重复 pk）。
+        #           ★ 挖空之前先把**行字节原样**留一份，供"越搬越大"时回滚。
+        rollback = []
+        for pid in sorted(src_moves):
+            page = self.bp.get_page(pid)
+            if page is None:
+                continue
+            for sid in src_moves[pid]:
+                rb = page.get_row(sid)
+                rollback.append(((pid, sid), None, rb))
+                page.delete_row(sid)
+            page.compact()
+        #    阶段二: 按 (目标页, 计划序号) 顺序 insert_row。
+        #           序号与 `insert_row` 返回的槽位号一一对应。
+        executed = {}
+        for pid in sorted(dst_rows):
+            page = self.bp.get_page(pid)
+            if page is None:
+                continue
+            for seq, rb in sorted(dst_rows[pid]):
+                got = page.insert_row(rb)
+                if got is None:
+                    continue          # 兜底：放不下就不搬
+                executed[(pid, seq)] = (pid, got)
+        # ---- 6) 位置映射: 搬走的行 → 新位置；没搬的行 → 原地
+        loc_map = {}
+        for old_loc, new_loc in plan.items():
+            real = executed.get(new_loc)
+            if real is not None:
+                loc_map[old_loc] = real
+        if not loc_map:
+            return n_pages, 0, self._heap_floor(heap_pages), None
+
+        # 供"越搬越大"时的**回滚**使用（见 `_reclaim_pages`）:
+        # (旧位置, 新位置, 行字节原样)
+        rollback = []
+        for old_loc, real in loc_map.items():
+            sp = self.bp.get_page(old_loc[0])
+            rb = sp.get_row(old_loc[1]) if sp is not None else None
+            rollback.append((old_loc, real, rb))
+
+        # ---- 5) 改写索引项（否则索引指向已删槽位） ----
+        for k, pid, sid in list(self.bt.scan()):
+            new_loc = loc_map.get((pid, sid))
+            if new_loc is not None:
+                self.bt.insert(k, new_loc[0], new_loc[1])
+
+        # ---- 6) 改写 prev 指针（所有搬动已完成，引用关系稳定） ----
+        for old_loc, (npid, nsid) in list(loc_map.items()):
+            page = self.bp.get_page(npid)
+            rb = page.get_row(nsid) if page is not None else None
+            if rb is None:
+                continue
+            pp, ps = struct.unpack_from('<II', rb, 13)
+            if not pp:
+                continue
+            new_prev = loc_map.get((pp, ps))
+            if new_prev is None:
+                continue
+            b = bytearray(rb)
+            struct.pack_into('<II', b, 13, new_prev[0], new_prev[1])
+            b = bytes(b)
+            if not page.update_row_inplace(nsid, b):
+                page.restore_row(nsid, b)
+
+        # ---- 7) 源页收尾紧凑化（搬空之后槽位数组与行游标一并复位） ----
+        for pid in set(old[0] for old in loc_map):
+            page = self.bp.get_page(pid)
+            if page is not None:
+                page.compact()
+        self.bp.flush()
+        # 搬完之后"还有活行的最高堆页 + 1": 之上所有页都可以安全丢弃
+        # （索引项与版本链都已被前向改写，全部指向这个位置以下）。
+        heap_floor = self._heap_floor(heap_pages)
+        # ★★ 收益门槛（**实测投影，不是估算**）: 如果"搬完之后还有活行的
+        #    最高堆页"不低于"搬之前"的最高活页，这次搬页等于白做
+        #    （甚至因为每页留了可复用余量而需要更多页）。此时把搬页
+        #    整体回滚，一行都不动 —— 宁可不缩，绝不越搬越大。
+        live_before = 2
+        for pid in heap_pages:
+            page = self.bp.get_page(pid)
+            if page is None:
+                continue
+            if any(True for _ in page.iter_rows()):
+                live_before = max(live_before, pid)
+        if heap_floor > live_before:
+            self._rollback_relocate(rollback)
+            self.bp.flush()
+            self._reloc_dbg = {'n_pages': n_pages,
+                               'target_pages': target_pages,
+                               'planned': len(plan), 'moved': 0,
+                               'rejected': 'no_gain(floor=%d>live=%d)'
+                                           % (heap_floor, live_before),
+                               'heap_floor': self._heap_floor(heap_pages)}
+            return n_pages, 0, live_before + 1, None
+        self._reloc_dbg = {'n_pages': n_pages, 'target_pages': target_pages,
+                           'planned': len(plan), 'moved': moved,
+                           'executed': len(loc_map),
+                           'heap_floor': heap_floor}
+        return n_pages, moved, heap_floor, rollback
+
+    def _heap_pages(self) -> list:
+        """当前文件里所有堆页的页号（升序）"""
+        out = []
+        for pid in range(1, self.bp.total_pages()):
+            page = self.bp.get_page(pid)
+            if page is not None and page.page_type == PAGE_TYPE_HEAP:
+                out.append(pid)
+        return out
+
+    def _free_page_candidates(self, floor_pages: int) -> list:
+        """
+        列出 `floor_pages` 之上那些**可以安全复用**的页号。
+
+        谁是安全的: `floor_pages` 之上、且不在"仍被引用的页"集合里的页。
+        `scan_pages` 给出的 `live_pages` 含**四条引用**（可达树页、叶子
+        兄弟链、活跃行所在堆页、被 prev 指向的堆页）。`floor_pages` 本身
+        已经保证"之上的堆页没有活跃行"，所以余下不在 `live_pages` 里的页
+        —— 主要是**即将被整棵丢弃的旧 B+Tree** —— 就是新树的落脚点。
+
+        为什么必须用它们: 新树如果追加到文件末尾，"回收"反而让文件变大
+        （本批次实测: 4000 行删 2/3 的场景 1257472 → 1306624 B）。
+        """
+        if floor_pages is None:
+            return []
+        try:
+            res = scan_pages(self.bp, self.bt, self.freelist.pages,
+                             protected_pages=self._reclaim_protected_pages())
+        except Exception:
+            return []
+        out = []
+        n_total = self.bp.total_pages()
+        for pid in range(2, n_total):
+            pg = self.bp.get_page(pid)
+            if pg is None:
+                continue
+            if pg.page_type == PAGE_TYPE_HEAP:
+                if pid >= floor_pages or any(True for _ in pg.iter_rows()):
+                    continue          # 还有行的堆页 / floor 以下的堆页: 不能动
+                out.append(pid)
+                continue
+            # 索引页: 旧树整棵都要丢弃（新树会密集打包），所以这些页号
+            # 都可以当新树的家。堆页则只允许"无活行且不在 floor 以下"的。
+            out.append(pid)
+        return out
+
+    def _rollback_relocate(self, rollback):
+        """
+        撤销一次前向搬页（把行写回**原页原槽位**），用于"越搬越大"的场合。
+
+        顺序: 先把新位置的行删掉，再按**倒序**写回旧位置并紧凑化。
+        倒序是为了让"同一页上多个槽位"的恢复不会互相覆盖（`restore_row`
+        在槽位需要新空间时会移动 `next_row_ptr`）。索引项与 prev 指针
+        不用管: 搬页时改过的索引项由调用方随后用 `_rebuild_btree` 重建，
+        prev 指针只可能被改成"新位置"，而恢复后这些行的位置与搬页前
+        完全一致 —— 调用方必须紧接着重建索引（`_reclaim_pages` 就是这么做的）。
+        """
+        pages = set()
+        for old_loc, new_loc, _rb in rollback:
+            pages.add(old_loc[0])
+            if new_loc:
+                pages.add(new_loc[0])
+        # 1) 删掉搬家后的行
+        for old_loc, new_loc, _rb in rollback:
+            if new_loc is None:
+                continue
+            p = self.bp.get_page(new_loc[0])
+            if p is not None:
+                p.delete_row(new_loc[1])
+        # 2) 倒序写回原位置
+        for old_loc, _new_loc, rb in reversed(rollback):
+            if rb is None:
+                continue
+            p = self.bp.get_page(old_loc[0])
+            if p is None:
+                continue
+            if not p.restore_row(old_loc[1], rb):
+                p.insert_row(rb)
+        # 3) 紧凑化涉及的页
+        for pid in pages:
+            p = self.bp.get_page(pid)
+            if p is not None:
+                p.compact()
+        self.bp.flush()
+
+    def _heap_floor(self, heap_pages) -> int:
+        """
+        "还有活行的最高堆页 + 1"（没有活行时返回 2 = 页 0/1 之后）。
+
+        这是本表堆页在**物理上**用到的上界: 之上的页要么是索引页、
+        要么是空页，全都可以在重建索引时一并丢弃。
+        """
+        floor = 2
+        for pid in heap_pages:
+            page = self.bp.get_page(pid)
+            if page is not None and any(True for _ in page.iter_rows()):
+                floor = max(floor, pid + 1)
+        return floor
+
+        self.bp.flush()
+        return n_pages, moved
+
+    # ---------- B+Tree 原地重建（索引页级回收） ----------
+
+    def _rebuild_btree(self, floor_pages: int = None,
+                       free_pages: list = None) -> dict:
+        """
+        按**密集打包**重建 B+Tree，把稀疏的索引页真正回收掉。
+
+        为什么索引也必须回收（实测）: 一次"插 20000 行 → 删 90%"之后
+        `.dat` 307 页里只有 187 页是堆页，**119 页是索引页** ——
+        20000 个主键分布在 60 片叶子上，删到只剩 2000 个键之后每片叶子
+        只剩几十个条目（`LEAF_CAPACITY` = 337）。只回收堆页的话文件上限
+        被索引页钉死在 307 页（1257472 B），实测只能截掉 1 页。
+
+        做法: 把"索引项 → 行位置"按主键升序取出 → 新建一棵空树 →
+        顺序插入。新树的叶子按 `LEAF_CAPACITY` 顺序填满，2000 个键只要
+        ~6 片叶子（旧树 60 片）。旧索引页全部变成不可达孤儿页。
+
+        ★ 新树必须**落在被丢弃的旧索引页号上**，不能追加到文件末尾
+        （否则"回收"反而让文件变大 —— 本批次实测: 4000 行删 2/3 的场景
+        1257472 → 1306624 B）。所以这里接收两样东西:
+          * `floor_pages`: 把文件先截到这里（之下是堆页与元数据，安全）；
+          * `free_pages`: 从 floor 之上挑出的**空页池**，`limit` 只在这些
+            页号里分配。
+
+        为什么还要"先把根指针置失效并 fsync": 截断之后盘上的旧根可能指向
+        已经不存在的页。先写 -1（`_load_btree_root` 会把它当作"没有可用
+        索引"）再建新树，崩溃后 `_rebuild_index()` 会扫堆页重建一份完整
+        索引 —— 数据一行不少。**不置失效**而直接截断的话，盘上会留着
+        指向垃圾页的根，比"没有索引"危险得多。
+
+        返回统计 dict。任何一步失败都不影响堆数据（索引可从堆重建）。
+        """
+        entries = [(k, pid, sid) for k, pid, sid in self.bt.scan()]
+        if not entries:
+            return {'index_entries': 0}
+        # ★ 只重建"槽位真实存在"的项: 页级回收刚把死版本的槽位置零过，
+        #   索引项若指向空槽位，重建后那一行就永远读不到了。
+        entries = [e for e in entries
+                   if (self.bp.get_page(e[1]) is not None
+                       and self.bp.get_page(e[1]).get_row(e[2]) is not None)]
+        if not entries:
+            return {'index_entries': 0}
+        old_bt = self.bt
+        old_live = self.bt.live_pages()
+        old_root = self.bt.root_page_id
+        old_file_size = self.bp.file_size()
+        self.bp.flush()
+
+        stats = {'index_entries': len(entries),
+                 'old_index_pages': len(old_live), 'old_root': old_root}
+
+        dropped = 0
+        if floor_pages and floor_pages >= 2:
+            if all(pid < floor_pages for _k, pid, _s in entries):
+                dropped = self.bp.truncate(floor_pages)
+                self._save_btree_root(-1, sync=True)
+                self.bp.flush()
+        stats['dropped_pages'] = dropped
+        size_before_tree = self.bp.file_size()
+
+        limit = None
+        lo = 1
+        if free_pages:
+            pool = sorted(p for p in free_pages
+                          if p >= 2 and (floor_pages is None
+                                         or p >= floor_pages))
+            if len(pool) >= 2:
+                # 取**最长的一段连续空页**当新树的家（保证不追加到文件尾）
+                runs, start, prev = [], None, None
+                for p in pool:
+                    if prev is None or p != prev + 1:
+                        if start is not None:
+                            runs.append((start, prev))
+                        start = p
+                    prev = p
+                if start is not None:
+                    runs.append((start, prev))
+                a, b = max(runs, key=lambda r: r[1] - r[0])
+                limit = b + 1
+                lo = a
+                stats['index_region'] = (a, b)
+                stats['free_region_pages'] = b - a + 1
+
+        new_bt = BTree(self.bp, root_page_id=None,
+                       page_limit=(lo, limit) if limit else None)  # 新建空树
+        for k, pid, sid in entries:
+            new_bt.insert(k, pid, sid)
+        self.bt = new_bt
+        self._save_btree_root(new_bt.root_page_id, sync=True)
+        self.bp.flush()
+        new_live = new_bt.live_pages()
+        grew = self.bp.file_size() > old_file_size
+        # ★★ 收益门槛（**实测**）: 新树页数不少于旧树 ⇒ 重建是负收益，
+        #    恢复旧树（它仍在盘上）。新树页数**更少**时接受它，并把
+        #    "新树被追加到文件尾"多出来的长度截回去 —— 旧树的内容在
+        #    `old_file_size` 之下，而新树的所有页都在它之上，因此这一步
+        #    是安全的（本批次实测: 20000 行删 90% 的场景新树 119 → 12 页，
+        #    若不截回文件长度就变成 1257472 → 1306624 B）。
+        if len(new_live) >= len(old_live):
+            self.bt = old_bt
+            self._save_btree_root(old_root, sync=True)
+            self.bp.truncate(max(1, old_file_size // PAGE_SIZE))
+            self.bp.flush()
+            stats.update({
+                'new_index_pages': len(old_live),
+                'new_root': old_root,
+                'orphan_index_pages': 0,
+                'rejected': 'no_gain(pages %d>=%d)'
+                            % (len(new_live), len(old_live)),
+            })
+            return stats
+        if grew:
+            # 新树更小但被追加到尾部: 把尾部截回旧长度（新树页都在其上，
+            # 截回后文件长度只覆盖旧树的位置；新树的页号仍然有效，
+            # 因为它们是"被丢弃的旧树页"留下的空洞）。
+            self.bp.truncate(max(1, old_file_size // PAGE_SIZE))
+            self.bp.flush()
+        self._save_btree_root(new_bt.root_page_id, sync=True)
+        self.bp.flush()
+        stats.update({
+            'new_index_pages': len(new_live),
+            'new_root': new_bt.root_page_id,
+            'orphan_index_pages': len(old_live - new_live),
+        })
+        return stats
+
+    # ==================== 完整性扫描器 ====================
+
+    def _vacuum_stats(self) -> dict:
+        """内部: 最近一次 vacuum 的页级统计"""
+        return dict(self._last_vacuum_pages or {})
+
+    def vacuum_stats(self) -> dict:
+        """最近一次 vacuum 的页级统计（`Database.vacuum` / `VACUUM SQL` 用）"""
+        return dict(self._last_vacuum_pages or {})
+
+    # ==================== 完整性扫描器 ====================
+
+    def integrity_scan(self, deep: bool = True) -> dict:
+        """
+        完整性扫描器: 遍历**索引**与**每一行的版本链**，报告所有
+        (page, slot) 引用是否自洽。
+
+        返回 dict（可直接断言/打印）:
+          index_entries     索引项数
+          chain_versions    沿链访问到的版本数
+          dangling_prev     悬空的 prev_page（指向不存在的页/空槽）
+          rows_on_free_pages 活跃版本落在**空闲页**上的行（不允许 > 0）
+          live_rows         活跃（xmax == 0）版本数
+          orphan_btree_pages 不可达的 B+Tree 页（浪费空间，非损坏）
+          unreferenced_pages 无人引用、无活跃行的堆页（可截断候选）
+          truncated_pages_ok 截断上界之上的页确实无人引用
+          bad_magic_pages   魔数坏页
+          leaked_slots      **活跃行**落在被截断页上的情况（恒为 0）
+
+        deep=False 时只查索引 + 版本链，不做全页引用扫描（省一次全文件读）。
+        """
+        with self._lock:
+            self.bp.flush()
+            entries = list(self.bt.scan())
+            seen_locs = set()
+            dangling = []
+            chain_count = 0
+            live_rows = 0
+            rows_on_free = []
+            free_set = set(self.freelist.pages)
+            n_pages = self.bp.total_pages()
+
+            for k, pid, sid in entries:
+                loc = (pid, sid)
+                # 1) 索引项必须落在存在的页上
+                if pid < 1 or pid >= n_pages:
+                    dangling.append(('index', k, loc, 'page-missing'))
+                    continue
+                chain = list(self._chain_versions(loc))
+                if not chain:
+                    dangling.append(('index', k, loc, 'slot-empty'))
+                    continue
+                for vpid, vsid, rb, _vals, xmin, xmax, pp, ps in chain:
+                    chain_count += 1
+                    seen_locs.add((vpid, vsid))
+                    if xmax == 0:
+                        live_rows += 1
+                    if xmax == 0 and (vpid, vsid) in free_set:
+                        # 活跃行落在空闲页上: 登记表把它当"可复用"，
+                        # 后续插入会把行**覆盖**掉 —— 这是最危险的一类
+                        rows_on_free.append((k, vpid, vsid))
+                    if pp == NO_PREV:
+                        continue
+                    tpage = self.bp.get_page(pp)
+                    if tpage is None:
+                        dangling.append(
+                            ('prev', k, (vpid, vsid), (pp, ps), 'page-missing'))
+                    elif tpage.get_row(ps) is None:
+                        dangling.append(
+                            ('prev', k, (vpid, vsid), (pp, ps), 'slot-empty'))
+
+            out = {
+                'table': self.name,
+                'total_pages': n_pages,
+                'index_entries': len(entries),
+                'chain_versions': chain_count,
+                'live_rows': live_rows,
+                'dangling_prev': dangling,
+                'rows_on_free_pages': rows_on_free,
+                'free_pages': len(free_set),
+            }
+            if deep:
+                res = scan_pages(self.bp, self.bt, self.freelist.pages,
+                                 protected_pages=self._reclaim_protected_pages())
+                out.update({
+                    'orphan_btree_pages': sorted(res.orphan_btree),
+                    'unreferenced_pages': sorted(res.truncatable),
+                    'bad_magic_pages': sorted(res.bad_magic),
+                    'max_live_page': res.max_live_page(),
+                    'scan_dangling_prev': res.dangling_prev,
+                    'truncatable_free_bytes': res.free_in_truncatable,
+                })
+            return out
 
     # ==================== checkpoint / WAL 轮转 ====================
 
@@ -2172,6 +3665,13 @@ class Table:
         """
         self.bp.flush()
         self._save_btree_root(self.bt.root_page_id, sync=True)
+        # 空闲页登记表随 checkpoint/close 一并落盘（内容没变时不写）:
+        # 这是"重启后仍知道哪些页可用"的持久化点之一，另两处是
+        # vacuum 收尾与"页被填满"时（_unregister_space_page）。
+        try:
+            self.freelist.save()
+        except Exception as e:
+            logger.warn(f"空闲页登记表落盘失败 {self.name}: {e}")
         self.wal.truncate(sync=sync_truncate)
 
     def _maybe_checkpoint(self) -> bool:

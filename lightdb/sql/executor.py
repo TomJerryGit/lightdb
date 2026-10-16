@@ -5943,6 +5943,65 @@ class Executor:
                 rows.append(got)
         return self._rs(list(self._CHECK_COLUMNS), rows)
 
+    #: `VACUUM` 结果集列（真实数字，不编造）
+    _VACUUM_COLUMNS = ['Table', 'Reclaimed_versions', 'Relocated_rows',
+                       'Pages_before', 'Pages_after', 'Trimmed_pages',
+                       'Free_pages', 'Free_bytes', 'Dat_before', 'Dat_after',
+                       'Shrink_ratio', 'Msg_type', 'Msg_text']
+
+    def _show_vacuum(self, p, s):
+        """
+        `VACUUM [TABLE t1, t2]` —— 版本回收 + **页级回收**（真正的磁盘空间回收）。
+
+        与 `OPTIMIZE TABLE` 的区别（两条语句都保留，职责不重叠）:
+          * `OPTIMIZE TABLE`: 回收历史版本 + 页内紧凑化 + 刷盘 + 刷新统计；
+          * `VACUUM`:        **额外**做"前向搬页 + 重建 B+Tree + 截断 `.dat`"，
+            并把空闲页登记表落盘 —— 会改变页号（索引与 prev 链同步改写），
+            是本引擎最重的空间回收动作。
+
+        安全门: 若表上存在**未提交事务**（`Table._read_views` 非空），
+        一律拒绝（返回 error 行），因为搬页会改变行位置，而未提交事务的
+        物理 undo 镜像记的是"原页原槽位" —— 搬完就回滚不回去了。
+        这正是 `Table.vacuum` 的 horizon 判定所保护的同一件事，
+        这里额外显式挡一道并如实报告。
+        """
+        rows = []
+        names = p.get('tables') or sorted(self.db.tables.keys())
+        for name in names:
+            if name not in self.db.tables:
+                rows.append((name, 0, 0, 0, 0, 0, 0, 0, 0, 0, '', 'error',
+                             f"Table '{name}' doesn't exist"))
+                continue
+            tbl = self.db.tables[name]
+            if getattr(tbl, '_read_views', None):
+                rows.append((name, 0, 0, 0, 0, 0, 0, 0, 0, 0, '', 'error',
+                             '存在未提交事务，拒绝回收（先 COMMIT/ROLLBACK）'))
+                continue
+            before = tbl.bp.file_size()
+            try:
+                reclaimed = tbl.vacuum()
+                tbl.flush()
+            except Exception as e:
+                rows.append((name, 0, 0, 0, 0, 0, 0, 0, before, before, '',
+                             'error', f'回收失败: {e}'))
+                continue
+            st = tbl.vacuum_stats()
+            fs = tbl.free_page_stats()
+            after = st.get('bytes_after', tbl.bp.file_size())
+            ratio = (1 - after / before) if before else 0.0
+            rows.append((
+                name, reclaimed, st.get('relocated_rows', 0),
+                st.get('pages_before', 0), st.get('pages_after', 0),
+                st.get('trimmed_pages', 0), fs['registered_pages'],
+                fs['free_bytes'], before, after, f'{ratio * 100:.1f}%',
+                'status',
+                f"回收 {reclaimed} 个版本，页内释放 "
+                f"{st.get('compacted_bytes', 0)} 字节，"
+                f"索引页 {st.get('btree_rebuild', {}).get('old_index_pages', 0)}"
+                f" → {st.get('btree_rebuild', {}).get('new_index_pages', 0)}，"
+                f"空闲页 {fs['registered_pages']} 个"))
+        return self._rs(list(self._VACUUM_COLUMNS), rows)
+
     def _show_optimize_table(self, p, s):
         """OPTIMIZE TABLE —— 真做回收 + 刷盘 + 刷新统计（列序同 CHECK TABLE）"""
         rows = []
