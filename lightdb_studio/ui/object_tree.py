@@ -93,6 +93,14 @@ class ObjectTree(QWidget):
         font.setBold(True)
         root.setFont(0, font)
 
+        # 第一棵树节点自动成为「当前连接」：否则连上了也是 `未连接`——
+        # `get_current_connection()` 只看 `tree.currentItem()`，而 Qt 插入
+        # 节点时**不会**自动设置 current（实测：插入后 currentItem() 仍为
+        # None，于是刚连上的连接用不了，查询还会弹「请先选择一个连接」）。
+        # 已经有当前项时不动它（不抢用户的选择）。
+        if self.tree.currentItem() is None:
+            self.tree.setCurrentItem(root)
+
         # 加载数据库
         try:
             loader = MetadataLoader(conn)
@@ -102,6 +110,21 @@ class ObjectTree(QWidget):
             err_item = QTreeWidgetItem(root)
             err_item.setText(0, f"⚠ 加载失败: {e}")
             err_item.setForeground(0, QColor("#f48771"))
+
+    def select_connection(self, name: str) -> bool:
+        """把 `name` 这条连接设为「当前连接」（找不到返回 False）。
+
+        用于自动连接后**主动选中** `last_connection`：这样
+        `get_current_connection()` / `MainWindow._get_current_conn()` 立刻
+        返回它，用户不必先去树里点一下。
+        """
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            data = item.data(0, Qt.UserRole)
+            if data and data[0] == NODE_CONN and data[1] == name:
+                self.tree.setCurrentItem(item)
+                return True
+        return False
 
     def remove_connection(self, name: str):
         # 遍历顶层节点

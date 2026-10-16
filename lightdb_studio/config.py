@@ -1,7 +1,8 @@
 """连接配置 + 应用设置"""
 import json
+import sys
 from pathlib import Path
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from typing import List
 
 
@@ -20,6 +21,30 @@ class ConnectionInfo:
     database: str = ""
     charset: str = "utf8mb4"
     ssl: bool = False
+
+
+# `connections.json` 里一条连接**恰好**是这些字段（`AppConfig.save()` 用
+# `asdict` 写出来，键名就是这里的字段名）。手写 JSON 时多写一个键以前会让
+# `ConnectionInfo(**c)` 抛 TypeError，而那个异常被 `load()` 的大 try 吞掉 →
+# **所有**连接一起消失，只在 stdout 留一行 print。现在按字段过滤 + 逐条兜底。
+CONNECTION_FIELDS = frozenset(f.name for f in fields(ConnectionInfo))
+
+
+def _connection_from_dict(d: dict) -> ConnectionInfo:
+    """把 json 里的一条连接转成 `ConnectionInfo`。
+
+    未知键**忽略并告警**（不再让 TypeError 把整份配置连坐丢掉）；缺的键用
+    `ConnectionInfo` 的默认值。注意「上次连接」标记不在每条连接里，而是
+    `connections.json` 的顶层 `last_connection`（见 `AppConfig.load`）。
+    """
+    if not isinstance(d, dict):
+        raise TypeError(f'连接配置必须是对象，收到 {type(d).__name__}')
+    known = {k: v for k, v in d.items() if k in CONNECTION_FIELDS}
+    unknown = sorted(set(d) - CONNECTION_FIELDS)
+    if unknown:
+        print(f"连接 {known.get('name')!r} 里有未知字段，已忽略: {unknown}"
+              f"（合法字段: {sorted(CONNECTION_FIELDS)}）", file=sys.stderr)
+    return ConnectionInfo(**known)
 
 
 @dataclass
@@ -81,10 +106,14 @@ class AppConfig:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             for c in data.get('connections', []):
-                self.connections.append(ConnectionInfo(**c))
+                try:
+                    self.connections.append(_connection_from_dict(c))
+                except Exception as e:            # noqa: BLE001
+                    # 单条写坏不该拖垮其余连接（以前是整份配置全丢）
+                    print(f"跳过无法解析的连接配置 {c!r}: {e}", file=sys.stderr)
             self.last_connection = data.get('last_connection', '')
         except Exception as e:
-            print(f"加载配置失败: {e}")
+            print(f"加载配置失败: {e}", file=sys.stderr)
 
     def save(self):
         data = {

@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt
 
 from ..config import ConnectionInfo
 from ..db.connection import DBConnection
+from .error_prompts import show_connection_error
 
 
 class ConnectionDialog(QDialog):
@@ -117,7 +118,10 @@ class ConnectionDialog(QDialog):
             QMessageBox.information(self, "成功",
                                     f"连接成功！\n服务器版本: {version}")
         except Exception as e:
-            QMessageBox.critical(self, "失败", f"连接失败:\n{e}")
+            # 不再只丢驱动原文：结论 + 下一步（本地 host 直接给可照抄的启动
+            # 命令）+ 一字不删的原始报文，文本可选中复制。
+            show_connection_error(self, e, host=info.host, port=info.port,
+                                  title="失败")
         finally:
             self.test_btn.setEnabled(True)
             self.test_btn.setText("测试连接")

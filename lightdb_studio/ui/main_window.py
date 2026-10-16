@@ -42,6 +42,7 @@ from ..utils.history import QueryHistory
 
 # ---------- DB 错误字段（errno / sqlstate / message，绝不丢） ----------
 from ..db.connection import error_code, error_sqlstate
+from ..core.db_errors import connection_error_summary
 
 # ---------- UI 面板 ----------
 from .ai_chat import AIChatPanel
@@ -56,6 +57,8 @@ from .lineage_view import LineageGraphView, LineageDialog
 from .review_panel import ReviewPanel, ReviewSubmitDialog
 from .snapshot_dialog import SnapshotDialog
 from .connection_dialog import ConnectionDialog
+from .error_prompts import (show_connection_error,
+                            show_connection_error_nonblocking)
 from .object_tree import ObjectTree
 from .sql_editor import SQLEditor
 from .result_table import ResultTable, parse_error_fields
@@ -800,7 +803,7 @@ class MainWindow(QMainWindow):
             conn = DBConnection(info)
             conn.connect()
         except Exception as e:
-            QMessageBox.critical(self, "连接失败", f"无法连接:\n{e}")
+            self._report_connection_failure(info, e)
             return
 
         self.config.add_connection(info)
@@ -808,19 +811,91 @@ class MainWindow(QMainWindow):
         self.config.save()
 
         self.object_tree.add_connection(info, conn)
+        self.object_tree.select_connection(info.name)
         self.status_label.setText(f"已连接: {info.name}")
         self._on_tab_changed(self.tabs.currentIndex())
 
+    def _report_connection_failure(self, info, exc, title='连接失败'):
+        """连接失败 → 弹「可行动」的框（原始报文一字不删）+ 状态栏一行结论。
+
+        文本由 `core/db_errors.explain_connection_error` 生成（错误码 →
+        结论 → 可照抄的启动命令 → 原始报文），对话框里文本可选中复制。
+        """
+        text = show_connection_error(self, exc, host=getattr(info, 'host', None),
+                                     port=getattr(info, 'port', None),
+                                     title=title)
+        self._set_status(connection_error_summary(
+            exc, host=getattr(info, 'host', None),
+            port=getattr(info, 'port', None)), error=True)
+        return text
+
     def _auto_restore(self):
-        for info in self.config.connections:
+        """启动时恢复保存的连接（首帧之后由 `do_startup_restore()` 调用）。
+
+        触发条件（读代码 + 实测确认的语义，schema 见 `config.py`）：
+
+          * `settings.json` 的 `auto_connect`（设置里「启动时自动连接」，默认
+            True）为 False 时**完全不拨号** —— 这一项此前根本没被读，
+            关掉也没用；
+          * `connections.json` 顶层 `last_connection` 就是「上次连接」标记
+            （`_new_connection()` 成功后写入），它被**最先**连接、并且连上后
+            被**选中**（`select_connection`），所以 `_get_current_conn()`
+            立刻可用（此前 Qt 不会自动设 currentItem，连上了也是「未连接」）；
+          * 其余保存的连接照旧连接并挂进对象树；
+          * 连不上的：状态栏写一行结论；`last_connection` 那条再弹一个
+            **非阻塞**对话框（含原始报文 + 可照抄的启动命令），不挡首屏。
+        """
+        if not getattr(self.settings, 'auto_connect', True):
+            # 只在状态栏还停在初始「就绪」时写这条提示：它是**纯信息**，
+            # 绝不能盖掉这次启动里更重要的东西（比如首屏之后用户已经跑出
+            # 来的一条错误信息 —— 启动期恢复是 `QTimer.singleShot(0)`，
+            # 完全可能排在用户的第一次查询之后）。
+            if self.status_label.text().strip() in ('', '就绪'):
+                self._set_status('已跳过自动连接（「启动时自动连接」已关闭）')
+            return
+
+        infos = list(self.config.connections)
+        if not infos:
+            return
+        last = getattr(self.config, 'last_connection', '') or ''
+        # 「上次连接」排最前：先把它连上，其余保持文件里的顺序（sorted 稳定）
+        infos.sort(key=lambda c: 0 if c.name == last else 1)
+
+        last_text = ''
+        last_failed = False
+        first_failure = ''
+        ok_count = 0
+        for info in infos:
             try:
                 conn = DBConnection(info)
                 conn.connect()
-                self.object_tree.add_connection(info, conn)
-                self.status_label.setText(f"自动连接: {info.name}")
-                self._on_tab_changed(self.tabs.currentIndex())
-            except Exception:
-                self.status_label.setText(f"自动连接失败: {info.name}")
+            except Exception as e:
+                text = '自动连接失败: %s — %s' % (
+                    info.name,
+                    connection_error_summary(e, info.host, info.port))
+                if not first_failure:
+                    first_failure = text
+                if info.name == last:
+                    last_text = text
+                    last_failed = True
+                    show_connection_error_nonblocking(
+                        self, e, host=info.host, port=info.port,
+                        title='自动连接失败: %s' % info.name)
+                continue
+            ok_count += 1
+            self.object_tree.add_connection(info, conn)
+            if info.name == last:
+                last_text = '自动连接: %s' % info.name
+                last_failed = False
+                self.object_tree.select_connection(info.name)
+            self._on_tab_changed(self.tabs.currentIndex())
+
+        if last_text:
+            self._set_status(last_text, error=last_failed)
+        elif first_failure:
+            self._set_status(first_failure, error=True)
+        elif not ok_count:
+            self._set_status('自动连接: 没有连上的连接')
 
     def _refresh_tree(self):
         self.object_tree.refresh_all()
