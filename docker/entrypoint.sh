@@ -36,6 +36,37 @@ export LIGHTDB_CONFIG="${LIGHTDB_CONFIG:-/app/config.json}"
 export LIGHTDB_HOST="${LIGHTDB_HOST:-0.0.0.0}"
 export LIGHTDB_PORT="${LIGHTDB_PORT:-8888}"
 
+# ---------- root initial password (P0-A secure default) ----------
+# The engine no longer ships an empty-password root. When
+# LIGHTDB_ROOT_PASSWORD is not provided explicitly, generate a random one
+# per container start, print it once here, and pass it to the server via the
+# environment (NOT via argv: secrets must not show up in ps / process lists).
+# Production: inject LIGHTDB_ROOT_PASSWORD explicitly (e.g. via secrets).
+ensure_root_password() {
+    if [ -z "${LIGHTDB_ROOT_PASSWORD:-}" ]; then
+        LIGHTDB_ROOT_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(16))')"
+        export LIGHTDB_ROOT_PASSWORD
+        warn "LIGHTDB_ROOT_PASSWORD is not set; generated a random root password (valid for this run only):"
+        echo "  root password: ${LIGHTDB_ROOT_PASSWORD}"
+        echo "  note: it changes on every container start; set LIGHTDB_ROOT_PASSWORD to pin it"
+    fi
+}
+
+# ---------- Studio Web admin password (P0-A secure default) ----------
+# Same idea for the web frontend: without LIGHTDB_WEB_USERS /
+# LIGHTDB_WEB_ADMIN_PASSWORD, generate a random admin password, print it
+# once, and export LIGHTDB_WEB_ADMIN_PASSWORD for the web process to read.
+ensure_web_admin_password() {
+    if [ -z "${LIGHTDB_WEB_USERS:-}" ] && [ -z "${LIGHTDB_WEB_ADMIN_PASSWORD:-}" ]; then
+        LIGHTDB_WEB_ADMIN_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(12))')"
+        export LIGHTDB_WEB_ADMIN_PASSWORD
+        warn "LIGHTDB_WEB_USERS / LIGHTDB_WEB_ADMIN_PASSWORD are not set; generated a random web admin password (valid for this run only):"
+        echo "  web admin user:     admin"
+        echo "  web admin password: ${LIGHTDB_WEB_ADMIN_PASSWORD}"
+        echo "  note: it changes on every container start; set LIGHTDB_WEB_ADMIN_PASSWORD to pin it"
+    fi
+}
+
 # ---------- 准备目录 ----------
 prepare_dirs() {
     mkdir -p "$LIGHTDB_DATA_DIR" \
@@ -85,6 +116,9 @@ print_banner() {
 
 # ---------- 命令: server ----------
 cmd_server() {
+    # 容器内显式监听 0.0.0.0（对外提供服务），因此必须保证 root 有口令：
+    # 未显式配置时由 ensure_root_password 生成随机口令并只打印一次。
+    ensure_root_password
     print_banner "server"
 
     log "启动 LightDB 服务器..."
@@ -107,6 +141,7 @@ cmd_web() {
     # 等待 LightDB 就绪
     wait_for_host "$target_host" "$LIGHTDB_PORT" "LightDB" 60 || true
 
+    ensure_web_admin_password
     log "启动 Studio Web..."
     exec python -m web.start \
         --host 0.0.0.0 \

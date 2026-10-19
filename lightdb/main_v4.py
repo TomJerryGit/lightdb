@@ -81,6 +81,7 @@ def run_multi(cfg) -> int:
     log.info(f"  监听:         {cfg.listen_addr}")
     log.info(f"  数据目录:     {cfg.data_dir}")
     log.info(f"  日志目录:     {cfg.log_dir or '(stdout)'}")
+    log.info(f"  root 认证:    {cfg._root_auth_desc()}")
     log.info(f"  Worker 数:    {workers}")
     log.info(f"  CPU 核数:     {os.cpu_count()}")
     log.info(
@@ -173,7 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog='lightdb-server-v4',
         description='LightDB v4.0 多进程数据库服务')
     ap.add_argument('--config', default='config.json')
-    ap.add_argument('--host', default=None)
+    ap.add_argument('--host', default=None,
+                    help='监听地址（默认仅回环 127.0.0.1）')
     ap.add_argument('--port', type=int, default=None)
     ap.add_argument('--workers', type=int, default=None,
                     help='Worker 进程数（0=CPU核数）')
@@ -182,6 +184,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--log-level', default=None,
                     choices=['DEBUG', 'INFO', 'WARN',
                              'WARNING', 'ERROR'])
+    # P0 安全默认：root 不再空口令；下面两个参数是显式覆盖/显式降级入口。
+    ap.add_argument('--root-password', default=None, metavar='PASSWORD',
+                    help='显式指定 root 口令（也可用环境变量 '
+                         'LIGHTDB_ROOT_PASSWORD；日志不打印明文）')
+    ap.add_argument('--allow-empty-password', action='store_true',
+                    help='【不安全】显式允许 root 空口令，仅限本地开发/演示')
     ap.add_argument('--check', action='store_true',
                     help='仅校验配置后退出')
     ap.add_argument('--version', action='store_true')
@@ -214,6 +222,10 @@ def main(argv=None) -> int:
         cfg.log_dir = os.path.abspath(args.log_dir)
     if args.log_level:
         cfg.log_level = args.log_level
+    if args.root_password is not None:
+        cfg.root_password = args.root_password
+    if args.allow_empty_password:
+        cfg.allow_empty_password = True
 
     cfg._normalize()
 
@@ -229,6 +241,15 @@ def main(argv=None) -> int:
         print("[OK] 配置校验通过")
         print(cfg.describe())
         return 0
+
+    # ---------- 安全提示（只提示，不改变显式配置的语义） ----------
+    if cfg.allow_empty_password:
+        print("[警告] 已显式允许 root 空口令（--allow-empty-password / "
+              "LIGHTDB_ALLOW_EMPTY_PASSWORD）：仅限本地开发/演示，"
+              "生产环境禁止使用", file=sys.stderr)
+    if cfg.host not in ('127.0.0.1', 'localhost', '::1'):
+        print(f"[提示] 监听地址为 {cfg.host}：数据库可被网络访问，"
+              f"请确认已设置 root 口令并按需配置 IP 白名单", file=sys.stderr)
 
     # ---------- 启动 ----------
     return run_multi(cfg)

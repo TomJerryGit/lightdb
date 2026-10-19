@@ -78,12 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
   python -m lightdb.main --port 9999
 
 环境变量:
-  LIGHTDB_HOST         监听地址
+  LIGHTDB_HOST         监听地址（默认 127.0.0.1）
   LIGHTDB_PORT         端口
   LIGHTDB_WORKERS      Worker 数
   LIGHTDB_DATA_DIR     数据目录
   LIGHTDB_LOG_LEVEL    日志级别
   LIGHTDB_LOG_DIR      日志目录
+  LIGHTDB_ROOT_PASSWORD
+                       root 口令（未设置则首次启动自动生成随机口令）
+  LIGHTDB_ALLOW_EMPTY_PASSWORD=1
+                       【不安全】显式允许 root 空口令（仅本地开发/演示）
         """)
 
     # ---------- 模式 ----------
@@ -94,9 +98,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---------- 网络 ----------
     ap.add_argument('--host', default=None,
-                    help='监听地址')
+                    help='监听地址（默认仅回环 127.0.0.1；'
+                         '对外提供服务需显式指定 0.0.0.0 或具体网卡地址）')
     ap.add_argument('--port', type=int, default=None,
                     help='监听端口')
+
+    # ---------- 认证 ----------
+    # P0 安全默认：root 不再空口令。默认首次启动生成随机口令并写入
+    # <data_dir>/root.password；下面两个参数是显式覆盖/显式降级入口。
+    ap.add_argument('--root-password', default=None, metavar='PASSWORD',
+                    help='显式指定 root 口令（也可用环境变量 '
+                         'LIGHTDB_ROOT_PASSWORD；日志不打印明文）')
+    ap.add_argument('--allow-empty-password', action='store_true',
+                    help='【不安全】显式允许 root 空口令，仅限本地开发/演示；'
+                         '等价于 LIGHTDB_ALLOW_EMPTY_PASSWORD=1')
 
     # ---------- Worker ----------
     ap.add_argument('--workers', type=int, default=None,
@@ -157,6 +172,10 @@ def main(argv=None) -> int:
         cfg.log_dir = os.path.abspath(args.log_dir)
     if args.log_level:
         cfg.log_level = args.log_level
+    if args.root_password is not None:
+        cfg.root_password = args.root_password
+    if args.allow_empty_password:
+        cfg.allow_empty_password = True
 
     # 规范化
     cfg._normalize()
@@ -173,6 +192,16 @@ def main(argv=None) -> int:
         print("[OK] 配置校验通过")
         print(cfg.describe())
         return 0
+
+    # ---------- 安全提示（只提示，不改变显式配置的语义） ----------
+    if cfg.allow_empty_password:
+        print("[警告] 已显式允许 root 空口令（--allow-empty-password / "
+              "LIGHTDB_ALLOW_EMPTY_PASSWORD）：仅限本地开发/演示，"
+              "生产环境禁止使用", file=sys.stderr)
+    if cfg.host not in ('127.0.0.1', 'localhost', '::1'):
+        print(f"[提示] 监听地址为 {cfg.host}：数据库可被网络访问，"
+              f"请确认已设置 root 口令（或用 LIGHTDB_ROOT_PASSWORD）"
+              f"并按需配置 IP 白名单", file=sys.stderr)
 
     # ---------- 决定模式 ----------
     mode = args.mode
@@ -209,11 +238,15 @@ def _run_single(cfg) -> int:
     log.info(f"  监听:   {cfg.listen_addr}")
     log.info(f"  数据:   {cfg.data_dir}")
     log.info(f"  日志:   {cfg.log_dir or '(stdout)'}")
+    log.info(f"  root:   {cfg._root_auth_desc()}")
     log.info("=" * 60)
 
     # ---------- 数据库 ----------
     try:
-        db = Database(cfg.effective_data_dir)
+        db = Database(
+            cfg.effective_data_dir,
+            root_password=cfg.root_password or None,
+            allow_empty_password=bool(cfg.allow_empty_password))
         log.info(f"  已加载 {len(db.tables)} 张表")
     except Exception as e:
         log.exception(f"初始化 Database 失败")

@@ -48,6 +48,10 @@ _ENV_MAP = {
     'LIGHTDB_SEMI_SYNC_ENABLED': ('semi_sync_enabled', bool),
     'LIGHTDB_MAX_CONN_PER_IP': ('max_conn_per_ip', int),
     'LIGHTDB_IP_WHITELIST_ENABLED': ('ip_whitelist_enabled', bool),
+    # root 初始口令：环境变量优先于「首次启动自动生成随机口令」。
+    'LIGHTDB_ROOT_PASSWORD': ('root_password', str),
+    # 显式允许 root 空口令（仅限本地开发/演示，默认关闭）。
+    'LIGHTDB_ALLOW_EMPTY_PASSWORD': ('allow_empty_password', bool),
     'LIGHTDB_PASSWORD_MIN_LENGTH': ('password_min_length', int),
     'LIGHTDB_PASSWORD_REQUIRE_DIGIT': ('password_require_digit', bool),
     'LIGHTDB_PASSWORD_DENY_WEAK': ('password_deny_weak', bool),
@@ -63,7 +67,10 @@ _ENV_MAP = {
 @dataclass
 class Config:
     # ---------- 网络 ----------
-    host: str = "0.0.0.0"
+    # 安全默认：只监听回环地址（旧默认为 0.0.0.0 —— 默认部署会把数据库
+    # 直接暴露到网络上）。需要对外提供服务时必须显式指定：
+    #   --host 0.0.0.0 / LIGHTDB_HOST=0.0.0.0 / config.json 的 "host"。
+    host: str = "127.0.0.1"
     port: int = 8888
     max_connections: int = 100
 
@@ -92,6 +99,14 @@ class Config:
     ssl_enabled: bool = False
     audit_level: str = "DDL"
     semi_sync_enabled: bool = False
+
+    # root 初始口令（空 = 未显式指定）。
+    # 优先级：LIGHTDB_ROOT_PASSWORD / --root-password > 首次启动随机生成。
+    # 明文只在内存/生成的 root.password 文件里，**绝不**打印到日志。
+    root_password: str = ""
+    # 显式允许 root 空口令（旧的不安全行为）。默认 False：
+    # 新库会生成随机口令、旧空口令库会自动迁移出随机口令。
+    allow_empty_password: bool = False
 
     # ---------- 连接限制 ----------
     max_conn_per_ip: int = 20
@@ -271,6 +286,16 @@ class Config:
                 f"slow_query_threshold 不能为负: "
                 f"{self.slow_query_threshold}")
 
+        # ---------- 认证 ----------
+        # 两者同时出现是矛盾的：显式口令优先，allow_empty_password 会被忽略，
+        # 容易造成"以为放宽了其实没有/以为有口令其实是空的"的误解，直接拒绝。
+        if self.allow_empty_password and self.root_password:
+            errors.append(
+                "root_password 与 allow_empty_password 冲突："
+                "请只保留一个（显式口令优先，空口令是显式降级）")
+        if not self.host:
+            errors.append("host 不能为空")
+
         return errors
 
     def validate_or_raise(self):
@@ -354,9 +379,23 @@ class Config:
             f"  默认隔离级别:   {self.default_isolation}",
             f"  SSL:            {self.ssl_enabled}",
             f"  审计级别:       {self.audit_level}",
+            f"  root 认证:      {self._root_auth_desc()}",
+            f"  允许空口令:     "
+            f"{'是（显式降级，仅限本地开发/演示）' if self.allow_empty_password else '否'}",
+            f"  连接限制:       总量 {self.max_connections} / 每 IP {self.max_conn_per_ip}",
+            f"  IP 白名单:      "
+            f"{('启用 ' + str(len(self.ip_whitelist or [])) + ' 条规则') if self.ip_whitelist_enabled else '未启用'}",
             "=" * 60,
         ]
         return '\n'.join(lines)
+
+    def _root_auth_desc(self) -> str:
+        """root 初始认证方式（只描述来源，绝不回显口令明文）"""
+        if self.root_password:
+            return "环境变量/命令行显式指定（不打印明文）"
+        if self.allow_empty_password:
+            return "显式允许空口令（不安全）"
+        return "首次启动自动生成随机口令（写入 data_dir/root.password）"
 
     def __repr__(self) -> str:
         return f"Config(host={self.host}, port={self.port}, " \

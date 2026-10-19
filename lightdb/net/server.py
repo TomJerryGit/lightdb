@@ -14,6 +14,7 @@ import socketserver
 import struct
 import threading
 import time
+import weakref
 from datetime import datetime
 from typing import Optional
 
@@ -23,6 +24,11 @@ from ..logger import logger
 # 实现（db/database.py），避免三条路径各编一套元数据。
 from ..db.database import describe_columns
 from . import mysql_protocol as mp
+
+
+#: 登录失败后的固定延迟（秒）。它让暴力破解/口令扫描变慢，同时不改变
+#: 正确登录路径的耗时。0.5s 足够拖垮在线爆破，又不会影响人的交互体验。
+LOGIN_FAILURE_DELAY = 0.5
 
 
 # ==================== 会话管理 ====================
@@ -93,7 +99,10 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         while len(data) < n:
             try:
                 chunk = self.sock.recv(n - len(data))
-            except (socket.timeout, ConnectionResetError):
+            except (socket.timeout, ConnectionResetError,
+                    ConnectionAbortedError):
+                # 客户端在握手前后直接断开（端口扫描/探活很常见）属于正常
+                # 情况：按"连接结束"处理，不要让 traceback 刷屏。
                 return None
             if not chunk:
                 return None
@@ -141,11 +150,10 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         # 用户校验
         user_info = self.db.users.get(self.user)
         if not user_info:
-            self._send_packet(mp.make_err_packet(
+            return self._auth_failure(
                 1045, "28000",
                 f"Access denied for user '{self.user}'@"
-                f"'{self.client_address[0]}'"))
-            return False
+                f"'{self.client_address[0]}'")
 
         # 密码校验
         stored_hash = b''
@@ -158,12 +166,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
         if not mp.mysql_native_password(
                 resp.auth_response, self.auth_seed, stored_hash):
-            self._send_packet(mp.make_err_packet(
+            return self._auth_failure(
                 1045, "28000",
                 f"Access denied for user '{self.user}'@"
                 f"'{self.client_address[0]}' "
-                f"(using password: YES)"))
-            return False
+                f"(using password: YES)")
 
         if resp.database:
             # 登录时指定的 database 必须**校验**：不存在的库要显式报错，
@@ -182,6 +189,22 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             f"用户 {self.user} 从 {self.client_address[0]} "
             f"登录成功 (sid={self.server_id})")
         return True
+
+    def _auth_failure(self, code: int, sql_state: str, message: str):
+        """登录失败：回 ERR 包 + WARN 日志 + 固定小延迟（抗暴力破解）。
+
+        延迟只发生在失败路径（`LOGIN_FAILURE_DELAY`），正确登录的耗时
+        完全不变；日志里带来源 IP，方便发现口令扫描。
+        """
+        self._send_packet(mp.make_err_packet(code, sql_state, message))
+        logger.warn(
+            f"登录失败 {self.user or '?'}@{self.client_address[0]} "
+            f"(sid={self.server_id}): {message[:160]}")
+        try:
+            time.sleep(LOGIN_FAILURE_DELAY)
+        except Exception:                     # pragma: no cover - 防御
+            pass
+        return False
 
     # ==================== 主循环 ====================
 
@@ -210,7 +233,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                     continue
                 self._dispatch(packet)
         except (socket.timeout, ConnectionResetError,
-                BrokenPipeError):
+                ConnectionAbortedError, BrokenPipeError):
             pass
         except Exception as e:
             logger.error(f"会话异常 (sid={self.server_id}): {e}")
@@ -1000,7 +1023,19 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 # ==================== Server ====================
 
 class MySQLServer(socketserver.ThreadingTCPServer):
-    """MySQL 兼容服务器"""
+    """MySQL 兼容服务器
+
+    除监听/服务外，本类负责**真正的连接准入执行**（P0-A 安全修复）：
+    * `max_connections`：全局并发连接上限（默认 100）；
+    * `max_conn_per_ip`：单个 IP 的并发连接上限（默认 20）；
+    * `ip_whitelist_enabled` / `ip_whitelist`：IP 白名单。
+
+    超限或不在白名单的连接在**握手之前**直接被回 ERR 包并关闭
+    （MySQL 协议允许服务端首包就是 ERR），客户端（pymysql 等）会看到
+    明确的 1040/1130 错误码，而不是"连上之后被莫名断开"。计数在
+    `verify_request` 里增加、在 `shutdown_request` 里减少，两者都由
+    socketserver 对每个已接受连接成对调用。
+    """
 
     allow_reuse_address = True
     daemon_threads = True
@@ -1010,14 +1045,160 @@ class MySQLServer(socketserver.ThreadingTCPServer):
         self.db = db
         self.executor = executor
         self.start_time = time.time()
+        # ---------- 连接准入状态 ----------
+        self._admission_lock = threading.Lock()
+        self._active_connections = 0
+        self._active_by_ip = {}
+        # 已准入的 socket -> 来源 IP。用弱引用键：即使某个连接的
+        # shutdown_request 因异常没走到，也不会在计数/映射上留下悬挂引用。
+        self._admitted = weakref.WeakKeyDictionary()
+
+        self.max_connections = self._int_cfg(
+            'max_connections', 100)
+        self.max_conn_per_ip = self._int_cfg(
+            'max_conn_per_ip', 20)
+
+        # ---------- IP 白名单 ----------
+        self.ip_whitelist = None
+        try:
+            from ..security.ip_whitelist import IPWhitelist
+            self.ip_whitelist = IPWhitelist(
+                enabled=bool(getattr(config, 'ip_whitelist_enabled', False)),
+                entries=list(getattr(config, 'ip_whitelist', None) or []))
+            if self.ip_whitelist.enabled and not self.ip_whitelist.entries:
+                logger.warn(
+                    "IP 白名单已启用但规则为空：所有连接都会被拒绝"
+                    "（在 config.json 的 ip_whitelist / "
+                    "LIGHTDB_IP_WHITELIST_ENABLED 配置）")
+        except Exception as e:               # pragma: no cover - 防御
+            logger.warn(f"初始化 IP 白名单失败（按未启用处理）: {e}")
+            self.ip_whitelist = None
+
         super().__init__(
             (config.host, config.port),
             MySQLHandler)
+
+    def _int_cfg(self, name: str, default: int) -> int:
+        """读取整型配置，非法值回退默认值（0/负数视为非法）"""
+        try:
+            val = int(getattr(self.config, name, default))
+        except (TypeError, ValueError):
+            return default
+        return val if val >= 1 else default
+
+    # ==================== 准入检查 ====================
+
+    def _is_ip_allowed(self, ip: str) -> bool:
+        """IP 是否允许连接。
+
+        优先用**执行器里的白名单对象**：`ADD/REMOVE IP WHITELIST` 改的是
+        它，那才是运行期的真实规则（`SHOW IP WHITELIST` 也读它）。两边都
+        按同一份 config 初始化时结果一致；只有运行时增删规则会分化——此时
+        必须以执行器为准，否则"看得见的新规则"不会生效。执行器没有该属性
+        时（多进程 RemoteDB）回退到本服务器按配置构建的白名单。
+        """
+        ex_wl = getattr(self.executor, 'ip_whitelist', None)
+        if ex_wl is not None and getattr(ex_wl, 'enabled', False):
+            return ex_wl.allow(ip)
+        wl = self.ip_whitelist
+        if wl is not None and getattr(wl, 'enabled', False):
+            return wl.allow(ip)
+        return True
+
+    def verify_request(self, request, client_address):
+        """socketserver 在握手前调用：返回 False = 拒绝该连接。
+
+        检查顺序：IP 白名单 → 全局连接数 → 单 IP 连接数。计数与准入在
+        同一个锁里完成，避免并发连接同时"看到没满"而一起挤进来。
+        """
+        ip = client_address[0] if client_address else ''
+
+        # 1) IP 白名单
+        if not self._is_ip_allowed(ip):
+            logger.warn(f"拒绝连接 {ip}：不在 IP 白名单内")
+            self._reject_connection(
+                request, 1130, "HY000",
+                f"Host '{ip}' is not allowed to connect "
+                f"to this LightDB server")
+            return False
+
+        # 2) 连接数上限（总量 + 单 IP）
+        reject_reason = None
+        with self._admission_lock:
+            total = self._active_connections
+            per_ip = self._active_by_ip.get(ip, 0)
+            if total >= self.max_connections:
+                reject_reason = (
+                    f"Too many connections (max_connections="
+                    f"{self.max_connections})")
+            elif per_ip >= self.max_conn_per_ip:
+                reject_reason = (
+                    f"Too many connections from this IP "
+                    f"(max_conn_per_ip={self.max_conn_per_ip})")
+            else:
+                self._active_connections = total + 1
+                self._active_by_ip[ip] = per_ip + 1
+                self._admitted[request] = ip
+
+        if reject_reason is not None:
+            logger.warn(f"拒绝连接 {ip}：{reject_reason}")
+            self._reject_connection(
+                request, 1040, "08004", reject_reason)
+            return False
+        return True
+
+    def shutdown_request(self, request):
+        """连接结束：先减计数，再走 socketserver 的关闭流程。"""
+        ip = None
+        with self._admission_lock:
+            try:
+                ip = self._admitted.pop(request)
+            except KeyError:
+                ip = None
+            if ip is not None:
+                self._active_connections = max(
+                    0, self._active_connections - 1)
+                left = self._active_by_ip.get(ip, 0) - 1
+                if left > 0:
+                    self._active_by_ip[ip] = left
+                else:
+                    self._active_by_ip.pop(ip, None)
+        try:
+            super().shutdown_request(request)
+        except Exception:                    # pragma: no cover - 防御
+            pass
+
+    def _reject_connection(self, request, code: int, sql_state: str,
+                           message: str):
+        """握手前直接回 ERR 包（MySQL 服务端首包允许是 ERR）"""
+        try:
+            request.sendall(mp.build_packet(
+                mp.make_err_packet(code, sql_state, message), 0))
+        except OSError:
+            pass
+
+    def connection_stats(self) -> dict:
+        """当前连接计数（调试/测试/监控用）"""
+        with self._admission_lock:
+            return {
+                'active_connections': self._active_connections,
+                'active_by_ip': dict(self._active_by_ip),
+                'max_connections': self.max_connections,
+                'max_conn_per_ip': self.max_conn_per_ip,
+            }
 
     def start(self):
         logger.info(
             f"LightDB MySQL Server 监听 "
             f"{self.config.host}:{self.config.port}")
+        logger.info(
+            f"  连接限制: 总量 {self.max_connections} / "
+            f"每 IP {self.max_conn_per_ip}")
+        if (self.ip_whitelist is not None
+                and self.ip_whitelist.enabled):
+            logger.info(
+                f"  IP 白名单: 启用，"
+                f"{len(self.ip_whitelist.entries)} 条规则")
         try:
             self.serve_forever()
         except KeyboardInterrupt:

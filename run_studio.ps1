@@ -15,6 +15,12 @@
 # Closing: close the GUI window. The background server keeps running; the
 # stop command is printed at the end.
 #
+# SECURITY NOTE (P0-A): the engine's secure default is "no empty-password
+# root" (a random password is written to <data_dir>/root.password). This
+# launcher is a *local demo* bound to 127.0.0.1, so it passes
+# --allow-empty-password on purpose: an explicit, auditable downgrade so the
+# GUI can connect as root/''. Never use that flag on a network-exposed server.
+#
 # NOTE: keep this file ASCII-only. Windows PowerShell 5.1 reads a BOM-less
 # .ps1 as ANSI (GBK here), so non-ASCII text gets mangled in the console.
 param(
@@ -49,7 +55,8 @@ if (Test-LightDbPort $Port) {
     $srv = Start-Process python -ArgumentList @(
         '-m', 'lightdb.main', '--mode', 'single',
         '--host', '127.0.0.1', '--port', "$Port",
-        '--data-dir', $DataDir
+        '--data-dir', $DataDir,
+        '--allow-empty-password'
     ) -PassThru -WindowStyle Hidden
 
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -62,7 +69,7 @@ if (Test-LightDbPort $Port) {
         Write-Host ("        stop it with: Stop-Process -Id {0}" -f $srv.Id) -ForegroundColor DarkGray
     } else {
         Write-Host '        server did not come up within 40s; run it manually:' -ForegroundColor Red
-        Write-Host ("        python -m lightdb.main --mode single --host 127.0.0.1 --port {0} --data-dir {1}" -f $Port, $DataDir) -ForegroundColor Yellow
+        Write-Host ("        python -m lightdb.main --mode single --host 127.0.0.1 --port {0} --data-dir {1} --allow-empty-password" -f $Port, $DataDir) -ForegroundColor Yellow
         exit 1
     }
 }

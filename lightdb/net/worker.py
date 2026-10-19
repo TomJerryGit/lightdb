@@ -170,7 +170,7 @@ def worker_main(worker_id: int, config: dict,
     if shared_state is None:
         shared_state = {}
 
-    host = config.get('host', '0.0.0.0')
+    host = config.get('host', '127.0.0.1')
     port = int(config.get('port', 8888))
 
     # 忽略 SIGINT（由 Master 统一管理）
@@ -485,7 +485,7 @@ def _handle_connection(worker_id: int, conn, addr, ctx: dict):
         """把 dict 适配为带属性的 Config 对象"""
         def __init__(self, cfg: dict):
             self._cfg = cfg
-            self.host = cfg.get('host', '0.0.0.0')
+            self.host = cfg.get('host', '127.0.0.1')
             self.port = int(cfg.get('port', 8888))
 
         def __getattr__(self, name):

@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import threading
 from pathlib import Path
 from typing import Dict, List
@@ -40,6 +41,17 @@ def hash_native_password(password: str) -> str:
     s1 = hashlib.sha1(password.encode()).digest()
     s2 = hashlib.sha1(s1).digest()
     return s2.hex()
+
+
+#: 自动生成的 root 明文口令文件名（位于数据目录内，权限尽量 0600）。
+#: 只在"未显式提供口令"且确实生成了随机口令时创建；启动日志只打印路径。
+ROOT_PASSWORD_FILE = 'root.password'
+
+
+def _env_flag(name: str) -> bool:
+    """解析布尔型环境变量（1/true/yes/on 视为真）"""
+    return os.environ.get(name, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
 
 
 #: 本引擎的默认库名（镜像 MySQL 的 `test`/`sys`：一个**真实存在**的名字，
@@ -192,7 +204,9 @@ def describe_columns(table) -> list:
 
 
 class Database:
-    def __init__(self, data_dir: str, name: str = DEFAULT_DATABASE):
+    def __init__(self, data_dir: str, name: str = DEFAULT_DATABASE,
+                 root_password: str = None,
+                 allow_empty_password: bool = None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -247,6 +261,10 @@ class Database:
         self._pending_ddl = None
 
         self._load()
+        # 认证引导必须紧跟在用户表加载之后：新库要生成随机口令，旧数据目录
+        # （root 仍为空口令）要在启动时安全迁移 —— 否则"升级后默认不再无认证"
+        # 只是一句空话。配置来源：main.py/main_v4 传参 > 环境变量 > 安全默认。
+        self._ensure_root_credentials(root_password, allow_empty_password)
         self._advance_mvcc_epoch()
         self._recover()
         # 恢复"未完成的结构变更"必须排在 WAL 重放之后：WAL 里可能还有
@@ -308,6 +326,106 @@ class Database:
 
     def _meta_path(self):
         return self.data_dir / "_meta.json"
+
+    # ==================== 认证引导（安全默认） ====================
+
+    def root_password_path(self) -> Path:
+        """自动生成的 root 明文口令文件路径（仅"随机生成"模式下存在）"""
+        return self.data_dir / ROOT_PASSWORD_FILE
+
+    def _ensure_root_credentials(self, root_password=None,
+                                 allow_empty_password=None):
+        """保证 root 不会因为"默认值"而成为无口令账户。
+
+        历史行为（已修复）：`users` 的初始 root `auth_hash` 是
+        `hash_native_password('')`（空串），于是**默认部署 = 无认证**，
+        任何能连到端口的人都能 `root/''` 登录。现在的优先级（高 → 低）：
+
+        1. **显式口令**：参数 `root_password` / 环境变量
+           `LIGHTDB_ROOT_PASSWORD` / CLI `--root-password`。已存在的库同样
+           以显式值为准（容器化部署常把环境变量当唯一事实来源）。
+        2. 库里已有**非空** root 口令：保持不动。绝不悄悄轮换用户自己
+           设置过的口令。
+        3. **显式允许空口令**：参数 `allow_empty_password` / 环境变量
+           `LIGHTDB_ALLOW_EMPTY_PASSWORD=1` / CLI `--allow-empty-password`
+           → 保持空口令并打 WARN（仅限本地开发/演示的降级开关）。
+        4. **安全默认**：生成 `secrets.token_urlsafe(16)` 随机口令，
+           更新 `_meta.json` 的 users，并把明文写入
+           `<data_dir>/root.password`（权限尽量 0600）。启动日志**只打印
+           文件路径**，绝不打印明文。
+
+        第 4 条同时覆盖**旧数据目录迁移**：`_meta.json` 里 root 的
+        `auth_hash` 为空、又没显式允许空口令时，启动即换成随机口令并落盘，
+        保证"升级后默认不再无认证"是真实生效的。
+        """
+        #: 是否由调用方（CLI/服务端配置）显式传入。env 是测试/运维的隐式降级
+        #: 通道：只允许空口令、但**不打印 WARN**——大量既有用例的子进程会把
+        #: stdout 当协议数据解析（如 `rows_written=2`、JSON），日志行会污染它们。
+        #: 显式传入时（main.py 的 `--allow-empty-password`/配置）仍然 WARN。
+        explicit_allow_empty = allow_empty_password is not None
+        if allow_empty_password is None:
+            allow_empty_password = _env_flag('LIGHTDB_ALLOW_EMPTY_PASSWORD')
+        if root_password is None:
+            root_password = os.environ.get('LIGHTDB_ROOT_PASSWORD') or ''
+        explicit = str(root_password) if root_password else ''
+
+        root = self.users.get('root')
+        if not isinstance(root, dict):
+            root = {}
+            self.users['root'] = root
+        root.setdefault('privs', ['ALL'])
+
+        current_hash = str(root.get('auth_hash') or '')
+        # 空串（旧默认值）与历史遗留的全零 20 字节都视为"无口令"。
+        is_empty = current_hash in ('', '00' * 20)
+
+        # 1) 显式口令优先（新库设置 / 已有库以显式值为准）
+        if explicit:
+            wanted = hash_native_password(explicit)
+            if wanted != current_hash:
+                root['auth_hash'] = wanted
+                self.save_meta()
+                logger.warn(
+                    "root 口令已由 LIGHTDB_ROOT_PASSWORD / --root-password "
+                    "设置（启动日志不打印明文）")
+            return
+
+        # 2) 用户自己设置过非空口令：保持不动
+        if not is_empty:
+            return
+
+        # 3) 显式允许空口令：旧的不安全行为，仅本地开发/演示
+        if allow_empty_password:
+            root['auth_hash'] = ''
+            if explicit_allow_empty:
+                # 只有「调用方显式选择」才打 WARN；env-only 降级（测试环境）
+                # 保持静默，避免污染子进程 stdout（见上方 explicit_allow_empty 注释）。
+                logger.warn(
+                    "已显式允许 root 空口令（LIGHTDB_ALLOW_EMPTY_PASSWORD=1 / "
+                    "--allow-empty-password）：仅限本地开发/演示，"
+                    "生产环境禁止使用")
+            return
+
+        # 4) 安全默认：生成随机口令并落盘（新库与旧空口令库迁移共用）
+        generated = secrets.token_urlsafe(16)
+        root['auth_hash'] = hash_native_password(generated)
+        self.save_meta()
+        path = self._write_root_password_file(generated)
+        logger.warn(
+            f"root 账户未配置口令：已生成随机口令并写入 {path}"
+            f"（权限尽量 0600；日志不打印明文）。"
+            f"首次登录请读取该文件；也可用 LIGHTDB_ROOT_PASSWORD / "
+            f"--root-password 显式指定")
+
+    def _write_root_password_file(self, password: str) -> Path:
+        """把自动生成的 root 明文口令写入数据目录（权限尽量 0600）"""
+        path = self.root_password_path()
+        path.write_text(password + '\n', encoding='utf-8')
+        try:
+            os.chmod(path, 0o600)   # Windows 上基本是 no-op，失败忽略
+        except OSError:
+            pass
+        return path
 
     def _load(self):
         p = self._meta_path()

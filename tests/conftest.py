@@ -16,6 +16,17 @@ import time
 
 import pytest
 
+# ==================== P0-A 安全修复的测试降级开关 ====================
+# 引擎默认部署不再有「root 空口令」：新库会生成随机口令、旧空口令库会在
+# 启动时迁移。而本仓库 700+ 既有用例（含大量经真实 MySQLServer 的
+# pymysql 连接，例如 tests/test_batch*.py、test_ddl_p1、test_index_declarations、
+# test_metadata_honesty、test_mysql_connect、test_snapshot_integrity）都按
+# `root/''` 连接。这里在**收集阶段、任何 Database 构造之前**显式降级，等价于
+# CLI `--allow-empty-password`（显式、可审计，不是把安全默认改回不安全）。
+# 新默认行为本身由 tests/test_auth_defaults.py 单独验证（那里会 delenv）。
+os.environ.setdefault('LIGHTDB_ALLOW_EMPTY_PASSWORD', '1')
+
+
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(errors='replace')

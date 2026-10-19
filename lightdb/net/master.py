@@ -419,7 +419,7 @@ class MasterServer:
 def run_master(config_path: str = 'config.json'):
     """启动 Master（供 main.py / main_v4.py 调用）"""
     config = {
-        'host': '0.0.0.0',
+        'host': '127.0.0.1',
         'port': 8888,
         'workers': os.cpu_count() or 4,
         'buffer_pool_size': 1024,
@@ -444,7 +444,14 @@ def run_master(config_path: str = 'config.json'):
 
         data_dir = os.path.abspath(
             config.get('data_dir', 'data'))
-        db = Database(data_dir)
+        # P0 安全默认：root 口令/显式降级随配置传到 Database（见
+        # db/database.py::_ensure_root_credentials）。多进程模式下 Master 是
+        # 唯一持有存储的进程，认证引导只需在这里执行一次。
+        db = Database(
+            data_dir,
+            root_password=config.get('root_password') or None,
+            allow_empty_password=bool(
+                config.get('allow_empty_password', False)))
         executor = Executor(db)
     except Exception as e:
         logger.error(f"初始化 Database 失败: {e}")
