@@ -9,6 +9,7 @@ LightDB MySQL 兼容服务器（修复版）
 - 查询语句识别更严谨
 """
 import os
+import re
 import socket
 import socketserver
 import struct
@@ -29,6 +30,70 @@ from . import mysql_protocol as mp
 #: 登录失败后的固定延迟（秒）。它让暴力破解/口令扫描变慢，同时不改变
 #: 正确登录路径的耗时。0.5s 足够拖垮在线爆破，又不会影响人的交互体验。
 LOGIN_FAILURE_DELAY = 0.5
+
+
+#: 错误码 → SQLSTATE 兜底映射。
+#:
+#: 执行器只在部分路径（DDL / CHECK 约束，见 `sql/executor.py::_err`）上带
+#: `sqlstate` 字段；其余错误只有 errno。旧实现把**所有**错误回包的 SQLSTATE
+#: 硬编码成 'HY000'（通用错误），于是客户端拿不到 MySQL 语义分类：
+#: 表不存在（42S02）与未知列（42S22）被说成同一类"未知错误"。
+#: 这里按 MySQL 官方错误码表补齐常用错误的 SQLSTATE；未收录的一律 HY000。
+_SQLSTATE_BY_ERRNO = {
+    1048: '23000',   # ER_BAD_NULL_ERROR：列不允许 NULL
+    1049: '42000',   # ER_BAD_DB_ERROR：未知数据库
+    1054: '42S22',   # ER_BAD_FIELD_ERROR：未知列
+    1062: '23000',   # ER_DUP_ENTRY：主键/唯一键冲突
+    1064: '42000',   # ER_PARSE_ERROR：语法错误
+    1105: 'HY000',   # ER_UNKNOWN_ERROR：通用错误
+    1146: '42S02',   # ER_NO_SUCH_TABLE：表不存在
+    1264: '22003',   # ER_WARN_DATA_OUT_OF_RANGE：数值越界
+    1292: '22007',   # ER_TRUNCATED_WRONG_VALUE：日期/时间值非法
+    1366: '22007',   # ER_WRONG_VALUE：取值不合法（类型转换失败）
+    1406: '22001',   # ER_DATA_TOO_LONG：数据超长
+}
+
+
+def classify_sqlstate(code) -> str:
+    """按 MySQL 语义把 errno 映射成 SQLSTATE（未知码按 'HY000' 兜底）"""
+    try:
+        return _SQLSTATE_BY_ERRNO.get(int(code), 'HY000')
+    except (TypeError, ValueError):
+        return 'HY000'
+
+
+#: `SET <var> = <value>` 里本引擎**认可为会话级可写**的系统变量白名单。
+#: 只把这些变量写进 `session['variables']` 并让 `SELECT @@x` / `SHOW VARIABLES`
+#: 反映出来；不在名单里的（如只读的 @@version，或本引擎没有的变量）只记录
+#: 原文到 `session['set_raw']`，不伪造效果 —— 否则 `SET @@version='x'` 会让
+#: 客户端读到假版本号。
+_SESSION_SETTABLE_VARS = frozenset({
+    'character_set_client',
+    'character_set_connection',
+    'character_set_database',
+    'character_set_results',
+    'collation_connection',
+    'collation_database',
+    'default_storage_engine',
+    'explicit_defaults_for_timestamp',
+    'foreign_key_checks',
+    'group_concat_max_len',
+    'interactive_timeout',
+    'max_allowed_packet',
+    'net_read_timeout',
+    'net_write_timeout',
+    'optimizer_switch',
+    'sql_mode',
+    'sql_safe_updates',
+    'sql_select_limit',
+    'time_zone',
+    'transaction_isolation',
+    'transaction_read_only',
+    'tx_isolation',
+    'tx_read_only',
+    'unique_checks',
+    'wait_timeout',
+})
 
 
 # ==================== 会话管理 ====================
@@ -85,6 +150,27 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         # 未指定库时为 None（`SELECT DATABASE()` 因此返回 SQL NULL）。
         # 旧实现默认 `"default"`，把"没选库"伪装成"选了 default"。
         self.database = None
+        # ★ 连接级会话（P1-B）：**每条连接一个** session dict，不能每条语句
+        # 新建。执行器把事务句柄写进 `session['txn']`（`_cmd_begin`）并在
+        # `_cmd_commit/_cmd_rollback` 里弹出、在 INSERT/UPDATE/DELETE 里读取；
+        # 旧实现每条语句都新建临时 dict，于是 BEGIN 写的 txn 下一条语句就丢，
+        # `BEGIN; INSERT; ROLLBACK` 实际上每条语句各自 autocommit —— 回滚
+        # 静默失效、未提交行对其它连接立即可见、断连还会泄漏 MVCC active。
+        self.session = {
+            'user': None,
+            'database': self.database,
+            'txn': None,
+            # 会话级 autocommit（不是全局 self.db.autocommit）。
+            # True = 每条 DML 自动提交；False = 首次 DML 时隐式开事务，
+            # 直到显式 COMMIT/ROLLBACK（MySQL 语义）。
+            'autocommit': True,
+            # `SET` 语句写入的会话变量（SHOW VARIABLES / SELECT @@x 读它）
+            'variables': {},
+            # `SET @x = ...` 写入的用户变量（执行器 SELECT @x 读它）
+            'user_vars': {},
+            # 原样记录未识别的 SET 语句，便于排障（不参与语义）
+            'set_raw': [],
+        }
         self.server_id = _alloc_server_id()
         self.auth_seed = os.urandom(20)
         self.closed = False
@@ -146,6 +232,8 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return False
 
         self.user = resp.username
+        # 连接级会话的 user 与真实登录身份一致（审计 / SHOW PROCESSLIST 用）
+        self.session['user'] = self.user
 
         # 用户校验
         user_info = self.db.users.get(self.user)
@@ -181,10 +269,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 self._send_packet(err)
                 return False
             self.database = resolved
+            self.session['database'] = resolved
             # 会话表里的 db 列与真实会话状态保持一致
             self._update_session(db=resolved)
 
-        self._send_packet(mp.make_ok_packet(0, 0))
+        self._send_packet(self._ok_packet())
         logger.info(
             f"用户 {self.user} 从 {self.client_address[0]} "
             f"登录成功 (sid={self.server_id})")
@@ -238,6 +327,13 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         except Exception as e:
             logger.error(f"会话异常 (sid={self.server_id}): {e}")
         finally:
+            # ★ 断连回滚（P1-B）：连接上还挂着的未提交事务必须真正回滚。
+            # 否则执行器里 `Database.begin()` 登记的 MVCC active 事务永不释放
+            # （vacuum horizon 被永久钉住，空间/内存只增不减），而且已写入
+            # 的未提交行会留在存储层。MySQL 的语义正是"连接断开 = 未提交事务
+            # 回滚"，这里用 `db.abort(txn)` 走与 ROLLBACK 相同的物理撤销路径。
+            self._rollback_session_txn()
+            self._clear_connection_session()
             _remove_session(self.server_id)
             logger.info(
                 f"用户 {self.user} 断开连接 "
@@ -312,7 +408,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self.closed = True
 
         elif cmd == mp.COM_PING:
-            self._send_packet(mp.make_ok_packet())
+            self._send_packet(self._ok_packet())
 
         elif cmd == mp.COM_INIT_DB:
             db_name = body.decode('utf-8', errors='replace')
@@ -324,8 +420,10 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 self._send_packet(err)
                 return
             self.database = resolved
+            # 连接级会话与 handler 状态保持一致（`USE` 语句路径同样会同步）
+            self.session['database'] = resolved
             self._update_session(db=resolved)
-            self._send_packet(mp.make_ok_packet())
+            self._send_packet(self._ok_packet())
 
         elif cmd == mp.COM_QUERY:
             sql = body.decode('utf-8', errors='replace')
@@ -360,7 +458,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
     def _handle_query_inner(self, sql: str):
         sql = sql.strip().rstrip(';').strip()
         if not sql:
-            self._send_packet(mp.make_ok_packet())
+            self._send_packet(self._ok_packet())
             return
 
         upper = sql.upper()
@@ -454,11 +552,13 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         # ---------- 会话设置语句 ----------
-        # 标准 MySQL 客户端在登录成功后固定发送 SET NAMES <charset>（字符集协商）
-        # 以及 SET AUTOCOMMIT/AUTOCOMMIT=1 等语句。本引擎不维护会话变量表，
-        # 这里直接确认；否则 pymysql 等客户端会在连接阶段就报 1064 而无法使用。
+        # 标准 MySQL 客户端在登录成功后固定发送 `SET NAMES <charset>`
+        # （字符集协商）以及 `SET AUTOCOMMIT = 1`（pymysql 的 autocommit 参数），
+        # 这些必须真实写进连接级会话，不能只 ACK：
+        # 旧实现对任何 `SET ...` 一律回 OK，于是 `SET autocommit=0` 看起来
+        # 成功却毫无效果 —— 客户端以为自己在事务里，服务端每条 DML 各自提交。
         if upper == "SET" or upper.startswith("SET "):
-            self._send_packet(mp.make_ok_packet())
+            self._handle_set(sql)
             return
 
         # ---------- 通用 SQL ----------
@@ -478,17 +578,25 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 f"'{sql[:50]}'"))
             return
 
-        session = {
-            'user': self.user or 'root',
-            'database': self.database,
-        }
+        # 事务边界预处理（autocommit=0 的隐式事务、BEGIN 的隐式提交）：
+        # 必须在 execute 之前完成，且失败时不能把语句交给执行器。
+        prep_err = self._prepare_transaction(parsed)
+        if prep_err is not None:
+            code, sqlstate, message = prep_err
+            self._send_packet(mp.make_err_packet(
+                code, sqlstate, message[:200]))
+            return
 
         try:
-            result = self.executor.execute(parsed, session)
+            # ★ 复用连接级 session（不再是每条语句新建的临时 dict）：
+            # BEGIN 写的 txn 因此能活到下一条语句；`s['database']` 的切库结果
+            # 也自动保留。这是 P1-B 事务修复的核心。
+            result = self.executor.execute(parsed, self.session)
         except Exception as e:
             logger.error(f"SQL执行错误: {e}")
+            code = 1105
             self._send_packet(mp.make_err_packet(
-                1105, "HY000", str(e)[:200]))
+                code, classify_sqlstate(code), str(e)[:200]))
             return
 
         # `USE <库>` 由执行器校验（不存在 → 1049）。成功时必须把会话状态
@@ -497,7 +605,9 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         if parsed.get('command') == 'USE' and not (
                 isinstance(result, dict)
                 and result.get('type') == 'error'):
-            self.database = session.get('database') or self.database
+            self.database = (
+                self.session.get('database') or self.database)
+            self.session['database'] = self.database
             self._update_session(db=self.database)
 
         self._send_execution_result(result, parsed)
@@ -507,6 +617,305 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             s = _sessions.get(self.server_id)
             if s:
                 s.update(kwargs)
+
+    # ==================== 连接级会话 / 事务生命周期 ====================
+
+    def _session_autocommit(self) -> bool:
+        """会话级 autocommit（缺省 True；不回退到全局 `db.autocommit`）"""
+        session = getattr(self, 'session', None)
+        if not isinstance(session, dict):
+            return True
+        return bool(session.get('autocommit', True))
+
+    def _status_flags(self) -> int:
+        """OK/EOF 包里的 server_status：autocommit 与"事务中"如实上报。
+
+        MySQL 客户端（pymysql 的 `get_autocommit()` 等）读的是这个标志位，
+        不是 `SELECT @@autocommit`。旧实现固定发 SERVER_STATUS_AUTOCOMMIT，
+        等于永远告诉客户端"你在自动提交模式"—— 与 `SET autocommit=0` 的
+        真实会话状态矛盾。
+        """
+        flags = 0
+        if self._session_autocommit():
+            flags |= mp.SERVER_STATUS_AUTOCOMMIT
+        session = getattr(self, 'session', None)
+        if isinstance(session, dict) and session.get('txn'):
+            flags |= mp.SERVER_STATUS_IN_TRANS
+        return flags
+
+    def _ok_packet(self, affected_rows: int = 0,
+                   last_insert_id: int = 0, message: str = "") -> bytes:
+        """带真实会话状态的 OK 包（autocommit / in-trans 标志）"""
+        return mp.make_ok_packet(
+            affected_rows=affected_rows,
+            last_insert_id=last_insert_id,
+            status_flags=self._status_flags(),
+            message=message)
+
+    def _begin_session_txn(self):
+        """在连接级 session 上开事务（autocommit=0 的隐式事务起点）
+
+        返回 None 表示成功；失败返回 `(errno, sqlstate, message)`。
+        """
+        try:
+            txn = self.db.begin()
+        except Exception as e:                # pragma: no cover - 防御
+            logger.error(f"开启会话事务失败: {e}")
+            return (1105, 'HY000', f"开启事务失败: {e}")
+        self.session['txn'] = txn
+        return None
+
+    def _commit_pending_txn(self):
+        """提交连接上残留事务（`SET autocommit=1` / BEGIN 的隐式提交）"""
+        txn = self.session.get('txn') if isinstance(
+            self.session, dict) else None
+        if not txn:
+            if isinstance(self.session, dict):
+                self.session['txn'] = None
+            return None
+        # 先摘掉句柄再提交：即使提交中途抛异常，也不会有语句再用到这个
+        # 已经处于半提交状态的事务句柄（交给上面的异常路径兜底记录）。
+        self.session['txn'] = None
+        try:
+            self.db.commit(txn)
+        except Exception as e:                # pragma: no cover - 防御
+            logger.error(f"提交事务失败: {e}")
+            return (1105, 'HY000', f"提交事务失败: {e}")
+        try:
+            self.executor.stats['commits'] += 1
+        except Exception:                     # pragma: no cover - 防御
+            pass
+        return None
+
+    def _rollback_session_txn(self):
+        """回滚连接上的未提交事务（断连 / 语句异常兜底）
+
+        与执行器 `_cmd_rollback` 走同一条物理撤销路径（`db.abort`），
+        保证数据真的回去、MVCC active 与行锁真正释放。
+        """
+        session = getattr(self, 'session', None)
+        if not isinstance(session, dict):
+            return
+        txn = session.get('txn')
+        session['txn'] = None
+        if not txn:
+            return
+        try:
+            self.db.abort(txn)
+            logger.info(
+                f"连接断开：已回滚未提交事务 "
+                f"(txn_id={txn.get('txn_id')}, sid={self.server_id})")
+        except Exception as e:                # pragma: no cover - 防御
+            logger.error(
+                f"断连回滚事务失败 (sid={self.server_id}): {e}")
+        finally:
+            # 释放会话里其它可能引用事务的对象（读视图/undo 句柄）
+            session.pop('txn', None)
+
+    def _clear_connection_session(self):
+        """连接结束：清空连接级 session（释放事务/读视图/用户变量的引用）"""
+        session = getattr(self, 'session', None)
+        if isinstance(session, dict):
+            session.clear()
+
+    def _prepare_transaction(self, parsed):
+        """语句执行前的事务边界处理
+
+        * `BEGIN`：MySQL 语义下会**隐式提交**当前事务（`START TRANSACTION`
+          同样），否则旧 txn 的 MVCC active/行锁会永久泄漏；
+        * `INSERT/UPDATE/DELETE` 且会话 `autocommit=0` 且当前没有事务：
+          先开一个事务并挂到 session 上 —— 这就是 MySQL 在关闭自动提交后
+          "语句自动进入事务、直到 COMMIT/ROLLBACK"的行为。
+
+        返回 None 或 `(errno, sqlstate, message)`。
+        """
+        cmd = str(parsed.get('command') or '')
+        if cmd == 'BEGIN':
+            return self._commit_pending_txn()
+        if (cmd in ('INSERT', 'UPDATE', 'DELETE')
+                and not self._session_autocommit()
+                and not self.session.get('txn')):
+            return self._begin_session_txn()
+        return None
+
+    # ---------- SET 语句 ----------
+
+    @staticmethod
+    def _split_set_assignments(text: str):
+        """按顶层逗号切分 SET 赋值列表（引号/括号内的逗号不算分隔符）"""
+        parts, buf, depth, quote = [], [], 0, None
+        for ch in text:
+            if quote:
+                buf.append(ch)
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                buf.append(ch)
+            elif ch == '(':
+                depth += 1
+                buf.append(ch)
+            elif ch == ')':
+                depth = max(0, depth - 1)
+                buf.append(ch)
+            elif ch == ',' and depth == 0:
+                parts.append(''.join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        if buf:
+            parts.append(''.join(buf).strip())
+        return [p for p in parts if p]
+
+    @staticmethod
+    def _strip_set_literal(raw: str) -> str:
+        """去掉 SET 值两侧的引号（SHOW VARIABLES / @@var 用原始字面值即可）"""
+        s = str(raw).strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            return s[1:-1]
+        return s
+
+    @staticmethod
+    def _set_bool_value(raw: str):
+        """解析 ON/OFF/TRUE/FALSE/1/0；无法识别返回 None"""
+        low = MySQLHandler._strip_set_literal(raw).lower()
+        if low in ('1', 'on', 'true', 'default'):
+            return True
+        if low in ('0', 'off', 'false'):
+            return False
+        return None
+
+    def _handle_set(self, sql: str):
+        """处理 `SET ...`：真实写进连接级会话（不再是"一律回 OK"）
+
+        覆盖：`SET [NAMES|CHARACTER SET] ...`、`SET [@@][SESSION.]autocommit = 0|1`
+        （含多赋值语句 `SET a=1, b=2`）、`SET @user_var = ...` 与普通会话变量。
+        不支持的 SET（例如 `SET GLOBAL ...`、`SET PASSWORD ...`）保持旧行为：
+        回 OK（客户端连接阶段的兼容性），但把原文记录到 `session['set_raw']`
+        便于排障 —— 绝不因为"不认识"就在连接阶段报 1064。
+        """
+        session = self.session
+        body = re.sub(r'^SET\b', '', sql.strip(), count=1,
+                      flags=re.IGNORECASE).strip()
+
+        # ---- SET NAMES <charset> [COLLATE <collation>] / SET CHARACTER SET ----
+        m = re.match(
+            r'(?is)^NAMES\s+(?:(DEFAULT)|([\w-]+))'
+            r'(?:\s+COLLATE\s+([\w-]+))?\s*$', body)
+        if m is None:
+            m = re.match(
+                r'(?is)^CHARACTER\s+SET\s+(?:(DEFAULT)|([\w-]+))'
+                r'(?:\s+COLLATE\s+([\w-]+))?\s*$', body)
+        if m is not None:
+            charset = (m.group(2) or 'utf8mb4').lower()
+            collation = (m.group(3) or '').lower()
+            # 只记录、不改变协议编码（服务端始终以 UTF-8 收发）；
+            # 但 @@character_set_client / SHOW VARIABLES 必须如实反映，
+            # 否则客户端会以为字符集协商生效了。
+            session['variables']['character_set_client'] = charset
+            session['variables']['character_set_connection'] = charset
+            session['variables']['character_set_results'] = charset
+            if collation:
+                session['variables']['collation_connection'] = collation
+            self._send_packet(self._ok_packet())
+            return
+
+        if not body:
+            self._send_packet(self._ok_packet())
+            return
+
+        for part in self._split_set_assignments(body):
+            err = self._apply_set_assignment(part)
+            if err is not None:
+                code, sqlstate, message = err
+                self._send_packet(mp.make_err_packet(
+                    code, sqlstate, message[:200]))
+                return
+
+        # 未识别的 SET 原文留档（有界，避免被恶意连接撑爆内存）
+        raw = session.setdefault('set_raw', [])
+        if len(raw) < 50:
+            raw.append(body[:200])
+
+        self._send_packet(self._ok_packet())
+
+    def _apply_set_assignment(self, part: str):
+        """应用一条 SET 赋值；返回 None 或 `(errno, sqlstate, message)`"""
+        if '=' not in part:
+            # 非赋值型 SET（`SET TRANSACTION ISOLATION LEVEL ...` 等）：
+            # 本引擎没有对应可执行语义，保持 ACK（旧行为），原文留档。
+            return None
+        name_raw, value_raw = part.split('=', 1)
+        name = name_raw.strip()
+        scope = None
+        sm = re.match(r'(?is)^(GLOBAL|SESSION|LOCAL)\s+(.*)$', name)
+        if sm:
+            scope, name = sm.group(1).upper(), sm.group(2).strip()
+        low = name.lower()
+        if low.startswith('@@'):
+            low = low[2:].strip()
+            for prefix in ('session.', 'local.', 'global.'):
+                if low.startswith(prefix):
+                    scope = prefix[:-1].upper()
+                    low = low[len(prefix):].strip()
+                    break
+
+        session = self.session
+
+        # ---- 用户变量 `SET @x = ...`（执行器 `SELECT @x` 读 session.user_vars）----
+        if low.startswith('@'):
+            uname = low[1:].strip()
+            if re.fullmatch(r'[\w$]+', uname):
+                session.setdefault('user_vars', {})[uname] = (
+                    self._set_literal_value(value_raw))
+            return None
+
+        if not re.fullmatch(r'[a-z_][\w.]*', low):
+            # 形如 `SET PASSWORD FOR 'u'@'h' = ...` 的语句：不是会话变量，
+            # 不在此实现（保持旧 ACK），也不当作变量记录
+            return None
+
+        # GLOBAL 变量：本引擎没有全局变量表，且改全局不应影响本会话；
+        # 保持旧行为回 OK（同时原文留档），不做假效果。
+        if scope == 'GLOBAL':
+            return None
+
+        if low == 'autocommit':
+            enabled = self._set_bool_value(value_raw)
+            if enabled is None:
+                return (1231, 'HY000',
+                        f"Variable 'autocommit' can't be set to the "
+                        f"value of '{self._strip_set_literal(value_raw)[:60]}'")
+            if enabled:
+                # `SET autocommit=1` 在 MySQL 里会提交当前事务
+                err = self._commit_pending_txn()
+                if err is not None:
+                    return err
+            session['autocommit'] = enabled
+            return None
+
+        # 其它会话变量：仅对白名单内的可写系统变量如实保存
+        # （SHOW VARIABLES / SELECT @@x 读它）；其余只留原文，不伪造效果。
+        if low in _SESSION_SETTABLE_VARS:
+            session.setdefault('variables', {})[low] = (
+                self._strip_set_literal(value_raw))
+        return None
+
+    @staticmethod
+    def _set_literal_value(raw: str):
+        """把 SET 右值转成 Python 字面值（用户变量 @x 用）"""
+        s = str(raw).strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            return s[1:-1]
+        low = s.lower()
+        if low == 'null':
+            return None
+        if re.fullmatch(r'[-+]?\d+', s):
+            return int(s)
+        if re.fullmatch(r'[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?', s):
+            return float(s)
+        return s
 
     # ==================== 结果集 ====================
 
@@ -524,15 +933,17 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._send_packet(
                 mp.make_column_definition(name, ctype, length))
 
-        # EOF
-        self._send_packet(mp.make_eof_packet())
+        # EOF（带真实会话状态：autocommit / in-trans 标志）
+        self._send_packet(
+            mp.make_eof_packet(status_flags=self._status_flags()))
 
         # 数据行
         for row in rows:
             self._send_packet(mp.make_text_row(list(row)))
 
         # 结束 EOF
-        self._send_packet(mp.make_eof_packet())
+        self._send_packet(
+            mp.make_eof_packet(status_flags=self._status_flags()))
 
     def _send_execution_result(self, result, parsed):
         cmd = parsed['command']
@@ -541,22 +952,28 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         # 因此这里必须优先翻译成 ERR 包；否则所有失败都会以 OK 包回给客户端，
         # 客户端（以及测试）会把失败当成成功。
         if isinstance(result, dict) and result.get('type') == 'error':
+            code = int(result.get('code') or 1105)
+            # ★ SQLSTATE 透传（P1-B）：执行器只在部分路径（DDL/CHECK）带
+            # `sqlstate`，其余错误只有 errno；旧实现**硬编码 'HY000'**，
+            # 于是"表不存在(42S02)"与"未知列(42S22)"被压成同一类。
+            # 优先用执行器给的真实值，缺失时按 errno 兜底映射。
+            sqlstate = result.get('sqlstate') or classify_sqlstate(code)
             self._send_packet(mp.make_err_packet(
-                int(result.get('code') or 1105),
-                'HY000',
+                code,
+                sqlstate,
                 str(result.get('message', 'execution error'))[:200]))
             return
 
         if cmd == 'INSERT':
             affected = self._extract_affected(result)
             self._send_packet(
-                mp.make_ok_packet(affected_rows=affected))
+                self._ok_packet(affected_rows=affected))
             return
 
         if cmd in ('UPDATE', 'DELETE'):
             affected = self._extract_affected(result)
             self._send_packet(
-                mp.make_ok_packet(affected_rows=affected))
+                self._ok_packet(affected_rows=affected))
             return
 
         if cmd in ('CREATE TABLE', 'DROP TABLE',
@@ -565,7 +982,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                    'ROLLBACK', 'GRANT', 'REVOKE',
                    'SET PASSWORD', 'ALTER TABLE',
                    'USE', 'ANALYZE'):
-            self._send_packet(mp.make_ok_packet())
+            self._send_packet(self._ok_packet())
             return
 
         if cmd == 'EXPLAIN':
@@ -575,12 +992,17 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                         result['columns'], result['rows']),
                     result['rows'])
             else:
-                self._send_packet(mp.make_ok_packet())
+                self._send_packet(self._ok_packet())
             return
 
-        if cmd == 'SELECT':
+        if cmd in ('SELECT', 'SELECT VARIABLES'):
+            # `SELECT @x`（用户变量）与普通 SELECT 一样必须把结果集发回去。
+            # 旧实现只认 cmd == 'SELECT'，于是 `SELECT @x` 落到"其他"分支回
+            # OK 包（pymysql 的 description=None、fetchall() 空）—— 用户变量
+            # 经协议永远读不到。连接级 session 修好后它读的是本连接
+            # `session['user_vars']`，这里补上结果集序列化路径。
             if result.get('type') != 'resultset':
-                self._send_packet(mp.make_ok_packet())
+                self._send_packet(self._ok_packet())
                 return
 
             cols, rows = self._extract_result(result, parsed)
@@ -589,7 +1011,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         # 其他：显示消息
-        self._send_packet(mp.make_ok_packet(
+        self._send_packet(self._ok_packet(
             message=str(result)[:200]))
 
     def _extract_affected(self, result) -> int:
@@ -712,6 +1134,15 @@ class MySQLHandler(socketserver.BaseRequestHandler):
     # ==================== SHOW 系列 ====================
 
     def _get_system_variable(self, var: str) -> str:
+        name = str(var).strip().lower().lstrip('@')
+        # ★ 会话级覆盖优先：`SET NAMES latin1` / `SET sql_mode=...` 写进
+        # `session['variables']` 后，`SELECT @@character_set_client` 等必须
+        # 读到本连接的**真实**值，而不是全局默认（旧实现读全局/写死值）。
+        session = getattr(self, 'session', None)
+        if isinstance(session, dict):
+            sess_vars = session.get('variables')
+            if isinstance(sess_vars, dict) and name in sess_vars:
+                return sess_vars[name]
         variables = {
             'version': '5.7.30-LightDB',
             'version_comment': 'LightDB Enterprise Server',
@@ -721,8 +1152,8 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             'character_set_server': 'utf8mb4',
             'collation_connection': 'utf8mb4_general_ci',
             'collation_server': 'utf8mb4_general_ci',
-            'autocommit': (
-                '1' if self.db.autocommit else '0'),
+            # 会话级 autocommit（不是全局 db.autocommit）
+            'autocommit': '1' if self._session_autocommit() else '0',
             'transaction_isolation': 'READ-COMMITTED',
             'tx_isolation': 'READ-COMMITTED',
             'max_allowed_packet': '67108864',
@@ -740,56 +1171,62 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             'port': str(self.server.config.port),
             'hostname': socket.gethostname(),
         }
-        return variables.get(
-            var.lower().lstrip('@'), '')
+        return variables.get(name, '')
 
     def _show_variables(self, sql: str):
-        import re
-        variables = [
-            ('auto_increment_increment', '1'),
-            ('auto_increment_offset', '1'),
-            ('autocommit',
-             'ON' if self.db.autocommit else 'OFF'),
-            ('character_set_client', 'utf8mb4'),
-            ('character_set_connection', 'utf8mb4'),
-            ('character_set_database', 'utf8mb4'),
-            ('character_set_results', 'utf8mb4'),
-            ('character_set_server', 'utf8mb4'),
-            ('collation_connection', 'utf8mb4_general_ci'),
-            ('collation_database', 'utf8mb4_general_ci'),
-            ('collation_server', 'utf8mb4_general_ci'),
-            ('have_innodb', 'YES'),
-            ('innodb_buffer_pool_size', '134217728'),
-            ('innodb_page_size', '16384'),
-            ('max_allowed_packet', '67108864'),
-            ('max_connections', '151'),
-            ('port', str(self.server.config.port)),
-            ('protocol_version', '10'),
-            ('query_cache_size', '0'),
-            ('query_cache_type', 'OFF'),
-            ('sql_mode',
-             'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES'),
-            ('system_time_zone', 'CST'),
-            ('time_zone', 'SYSTEM'),
-            ('transaction_isolation', 'READ-COMMITTED'),
-            ('version', '5.7.30-LightDB'),
-            ('version_comment', 'LightDB Enterprise Server'),
-        ]
+        variables = {
+            'auto_increment_increment': '1',
+            'auto_increment_offset': '1',
+            # 会话级 autocommit：`SET autocommit=0` 后这里必须显示 OFF
+            'autocommit': 'ON' if self._session_autocommit() else 'OFF',
+            'character_set_client': 'utf8mb4',
+            'character_set_connection': 'utf8mb4',
+            'character_set_database': 'utf8mb4',
+            'character_set_results': 'utf8mb4',
+            'character_set_server': 'utf8mb4',
+            'collation_connection': 'utf8mb4_general_ci',
+            'collation_database': 'utf8mb4_general_ci',
+            'collation_server': 'utf8mb4_general_ci',
+            'have_innodb': 'YES',
+            'innodb_buffer_pool_size': '134217728',
+            'innodb_page_size': '16384',
+            'max_allowed_packet': '67108864',
+            'max_connections': '151',
+            'port': str(self.server.config.port),
+            'protocol_version': '10',
+            'query_cache_size': '0',
+            'query_cache_type': 'OFF',
+            'sql_mode': 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES',
+            'system_time_zone': 'CST',
+            'time_zone': 'SYSTEM',
+            'transaction_isolation': 'READ-COMMITTED',
+            'version': '5.7.30-LightDB',
+            'version_comment': 'LightDB Enterprise Server',
+        }
+        # 会话级 SET 覆盖（SET NAMES / SET SESSION x=... 写入）优先
+        session = getattr(self, 'session', None)
+        if isinstance(session, dict):
+            sess_vars = session.get('variables')
+            if isinstance(sess_vars, dict):
+                variables.update(
+                    {k: str(v) for k, v in sess_vars.items()})
+        # 按变量名排序（MySQL 的 SHOW VARIABLES 输出同样有序）
+        variable_rows = sorted(variables.items())
 
         m = re.search(r"LIKE\s+'([^']+)'", sql,
                       re.IGNORECASE)
         if m:
             import fnmatch
             pattern = m.group(1).replace('%', '*')
-            variables = [
-                v for v in variables
+            variable_rows = [
+                v for v in variable_rows
                 if fnmatch.fnmatch(v[0], pattern)
             ]
 
         self._send_resultset(
             [("Variable_name", mp.MYSQL_TYPE_VAR_STRING, 64),
              ("Value", mp.MYSQL_TYPE_VAR_STRING, 1024)],
-            variables)
+            variable_rows)
 
     def _show_status(self):
         stats = getattr(self.executor, 'stats', {})
@@ -890,7 +1327,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         # 再把本连接标记为已关闭（外层 `while not self.closed` 会退出）。
         if target_sid == self.server_id:
             self.closed = True
-            self._send_packet(mp.make_ok_packet(
+            self._send_packet(self._ok_packet(
                 message=f"Connection {target_sid} killed"))
             return
 
@@ -917,7 +1354,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             except OSError:
                 pass
         _remove_session(target_sid)
-        self._send_packet(mp.make_ok_packet(
+        self._send_packet(self._ok_packet(
             message=f"Connection {target_sid} killed"))
 
     def _show_columns(self, sql: str):
