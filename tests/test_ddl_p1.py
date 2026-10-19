@@ -263,17 +263,27 @@ def test_show_index_expands_multicolumn_index_into_multiple_rows(fresh):
 
 
 def test_show_index_does_not_fabricate_a_unique_index(fresh):
-    """`UNIQUE` 目前只是"已声明、未强制"的列属性（没有索引结构、插入不查重），
-    因此 `SHOW INDEX` **不**为它编造一条 `Non_unique=0` 的索引行"""
+    """列级 `UNIQUE` 现在真强制（等价于"索引名 = 列名"的唯一索引），
+    因此 `SHOW INDEX` 如实列出它，但 `Index_type` 报 `UNIQUE-CHECK`
+    （不谎称 BTREE）；重复写入必须 1062"""
     ok(fresh, 'ALTER TABLE t ADD COLUMN email VARCHAR(60) UNIQUE')
     r = rs(fresh, 'SHOW INDEX FROM t')
     key_names = {row[2] for row in r['rows']}
-    assert key_names == {'PRIMARY'}, r['rows']
-    # 但列元数据里 UNIQUE 声明仍如实保留（SHOW COLUMNS 的 Key = UNI）
+    assert key_names == {'PRIMARY', 'email'}, r['rows']
+    email = [row for row in r['rows'] if row[2] == 'email'][0]
+    assert email[1] == 0, email                    # Non_unique=0
+    assert email[4] == 'email', email              # Column_name
+    assert email[10] == 'UNIQUE-CHECK', email      # 不谎称 BTREE
+    # 列元数据里 UNIQUE 声明仍如实保留（SHOW COLUMNS 的 Key = UNI）
     cols = {row[0]: row for row in rs(fresh, 'SHOW COLUMNS FROM t')['rows']}
     assert cols['email'][3] == 'UNI', cols['email']
-    print(f"  → SHOW INDEX 只报真实索引 {key_names}；"
-          f"SHOW COLUMNS 仍报 UNI（声明保留、但不假装有索引）")
+    ok(fresh, "INSERT INTO t (id, name, secret, age, email) "
+              "VALUES (4, 'd', 's', 8, 'x@y.z')")
+    dup = err(fresh, "INSERT INTO t (id, name, secret, age, email) "
+                     "VALUES (5, 'e', 's', 9, 'x@y.z')")
+    assert dup['code'] == 1062 and "'x@y.z'" in dup['message'], dup
+    print(f"  → SHOW INDEX 列出列级 UNIQUE {key_names}，"
+          f"email(Non_unique=0, UNIQUE-CHECK)；重复 INSERT {dup['code']}")
 
 
 # ==================== 3. ALTER TABLE ... ADD COLUMN ====================

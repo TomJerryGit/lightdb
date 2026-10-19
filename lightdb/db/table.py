@@ -375,15 +375,19 @@ class Table:
         self._checks = []
         self._refresh_check_flag()
 
-        # 表级 `UNIQUE KEY/INDEX 名字 (列...)`（含 `CONSTRAINT 名字 UNIQUE`）。
-        # 本引擎**没有**独立的唯一索引结构，唯一性由写入路径（INSERT /
-        # UPDATE）扫描强制，因此这份声明必须随 `_meta.json` 持久化、
-        # 重启后仍在（见 `Database._load` / `save_meta`）。
+        # 唯一性约束：表级 `UNIQUE KEY/INDEX 名字 (列...)`（含
+        # `CONSTRAINT 名字 UNIQUE`）**与列级 `col ... UNIQUE`（单列）**。
+        # 本引擎没有独立唯一索引结构，唯一性由写入路径（INSERT / UPDATE）
+        # 扫描强制，因此这份声明必须随 `_meta.json` 持久化、重启后仍在
+        # （见 `Database._load` / `save_meta`）。
         #
-        # 注意：列级 `col ... UNIQUE`（`cols[i]['unique']`）是另一码事 ——
-        # 本批次保持其原有语义（已声明、`SHOW COLUMNS.Key='UNI'`、但写入
-        # 路径不查重），`SHOW INDEX` 也不会为它编造索引行。**表级**
-        # `UNIQUE KEY` 才是这里真强制的约束。
+        # 两类声明落成同一份规格：
+        #   * 表级：{'name': 索引名, 'columns': [列...]}
+        #   * 列级：{'name': 列名, 'columns': [列名], 'origin': 'column'}
+        #     —— MySQL 给列级 UNIQUE 自动建的索引名就是列名。
+        # 列级规格由 `_sync_column_unique_indexes()` 从 `cols[i]['unique']`
+        # 推导，因此老 `_meta.json`（只有 `unique=true`、没有
+        # `unique_indexes` 条目）打开后也会自动补上并强制。
         self._unique_indexes = []
         self.set_unique_indexes(unique_indexes)
 
@@ -401,27 +405,27 @@ class Table:
         self._refresh_check_flag()
         return self._checks
 
-    # ==================== 表级 UNIQUE 唯一性约束 ====================
+    # ==================== 唯一性约束（表级 UNIQUE / 列级 UNIQUE） ====================
     #
     # 设计取舍（**正确性优先**）：本引擎只有主键一个真实 B+Tree，没有
-    # 二级索引。表级 `UNIQUE KEY k (列...)` 如果"建索引"就要再写一套
-    # 索引结构 + 崩溃恢复，本批次选择**写入路径唯一性检查**（全表扫描
-    # 当前版本，O(n)）：
+    # 二级索引。表级 `UNIQUE KEY k (列...)` 与列级 `col ... UNIQUE` 如果
+    # "建索引"就要再写一套索引结构 + 崩溃恢复，本批次选择**写入路径唯一性
+    # 检查**（全表扫描当前版本，O(n)）：
     #
+    #   * 两类声明都进 `_unique_indexes`，走同一套校验；
     #   * 声明随 `_meta.json` 持久化 → 重启后仍强制；
     #   * INSERT / UPDATE（含多行 UPDATE）都在**写任何一页之前**整体校验，
     #     冲突抛 `UniqueViolationError`（1062），不会留下半套写入；
-    #   * `SHOW INDEX` 会列出它，但 `Index_type` 如实写 `UNIQUE-CHECK`
+    #   * `SHOW INDEX` 会列出它们，但 `Index_type` 如实写 `UNIQUE-CHECK`
     #     （不是 BTREE），并由 `Cardinality` 给出真实的不同键值个数；
     #   * 多个 NULL 允许共存（与 MySQL 唯一索引语义一致；NULL 不参与
     #     唯一性判定）。
     #
-    # 与"列级 `col ... UNIQUE`"的区别：列级属性本批次**保持原样**
-    # （`SHOW COLUMNS.Key='UNI'`，不查重、`SHOW INDEX` 不报），原有测试
-    # 锁定了这个口径；表级声明才是本批次真正强制的那一类。
+    # 列级 UNIQUE 的索引名按 MySQL 惯例取**列名**（`email`），因此
+    # 重复 INSERT 的报文是 `Duplicate entry 'x' for key 'email'`。
 
     def set_unique_indexes(self, specs):
-        """设置表级 UNIQUE 约束（名字/列名规范由 `Database.create_table` 做）
+        """设置唯一性约束（表级显式声明 + 列级 UNIQUE 推导）
 
         列名不存在的条目在这里仍然保留（不静默丢声明）：定义期
         `Database.create_table` 会先校验，运行期 `_col_idx` 找不到列会
@@ -435,17 +439,104 @@ class Table:
             if not columns:
                 continue
             name = str(spec.get('name') or columns[0])
-            out.append({'name': name, 'columns': columns})
+            item = {'name': name, 'columns': columns}
+            if spec.get('origin') == 'column':
+                item['origin'] = 'column'
+            out.append(item)
         self._unique_indexes = out
+        self._sync_column_unique_indexes()
         return self.unique_indexes()
 
+    def _sync_column_unique_indexes(self):
+        """把列级 `UNIQUE` 同步成等价的唯一索引规格（幂等）
+
+        `email VARCHAR(50) UNIQUE` 在 MySQL 里等价于自动建一个名为
+        `email` 的唯一索引；这里把它注册进同一份 `_unique_indexes`，
+        于是 INSERT / UPDATE 走同一套 `_validate_unique_*`、`SHOW INDEX`
+        走同一份 `index_specs()`、`_meta.json` 走同一份 `unique_indexes`。
+
+        以 `cols` 为**唯一事实来源**：元数据里可能已有新版写出的
+        `origin='column'` 规格，也可能只有老版的 `unique=true`（没有
+        `unique_indexes` 条目）——两者都在这里重新推导，避免"列已删/已
+        改、规格还在"的残影。表级规格原样保留；若与列级自动名（列名）
+        撞名：
+          * 列完全相同 → 视为同一条约束，由列级规格接管（DDL 只写内联
+            UNIQUE，不再重复写 UNIQUE KEY）；
+          * 列不同 → 表级规格改用 `<名字>_2`（列级自动名保持 MySQL 惯例
+            的列名，且保证 SHOW CREATE TABLE 仍能往返）。
+        """
+        table_specs = [dict(s) for s in self._unique_indexes
+                       if s.get('origin') != 'column']
+        # 列级自动名（列名）优先保留：老元数据里可能有一条表级规格恰好
+        # 用了某个 UNIQUE 列的名字（旧版允许这种声明，因为列级 UNIQUE
+        # 当时不参与索引名冲突检查）。若列不同，表级规格让名（改成
+        # `<名字>_2`），否则 SHOW CREATE 会写出两个同名约束、无法恢复。
+        col_unique = {str(c['name']).lower(): str(c['name'])
+                      for c in self.cols if c.get('unique')}
+        taken = set(col_unique)
+        kept_specs = []
+        for spec in table_specs:
+            name = str(spec['name'])
+            low = name.lower()
+            if low in col_unique:
+                if list(spec.get('columns') or []) == [col_unique[low]]:
+                    # 与列级自动推导完全同一条约束：由列级规格接管
+                    continue
+                base, n = name, 2
+                while f"{base}_{n}".lower() in taken:
+                    n += 1
+                name = f"{base}_{n}"
+                spec['name'] = name
+                low = name.lower()
+            taken.add(low)
+            kept_specs.append(spec)
+        by_name = {str(s['name']).lower(): s for s in kept_specs}
+        derived = []
+        for c in self.cols:
+            if not c.get('unique'):
+                continue
+            cname = str(c.get('name') or '')
+            if not cname:
+                continue
+            auto = {'name': cname, 'columns': [cname], 'origin': 'column'}
+            hit = by_name.get(cname.lower())
+            if hit is not None:
+                # 正常情况下 col_unique 已保证不会撞名；防御旧/手工元数据
+                if list(hit.get('columns') or []) == [cname]:
+                    kept_specs.remove(hit)
+                    by_name.pop(cname.lower(), None)
+                else:
+                    base, n = cname, 2
+                    while f"{base}_{n}".lower() in by_name:
+                        n += 1
+                    auto['name'] = f"{base}_{n}"
+            derived.append(auto)
+            by_name[auto['name'].lower()] = auto
+        self._unique_indexes = kept_specs + derived
+
     def unique_indexes(self):
-        """表级 UNIQUE 约束（深拷贝，防止调用方改到内部状态）"""
-        return [{'name': s['name'], 'columns': list(s['columns'])}
-                for s in self._unique_indexes]
+        """全部唯一性约束（表级 + 列级；深拷贝，防止调用方改内部状态）
+
+        表级条目是 `{'name','columns'}`；列级条目额外带
+        `'origin': 'column'`。只想要表级声明（`SHOW CREATE TABLE` 已把
+        列级内联成 `UNIQUE`，不能重复写 `UNIQUE KEY`）用
+        `table_unique_indexes()`。
+        """
+        out = []
+        for s in self._unique_indexes:
+            item = {'name': s['name'], 'columns': list(s['columns'])}
+            if s.get('origin') == 'column':
+                item['origin'] = 'column'
+            out.append(item)
+        return out
+
+    def table_unique_indexes(self):
+        """表级 `UNIQUE KEY/INDEX` 声明（不含列级自动推导的规格）"""
+        return [s for s in self.unique_indexes()
+                if s.get('origin') != 'column']
 
     def unique_columns(self):
-        """被表级 UNIQUE 约束覆盖的列名集合"""
+        """被任意唯一性约束覆盖的列名集合（表级 + 列级）"""
         out = set()
         for spec in self._unique_indexes:
             out.update(spec['columns'])
@@ -455,9 +546,10 @@ class Table:
         """全表扫描"当前仍存活"的版本：返回 `[(pk, values)]`
 
         判据是行头 `xmax == 0`（未被更新/删除墓碑化），**不看**读视图：
-        唯一性是表级不变量，必须把别的会话**未提交**的插入也算进来
-        （否则两个事务各插一行相同唯一值就能都提交）。代价是对未提交
-        写入偏保守：对方若回滚，本次插入会报 1062 而不会重复。
+        唯一性是表级不变量（表级 UNIQUE 与列级 UNIQUE 共用），必须把别的
+        会话**未提交**的插入也算进来（否则两个事务各插一行相同唯一值就能
+        都提交）。代价是对未提交写入偏保守：对方若回滚，本次插入会报
+        1062 而不会重复。
         """
         out = []
         for pk, pid, sid in self.bt.scan():
@@ -497,7 +589,11 @@ class Table:
         return None
 
     def _validate_unique_insert(self, row):
-        """INSERT 前的唯一性检查（在任何 WAL / 页写入之前）"""
+        """INSERT 前的唯一性检查（在任何 WAL / 页写入之前）
+
+        覆盖表级 `UNIQUE KEY` 与列级 `col ... UNIQUE`（后者已由
+        `_sync_column_unique_indexes` 注册成同名唯一规格）。
+        """
         if not self._unique_indexes:
             return
         for spec in self._unique_indexes:
@@ -1298,10 +1394,10 @@ class Table:
           （`Non_unique=0` 是真的），但 `Index_type='UNIQUE-CHECK'`
           **不谎称 BTREE**；`Cardinality` 是当前存活行里不同非 NULL 键值
           的**真实个数**（不是估计值）；
-        * 列级 `col ... UNIQUE`（`cols[i]['unique']`）：本批次仍只是
-          "已声明、未强制"的列属性（`SHOW COLUMNS.Key='UNI'`），**不**为
-          它报索引行 —— 报一条 `Non_unique=0` 等于宣称一个不存在的约束
-          已经生效。
+        * **列级 `col ... UNIQUE`**：等价于自动建一个名为列名的唯一索引
+          （MySQL 惯例），由 `_sync_column_unique_indexes()` 注册进同一份
+          `_unique_indexes` → 同样真实强制、同样报 `Non_unique=0` /
+          `Index_type='UNIQUE-CHECK'`。
 
         返回 `[{'name','unique','columns','cardinality','index_type'}]`；
         多列索引会给出多个列名（`SHOW INDEX` 侧按 `Seq_in_index` 展开成
@@ -1322,7 +1418,7 @@ class Table:
         return out
 
     def _unique_cardinality(self, spec):
-        """表级 UNIQUE 约束的真实基数（不同非 NULL 键值个数，含未提交行）"""
+        """唯一约束的真实基数（不同非 NULL 键值个数，含未提交行）"""
         idxs = [self._col_idx(c) for c in spec['columns']]
         seen = set()
         for _pk, values in self._live_rows():
@@ -1350,6 +1446,10 @@ class Table:
         spec = getattr(self, '_partition_spec', None) or {}
         col = spec.get('col')
         self._partition_col_idx = names.index(col) if col in names else None
+        # 列级 UNIQUE 同步（ADD/DROP COLUMN、崩溃恢复补完 DDL 后都走这里）：
+        # 新加的 `UNIQUE` 列必须立刻参与写入校验，不能等下一次重启。
+        if hasattr(self, '_unique_indexes'):
+            self._sync_column_unique_indexes()
 
     def _col_idx(self, name: str) -> int:
         for i, c in enumerate(self.cols):

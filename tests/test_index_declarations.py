@@ -18,11 +18,11 @@
    表数据/索引无损坏；
 7. 逻辑备份：`build_dump` → `restore_dump` 往返后唯一约束仍在。
 
-约定：本引擎没有独立二级索引结构，表级 UNIQUE 的唯一性由写入路径
-全表检查强制，因此 `SHOW INDEX.Index_type` 如实报 `UNIQUE-CHECK`
-（**不谎称 BTREE**）；列级 `col ... UNIQUE` 仍保持原有口径（声明保留、
-`SHOW COLUMNS.Key='UNI'`、写入路径不强制）——需要强制唯一性请用表级
-`UNIQUE KEY`。
+约定：本引擎没有独立二级索引结构，表级与列级 UNIQUE 的唯一性都由写入
+路径全表检查强制，因此 `SHOW INDEX.Index_type` 如实报 `UNIQUE-CHECK`
+（**不谎称 BTREE**）；列级 `col ... UNIQUE` 按 MySQL 惯例注册成"索引名 =
+列名"的等价唯一规格（`SHOW COLUMNS.Key='UNI'`、重复写入 1062），
+`SHOW INDEX` 同样如实列出。
 """
 import json
 import os
@@ -436,16 +436,24 @@ def test_show_index_reports_real_cardinality_and_does_not_fabricate(
     assert rows['u']['Non_unique'] == 0
     assert rows['u']['Index_type'] == 'UNIQUE-CHECK'  # 不谎称 BTREE
 
-    # 列级 UNIQUE 仍是"声明保留、不强制、不假装有索引"的原有口径
+    # 列级 UNIQUE 现在也是真强制：等价于"索引名 = 列名"的唯一索引，
+    # SHOW INDEX 必须如实列出，但 Index_type 仍报 UNIQUE-CHECK。
     ok(db, 'CREATE TABLE cu (id INT PRIMARY KEY, '
            'email VARCHAR(50) UNIQUE, a INT)')
-    cu_rows = {d['Key_name'] for d in index_rows(db, 'cu')}
-    assert cu_rows == {'PRIMARY'}, cu_rows
+    cu_rows = {d['Key_name']: d for d in index_rows(db, 'cu')}
+    assert set(cu_rows) == {'PRIMARY', 'email'}, cu_rows
+    assert cu_rows['email']['Non_unique'] == 0, cu_rows['email']
+    assert cu_rows['email']['Index_type'] == 'UNIQUE-CHECK', cu_rows['email']
     assert column_keys(db, 'cu')['email'] == 'UNI'
+    ok(db, "INSERT INTO cu VALUES (1, 'x@y.z', 1)")
+    r = err(db, "INSERT INTO cu VALUES (2, 'x@y.z', 2)")
+    assert r['code'] == 1062 and "'x@y.z'" in r['message'] \
+        and "'email'" in r['message'], r
     # 表级 UNIQUE 覆盖的列在 SHOW COLUMNS 里如实报 UNI
     assert column_keys(db, 't')['a'] == 'UNI'
     print(f"  → SHOW INDEX: u(Non_unique=0, Index_type=UNIQUE-CHECK, "
-          f"Cardinality=2)，PRIMARY Cardinality=3；列级 UNIQUE 不编造索引行")
+          f"Cardinality=2)，PRIMARY Cardinality=3；列级 UNIQUE 同样列出 "
+          f"email(UNIQUE-CHECK)，重复 INSERT {r['code']}")
 
 
 # ==================== 10. DDL 之后约束仍在 ====================

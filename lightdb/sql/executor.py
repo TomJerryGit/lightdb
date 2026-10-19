@@ -745,8 +745,10 @@ class Executor:
                              partition=p.get('partition'),
                              checks=p.get('checks'),
                              # 表级 `UNIQUE KEY/INDEX`：解析器已不再静默
-                             # 丢弃，这里必须如实传下去（唯一性由写入路径
-                             # 强制，`SHOW INDEX` 会列出 UNIQUE-CHECK）。
+                             # 丢弃，这里必须如实传下去；列级 `col UNIQUE`
+                             # 由 `create_table` 从 cols 推导成等价规格。
+                             # 两类唯一性都由写入路径强制，`SHOW INDEX`
+                             # 会列出 UNIQUE-CHECK。
                              unique_indexes=p.get('unique_indexes'))
         return self._ok(
             message=f"Table '{p['table']}' created")
@@ -6192,8 +6194,9 @@ class Executor:
         * 表级 `UNIQUE KEY/INDEX`（写入路径唯一性检查强制）→
           `Non_unique=0` 是真的，但 `Index_type='UNIQUE-CHECK'`，**不谎称
           BTREE**；`Cardinality` 是真实的不同非 NULL 键值个数；
-        * 列级 `col ... UNIQUE` 仍只是"已声明但未强制"的列属性，**不**
-          为它编造索引行（见 `Table.index_specs` 的说明）。
+        * 列级 `col ... UNIQUE`：等价于自动建一个名为列名的唯一索引
+          （MySQL 惯例），由写入路径同样强制 → 同样报 `Non_unique=0`，
+          `Index_type='UNIQUE-CHECK'`，**不**谎称 BTREE。
 
         列形状（15 列、顺序、`Key_name`/`Column_name`/`Seq_in_index` 名字）
         保持不变：`lightdb_studio` 的 `health_score._check_indexes` 与

@@ -329,6 +329,11 @@ class TableSchema:
         for spec in (unique_indexes or []):
             if not isinstance(spec, dict):
                 continue
+            if spec.get('origin') == 'column':
+                # 列级 UNIQUE 已经内联在列定义里（`c['unique']`），不能
+                # 再写成表级 `UNIQUE KEY 列名 (列)`：那会让 DDL 出现两条
+                # 同名约束（恢复时 1061），且与 MySQL 的列级语义重复。
+                continue
             uq_cols = [str(c) for c in (spec.get('columns') or [])]
             if not uq_cols:
                 continue
@@ -367,7 +372,9 @@ class TableSchema:
         表级 `UNIQUE KEY` 写在列定义之后、CHECK 之前：
         `UNIQUE KEY <名字> (<列>, ...)`。它是**真强制**的约束（写入路径
         唯一性检查），不写出来就等于"备份 → 恢复"把唯一性丢掉。列级
-        `col INT UNIQUE` 仍按列属性内联（保持原有行为，它是另一类声明）。
+        `col INT UNIQUE` 现在同样**真强制**（索引名 = 列名），但 DDL 仍按
+        列属性内联（`c INT NULL UNIQUE`）：恢复时解析器会把它重新注册成
+        等价规格，不会重复写成 `UNIQUE KEY`。
 
         没有任何 CHECK / UNIQUE KEY 时输出与旧版本**逐字节相同**（老 dump
         的解析/恢复行为不变）。
@@ -397,6 +404,8 @@ class TableSchema:
         # 表级 UNIQUE 约束（真强制）：必须写回 DDL，否则恢复后唯一性
         # 静默消失。名字/列名都在 `assert_supported` 里校验过能原样解析。
         for uq in self.unique_indexes:
+            if uq.get('origin') == 'column':
+                continue
             cols_sql = ', '.join(str(c) for c in (uq.get('columns') or []))
             parts.append(f"  UNIQUE KEY {uq['name']} ({cols_sql})")
         # 表级约束的自动名序号要**接在列级之后**（MySQL 的 `表名_chk_n`
@@ -1075,7 +1084,7 @@ def table_schemas(db) -> list:
         tbl = db.tables[name]
         out.append(TableSchema.from_engine_cols(
             name, tbl.cols, getattr(tbl, '_checks', None),
-            unique_indexes=tbl.unique_indexes()))
+            unique_indexes=tbl.table_unique_indexes()))
     return out
 
 
@@ -1091,7 +1100,7 @@ def check_ddl(db, name: str, if_not_exists: bool = False) -> str:
     tbl = db.tables[name]
     schema = TableSchema.from_engine_cols(
         name, tbl.cols, getattr(tbl, '_checks', None),
-        unique_indexes=tbl.unique_indexes())
+        unique_indexes=tbl.table_unique_indexes())
     schema.assert_supported()
     return schema.canonical_ddl(if_not_exists=if_not_exists)
 
@@ -1543,7 +1552,7 @@ def verify_restore(db, plan: DumpPlan) -> VerifyReport:
         try:
             have_uq = [(str(s.get('name') or ''),
                         tuple(str(c) for c in (s.get('columns') or [])))
-                       for s in tbl.unique_indexes()]
+                       for s in tbl.table_unique_indexes()]
         except Exception as e:                      # noqa: BLE001
             rep.add(False, f"表 {name}: 读取表级 UNIQUE 约束失败: "
                            f"{type(e).__name__}: {e}")

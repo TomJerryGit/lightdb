@@ -74,10 +74,12 @@ _UNIQUE_NAME_RE = re.compile(r'^[A-Za-z_]\w*$')
 
 
 def resolve_unique_indexes(table: str, cols: List[dict], specs) -> List[dict]:
-    """校验并规范化 `CREATE TABLE` 里的表级 `UNIQUE KEY/INDEX` 声明
+    """校验并规范化 `CREATE TABLE` 的唯一性声明（表级 + 列级）
 
-    **定义期**就拒绝坏定义（未知列 / 重名 / 非法名字 / 空列清单），绝不
-    把一条"永远不会生效"的唯一约束写进元数据：
+    `specs` 同时接收表级 `UNIQUE KEY/INDEX` 与列级 `col ... UNIQUE`
+    推导出的规格（后者带 `origin='column'`、名字默认为列名）。**定义期**
+    就拒绝坏定义（未知列 / 重名 / 非法名字 / 空列清单），绝不把一条
+    "永远不会生效"的唯一约束写进元数据：
     * 未知列 → 1072（`Key column 'x' doesn't exist in table`）；
     * 索引重名 / 占用 PRIMARY 名字 → 1061（`Duplicate key name`）；
     * 名字含不支持字符 → 1064（名字要能写进 DDL 并原样读回，
@@ -115,7 +117,13 @@ def resolve_unique_indexes(table: str, cols: List[dict], specs) -> List[dict]:
             raise DdlError(f"Duplicate key name '{name}'", errno=1061,
                            sqlstate='42000')
         seen[low] = True
-        out.append({'name': name, 'columns': columns})
+        item = {'name': name, 'columns': columns}
+        if spec.get('origin') == 'column':
+            # 列级 `col ... UNIQUE` 自动推导出的规格（索引名 = 列名）。
+            # 标记来源，避免 `SHOW CREATE TABLE` 既写内联 UNIQUE 又写
+            # 一条重复的 `UNIQUE KEY 列名 (列)`。
+            item['origin'] = 'column'
+        out.append(item)
     return out
 
 
@@ -156,8 +164,8 @@ def describe_columns(table) -> list:
     `UNIQUE KEY (列)` 覆盖的列同样报 `UNI`（MySQL 里唯一索引的列就是
     `UNI`，这是真实约束，不是推断）。
     """
-    # 表级 UNIQUE 覆盖的列（`_unique_indexes` 只有真 Table 才有；
-    # RemoteTable 之类的最小投影没有就按空集处理）
+    # 唯一约束覆盖的列（表级 UNIQUE + 列级 UNIQUE 推导；`_unique_indexes`
+    # 只有真 Table 才有，RemoteTable 之类的最小投影没有就按空集处理）
     unique_cols = set()
     for spec in (getattr(table, '_unique_indexes', None) or []):
         unique_cols.update(spec.get('columns') or [])
@@ -312,8 +320,11 @@ class Database:
                 self.tables[tname] = Table(
                     tname, tinfo['cols'], str(self.data_dir),
                     self.lock_manager, self.mvcc,
-                    # 表级 UNIQUE 约束必须跨重启保留：丢了它，重启后
-                    # 唯一性就悄悄失效（声明还在列里、约束却没了）。
+                    # 唯一性约束必须跨重启保留：丢了它，重启后唯一性就
+                    # 悄悄失效（声明还在列里、约束却没了）。列级 UNIQUE
+                    # 由 `Table.__init__` 从 `cols[i]['unique']` 推导，
+                    # 因此老 `_meta.json`（没有 unique_indexes 条目）也
+                    # 会在打开时补上（见 `_sync_column_unique_indexes`）。
                     unique_indexes=tinfo.get('unique_indexes'),
                 )
                 if tinfo.get('partition'):
@@ -344,8 +355,9 @@ class Database:
             'tables': {
                 n: {'cols': t.cols,
                     'partition': getattr(t, '_partition_spec', None),
-                    # 表级 UNIQUE 约束（`UNIQUE KEY 名字 (列...)`）随元数据
-                    # 持久化：它由写入路径真实强制，重启后必须继续强制。
+                    # 唯一性约束（表级 UNIQUE KEY + 列级 UNIQUE 推导）
+                    # 随元数据持久化：它们由写入路径真实强制，重启后必须
+                    # 继续强制。列级条目带 origin='column'。
                     'unique_indexes': t.unique_indexes(),
                     # CHECK 约束随元数据持久化（列级约束本来就在 cols 里，
                     # 表级约束在这里）。没有它，重启后表级 CHECK 就消失，
@@ -429,6 +441,11 @@ class Database:
         不再静默丢弃它们）。这里在定义期校验列引用/重名/名字形态，然后
         交给 `Table` —— 由写入路径**真正强制**唯一性，并随 `_meta.json`
         持久化（重启后仍强制，`SHOW INDEX` 如实列出）。
+
+        列级 `col ... UNIQUE`（`cols[i]['unique']`）在这里等价成"索引名 =
+        列名"的单列唯一规格，与表级声明一起校验、一起强制。因此
+        `CREATE TABLE t (a INT UNIQUE)` 与
+        `CREATE TABLE t (a INT, UNIQUE KEY a (a))` 在本引擎里是同一件事。
         """
         if name in self.tables:
             raise ValueError(f"表 {name} 已存在")
@@ -436,7 +453,20 @@ class Database:
             resolve_check_names, validate_check_definitions)
         checks = resolve_check_names(name, cols, checks)
         validate_check_definitions(name, cols, checks)
-        unique_specs = resolve_unique_indexes(name, cols, unique_indexes)
+        # 表级显式声明 + 列级 UNIQUE 推导（列名 = 自动索引名）。列级规格
+        # 由调用方传进来的旧元数据里可能已经存在（带 origin），这里以
+        # `cols` 为准重新推导，避免重复添加同名规格。
+        merged_specs = [
+            dict(s) for s in (unique_indexes or [])
+            if isinstance(s, dict) and s.get('origin') != 'column']
+        for c in cols:
+            if c.get('unique'):
+                cname = str(c.get('name') or '')
+                if cname:
+                    merged_specs.append({'name': cname,
+                                         'columns': [cname],
+                                         'origin': 'column'})
+        unique_specs = resolve_unique_indexes(name, cols, merged_specs)
         tbl = Table(
             name, cols, str(self.data_dir),
             self.lock_manager, self.mvcc,
@@ -595,6 +625,19 @@ class Database:
                     f"DEFAULT 取值 {fill!r} 无法转换为 {col.get('type')}: {e}",
                     errno=1366, sqlstate='22007')
 
+        # `ADD COLUMN email ... UNIQUE DEFAULT 'x'`：已有行会全部回填成
+        # 同一个非 NULL 值，唯一性从第一天起就不成立。定义期直接报 1062，
+        # 而不是先把列加上、等到下一次写入才发现"声明没生效"。
+        if col.get('unique') and fill is not None:
+            live = len(tbl._live_rows())
+            if live > 1:
+                raise DdlError(
+                    f"Duplicate entry '{fill}' for key '{cname}'"
+                    f"（ADD COLUMN ... UNIQUE 会把 {live} 行已有数据回填成"
+                    f"同一个非 NULL 值，唯一性无法成立；请改用允许 NULL 的"
+                    f"默认值或先清洗数据）",
+                    errno=1062, sqlstate='23000')
+
         old_cols = [dict(c) for c in tbl.cols]
         new_cols = old_cols + [col]
         entry = {'op': 'ADD COLUMN', 'table': name,
@@ -655,7 +698,7 @@ class Database:
         for uspec in tbl.unique_indexes():
             if colname in uspec['columns']:
                 raise DdlError(
-                    f"Can't DROP '{colname}'; 该列属于表级 UNIQUE 约束 "
+                    f"Can't DROP '{colname}'; 该列属于 UNIQUE 约束 "
                     f"'{uspec['name']}'，删除它会破坏唯一性"
                     f"（本引擎不支持连带删除约束）",
                     errno=1091, sqlstate='42000')

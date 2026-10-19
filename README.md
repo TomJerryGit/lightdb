@@ -139,9 +139,9 @@
 | 表级 `PRIMARY KEY (col)`（单列） | ✅ 真正生效：成为主键 B+Tree，重复插入 **1062** |
 | 表级 `UNIQUE KEY/INDEX [名字] (col...)`（单列/多列）、`CONSTRAINT <名字> UNIQUE` | ✅ 真正强制：INSERT / UPDATE 冲突 **1062**（报文含键名/值）；重启后仍强制；`SHOW CREATE TABLE` 往返；`SHOW INDEX` 列出但 `Index_type` 如实报 **`UNIQUE-CHECK`**（不谎称 BTREE） |
 | 非唯一 `KEY/INDEX`、`FULLTEXT`、`SPATIAL`、`FOREIGN KEY`、复合 `PRIMARY KEY (a, b)`、前缀/表达式索引、`USING BTREE\|HASH` | ❌ **显式 1064**（说明不支持原因/替代做法），绝不静默丢弃、不建出假列 |
-| 列级 `col ... UNIQUE` | ⚠️ 保持原口径：声明保留（`SHOW COLUMNS.Key='UNI'`），但写入路径**不强制**、`SHOW INDEX` 不编造索引行；需要真正唯一性请改用表级 `UNIQUE KEY` |
+| 列级 `col ... UNIQUE` | ✅ 真正强制（单列）：按 MySQL 惯例注册成"索引名 = 列名"的唯一约束，INSERT / UPDATE 冲突 **1062**（如 `Duplicate entry '1' for key 'a'`）；多个 NULL 可共存；重启后仍强制；`SHOW CREATE TABLE` 内联 `UNIQUE` 并可往返；`SHOW INDEX` 列出且 `Index_type` 如实报 **`UNIQUE-CHECK`**（不谎称 BTREE） |
 
-> 表级 UNIQUE 没有独立索引结构，唯一性由写入路径（INSERT / UPDATE 的写入前整体检查）强制，因此 `SHOW INDEX` 的 `Index_type` 写 `UNIQUE-CHECK`，`Cardinality` 是真实的不同非 NULL 键值个数；多列 UNIQUE 支持，NULL 不参与唯一性判定。逻辑备份 / 恢复会原样带回表级 UNIQUE 约束。
+> 表级与列级 UNIQUE 都**没有独立索引结构**，唯一性由写入路径（INSERT / UPDATE 的写入前整体检查）强制，因此 `SHOW INDEX` 的 `Index_type` 写 `UNIQUE-CHECK`，`Cardinality` 是真实的不同非 NULL 键值个数；多列 UNIQUE 支持，NULL 不参与唯一性判定。代价是每次写入做 **O(n) 全表扫描**（不是 B+Tree 点查）；逻辑备份 / 恢复会原样带回两类 UNIQUE 约束，老 `_meta.json` 里只有 `unique=true` 而没有 `unique_indexes` 条目的表，打开时会自动推导出列级唯一索引并继续强制。
 
 **多进程模式实测**（`python -m lightdb.main --mode multi --workers 2` + 真实 pymysql）：
 
