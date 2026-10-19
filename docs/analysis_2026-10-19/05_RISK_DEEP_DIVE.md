@@ -549,7 +549,9 @@ python -m benchmarks.run --suite quick --gate      # → PASS 5/5
    非整型主键不会被定义期拒绝（仅 SQL 路径生效）。
 3. **旧数据目录中的坏触发器不会自动禁用**：升级前已落库的坏体触发器在首次触发时仍报错，
    需用新增的 `DROP TRIGGER` 自助清理（文档已说明）。
-4. **复制仍为实验性**：本轮只做摘牌 + 状态语义，未做 append-only binlog（1–2 周工程）。
+4. **复制**：E 阶段曾摘牌；用户决策 D 后已升级为**真 append-only binlog**（阶段 1 完成，见 §II），
+   但仍是 beta：无轮转（`max_bytes` 仅告警）、无 GTID/半同步、binlog 写失败只告警不拒绝提交、
+   `UPDATE`/`DELETE` 额外一次 SELECT 取行镜像、绕过执行器的直接存储写不产生事件。
 5. 多进程 Worker 自 accept 循环未接入准入检查（限流/白名单只在单进程路径生效；认证在
    握手阶段、多进程同样生效）。
 6. Windows 上 `chmod 0600` 无实际效果；`root.password` 等文件依赖目录 ACL。
@@ -560,6 +562,35 @@ python -m benchmarks.run --suite quick --gate      # → PASS 5/5
 9. B 的遗留：`executor._active_session` 仍为全局共享（并发嵌套子查询的会话串用风险，既有）；
    无事务 SELECT 的 read view 不主动释放属 executor/db 层既有泄漏；`SET PASSWORD POLICY`
    经协议仍 ACK 不生效（保持旧行为）。
+
+---
+
+## II. 决策执行记录（2026-10-19 晚：阶段 0 + 决策 3/4）
+
+用户拍板四项决策（产品定位可交付 / OLAP 接入 / Studio 死代码删除 / 真 binlog）后，本轮已执行：
+
+| 工作项 | 结果 | 提交 |
+|---|---|---|
+| **阶段 0 交付底座** | 打包修复（wheel 含 `lightdb` 引擎包 + 3 个入口 + 版本单一来源；venv 实测 `lightdb-server --version` → `LightDB 4.0.0`）；CI（`.github/workflows/ci.yml` + 本地 `scripts/ci.ps1`）；**门禁清零**（24 条失败 → 0：修 3 处真实缺陷 + 其余带 reason 的 skip/xfail） | `9c108f0` + `fix(ci)` |
+| **决策 3 Studio 死代码** | 删除 44 模块 / 15,728 行 + 6 个死测试文件；`lightdb_studio` **134 文件/39,256 行 → 90 文件/23,532 行**；90/90 模块 import 成功、全仓悬空 import=0；offscreen MainWindow（6 菜单/42 动作/2 Dock/6 右标签）正常 | `32f479f` |
+| **决策 4 真 binlog（阶段 1）** | 新增 `replication/append_only_binlog.py`（独立文件、magic/version + 记录头 + JSON + **CRC32**、真实字节位点只增不回退、事务成组、DDL 事件）；`SHOW MASTER STATUS`/`SHOW BINLOG EVENTS`/`__BINLOG_FETCH__` 改读真文件；从库 `master.info` 持久位点续传 + DDL 重放；新增 `START SLAVE`/`STOP SLAVE`/`CHANGE MASTER TO`；新 16 例 + 166 条回归全绿 | `903d8e4` |
+| **决策 2 OLAP 接入** | ⏳ 未启动；计划见 [06_ROADMAP.md](06_ROADMAP.md) §2.5（1–2 个月） | — |
+
+**最终门禁（2026-10-19 晚）**：
+
+- 全量 pytest：**811 用例 = 771 passed / 0 failed / 35 skipped / 5 xfailed**（详见本节末实测记录）；
+- `benchmarks.run --suite quick --gate`：**PASS 5/5**（逐行 INSERT 3,928 rows/s、批量/逐行 1.512×、
+  点查 1,404 q/s、WAL 468.6 KB、崩溃恢复 0.543 s、丢/漏行 0）；
+- 打包：`scripts/check_packaging.py` **PASS**（引擎包 + 3 入口 + 版本 4.0.0）；wheel 安装到
+  `--system-site-packages` venv 后 `lightdb-server --version` 正常。
+
+**本轮新增残余风险/未完成**：
+1. 复制阶段 2：无轮转（`max_bytes` 仅告警）、无 GTID/半同步、binlog 写失败只告警不拒提交、
+   `UPDATE`/`DELETE` 额外 SELECT 取镜像、绕过执行器的直接存储写不产生事件。
+2. Studio 删码后 `net/__init__.py`、`plugins/__init__.py` 为空壳（保留为扩展位）；列级血缘
+   （`lineage_enhanced`）仍是已知缺陷（xfail，路线图阶段 3）。
+3. CI 尚未在 GitHub 实跑（本地 `scripts/ci.ps1` 已验证）；Linux/macOS 路径未验证。
+4. OLAP/列存/并行接入未启动（决策 2，下一阶段）。
 
 ---
 

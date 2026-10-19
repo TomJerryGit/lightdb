@@ -146,26 +146,33 @@ def _replication_section(text):
     return text[start:end]
 
 
-def test_readme_replication_is_disclaimed():
-    """README 复制段必须明确「实验性 / 不可用于生产」并列出缺陷"""
+def test_readme_replication_matches_beta_binlog_contract():
+    """决策 D 后：README 复制段必须如实写明「beta + 真 append-only binlog + 剩余限制」
+
+    契约随实现升级而升级（原 E1 摘牌契约已被真 binlog 取代）：
+    * 定位必须是 beta（不是"生产可用"，也不是继续停留在"仅实验性摘牌"）；
+    * 必须写明已落地的核心事实：append-only binlog / CRC / 真实位点 / DDL 复制；
+    * 必须继续列明**尚未完成**的限制，防止重新过度宣称：无日志轮转、无 GTID、无半同步、
+      binlog 写失败不拒绝提交。
+    """
     text = _readme()
     section = _replication_section(text)
-    for keyword in ('实验性', '不可用于生产', '单向'):
+    for keyword in ('beta', '单向', 'append-only binlog', 'CRC'):
         assert keyword in section, (
-            f'README 复制段缺少摘牌关键词 {keyword!r}:\n{section[:400]}')
-    for defect in ('位点会回退', 'checkpoint', 'DDL', 'START SLAVE'):
+            f'README 复制段缺少 beta 契约关键词 {keyword!r}:\n{section[:500]}')
+    for defect in ('轮转', 'GTID', '半同步', '写失败'):
         assert defect in section, (
-            f'README 复制段没有写明缺陷 {defect!r}:\n{section[:400]}')
-    # 当前实测状态里也要有一句明确结论（不埋在支持边界表格里）
+            f'README 复制段没有写明未完成项 {defect!r}:\n{section[:500]}')
+    # 「当前实测状态」首段也要有明确结论（不埋在支持边界表格里）
     head = text[:text.index('### 🔐')]
-    assert '复制' in head and '不可用于生产' in head, (
-        'README「当前实测状态」缺少复制不可用于生产的明确结论')
-    print('  → README 复制段已摘牌（实验性/单向/不可用于生产 + 缺陷清单）')
+    assert '复制' in head and 'beta' in head, (
+        'README「当前实测状态」缺少复制 beta 定位的明确结论')
+    print('  → README 复制段符合 beta 契约（append-only + CRC + 未完成项清单）')
 
 
 def test_readme_has_no_replication_production_claim():
-    """README 不得再出现「复制可用」这类生产级声明"""
+    """README 不得出现「复制生产可用」这类过度声明（beta 契约下仍禁止）"""
     text = _readme()
-    for bad in ('复制可用', '复制已经可用', '复制可用于生产'):
+    for bad in ('复制可用于生产', '复制已经在生产', '生产级复制'):
         assert bad not in text, f'README 仍存在复制生产声明: {bad!r}'
-    print('  → README 无「复制可用」类声明')
+    print('  → README 无复制"生产可用"类声明')
