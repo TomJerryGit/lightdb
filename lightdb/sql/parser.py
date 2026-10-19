@@ -1595,6 +1595,10 @@ class Parser:
 
         cols = []
         constraints = []
+        #: 表级 `PRIMARY KEY (...)`（只允许一条；单列）
+        table_pk = None
+        #: 表级 `UNIQUE [KEY|INDEX] [名字] (...)`（每条都真的强制唯一性）
+        unique_indexes = []
         for part in self._split_top_level(body):
             part_stripped = part.strip()
             up = part_stripped.upper()
@@ -1611,16 +1615,49 @@ class Parser:
             # `_column_def`，而它把 `CONSTRAINT` 开头的表级约束一律
             # `return None` —— 带名字的 CHECK 因此被**静默丢弃**（实测
             # `CREATE TABLE t (a INT, CONSTRAINT ck CHECK (a>0))` 得到
-            # `checks=[]`）。这里接住 CHECK 形态；`CONSTRAINT ... FOREIGN
-            # KEY / UNIQUE / PRIMARY KEY` 仍走原分支（不在本批次范围）。
+            # `checks=[]`）。这里接住 CHECK 形态；`CONSTRAINT 名字
+            # UNIQUE/PRIMARY KEY` 走同一条表级键声明解析；`FOREIGN KEY`
+            # 显式报错（本引擎没有外键实现，绝不静默丢弃）。
             if up.startswith('CONSTRAINT'):
                 cm = re.match(
                     r'CONSTRAINT\s+[`"]?(\w+)[`"]?\s+(.*)$',
                     part_stripped, re.IGNORECASE | re.DOTALL)
-                if cm and cm.group(2).strip().upper().startswith('CHECK'):
+                if not cm:
+                    raise SyntaxError(
+                        f"表级 CONSTRAINT 声明无法解析: {part_stripped[:120]}")
+                body = cm.group(2).strip()
+                if body.upper().startswith('CHECK'):
                     constraints.append(self._parse_check(
-                        cm.group(2).strip(), name=cm.group(1)))
+                        body, name=cm.group(1)))
                     continue
+                kd = self._parse_table_key(
+                    body, constraint_name=cm.group(1),
+                    original=part_stripped)
+                if kd is None:
+                    raise SyntaxError(
+                        f"不支持的 CONSTRAINT 内容: {part_stripped[:120]}"
+                        f"（本引擎只支持 CONSTRAINT <名字> CHECK / UNIQUE / "
+                        f"PRIMARY KEY）")
+                table_pk, unique_indexes = self._apply_table_key(
+                    kd, table_pk, unique_indexes)
+                continue
+
+            # ---- 表级索引/键声明 ----
+            #
+            # 旧实现把这些 part 交给 `_column_def`，而它对
+            # `PRIMARY KEY / KEY / INDEX / UNIQUE KEY / FULLTEXT ...`
+            # 一律 `return None` —— 声明被**静默丢弃**（用户以为建了索引，
+            # `SHOW INDEX` 里却没有）。更糟的是 `UNIQUE INDEX uq (c)` /
+            # `UNIQUE (c)` / `SPATIAL KEY ...` 压根不在它的跳过列表里，
+            # 会被当成一列（列名 `UNIQUE`、类型 `INDEX`）建出来，元数据
+            # 直接长出一根假列。现在：能真做的（表级单列主键、UNIQUE）
+            # 真做，做不到的（二级索引 / FULLTEXT / SPATIAL / 外键）
+            # 一律显式 SyntaxError。
+            kd = self._parse_table_key(part_stripped)
+            if kd is not None:
+                table_pk, unique_indexes = self._apply_table_key(
+                    kd, table_pk, unique_indexes)
+                continue
 
             col = self._column_def(part_stripped)
             if col:
@@ -1628,6 +1665,30 @@ class Parser:
 
         if not cols:
             raise SyntaxError("表至少需要一列")
+
+        if table_pk is not None:
+            if any(c.get('primary') for c in cols):
+                # MySQL 1068：一张表只能有一个主键。静默二选一会让
+                # `SHOW INDEX` 变成谎言，因此显式报错。
+                raise SyntaxError(
+                    "Multiple primary key defined（列级 PRIMARY KEY 与表级 "
+                    "PRIMARY KEY 同时出现；本引擎只支持一个主键）")
+            if len(table_pk['columns']) != 1:
+                # 主轴索引是「一个主键值 → 版本位置」的 B+Tree，**不支持**
+                # 复合键。这里如实拒绝而不是只取第一列（那等于悄悄换了
+                # 主键语义）。
+                raise SyntaxError(
+                    f"本引擎不支持复合主键：表级 PRIMARY KEY "
+                    f"({', '.join(table_pk['columns'])}) 无法生效"
+                    f"（主键 B+Tree 只支持单列）。请改成单列主键，或去掉"
+                    f"该表级声明后用列级 PRIMARY KEY")
+            target = table_pk['columns'][0]
+            hit = [c for c in cols if c['name'] == target]
+            if not hit:
+                raise SyntaxError(
+                    f"Key column '{target}' doesn't exist in table "
+                    f"{table}（表级 PRIMARY KEY 引用了不存在的列）")
+            hit[0]['primary'] = True
 
         if not any(c.get('primary') for c in cols):
             cols[0]['primary'] = True
@@ -1650,12 +1711,179 @@ class Parser:
             'columns': cols,
             'checks': constraints,
             'partition': partition,
+            # 表级 `UNIQUE KEY/INDEX 名字 (列...)`：由 `Database.create_table`
+            # 落成**真实强制**的唯一约束（写入路径检查 + `_meta.json`
+            # 持久化 + `SHOW INDEX` 如实列出）。不再静默丢弃。
+            'unique_indexes': unique_indexes,
             # `CREATE TABLE IF NOT EXISTS` 原实现被正则吃掉后丢掉：执行器
             # 于是"表已存在就报错"，同一份 dump 无法重复恢复。此处如实
             # 回传，由执行器决定幂等语义。
             'if_not_exists': bool(re.match(
                 r'CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b', sql, re.IGNORECASE)),
         }
+
+    #: 表级键/索引声明的起始关键字（长的在前，避免 `UNIQUE KEY` 被
+    #: `UNIQUE` 抢先匹配）。`\b` 保证 `KEYED` 这类标识符不会被误判。
+    _TABLE_KEY_RE = re.compile(
+        r'^(PRIMARY\s+KEY|UNIQUE(?:\s+(?:KEY|INDEX))?|'
+        r'FULLTEXT(?:\s+(?:KEY|INDEX))?|'
+        r'SPATIAL(?:\s+(?:KEY|INDEX))?|'
+        r'FOREIGN\s+KEY|KEY|INDEX)\b(.*)$',
+        re.IGNORECASE | re.DOTALL)
+
+    def _parse_table_key(self, s: str, constraint_name: str = None,
+                         original: str = None):
+        """解析一条**表级**键/索引声明；不是这类声明返回 None
+
+        返回 `{'kind','name','columns','tail'}`（kind 为大写关键字家族名）。
+        语法能解析、但本引擎无法让它生效的形态在调用方
+        `_apply_table_key` 里显式报错 —— 本方法只负责"读对结构"。
+        """
+        m = self._TABLE_KEY_RE.match(s.strip())
+        if not m:
+            return None
+        kw = re.sub(r'\s+', ' ', m.group(1).strip().upper())
+        kind = kw.split()[0]
+        rest = m.group(2).strip()
+
+        if kind == 'FOREIGN':
+            # `FOREIGN KEY [名字] (列) REFERENCES ...`：结构读出来，
+            # 是否支持由调用方决定（这里是显式报错）。
+            name = None
+            if not rest.startswith('('):
+                nm = re.match(r'`?([A-Za-z_]\w*)`?\s*(.*)$', rest,
+                              re.DOTALL)
+                if not nm:
+                    raise SyntaxError(
+                        f"FOREIGN KEY 声明无法解析: {s[:120]}")
+                name, rest = nm.group(1), nm.group(2).strip()
+            if not rest.startswith('('):
+                raise SyntaxError(
+                    f"FOREIGN KEY 声明缺少列清单: {s[:120]}")
+            inner, end = self._extract_paren(rest, 0)
+            return {'kind': kind, 'name': name,
+                    'columns': self._parse_key_columns(inner, kw),
+                    'tail': rest[end + 1:].strip(),
+                    'original': original or s}
+
+        name = None
+        if not rest.startswith('('):
+            nm = re.match(r'`?([A-Za-z_]\w*)`?\s*(.*)$', rest, re.DOTALL)
+            if not nm:
+                raise SyntaxError(f"{kw} 声明无法解析: {s[:120]}")
+            name, rest = nm.group(1), nm.group(2).strip()
+            if not rest.startswith('('):
+                raise SyntaxError(
+                    f"{kw} 声明缺少列清单 `(...)`: {s[:120]}")
+        inner, end = self._extract_paren(rest, 0)
+        tail = rest[end + 1:].strip()
+        columns = self._parse_key_columns(inner, kw)
+        if kind == 'PRIMARY':
+            if name is not None:
+                raise SyntaxError(
+                    f"PRIMARY KEY 不接受索引名 `{name}`（MySQL 语法里主键名"
+                    f"固定是 PRIMARY）: {s[:120]}")
+        elif name is None and constraint_name:
+            # `CONSTRAINT uq UNIQUE (col)`：MySQL 的约束名在这里同时充当
+            # 索引名（没有单独的索引名时）。
+            name = constraint_name
+        return {'kind': kind, 'name': name, 'columns': columns,
+                'tail': tail, 'original': original or s}
+
+    def _parse_key_columns(self, inner: str, kw: str):
+        """解析 `键声明` 括号里的列清单（整列，不支持表达式/前缀长度）"""
+        cols = []
+        for raw in self._split_top_level(inner):
+            item = raw.strip()
+            if not item:
+                raise SyntaxError(f"{kw} 的列清单为空: {inner[:80]}")
+            cm = re.match(
+                r'^`?([A-Za-z_]\w*)`?\s*(?:\(\s*(\d+)\s*\))?'
+                r'\s*(?:ASC|DESC)?$', item, re.IGNORECASE)
+            if not cm:
+                raise SyntaxError(
+                    f"{kw} 的列清单里有本引擎无法解析的项 {item!r}"
+                    f"（不支持表达式索引 / 前缀索引）")
+            if cm.group(2):
+                raise SyntaxError(
+                    f"{kw}: 不支持前缀索引 {item!r}（本引擎的键只认整列）")
+            cols.append(cm.group(1))
+        return cols
+
+    def _apply_table_key(self, kd, table_pk, unique_indexes):
+        """把一条表级键声明落到建表结果上；**做不到的一律显式报错**
+
+        支持：`PRIMARY KEY (...)`（单列）、`UNIQUE [KEY|INDEX] ...`
+        （单列/多列，都真强制）。其余（非唯一 KEY/INDEX、FULLTEXT、
+        SPATIAL、FOREIGN KEY）本引擎没有对应实现，声明会被静默丢弃 ——
+        这里改为 SyntaxError，报文说明"没有这个能力"以及替代做法。
+        """
+        kind = kd['kind']
+        original = kd.get('original') or ''
+
+        if kind == 'PRIMARY':
+            if kd['tail']:
+                um = re.fullmatch(r'USING\s+(BTREE|HASH)', kd['tail'],
+                                  re.IGNORECASE)
+                if not um:
+                    raise SyntaxError(
+                        f"PRIMARY KEY 声明后面有多余内容 {kd['tail']!r}: "
+                        f"{original[:120]}")
+                if um.group(1).upper() != 'BTREE':
+                    raise SyntaxError(
+                        f"PRIMARY KEY 只支持 USING BTREE（本引擎的主键索引"
+                        f"就是 B+Tree），不支持 {um.group(1).upper()}: "
+                        f"{original[:120]}")
+            if table_pk is not None:
+                raise SyntaxError(
+                    "Multiple primary key defined（CREATE TABLE 里有两条"
+                    "表级 PRIMARY KEY 声明）")
+            return kd, unique_indexes
+
+        if kind == 'UNIQUE':
+            if kd['tail']:
+                um = re.fullmatch(r'USING\s+(BTREE|HASH)', kd['tail'],
+                                  re.IGNORECASE)
+                if um:
+                    raise SyntaxError(
+                        f"UNIQUE 的 USING {um.group(1).upper()} 无法实现："
+                        f"本引擎的唯一性由**写入路径唯一性检查**强制"
+                        f"（SHOW INDEX 的 Index_type 如实报 UNIQUE-CHECK），"
+                        f"没有按指定索引结构建的真实索引。请删除 USING 子句"
+                        f"（唯一性照样强制）: {original[:120]}")
+                raise SyntaxError(
+                    f"UNIQUE 声明后面有多余内容 {kd['tail']!r}: "
+                    f"{original[:120]}")
+            unique_indexes.append({'name': kd['name'],
+                                   'columns': list(kd['columns'])})
+            return table_pk, unique_indexes
+
+        if kind == 'KEY' or kind == 'INDEX':
+            raise SyntaxError(
+                f"本引擎不支持二级索引：CREATE TABLE 里的非唯一 "
+                f"KEY/INDEX 声明 `{original[:80]}` 无法生效（只有主键 "
+                f"B+Tree 与 UNIQUE 唯一性检查）。请删除该 KEY 声明后重试。"
+                f"注意：含 KEY 行的 mysqldump 一类 DDL **不能**直接恢复")
+
+        if kind == 'FULLTEXT':
+            raise SyntaxError(
+                f"CREATE TABLE 里的 FULLTEXT 声明不支持：`{original[:80]}`"
+                f"不会生效。本引擎的全文索引由独立语句 "
+                f"`CREATE FULLTEXT INDEX <名字> ON <表> (<列>)` 建立"
+                f"（请建表后单独执行）")
+
+        if kind == 'SPATIAL':
+            raise SyntaxError(
+                f"本引擎不支持 SPATIAL 索引：`{original[:80]}` 没有对应的"
+                f"实现（没有空间索引），该声明不会生效")
+
+        if kind == 'FOREIGN':
+            raise SyntaxError(
+                f"本引擎不支持外键（没有外键强制/级联实现）："
+                f"`{original[:80]}` 不会生效，因此显式拒绝而不是静默丢弃。"
+                f"请在应用层保证引用完整性")
+
+        raise SyntaxError(f"不支持的表级键声明: {original[:120]}")
 
     def _parse_check(self, s: str, name: str = None,
                      strict_tail: bool = True):
@@ -1784,12 +2012,20 @@ class Parser:
             return None
         upper = s.upper()
 
-        # 跳过表级约束
+        # 表级约束/索引声明必须由 `_create_table` / `_alter_table` 在
+        # 调用本方法**之前**拦下。走到这里的只可能是漏网的声明 ——
+        # 旧实现 `return None` 把它们静默丢掉（`UNIQUE INDEX uq (c)`、
+        # `UNIQUE (c)`、`SPATIAL KEY` 甚至会被当成列建出来）。现在一律
+        # 显式报错：宁可让 DDL 失败，也不让"声明了却不存在"通过。
         if upper.startswith((
                 'PRIMARY KEY', 'KEY ', 'INDEX ',
-                'UNIQUE KEY', 'CONSTRAINT ',
-                'FOREIGN KEY', 'FULLTEXT', 'CHECK')):
-            return None
+                'UNIQUE KEY', 'UNIQUE INDEX', 'UNIQUE (',
+                'CONSTRAINT ', 'FOREIGN KEY', 'FULLTEXT', 'SPATIAL',
+                'CHECK')):
+            raise SyntaxError(
+                f"无法识别的表级声明 {s[:100]!r}：本引擎只支持表级单列 "
+                f"PRIMARY KEY 与 UNIQUE KEY/INDEX（其余表级索引/外键"
+                f"一律显式拒绝），该声明不会被静默忽略")
 
         parts = s.split(None, 2)
         if len(parts) < 2:
@@ -2359,8 +2595,19 @@ class Parser:
             if '=' not in pair:
                 continue
             k, v = pair.split('=', 1)
-            set_pairs[k.strip().strip('`"')] = \
-                v.strip().strip("'\"")
+            raw = v.strip()
+            # `SET col = NULL` 必须是真正的 SQL NULL（交给 `coerce` 变成
+            # None），否则唯一列上的"改成 NULL"会报 1105 类型转换失败。
+            # 引号字面量 `'NULL'` 仍按字符串处理（与 INSERT 的
+            # `_unquote_literal` 同一口径）；旧实现 `strip("'\"")` 既分不清
+            # 二者，也会把 `'it''s'` 这类转义弄坏。
+            if raw[:1] in ("'", '"'):
+                value = self._unquote_literal(raw)
+            elif raw.upper() == 'NULL':
+                value = None
+            else:
+                value = raw
+            set_pairs[k.strip().strip('`"')] = value
 
         where = self._where(m.group(3)) if m.group(3) else None
         return {

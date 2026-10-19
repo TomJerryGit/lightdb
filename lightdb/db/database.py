@@ -56,12 +56,67 @@ INFORMATION_SCHEMA_TABLES = ('COLUMNS', 'SCHEMATA', 'TABLES')
 
 
 def column_key(col: dict) -> str:
-    """`SHOW COLUMNS` / `information_schema` 的 Key 列（真实约束，不推断）"""
+    """`SHOW COLUMNS` / `information_schema` 的 Key 列（真实约束，不推断）
+
+    只读**列自身**的声明（列级 PRIMARY KEY / 列级 UNIQUE）。表级
+    `UNIQUE KEY (列)` 覆盖到的列由 `describe_columns` 补 `UNI`
+    （那需要表的上下文，单列字典看不到）。
+    """
     if col.get('primary'):
         return 'PRI'
     if col.get('unique'):
         return 'UNI'
     return ''
+
+
+#: 本引擎能写进 `SHOW CREATE TABLE` / 逻辑 dump 并原样读回的索引名
+_UNIQUE_NAME_RE = re.compile(r'^[A-Za-z_]\w*$')
+
+
+def resolve_unique_indexes(table: str, cols: List[dict], specs) -> List[dict]:
+    """校验并规范化 `CREATE TABLE` 里的表级 `UNIQUE KEY/INDEX` 声明
+
+    **定义期**就拒绝坏定义（未知列 / 重名 / 非法名字 / 空列清单），绝不
+    把一条"永远不会生效"的唯一约束写进元数据：
+    * 未知列 → 1072（`Key column 'x' doesn't exist in table`）；
+    * 索引重名 / 占用 PRIMARY 名字 → 1061（`Duplicate key name`）；
+    * 名字含不支持字符 → 1064（名字要能写进 DDL 并原样读回，
+      否则 `SHOW CREATE TABLE` → 重建 的往返会失败）；
+    * 同一索引里同一列出现两次 → 1060（MySQL 同样拒绝）。
+    """
+    names = [c.get('name') for c in cols]
+    out, seen = [], {}
+    for spec in (specs or []):
+        if not isinstance(spec, dict):
+            raise DdlError(
+                f"表 {table} 的 UNIQUE 声明格式错误: {spec!r}", errno=1064)
+        columns = [str(c) for c in (spec.get('columns') or [])]
+        if not columns:
+            raise DdlError(
+                f"表 {table} 的 UNIQUE 声明没有列（无法强制任何唯一性）",
+                errno=1064)
+        if len(set(columns)) != len(columns):
+            raise DdlError(
+                f"表 {table} 的 UNIQUE 声明列清单里有重复列: {columns}",
+                errno=1060)
+        for cname in columns:
+            if cname not in names:
+                raise DdlError(
+                    f"Key column '{cname}' doesn't exist in table "
+                    f"'{table}'", errno=1072, sqlstate='42022')
+        name = str(spec.get('name') or columns[0]).strip()
+        if not _UNIQUE_NAME_RE.match(name):
+            raise DdlError(
+                f"表 {table} 的唯一索引名 {name!r} 含不支持的字符"
+                f"（只支持 [A-Za-z_]\\w*；否则 SHOW CREATE TABLE / 逻辑"
+                f"备份无法往返）", errno=1064)
+        low = name.lower()
+        if low == 'primary' or low in seen:
+            raise DdlError(f"Duplicate key name '{name}'", errno=1061,
+                           sqlstate='42000')
+        seen[low] = True
+        out.append({'name': name, 'columns': columns})
+    return out
 
 
 def column_default(col: dict):
@@ -96,9 +151,21 @@ def describe_columns(table) -> list:
     sql/net），所以进程内执行器、`information_schema` 虚拟表、
     MySQL 协议服务端三条路径可以共用同一份实现，不会再各自"编"一套。
     `table` 只需要有 `.cols`（`RemoteTable` 在 multiprocess 下也满足）。
+
+    `Key` 列：列级 `PRIMARY KEY`/`UNIQUE` 来自列自身声明；表级
+    `UNIQUE KEY (列)` 覆盖的列同样报 `UNI`（MySQL 里唯一索引的列就是
+    `UNI`，这是真实约束，不是推断）。
     """
+    # 表级 UNIQUE 覆盖的列（`_unique_indexes` 只有真 Table 才有；
+    # RemoteTable 之类的最小投影没有就按空集处理）
+    unique_cols = set()
+    for spec in (getattr(table, '_unique_indexes', None) or []):
+        unique_cols.update(spec.get('columns') or [])
     out = []
     for c in getattr(table, 'cols', None) or []:
+        key = column_key(c)
+        if not key and c.get('name') in unique_cols:
+            key = 'UNI'
         out.append({
             'name': c.get('name', ''),
             # 解析器保留长度/精度：`VARCHAR(20)` / `DECIMAL(10,2)`。
@@ -109,7 +176,7 @@ def describe_columns(table) -> list:
             # NOT NULL 执行（不提供主键值会显式报错）。之前只读 `notnull`
             # 标志，于是主键列报 `Null=YES` —— 与真实行为矛盾，属假元数据。
             'null': ('NO' if (c.get('notnull') or c.get('primary')) else 'YES'),
-            'key': column_key(c),
+            'key': key,
             'default': column_default(c),
             'extra': column_extra(c),
         })
@@ -245,6 +312,9 @@ class Database:
                 self.tables[tname] = Table(
                     tname, tinfo['cols'], str(self.data_dir),
                     self.lock_manager, self.mvcc,
+                    # 表级 UNIQUE 约束必须跨重启保留：丢了它，重启后
+                    # 唯一性就悄悄失效（声明还在列里、约束却没了）。
+                    unique_indexes=tinfo.get('unique_indexes'),
                 )
                 if tinfo.get('partition'):
                     # 分区描述随表元数据一起持久化（SHOW PARTITIONS /
@@ -274,6 +344,9 @@ class Database:
             'tables': {
                 n: {'cols': t.cols,
                     'partition': getattr(t, '_partition_spec', None),
+                    # 表级 UNIQUE 约束（`UNIQUE KEY 名字 (列...)`）随元数据
+                    # 持久化：它由写入路径真实强制，重启后必须继续强制。
+                    'unique_indexes': t.unique_indexes(),
                     # CHECK 约束随元数据持久化（列级约束本来就在 cols 里，
                     # 表级约束在这里）。没有它，重启后表级 CHECK 就消失，
                     # 违规数据会被静默写进来。
@@ -342,7 +415,8 @@ class Database:
     def create_table(self, name: str,
                      cols: List[dict],
                      partition: dict = None,
-                     checks: List[dict] = None) -> Table:
+                     checks: List[dict] = None,
+                     unique_indexes: List[dict] = None) -> Table:
         """建表
 
         `checks` 是 `CREATE TABLE` 里表级 CHECK 约束（`sql/parser.py` 的
@@ -350,6 +424,11 @@ class Database:
         校验（列引用 / 函数名 / 不支持的形态）：不合法直接抛
         `CheckConstraintError`，绝不把一条"永远不会生效"的约束写进元数据。
         校验通过后按 MySQL 规则补全自动名，随 `_meta.json` 一起持久化。
+
+        `unique_indexes` 是表级 `UNIQUE KEY/INDEX 名字 (列...)`（解析器
+        不再静默丢弃它们）。这里在定义期校验列引用/重名/名字形态，然后
+        交给 `Table` —— 由写入路径**真正强制**唯一性，并随 `_meta.json`
+        持久化（重启后仍强制，`SHOW INDEX` 如实列出）。
         """
         if name in self.tables:
             raise ValueError(f"表 {name} 已存在")
@@ -357,9 +436,11 @@ class Database:
             resolve_check_names, validate_check_definitions)
         checks = resolve_check_names(name, cols, checks)
         validate_check_definitions(name, cols, checks)
+        unique_specs = resolve_unique_indexes(name, cols, unique_indexes)
         tbl = Table(
             name, cols, str(self.data_dir),
-            self.lock_manager, self.mvcc)
+            self.lock_manager, self.mvcc,
+            unique_indexes=unique_specs)
         if partition:
             tbl.set_partition(partition)
         tbl.set_checks(checks)
@@ -571,6 +652,13 @@ class Database:
                 f"Can't DROP '{colname}'; 该列声明了 UNIQUE，"
                 f"删除它会破坏唯一性约束（本引擎不支持连带删除约束）",
                 errno=1091, sqlstate='42000')
+        for uspec in tbl.unique_indexes():
+            if colname in uspec['columns']:
+                raise DdlError(
+                    f"Can't DROP '{colname}'; 该列属于表级 UNIQUE 约束 "
+                    f"'{uspec['name']}'，删除它会破坏唯一性"
+                    f"（本引擎不支持连带删除约束）",
+                    errno=1091, sqlstate='42000')
         # 被 CHECK 引用的列（MySQL 的 3959 就是这个场景）
         from ..sql.checks import check_columns, parse_check_predicate
         for spec in tbl.check_constraints():
@@ -653,6 +741,9 @@ class Database:
         entry = {'op': 'RENAME', 'table': old, 'new_name': new,
                  'old_cols': cols, 'new_cols': cols,
                  'partition': getattr(tbl, '_partition_spec', None),
+                 # 表级 UNIQUE 约束跟着改名走：漏了它，改名后唯一性
+                 # 就悄悄失效（声明还在，强制没了）。
+                 'unique_indexes': tbl.unique_indexes(),
                  'checks': [dict(c) for c in getattr(tbl, '_checks', [])]}
         self._ddl_begin(entry)
         self._finish_rename(entry)
@@ -687,7 +778,11 @@ class Database:
                 raise DdlError(
                     f"表 {old} 改名为 {new} 时文件改名失败: {e}", errno=1105)
         newtbl = Table(new, entry.get('new_cols') or tbl.cols,
-                       str(self.data_dir), self.lock_manager, self.mvcc)
+                       str(self.data_dir), self.lock_manager, self.mvcc,
+                       unique_indexes=(entry.get('unique_indexes')
+                                       if entry.get('unique_indexes')
+                                       is not None
+                                       else tbl.unique_indexes()))
         if entry.get('partition'):
             newtbl.set_partition(entry['partition'])
         if entry.get('checks'):

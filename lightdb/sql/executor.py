@@ -743,7 +743,11 @@ class Executor:
                 message=f"Table '{p['table']}' already exists")
         self.db.create_table(p['table'], p['columns'],
                              partition=p.get('partition'),
-                             checks=p.get('checks'))
+                             checks=p.get('checks'),
+                             # 表级 `UNIQUE KEY/INDEX`：解析器已不再静默
+                             # 丢弃，这里必须如实传下去（唯一性由写入路径
+                             # 强制，`SHOW INDEX` 会列出 UNIQUE-CHECK）。
+                             unique_indexes=p.get('unique_indexes'))
         return self._ok(
             message=f"Table '{p['table']}' created")
 
@@ -6181,10 +6185,19 @@ class Executor:
     def _show_index(self, p, s):
         """`SHOW INDEX FROM t` —— 列形状与 MySQL 一致，取值来自真实索引
 
-        数据源是 `Table.index_specs()`，**只报真的存在、真的在维护的索引**
-        （本引擎当前是主键 B+Tree）。`UNIQUE` 是"已声明但未强制"的列属性，
-        这里不替它编造索引行（见 `Table.index_specs` 的说明）。
+        数据源是 `Table.index_specs()`，**只报真的存在 / 真的在强制的
+        索引**：
 
+        * 主键 B+Tree → `Index_type='BTREE'`；
+        * 表级 `UNIQUE KEY/INDEX`（写入路径唯一性检查强制）→
+          `Non_unique=0` 是真的，但 `Index_type='UNIQUE-CHECK'`，**不谎称
+          BTREE**；`Cardinality` 是真实的不同非 NULL 键值个数；
+        * 列级 `col ... UNIQUE` 仍只是"已声明但未强制"的列属性，**不**
+          为它编造索引行（见 `Table.index_specs` 的说明）。
+
+        列形状（15 列、顺序、`Key_name`/`Column_name`/`Seq_in_index` 名字）
+        保持不变：`lightdb_studio` 的 `health_score._check_indexes` 与
+        `sql_auto_optimizer`、`lightdb/monitor/index_advisor` 都按列名读。
         一个索引多列 → 多行（`Seq_in_index` 从 1 递增），与 MySQL 一致；
         表不存在 → 1146（不返回空结果集，免得客户端把"表没了"当成"没索引"）。
         """
@@ -6192,9 +6205,17 @@ class Executor:
         if name not in self.db.tables:
             return self._err(1146, f"Table '{name}' doesn't exist")
         tbl = self.db.tables[name]
+        # `Null` 列按 MySQL 语义报**该行对应列**能否为 NULL（主键隐式
+        # NOT NULL）—— 不是按"索引是否唯一"编造。
+        null_by_col = {
+            c.get('name'): ('NO' if (c.get('notnull') or c.get('primary'))
+                            else 'YES')
+            for c in (getattr(tbl, 'cols', None) or [])
+        }
         rows = []
         for spec in tbl.index_specs():
             for seq, cname in enumerate(spec.get('columns') or [], start=1):
+                index_type = spec.get('index_type') or 'BTREE'
                 rows.append((
                     name,
                     0 if spec.get('unique') else 1,
@@ -6205,8 +6226,8 @@ class Executor:
                     spec.get('cardinality'),
                     None,                                # Sub_part
                     None,                                # Packed
-                    '' if spec.get('unique') else 'YES',  # Null
-                    'BTREE',                             # Index_type（真实实现）
+                    '' if null_by_col.get(cname) == 'NO' else 'YES',
+                    index_type,                          # 真实实现形态
                     '',                                  # Comment
                     '',                                  # Index_comment
                     'YES',                               # Visible

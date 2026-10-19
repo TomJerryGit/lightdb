@@ -117,6 +117,25 @@ _IDENT_RE = re.compile(r'^[A-Za-z_]\w*$')
 _DDL_COL_RE = re.compile(
     r'^`?([A-Za-z_]\w*)`?\s+([A-Za-z_]\w*)\s*(\([^)]*\))?\s*(.*)$')
 
+#: dump 里的**表级键声明**行：`[CONSTRAINT 名字] PRIMARY KEY (列...)` /
+#: `[CONSTRAINT 名字] UNIQUE [KEY|INDEX] [索引名] (列...)`。
+#: `canonical_ddl` 自己写出的是 `UNIQUE KEY 名字 (列...)`，但手写/外部
+#: 生成的 dump 也可能用 `UNIQUE INDEX` / `UNIQUE` / `CONSTRAINT` 形态；
+#: 这些是同一份语义，解析端必须都认，否则"备份能写、恢复读不回"。
+_DDL_KEY_ROW_RE = re.compile(
+    r'^(?:CONSTRAINT\s+`?([A-Za-z_]\w*)`?\s+)?'
+    r'(PRIMARY\s+KEY|UNIQUE(?:\s+(?:KEY|INDEX))?)'
+    r'\s*(?:`?([A-Za-z_]\w*)`?\s*)?'
+    r'\((.*)\)\s*$', re.IGNORECASE | re.DOTALL)
+
+#: `CONSTRAINT ...` / `PRIMARY KEY ...` / `UNIQUE ...` 的**词边界**前缀
+#: （`unique_col INT` 这种列名不能被当成表级键声明）。
+_DDL_CONSTRAINT_RE = re.compile(r'^CONSTRAINT\b', re.IGNORECASE)
+_DDL_KEY_PREFIX_RE = re.compile(r'^(?:PRIMARY\s+KEY|UNIQUE)\b', re.IGNORECASE)
+_DDL_UNSUPPORTED_INDEX_RE = re.compile(
+    r'^(?:KEY\b|INDEX\b|FULLTEXT\b|SPATIAL\b|FOREIGN\s+KEY\b)',
+    re.IGNORECASE)
+
 _IGNORABLE_PREFIXES = (
     'SET ', 'USE ', 'BEGIN', 'COMMIT', 'ROLLBACK', 'START TRANSACTION',
     'LOCK TABLES', 'UNLOCK TABLES', 'DELIMITER', '/*!', 'SOURCE ',
@@ -221,6 +240,10 @@ class TableSchema:
     name: str
     columns: list = field(default_factory=list)   # [{name,type,primary,unique,notnull,has_default,default,check}]
     table_checks: list = field(default_factory=list)  # [{'name','expr'}]
+    #: 表级 `UNIQUE KEY 名字 (列...)`（**真实强制**的唯一约束，不是列属性）。
+    #: 本引擎没有独立唯一索引结构，唯一性由写入路径检查强制；这里把它
+    #: 原样写回 DDL，恢复后仍然强制（`SHOW INDEX` 报 UNIQUE-CHECK）。
+    unique_indexes: list = field(default_factory=list)  # [{'name','columns'}]
 
     @property
     def col_names(self):
@@ -274,7 +297,7 @@ class TableSchema:
         ]
 
     @classmethod
-    def from_engine_cols(cls, name, cols, checks=None):
+    def from_engine_cols(cls, name, cols, checks=None, unique_indexes=None):
         columns = []
         for c in cols:
             ck = c.get('check') or {}
@@ -302,7 +325,17 @@ class TableSchema:
             if isinstance(ck, dict) and ck.get('expr'):
                 table_checks.append({'name': ck.get('name') or '',
                                      'expr': str(ck['expr']).strip()})
-        schema = cls(name=name, columns=columns, table_checks=table_checks)
+        uq = []
+        for spec in (unique_indexes or []):
+            if not isinstance(spec, dict):
+                continue
+            uq_cols = [str(c) for c in (spec.get('columns') or [])]
+            if not uq_cols:
+                continue
+            uq.append({'name': str(spec.get('name') or uq_cols[0]),
+                       'columns': uq_cols})
+        schema = cls(name=name, columns=columns, table_checks=table_checks,
+                     unique_indexes=uq)
         # 用与 `Database.create_table` 完全相同的一份命名规则补全自动名：
         # 否则"dump 里的匿名约束"与"恢复后引擎自动命名的约束"名字对不上，
         # 恢复校验会把一次正确恢复误判成失败。
@@ -331,8 +364,13 @@ class TableSchema:
         * 两者都保持"**列级在前、表级在后**"，与
           `Table.check_constraints()` 的顺序一致，自动编号同规则。
 
-        没有任何 CHECK 时输出与旧版本**逐字节相同**（老 dump 的解析/恢复
-        行为不变）。
+        表级 `UNIQUE KEY` 写在列定义之后、CHECK 之前：
+        `UNIQUE KEY <名字> (<列>, ...)`。它是**真强制**的约束（写入路径
+        唯一性检查），不写出来就等于"备份 → 恢复"把唯一性丢掉。列级
+        `col INT UNIQUE` 仍按列属性内联（保持原有行为，它是另一类声明）。
+
+        没有任何 CHECK / UNIQUE KEY 时输出与旧版本**逐字节相同**（老 dump
+        的解析/恢复行为不变）。
         """
         parts = []
         for c in self.columns:
@@ -356,6 +394,11 @@ class TableSchema:
             if ck.get('expr'):
                 line += f" CHECK ({ck['expr']})"
             parts.append(line)
+        # 表级 UNIQUE 约束（真强制）：必须写回 DDL，否则恢复后唯一性
+        # 静默消失。名字/列名都在 `assert_supported` 里校验过能原样解析。
+        for uq in self.unique_indexes:
+            cols_sql = ', '.join(str(c) for c in (uq.get('columns') or []))
+            parts.append(f"  UNIQUE KEY {uq['name']} ({cols_sql})")
         # 表级约束的自动名序号要**接在列级之后**（MySQL 的 `表名_chk_n`
         # 按约束在语句里的出现顺序编号），否则 dump 里写出的名字与恢复后
         # 引擎重新编号的名字会错位。
@@ -396,6 +439,34 @@ class TableSchema:
                 raise BackupError(
                     f"表 {self.name} 的 CHECK 约束名 {spec['name']!r} 含"
                     f"不支持的字符（只支持 [A-Za-z_]\\w*）")
+        col_names = {c['name'] for c in self.columns}
+        seen_uq = set()
+        for spec in self.unique_indexes:
+            if not _check_ident_ok(spec.get('name')):
+                raise BackupError(
+                    f"表 {self.name} 的 UNIQUE 索引名 {spec.get('name')!r} 含"
+                    f"不支持的字符（只支持 [A-Za-z_]\\w*，否则 dump 无法"
+                    f"往返）")
+            low = str(spec.get('name') or '').lower()
+            if low == 'primary' or low in seen_uq:
+                raise BackupError(
+                    f"表 {self.name} 的 UNIQUE 索引名 {spec.get('name')!r} "
+                    f"重复或占用了 PRIMARY（无法原样恢复）")
+            seen_uq.add(low)
+            if not spec.get('columns'):
+                raise BackupError(
+                    f"表 {self.name} 的 UNIQUE 索引 {spec.get('name')!r} "
+                    f"没有列，无法导出（导出空约束等于恢复出不强制唯一性"
+                    f"的表）")
+            if len(set(spec['columns'])) != len(spec['columns']):
+                raise BackupError(
+                    f"表 {self.name} 的 UNIQUE 索引 {spec.get('name')!r} "
+                    f"列清单里有重复列 {spec['columns']}（无法原样恢复）")
+            for cn in spec['columns']:
+                if cn not in col_names:
+                    raise BackupError(
+                        f"表 {self.name} 的 UNIQUE 索引 {spec.get('name')!r} "
+                        f"引用了不存在的列 {cn!r}，无法导出")
         if not any(c.get('primary') for c in self.columns):
             raise BackupError(f"表 {self.name} 没有主键，无法按主键扫描备份")
 
@@ -464,6 +535,37 @@ def normalize_type(t: str) -> str:
     return _TYPE_ALIASES.get(t, t)
 
 
+def _parse_ddl_key_row(part: str, table: str):
+    """解析 dump 里的一条**表级**键声明
+
+    返回 `(kind, constraint_name, index_name, columns)`；不是表级键声明
+    （例如 `CONSTRAINT ... CHECK`）返回 None。列清单只接受整列（可带
+    ASC/DESC）；前缀/表达式索引显式报错 —— 与引擎的 `CREATE TABLE`
+    解析器口径一致，绝不把不认识的声明静默跳过。
+    """
+    m = _DDL_KEY_ROW_RE.match(str(part).strip())
+    if not m:
+        return None
+    constraint_name, keyword, index_name, inner = m.groups()
+    kind = ('PRIMARY' if keyword.upper().startswith('PRIMARY')
+            else 'UNIQUE')
+    columns = []
+    for raw in _split_top_level(inner):
+        item = raw.strip()
+        if not item:
+            raise BackupError(
+                f"表 {table} 的 {keyword} 列清单为空")
+        cm = re.fullmatch(
+            r'`?([A-Za-z_]\w*)`?(?:\s+(?:ASC|DESC))?', item,
+            re.IGNORECASE)
+        if not cm:
+            raise BackupError(
+                f"表 {table} 的 {keyword} 列清单项 {item!r} 无法解析"
+                f"（本格式只支持整列，不支持前缀/表达式索引）")
+        columns.append(cm.group(1))
+    return kind, constraint_name, index_name, columns
+
+
 def parse_create_table(stmt: str) -> TableSchema:
     """解析 `CREATE TABLE [IF NOT EXISTS] t ( ... );` → TableSchema
 
@@ -515,11 +617,45 @@ def parse_create_table(stmt: str) -> TableSchema:
 
     columns = []
     table_checks = []
+    table_pk_cols = None
+    table_unique = []
     for part in _split_top_level(body):
         part = part.strip()
         if not part:
             continue
         up = part.upper()
+
+        # ---- 表级键声明（PRIMARY KEY / UNIQUE，含 CONSTRAINT 形态）----
+        #
+        # `canonical_ddl` 现在会为表级 UNIQUE 写出 `UNIQUE KEY 名字 (列...)`；
+        # 解析端若不认，备份就会"能导出、不能恢复"（恢复时在这里报
+        # "列 UNIQUE 带不支持的属性"）。这里把四种等价写法都读成同一份
+        # `TableSchema.unique_indexes`，恢复后仍由写入路径强制唯一性。
+        if (_DDL_CONSTRAINT_RE.match(part)
+                or _DDL_KEY_PREFIX_RE.match(part)):
+            key_row = _parse_ddl_key_row(part, name)
+            if key_row is not None:
+                kind, constraint_name, index_name, key_cols = key_row
+                if kind == 'PRIMARY':
+                    if table_pk_cols is not None:
+                        raise BackupError(
+                            f"表 {name} 有两条 PRIMARY KEY 声明"
+                            f"（Multiple primary key defined）")
+                    if index_name:
+                        raise BackupError(
+                            f"表 {name} 的 PRIMARY KEY 不接受索引名 "
+                            f"{index_name!r}")
+                    table_pk_cols = key_cols
+                else:
+                    uname = (index_name or constraint_name
+                             or (key_cols[0] if key_cols else ''))
+                    if not uname:
+                        raise BackupError(
+                            f"表 {name} 的 UNIQUE 声明没有索引名且没有列，"
+                            f"无法表达")
+                    table_unique.append({'name': uname,
+                                         'columns': list(key_cols)})
+                continue
 
         # 表级 CHECK 行：`[CONSTRAINT <名字>] CHECK (<expr>)`
         #
@@ -529,13 +665,14 @@ def parse_create_table(stmt: str) -> TableSchema:
         # 绝不"跳过这条约束、假装恢复成功"。
         ck_name = None
         ck_body = part
-        if up.startswith('CONSTRAINT'):
+        if _DDL_CONSTRAINT_RE.match(part):
             cnm = re.match(r'CONSTRAINT\s+`?([A-Za-z_]\w*)`?\s+(.*)$',
                            part, re.IGNORECASE | re.DOTALL)
             if not cnm:
                 raise BackupError(
                     f"表 {name} 的约束行 {part[:60]!r} 无法解析"
-                    f"（本格式只支持 CONSTRAINT <名字> CHECK (<expr>)）")
+                    f"（本格式只支持 CONSTRAINT <名字> CHECK (<expr>) / "
+                    f"UNIQUE / PRIMARY KEY）")
             ck_name, ck_body = cnm.group(1), cnm.group(2).strip()
         if ck_body.upper().startswith('CHECK'):
             ck = _parse_check_clause(ck_body, table=f"{name}")
@@ -543,6 +680,27 @@ def parse_create_table(stmt: str) -> TableSchema:
                 ck['name'] = ck_name
             table_checks.append(ck)
             continue
+        if _DDL_CONSTRAINT_RE.match(part):
+            raise BackupError(
+                f"表 {name} 的 CONSTRAINT 行 {part[:60]!r} 既不是 CHECK，"
+                f"也不是可解析的 UNIQUE/PRIMARY KEY（显式拒绝，不静默丢弃）")
+
+        # 走到这里还以 PRIMARY KEY / UNIQUE 开头，说明是**能认出是键声明、
+        # 但本格式不支持的形态**（例如 `UNIQUE KEY u (a) USING BTREE`）。
+        # 必须在 `_DDL_COL_RE` 之前显式拒绝，否则它会被当成一根名为
+        # UNIQUE 的假列建出来。
+        if _DDL_KEY_PREFIX_RE.match(part):
+            raise BackupError(
+                f"表 {name} 的表级键声明 {part[:60]!r} 无法解析"
+                f"（本格式只支持 PRIMARY KEY (列) / UNIQUE [KEY|INDEX] "
+                f"[名字] (列...)，不支持 USING / 前缀 / 表达式索引）")
+
+        # 非唯一二级索引 / FULLTEXT / SPATIAL / 外键：本格式不保存，
+        # 显式拒绝而不是让 `_DDL_COL_RE` 把它当成一根假列建出来。
+        if _DDL_UNSUPPORTED_INDEX_RE.match(part):
+            raise BackupError(
+                f"表 {name} 含本格式不支持的索引/外键行 {part[:60]!r}"
+                f"（本引擎没有对应实现，拒绝静默丢弃）")
 
         cm = _DDL_COL_RE.match(part)
         if not cm:
@@ -551,7 +709,8 @@ def parse_create_table(stmt: str) -> TableSchema:
             if up.startswith('PRIMARY KEY') and ',' in part:
                 raise BackupError(
                     f"表 {name} 使用多列主键，lightdb-logical-dump v1 不支持")
-            if up.startswith(('PRIMARY KEY', 'UNIQUE', 'KEY', 'INDEX')):
+            if (_DDL_KEY_PREFIX_RE.match(part)
+                    or _DDL_UNSUPPORTED_INDEX_RE.match(part)):
                 raise BackupError(
                     f"表 {name} 的索引/约束行 {part[:40]!r} 无法表达为"
                     f"列属性（本格式只保存主键）")
@@ -601,8 +760,28 @@ def parse_create_table(stmt: str) -> TableSchema:
             'check': col_check,
         })
 
+    # 表级 `PRIMARY KEY (col)`：本引擎主键 B+Tree 只支持单列，dump 侧
+    # 同样只接受单列；复合主键显式报错（不静默降级成复合语义）。
+    if table_pk_cols is not None:
+        if len(table_pk_cols) != 1:
+            raise BackupError(
+                f"表 {name} 使用多列主键 PRIMARY KEY "
+                f"({', '.join(table_pk_cols)})，lightdb-logical-dump v1 不支持"
+                f"（主键 B+Tree 只支持单列）")
+        if any(c.get('primary') for c in columns):
+            raise BackupError(
+                f"表 {name} 同时有列级 PRIMARY KEY 与表级 PRIMARY KEY"
+                f"（Multiple primary key defined）")
+        target = table_pk_cols[0]
+        hit = [c for c in columns if c['name'] == target]
+        if not hit:
+            raise BackupError(
+                f"表 {name} 的表级 PRIMARY KEY 引用了不存在的列 {target!r}")
+        hit[0]['primary'] = True
+
     schema = TableSchema(name=name, columns=columns,
-                         table_checks=table_checks)
+                         table_checks=table_checks,
+                         unique_indexes=table_unique)
     # 匿名约束按与 `Database.create_table` 相同的规则补名，再自检支持面
     _assign_check_names(schema)
     schema.assert_supported()
@@ -895,7 +1074,8 @@ def table_schemas(db) -> list:
     for name in sorted(db.tables):
         tbl = db.tables[name]
         out.append(TableSchema.from_engine_cols(
-            name, tbl.cols, getattr(tbl, '_checks', None)))
+            name, tbl.cols, getattr(tbl, '_checks', None),
+            unique_indexes=tbl.unique_indexes()))
     return out
 
 
@@ -910,7 +1090,8 @@ def check_ddl(db, name: str, if_not_exists: bool = False) -> str:
         raise BackupError(f"表 {name} 不存在")
     tbl = db.tables[name]
     schema = TableSchema.from_engine_cols(
-        name, tbl.cols, getattr(tbl, '_checks', None))
+        name, tbl.cols, getattr(tbl, '_checks', None),
+        unique_indexes=tbl.unique_indexes())
     schema.assert_supported()
     return schema.canonical_ddl(if_not_exists=if_not_exists)
 
@@ -1351,6 +1532,27 @@ def verify_restore(db, plan: DumpPlan) -> VerifyReport:
 
         # ---- CHECK 约束（dump 声明 vs 恢复后真实挂上的）----
         _verify_checks(rep, name, plan, schema, tbl)
+
+        # ---- 表级 UNIQUE 约束（dump 声明 vs 恢复后真实挂上的）----
+        # 这条不是"锦上添花"：UNIQUE 由写入路径强制，恢复时若 CREATE TABLE
+        # 文本被改掉/解析丢了，表照样能建出来、行照样能灌进去，只是唯一性
+        # 悄悄没了。必须逐项对账（名字 + 列顺序）并在报告里显式记一行。
+        want_uq = [(str(s.get('name') or ''),
+                    tuple(str(c) for c in (s.get('columns') or [])))
+                   for s in schema.unique_indexes]
+        try:
+            have_uq = [(str(s.get('name') or ''),
+                        tuple(str(c) for c in (s.get('columns') or [])))
+                       for s in tbl.unique_indexes()]
+        except Exception as e:                      # noqa: BLE001
+            rep.add(False, f"表 {name}: 读取表级 UNIQUE 约束失败: "
+                           f"{type(e).__name__}: {e}")
+        else:
+            rep.add(
+                want_uq == have_uq,
+                f"表 {name}: 表级 UNIQUE 约束 {len(want_uq)} 条"
+                f"{'逐项一致' if want_uq == have_uq else '不一致'} "
+                f"（dump={want_uq} / 恢复后={have_uq}）")
 
         rows = list(iter_rows(tbl))
         rep.rows[name] = len(rows)

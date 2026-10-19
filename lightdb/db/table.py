@@ -265,6 +265,24 @@ def coerce(value, col_type: str):
         raise ValueError(f"无法将 {value!r} 转换为 {col_type}")
 
 
+class UniqueViolationError(ValueError):
+    """唯一约束冲突（写入路径检查出来的，对应 MySQL 1062）
+
+    为什么是 `ValueError` 子类：`sql/executor.py` 的 `ValueError` 分支按
+    报文归类错误码（`Duplicate entry` / `唯一` → 1062）。本异常自带
+    `errno=1062` / `sqlstate='23000'`，即使将来改成按类型分派也能直接
+    使用；报文同样包含 `Duplicate entry ... for key ...` 的 MySQL 形态。
+    """
+
+    errno = 1062
+    sqlstate = '23000'
+
+    def __init__(self, message: str, key: str = None, entry=None):
+        super().__init__(str(message))
+        self.key = key
+        self.entry = entry
+
+
 class Table:
     """表对象"""
 
@@ -274,7 +292,8 @@ class Table:
 
     def __init__(self, name: str, cols: List[Dict], data_dir: str,
                  lock_manager: LockManager = None,
-                 mvcc: MVCCManager = None):
+                 mvcc: MVCCManager = None,
+                 unique_indexes: List[Dict] = None):
         self.name = name
         self.cols = cols
         self.data_dir = Path(data_dir)
@@ -356,6 +375,18 @@ class Table:
         self._checks = []
         self._refresh_check_flag()
 
+        # 表级 `UNIQUE KEY/INDEX 名字 (列...)`（含 `CONSTRAINT 名字 UNIQUE`）。
+        # 本引擎**没有**独立的唯一索引结构，唯一性由写入路径（INSERT /
+        # UPDATE）扫描强制，因此这份声明必须随 `_meta.json` 持久化、
+        # 重启后仍在（见 `Database._load` / `save_meta`）。
+        #
+        # 注意：列级 `col ... UNIQUE`（`cols[i]['unique']`）是另一码事 ——
+        # 本批次保持其原有语义（已声明、`SHOW COLUMNS.Key='UNI'`、但写入
+        # 路径不查重），`SHOW INDEX` 也不会为它编造索引行。**表级**
+        # `UNIQUE KEY` 才是这里真强制的约束。
+        self._unique_indexes = []
+        self.set_unique_indexes(unique_indexes)
+
     # ==================== CHECK 约束 ====================
 
     def _refresh_check_flag(self):
@@ -369,6 +400,166 @@ class Table:
                         if isinstance(c, dict) and c.get('expr')]
         self._refresh_check_flag()
         return self._checks
+
+    # ==================== 表级 UNIQUE 唯一性约束 ====================
+    #
+    # 设计取舍（**正确性优先**）：本引擎只有主键一个真实 B+Tree，没有
+    # 二级索引。表级 `UNIQUE KEY k (列...)` 如果"建索引"就要再写一套
+    # 索引结构 + 崩溃恢复，本批次选择**写入路径唯一性检查**（全表扫描
+    # 当前版本，O(n)）：
+    #
+    #   * 声明随 `_meta.json` 持久化 → 重启后仍强制；
+    #   * INSERT / UPDATE（含多行 UPDATE）都在**写任何一页之前**整体校验，
+    #     冲突抛 `UniqueViolationError`（1062），不会留下半套写入；
+    #   * `SHOW INDEX` 会列出它，但 `Index_type` 如实写 `UNIQUE-CHECK`
+    #     （不是 BTREE），并由 `Cardinality` 给出真实的不同键值个数；
+    #   * 多个 NULL 允许共存（与 MySQL 唯一索引语义一致；NULL 不参与
+    #     唯一性判定）。
+    #
+    # 与"列级 `col ... UNIQUE`"的区别：列级属性本批次**保持原样**
+    # （`SHOW COLUMNS.Key='UNI'`，不查重、`SHOW INDEX` 不报），原有测试
+    # 锁定了这个口径；表级声明才是本批次真正强制的那一类。
+
+    def set_unique_indexes(self, specs):
+        """设置表级 UNIQUE 约束（名字/列名规范由 `Database.create_table` 做）
+
+        列名不存在的条目在这里仍然保留（不静默丢声明）：定义期
+        `Database.create_table` 会先校验，运行期 `_col_idx` 找不到列会
+        抛 `KeyError` —— 两种都是显式失败，而不是"约束悄悄没了"。
+        """
+        out = []
+        for spec in (specs or []):
+            if not isinstance(spec, dict):
+                continue
+            columns = [str(c) for c in (spec.get('columns') or []) if str(c)]
+            if not columns:
+                continue
+            name = str(spec.get('name') or columns[0])
+            out.append({'name': name, 'columns': columns})
+        self._unique_indexes = out
+        return self.unique_indexes()
+
+    def unique_indexes(self):
+        """表级 UNIQUE 约束（深拷贝，防止调用方改到内部状态）"""
+        return [{'name': s['name'], 'columns': list(s['columns'])}
+                for s in self._unique_indexes]
+
+    def unique_columns(self):
+        """被表级 UNIQUE 约束覆盖的列名集合"""
+        out = set()
+        for spec in self._unique_indexes:
+            out.update(spec['columns'])
+        return out
+
+    def _live_rows(self):
+        """全表扫描"当前仍存活"的版本：返回 `[(pk, values)]`
+
+        判据是行头 `xmax == 0`（未被更新/删除墓碑化），**不看**读视图：
+        唯一性是表级不变量，必须把别的会话**未提交**的插入也算进来
+        （否则两个事务各插一行相同唯一值就能都提交）。代价是对未提交
+        写入偏保守：对方若回滚，本次插入会报 1062 而不会重复。
+        """
+        out = []
+        for pk, pid, sid in self.bt.scan():
+            for _vpid, _vsid, _rb, values, _xmin, xmax, _pp, _ps in \
+                    self._chain_versions((pid, sid)):
+                if xmax == 0:
+                    out.append((pk, values))
+                    break
+        return out
+
+    @staticmethod
+    def _key_tuple(values, idxs):
+        return tuple(values[i] for i in idxs)
+
+    @staticmethod
+    def _key_has_null(tup):
+        """MySQL 语义：唯一索引里的 NULL 不参与唯一性判定（可多行共存）"""
+        return any(v is None for v in tup)
+
+    def _raise_unique(self, spec, tup):
+        # 报文保持 MySQL 的 `Duplicate entry '<值>' for key '<键名>'`
+        # 形态（1062 的归类同时靠 `Duplicate entry` 与 `唯一` 两个词，
+        # 见 `Executor._storage_errno`）。
+        shown = '-'.join('NULL' if v is None else str(v) for v in tup)
+        raise UniqueViolationError(
+            f"Duplicate entry '{shown}' for key '{spec['name']}'"
+            f"（唯一约束冲突：列 {list(spec['columns'])} 的取值组合已存在）",
+            key=spec['name'], entry=tup)
+
+    def _find_unique_conflict(self, spec, tup, exclude_pks=()):
+        idxs = [self._col_idx(c) for c in spec['columns']]
+        for pk, values in self._live_rows():
+            if pk in exclude_pks:
+                continue
+            if self._key_tuple(values, idxs) == tup:
+                return pk
+        return None
+
+    def _validate_unique_insert(self, row):
+        """INSERT 前的唯一性检查（在任何 WAL / 页写入之前）"""
+        if not self._unique_indexes:
+            return
+        for spec in self._unique_indexes:
+            idxs = [self._col_idx(c) for c in spec['columns']]
+            tup = self._key_tuple(row, idxs)
+            if self._key_has_null(tup):
+                continue
+            if self._find_unique_conflict(spec, tup) is not None:
+                self._raise_unique(spec, tup)
+
+    def _validate_unique_update(self, pks, set_pairs):
+        """UPDATE 前的**整体**唯一性检查（与 CHECK 同样的"先全查再写"）
+
+        两条判据缺一不可：
+        1. 本条 UPDATE 改出来的多个新行之间不能撞同一个唯一值
+           （`UPDATE t SET email='x'` 命中两行 → 1062，MySQL 同样拒绝）；
+        2. 新值不能与**未被本条 UPDATE 命中**的存活行相同。
+
+        候选行用 `allow_pk_change=True` 算：唯一列恰好也是主键时
+        （`CREATE TABLE t2 (a INT, UNIQUE KEY u (a))` 的首列会被自动选为
+        主键），冲突必须在"不允许修改主键"之前被认出并报 1062 —— 用户
+        看到的是"唯一冲突 + 键名/值"，不是一句与唯一性无关的通用 1105。
+        无冲突时写入路径仍按主键不可改显式拒绝（1105），语义不变。
+        """
+        if not self._unique_indexes:
+            return
+        targets = set(pks)
+        new_rows = {}
+        for pk in pks:
+            loc = self.bt.search(pk)
+            if loc is None:
+                continue
+            current = None
+            for _vpid, _vsid, _rb, values, _xmin, xmax, _pp, _ps in \
+                    self._chain_versions(loc):
+                if xmax == 0:
+                    current = values
+                    break
+            if current is None:
+                continue
+            new_rows[pk] = self._apply_set_pairs(
+                current, set_pairs, allow_pk_change=True)
+        for spec in self._unique_indexes:
+            idxs = [self._col_idx(c) for c in spec['columns']]
+            seen = {}
+            for pk, values in new_rows.items():
+                tup = self._key_tuple(values, idxs)
+                if self._key_has_null(tup):
+                    continue
+                if tup in seen:
+                    self._raise_unique(spec, tup)
+                seen[tup] = pk
+            if not seen:
+                continue
+            for pk, values in self._live_rows():
+                if pk in targets:
+                    continue
+                tup = self._key_tuple(values, idxs)
+                if self._key_has_null(tup):
+                    continue
+                if tup in seen:
+                    self._raise_unique(spec, tup)
 
     def check_constraints(self):
         """本表全部 CHECK 约束（列级在前、表级在后，顺序稳定）"""
@@ -419,12 +610,20 @@ class Table:
                     table=self.name, constraint=spec.get('name'),
                     column=col)
 
-    def _apply_set_pairs(self, old_row, set_pairs):
-        """按 SET 列表算出新行（写入路径与"写入前整体校验"共用一份语义）"""
+    def _apply_set_pairs(self, old_row, set_pairs, allow_pk_change=False):
+        """按 SET 列表算出新行（写入路径与"写入前整体校验"共用一份语义）
+
+        `allow_pk_change` 只给**写入前的唯一性校验**用：本引擎的索引把
+        "主键值 → 版本位置"当 key，改主键需要给 B+Tree 换 key（本批次
+        不做，写入路径仍显式拒绝）。但校验阶段必须先按"用户写的 SET"
+        算出候选行 —— 否则 `UPDATE t SET a=1 WHERE a=2`（a 同时是主键
+        与表级 UNIQUE 列）会先撞上"不允许修改主键"的 1105，把真正的
+        唯一冲突（1062）盖掉，排障方向完全错。
+        """
         new = list(old_row)
         for col, val in set_pairs.items():
             ci = self._col_idx(col)
-            if ci == self.pk_idx:
+            if ci == self.pk_idx and not allow_pk_change:
                 raise ValueError("不允许修改主键")
             new[ci] = coerce(val, self.cols[ci]['type'])
         return new
@@ -1087,29 +1286,51 @@ class Table:
             return {'deleted_versions': dropped}
 
     def index_specs(self):
-        """本表**真实存在**的索引（`SHOW INDEX` 的唯一数据源）
+        """本表**真实存在 / 真实强制**的索引（`SHOW INDEX` 的唯一数据源）
 
         现状必须如实说明（宁可少报，也不"看起来有、其实没有"）：
 
-        * 本引擎真做出来的索引只有**主键 B+Tree**（Scheme A：key = 主键取值，
-          value = 该主键最新版本的 `(page, slot)`），插入时的主键重复检测
-          也是它做的；
-        * `UNIQUE` 目前只是**已声明、未强制**的列属性（`SHOW COLUMNS` 的
-          `Key` 报 `UNI`，见 `db/database.py::column_key`）：既没有独立索引
-          结构，插入/更新时也不查重。因此这里**不**为它编造一条索引行 ——
-          报一条 `Non_unique=0` 的 UNIQUE 索引等于宣称一个不存在的约束
+        * **主键 B+Tree**：本引擎唯一的存储层索引（Scheme A：key = 主键
+          取值，value = 该主键最新版本的 `(page, slot)`），插入时的主键
+          重复检测也是它做的 → `Index_type='BTREE'`；
+        * **表级 `UNIQUE KEY/INDEX 名字 (列...)`**：没有独立索引结构，
+          唯一性由写入路径（INSERT / UPDATE）的整体检查强制 → 这里报出来
+          （`Non_unique=0` 是真的），但 `Index_type='UNIQUE-CHECK'`
+          **不谎称 BTREE**；`Cardinality` 是当前存活行里不同非 NULL 键值
+          的**真实个数**（不是估计值）；
+        * 列级 `col ... UNIQUE`（`cols[i]['unique']`）：本批次仍只是
+          "已声明、未强制"的列属性（`SHOW COLUMNS.Key='UNI'`），**不**为
+          它报索引行 —— 报一条 `Non_unique=0` 等于宣称一个不存在的约束
           已经生效。
 
-        返回 `[{'name','unique','columns','cardinality'}]`；多列索引会给出
-        多个列名（`SHOW INDEX` 侧按 `Seq_in_index` 展开成多行）。
+        返回 `[{'name','unique','columns','cardinality','index_type'}]`；
+        多列索引会给出多个列名（`SHOW INDEX` 侧按 `Seq_in_index` 展开成
+        多行）。
         """
         out = []
         pk_cols = [c['name'] for c in self.cols if c.get('primary')]
         if pk_cols:
             out.append({'name': 'PRIMARY', 'unique': True,
                         'columns': pk_cols,
-                        'cardinality': self.bt.count()})
+                        'cardinality': self.bt.count(),
+                        'index_type': 'BTREE'})
+        for spec in self._unique_indexes:
+            out.append({'name': spec['name'], 'unique': True,
+                        'columns': list(spec['columns']),
+                        'cardinality': self._unique_cardinality(spec),
+                        'index_type': 'UNIQUE-CHECK'})
         return out
+
+    def _unique_cardinality(self, spec):
+        """表级 UNIQUE 约束的真实基数（不同非 NULL 键值个数，含未提交行）"""
+        idxs = [self._col_idx(c) for c in spec['columns']]
+        seen = set()
+        for _pk, values in self._live_rows():
+            tup = self._key_tuple(values, idxs)
+            if self._key_has_null(tup):
+                continue
+            seen.add(tup)
+        return len(seen)
 
     def refresh_schema_meta(self):
         """结构变更后刷新派生元数据（主键位置 / CHECK 缓存 / 分区列下标）
@@ -1297,6 +1518,11 @@ class Table:
         # 任何半条记录。违规抛 `CheckConstraintError`（ValueError 子类），
         # SQL 层据此返回 `ERROR 3819 (HY000)`。
         self._validate_checks(row)
+
+        # 唯一性（表级 UNIQUE KEY）：与 CHECK 同一位置 —— 拿锁 / 写 WAL
+        # **之前**。冲突时抛 1062 语义的 UniqueViolationError，不会留下
+        # 任何半条记录（也不会白占一个 WAL 序号）。
+        self._validate_unique_insert(row)
 
         # 加锁
         self._acquire_row_lock(tid, pk)
@@ -1529,6 +1755,15 @@ class Table:
     def _update_locked(self, set_pairs, where, tid,
                        read_view, owned) -> int:
         pks = self._find_pks(where, read_view)
+
+        # 唯一性（表级 UNIQUE KEY）：**先**做整体校验，理由有两层：
+        # 1. 与 CHECK 一样"先对全部目标行整体校验，再逐行写"，否则第 N 行
+        #    撞唯一值时前 N-1 行已经落盘（autocommit 下退不回来），语句
+        #    报错却留下部分更新 —— 另一种"假成功"；
+        # 2. 唯一冲突必须是 1062（带键名/值），不能被"不允许修改主键"这类
+        #    通用 1105 抢先盖掉 —— 唯一列恰好是主键时最容易踩到。
+        if self._unique_indexes:
+            self._validate_unique_update(pks, set_pairs)
 
         # CHECK 约束：**先对全部目标行整体校验，再逐行写**。若一边写一边
         # 校验，第 N 行违规时前 N-1 行已经落盘（autocommit 下退不回来），

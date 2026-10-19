@@ -132,6 +132,17 @@
 
 **事务实测**（Lead 亲自复核，非子代理自述）：初始 3 行 → 三种 ROLLBACK 后仍是 `[(1,'v1'),(2,'v2'),(3,'v3')]` → 连续重开 2 次行数不变（无重复行累积）→ 子进程 autocommit 写入后 `os._exit(1)` 硬杀，重开后该行仍在（日志 `崩溃恢复 t: redo 1 条, undo 0 条`）。
 
+### 🔑 索引声明支持边界（`CREATE TABLE` 内）
+
+| 声明 | 状态 |
+|---|---|
+| 表级 `PRIMARY KEY (col)`（单列） | ✅ 真正生效：成为主键 B+Tree，重复插入 **1062** |
+| 表级 `UNIQUE KEY/INDEX [名字] (col...)`（单列/多列）、`CONSTRAINT <名字> UNIQUE` | ✅ 真正强制：INSERT / UPDATE 冲突 **1062**（报文含键名/值）；重启后仍强制；`SHOW CREATE TABLE` 往返；`SHOW INDEX` 列出但 `Index_type` 如实报 **`UNIQUE-CHECK`**（不谎称 BTREE） |
+| 非唯一 `KEY/INDEX`、`FULLTEXT`、`SPATIAL`、`FOREIGN KEY`、复合 `PRIMARY KEY (a, b)`、前缀/表达式索引、`USING BTREE\|HASH` | ❌ **显式 1064**（说明不支持原因/替代做法），绝不静默丢弃、不建出假列 |
+| 列级 `col ... UNIQUE` | ⚠️ 保持原口径：声明保留（`SHOW COLUMNS.Key='UNI'`），但写入路径**不强制**、`SHOW INDEX` 不编造索引行；需要真正唯一性请改用表级 `UNIQUE KEY` |
+
+> 表级 UNIQUE 没有独立索引结构，唯一性由写入路径（INSERT / UPDATE 的写入前整体检查）强制，因此 `SHOW INDEX` 的 `Index_type` 写 `UNIQUE-CHECK`，`Cardinality` 是真实的不同非 NULL 键值个数；多列 UNIQUE 支持，NULL 不参与唯一性判定。逻辑备份 / 恢复会原样带回表级 UNIQUE 约束。
+
 **多进程模式实测**（`python -m lightdb.main --mode multi --workers 2` + 真实 pymysql）：
 
 | 验证项 | 结果 |
