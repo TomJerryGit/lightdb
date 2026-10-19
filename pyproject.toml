@@ -4,15 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lightdb-studio"
-version = "1.0.0"
-description = "LightDB Studio - 图形化数据库管理工具 (Navicat 替代)"
+dynamic = ["version"]
+description = "LightDB - 纯 Python 实现的 MySQL 兼容数据库引擎 + LightDB Studio 图形化管理工具"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "LightDB Team" }]
 keywords = ["database", "gui", "navicat", "mysql", "sql", "pyside6"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    # 2026-10-19：P0/P1 安全与正确性修复后进入可交付化阶段；仍有已知失败测试与
+    # 未完成能力（见 docs/analysis_2026-10-19/06_ROADMAP.md），因此不宣称 Production/Stable。
+    "Development Status :: 4 - Beta",
     "Environment :: X11 Applications :: Qt",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
@@ -24,10 +26,15 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Database",
     "Topic :: Database :: Front-Ends",
+    "Topic :: Database :: Database Engines/Servers",
 ]
 
+# 核心依赖：引擎运行期真实需要（psutil/numpy 与 requirements.txt 对齐；
+# 之前 pyproject 只声明 pymysql，装出来的包缺 psutil/numpy）。
 dependencies = [
     "pymysql>=1.0.0",
+    "psutil>=5.9.0",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]
@@ -38,20 +45,18 @@ gui = [
 web = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
-    "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
     "jinja2>=3.1.0",
     "python-multipart>=0.0.6",
+    "websockets>=12.0",
 ]
 all = [
     "PySide6>=6.5.0",
     "openpyxl>=3.1.0",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
-    "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
     "jinja2>=3.1.0",
     "python-multipart>=0.0.6",
+    "websockets>=12.0",
 ]
 dev = [
     "pytest>=7.0",
@@ -62,20 +67,32 @@ dev = [
 ]
 
 [project.scripts]
+# 引擎服务端入口（README 早就宣称存在，之前 pyproject 里一直没有）
+lightdb-server = "lightdb.main:main"
+# 桌面端
 lightdb-studio = "lightdb_studio.app:run"
+# Web 版
 lightdb-studio-web = "web.start:main"
-lightdb-studio-cli = "lightdb_studio.tools.cli:main"
+# 注意：原 `lightdb-studio-cli = "lightdb_studio.tools.cli:main"` 指向不存在的模块，
+# 已删除（引擎侧有 `python -m lightdb.tools.cli` / `lightdb` 命令行客户端）。
 
 [project.urls]
 Homepage = "https://github.com/lightdb/studio"
 Documentation = "https://github.com/lightdb/studio/docs"
 Repository = "https://github.com/lightdb/studio"
 
+[tool.setuptools.dynamic]
+# 版本单一来源：lightdb/__init__.py::__version__（当前 4.0.0）
+version = { attr = "lightdb.__version__" }
+
 [tool.setuptools.packages.find]
-include = ["lightdb_studio*", "web*"]
+# 之前只打包 lightdb_studio*/web*，wheel 里没有 lightdb 引擎包 —— 装完无法启动服务端。
+include = ["lightdb*", "lightdb_studio*", "web*"]
+exclude = ["tests*", "benchmarks*", "docs*", "scripts*", "docker*"]
 
 [tool.setuptools.package-data]
 lightdb_studio = ["**/*.json", "**/*.qss"]
+lightdb = ["cython/*.pyx"]
 web = ["static/*"]
 
 [tool.pytest.ini_options]

@@ -51,6 +51,11 @@ class BinaryRowFormat:
                 self.types.append(T_DOUBLE)
             elif 'FLOAT' in t:
                 self.types.append(T_FLOAT)
+            elif 'DECIMAL' in t or 'NUMERIC' in t:
+                # 定点数用 double 近似编码（该二进制行格式只用于实验/Cython
+                # fallback，不是生产行格式）。旧实现把 DECIMAL 落到下面的
+                # T_STRING 分支，`bytes(1.5)` 直接 TypeError。
+                self.types.append(T_DOUBLE)
             elif 'TEXT' in t or 'BLOB' in t:
                 self.types.append(T_STRING)  # 大文本
             else:

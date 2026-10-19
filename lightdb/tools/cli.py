@@ -7,8 +7,13 @@ import argparse
 import getpass
 import os
 import sys
-import readline  # 命令历史
 import cmd
+
+# Windows 的 CPython 没有 readline 模块：旧实现在顶层 `import readline`，
+# 导致 `python -m lightdb.tools.cli` / `test_batch9::test_cli_tool` 在 Windows
+# 直接 ModuleNotFoundError（Linux/macOS 才通过）。本文件并不使用 readline
+# 的任何 API（历史/补全未实现），因此直接移除导入即可跨平台。
+
 
 
 class LightDBClient(cmd.Cmd):
@@ -143,7 +148,10 @@ SQL 语句直接输入，以分号结尾。
 
 
 def main():
-    ap = argparse.ArgumentParser(description='LightDB CLI')
+    # 兼容 mysql 客户端习惯：`-h` 是 host，不是 help；因此关闭默认 -h 并
+    # 显式提供 `-?` / `--help`。旧实现在 add_argument('-h', '--host') 时
+    # 直接与 argparse 内建 -h 冲突（ArgumentError，Windows 上 CLI 必崩）。
+    ap = argparse.ArgumentParser(description='LightDB CLI', add_help=False)
     ap.add_argument('-h', '--host', default='127.0.0.1', dest='host')
     ap.add_argument('-P', '--port', type=int, default=8888)
     ap.add_argument('-u', '--user', default='root')
@@ -151,6 +159,8 @@ def main():
     ap.add_argument('-D', '--database', default='default')
     ap.add_argument('-e', '--execute', default=None,
                     help='执行一条SQL后退出')
+    ap.add_argument('-?', '--help', action='help',
+                    help='显示帮助后退出')
     args = ap.parse_args()
 
     if args.password is None:

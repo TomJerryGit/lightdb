@@ -57,17 +57,17 @@ def main():
         subprocess.run(['py-spy', '--version'],
                         capture_output=True, timeout=2)
         has_pyspy = True
-        print(f"  py-spy: ✅")
+        print(f"  py-spy: [OK]")
     except Exception:
-        print(f"  py-spy: ❌ (建议安装: pip install py-spy)")
+        print(f"  py-spy: [FAIL] (建议安装: pip install py-spy)")
 
     has_cython = False
     try:
         import Cython
         has_cython = True
-        print(f"  Cython: ✅ {Cython.__version__}")
+        print(f"  Cython: [OK] {Cython.__version__}")
     except ImportError:
-        print(f"  Cython: ❌ (建议安装: pip install cython)")
+        print(f"  Cython: [FAIL] (建议安装: pip install cython)")
 
     # 2. 采集 CPU Profile
     print("\n【2/5】采集 CPU Profile")
@@ -78,9 +78,9 @@ def main():
         gen = FlameGraphGenerator(str(output_dir))
         svg = gen.record_pid(pid, duration=args.duration)
         if svg:
-            print(f"  ✅ 火焰图: {svg}")
+            print(f"  [OK] 火焰图: {svg}")
     else:
-        print(f"  ⚠️ 跳过（PID={pid}, py-spy={has_pyspy}）")
+        print(f"  [WARN] 跳过（PID={pid}, py-spy={has_pyspy}）")
 
     # 3. 分析热点
     print("\n【3/5】热点分析")
@@ -113,7 +113,7 @@ def main():
         analyzer.profile_workload(
             dummy_workload, duration=args.duration,
             output=prof_file)
-        print(f"  ✅ Profile: {prof_file}")
+        print(f"  [OK] Profile: {prof_file}")
 
         # 热点排行
         ranker = HotspotRanker(
@@ -124,10 +124,10 @@ def main():
         # 保存
         report_file = output_dir / 'hotspot_report.txt'
         report_file.write_text(hotspot_report, encoding='utf-8')
-        print(f"\n  ✅ 报告: {report_file}")
+        print(f"\n  [OK] 报告: {report_file}")
 
     except Exception as e:
-        print(f"  ⚠️ 分析失败: {e}")
+        print(f"  [WARN] 分析失败: {e}")
 
     # 4. GIL 分析
     if args.mode in ('all', 'gil'):
@@ -143,9 +143,9 @@ def main():
             gil_file.write_text(
                 json.dumps(gil_result, indent=2, default=str),
                 encoding='utf-8')
-            print(f"\n  ✅ GIL 报告: {gil_file}")
+            print(f"\n  [OK] GIL 报告: {gil_file}")
         except Exception as e:
-            print(f"  ⚠️ 失败: {e}")
+            print(f"  [WARN] 失败: {e}")
 
     # 5. 技术路线验证
     if not args.skip_experiments and args.mode in ('all', 'route'):
@@ -159,7 +159,7 @@ def main():
 
         route_file = output_dir / 'route_comparison.txt'
         route_file.write_text(report, encoding='utf-8')
-        print(f"\n  ✅ 路线报告: {route_file}")
+        print(f"\n  [OK] 路线报告: {route_file}")
 
         route_json = output_dir / 'route_comparison.json'
         route_json.write_text(
@@ -167,7 +167,7 @@ def main():
             encoding='utf-8')
 
     print("\n" + "=" * 70)
-    print("  ✅ 诊断完成")
+    print("  [OK] 诊断完成")
     print(f"  📁 结果目录: {output_dir}")
     print("=" * 70)
 

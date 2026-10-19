@@ -3,6 +3,8 @@ import os
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
@@ -314,6 +316,9 @@ def test_icp():
     print(f"  ✅ ICP 过滤: 4 → {len(filtered)}")
 
 
+@pytest.mark.skip(
+    reason="ParserV3B4 是死代码（生产路径零引用）；现役解析器由 tests/test_v4_sql_features.py "
+           "等覆盖。保留该文件仅供历史对照，不再作为门禁")
 def test_parser_v3b4():
     """测试9: 扩展解析器"""
     print("\n【测试9】扩展解析器")
@@ -356,6 +361,9 @@ def test_parser_v3b4():
     print(f"  ✅ INTERVAL 解析")
 
 
+@pytest.mark.skip(
+    reason="VariableExecutor/ParserV3B4 是死代码（生产路径零引用）；会话变量由 "
+           "net/server.py + executor 实现并在 tests/test_wire_transaction.py 覆盖")
 def test_variable_executor():
     """测试10: 变量执行器"""
     print("\n【测试10】变量执行器")
