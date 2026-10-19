@@ -22,6 +22,41 @@
 - **Web 版可运行**（17 个 API 端点，JWT 校验有效），但存在硬编码签名密钥与默认口令等问题，详见审计报告。
 - **文档中的性能数字未经仓库自身工具验证**：仓库内没有任何基准产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录不存在；`tests/regression_v4/test_performance_v4.py:13-18` 中的 12000 / 80000 QPS 目标**从未被任何测试断言**。这些数字应视为设计目标，而非实测结果。
 
+### 🔐 安全默认值（2026-10-19 P0 修复：认证 / Web / 连接限制）
+
+> 2026-10-19 全面分析确认「默认部署 = 无认证远程数据库」是 P0：新库 root 空口令可登录、
+> 默认监听 `0.0.0.0`、连接限制/白名单配置无人读取；Web 版硬编码 JWT 密钥与默认口令、
+> 存在已认证 SQL 注入且没有新建连接端点。以下默认行为已修复（**破坏性变更，升级前必读**）：
+
+- **root 不再空口令**（`lightdb/db/database.py`）：新数据目录首次启动生成随机口令并写入
+  `<data_dir>/root.password`（日志只打印文件路径，**不打印明文**）；**旧数据目录**里 root 为空口令的，
+  启动时自动迁移成随机口令（同样写 `root.password`）。
+  - 显式口令：`LIGHTDB_ROOT_PASSWORD` 环境变量或 `--root-password <pwd>`（优先级最高）；
+  - 本地开发/演示需要空口令时，必须显式降级：`--allow-empty-password` 或
+    `LIGHTDB_ALLOW_EMPTY_PASSWORD=1`（启动会打 WARN；**禁止**用于网络可达环境）。
+  - `run_studio.ps1` / `run_studio.cmd` 是绑定 `127.0.0.1` 的本地 demo，已显式携带该降级参数。
+- **默认只监听回环**（`lightdb/config.py`）：`host` 默认 `127.0.0.1`；对外提供服务必须显式指定
+  `--host 0.0.0.0`（或 `LIGHTDB_HOST` / config.json），启动会打印网络暴露提示。
+- **连接限制真正生效**（`lightdb/net/server.py`）：`max_connections` / `max_conn_per_ip` 在握手前执行
+  （超限回 1040），`ip_whitelist_enabled` / `ip_whitelist` 同样在准入阶段拦截（1130）；失败登录加 0.5s 延迟。
+- **Web 版**（`web/`）：
+  - JWT 密钥不再硬编码：`LIGHTDB_WEB_SECRET` > `~/.lightdb_studio/web_secret`（0600，自动生成）> 进程内随机；
+  - 默认用户已删除：用 `LIGHTDB_WEB_USERS`（JSON）或 `--admin-password` / `LIGHTDB_WEB_ADMIN_PASSWORD` 配置；
+    都没有时自动生成随机 admin 口令写入 `~/.lightdb_studio/web_admin.txt`（日志不打印明文）；
+  - 表名/库名/列名/`order_by` 全部走标识符白名单校验（非法 400），取值继续 `%s` 参数化；
+  - CORS 改为 `LIGHTDB_WEB_ORIGINS` 白名单（默认本机两个源，不再 `*`+credentials）；
+  - 新增 `POST /api/v1/connections`（仅 admin）与 `web.start --connections-file`，Web 端可以真正配置连接并查库；
+    `/connections/test` 仅 admin、支持 `LIGHTDB_WEB_ALLOWED_HOSTS` 白名单；`/metrics` 已真正挂载；
+  - `web.start` 默认 `--host 127.0.0.1`。
+- **测试兼容**：`tests/conftest.py` 对既有 700+ 空口令用例显式设置降级 env（可审计的显式降级，
+  不是把安全默认改回不安全）；新默认行为由 `tests/test_auth_defaults.py`（11 例）与
+  `tests/test_web_security.py`（22 例）单独验证。
+- **部署**：`docker/entrypoint*.sh` 在未提供 `LIGHTDB_ROOT_PASSWORD` / `LIGHTDB_WEB_USERS` 时生成随机口令并
+  echo 一次（容器重启会变，生产请显式注入）。
+
+> 本次修复的详细证据、复现与仍未修复项（协议事务、类型校验、触发器、复制等）见
+> [docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md](docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md)。
+
 ### ⚠️ 性能声明状态说明（2026-10 阶段 0 收尾 + 阶段 2 第 6 项「摘牌」，**必读**）
 
 > 本节覆盖 `README` / `docs/**` 里全部 OLAP / 列存 / 并行 / Cython 性能数字，
@@ -78,7 +113,11 @@
   [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
   顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
 
-- 一次完整测试运行的结果为 **268 个测试中 118 失败 / 150 通过**。
+- 一次完整测试运行的结果（2026-10-19，含 P0 安全修复新增 33 个用例）：**794 个用例中
+  **746 通过 / 24 失败 / 23 跳过 / 1 xfailed**。24 条失败均为**既有**问题（9 条
+  `test_batch*`/`test_v2_*`/`test_v3_*` 历史模块缺陷、2 条环境权限限制、若干 OLAP/列存
+  设计目标未达成与既有平台问题）；分诊与逐条根因见
+  [docs/analysis_2026-10-19/04_verification.md](docs/analysis_2026-10-19/04_verification.md)。
 
 ### ✅ 本次会话已修复（2026-10，含实测验证）
 
@@ -88,7 +127,10 @@
 - **客户端兼容**：新增 `SET NAMES` / `SET AUTOCOMMIT` 等会话语句确认，否则标准客户端在连接协商阶段就报 1064。
 - **启动不再因 emoji 崩溃**：[`lightdb/main.py`](lightdb/main.py)、[`lightdb/main_v4.py`](lightdb/main_v4.py) 增加控制台编码保护并把裸 emoji 换成 ASCII 标记，`--check` 现已正常退出。
 - **桌面端可启动**：[`lightdb_studio/core/reports.py`](lightdb_studio/core/reports.py) 的 f-string 改写为 Python 3.8+ 兼容；另修 [`agent_chat.py`](lightdb_studio/ui/agent_chat.py) 缺失的 `QLineEdit` 导入、[`sql_editor.py`](lightdb_studio/ui/sql_editor.py) 的 `QPlainTextEdit.ExtraSelection`、[`main_window.py`](lightdb_studio/ui/main_window.py) 的状态栏构建顺序。offscreen 实测 `MainWindow` 可构造（6 个菜单）。
-- **打包与容器**：[`pyproject.toml`](pyproject.toml) 现在会打包 `lightdb` 并补上 `lightdb-server` 入口，Dockerfile 不再 COPY 不存在的 `main.py`。
+- **打包与容器**：Dockerfile/entrypoint 可用，但 [`pyproject.toml`](pyproject.toml) 的
+  `packages.find` **仍未包含 `lightdb` 引擎包**、也没有 `lightdb-server` 入口
+  （`lightdb-studio-cli` 指向不存在的 `lightdb_studio.tools.cli`）——该问题仍待修，
+  详见 [docs/COMPREHENSIVE_ANALYSIS_2026-10-19.md](docs/COMPREHENSIVE_ANALYSIS_2026-10-19.md) §10。
 - **多进程模式已接线可用**：[`master.py`](lightdb/net/master.py) 现在会建立每 Worker 的连接队列与响应队列、运行执行服务线程、绑定端口并把 accept 到的连接交给 Worker；[`worker.py`](lightdb/net/worker.py) 通过 RPC 把 SQL 交回 Master 执行，连接句柄用 `socket.share/fromshare` 跨进程交接（Windows）。
 - **SQL 能力补齐（窗口函数 / CTE / UNION）**：[`parser.py`](lightdb/sql/parser.py) 新增 `WITH [RECURSIVE] ... AS (...)` 与 `FUNC(...) OVER (PARTITION BY ... ORDER BY ...)` 解析，[`executor.py`](lightdb/sql/executor.py) 新增 UNION / UNION ALL 执行分支与窗口计算（ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / SUM / AVG / COUNT / MIN / MAX）。同时修掉两个**静默错答**：`GROUP BY` 原先被完全忽略（`SELECT dept, COUNT(*) ... GROUP BY dept` 退化成全表一行）、`DISTINCT` 只在解析器里记录而执行路径从未使用。回归测试见 [`tests/test_v4_sql_features.py`](tests/test_v4_sql_features.py)。
 - **带表别名的 JOIN 与 JOIN 聚合可用**：原先解析器不认识表别名，`FROM users u JOIN orders o ON ...` 的 JOIN 会被**静默丢弃**、查询退化成单表查询（返回看似正常但错误的结果）。现在别名会贯通解析器 → 优化器 → 扫描节点（列前缀用别名，两表同名列不再歧义），实测 `SELECT u.city, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.city` 返回 `[('BJ',3,60),('SH',3,150)]`，LEFT JOIN 正确保留未匹配行，- **子查询条件与 HAVING 可用**：`WHERE id IN (SELECT ...)` / `NOT IN` / `EXISTS` 原先只解析不求值（单表路径报 `KeyError: 'rows'`），现在执行器先求值再下推（IN 展开为等值 or 链、EXISTS 非空即真、空集显式恒假/恒真，支持嵌套）；`HAVING COUNT(*) > 1` 这类聚合谓词原先直接 `SyntaxError`，现在解析为 `{'agg':...}` 并在分组阶段用聚合值过滤。实测：`IN`→15 行、`NOT IN`→5 行、`EXISTS`→20 行、`HAVING COUNT(*)>5`→`[('Beijing',12)]`。相关子查询仍不支持，但会显式报错而不是静默错答。
@@ -158,7 +200,7 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**：**299 通过 / 83 失败 / 1 跳过**（本轮优化开始时是 150 通过 / 118 失败）。剩余失败中约 28 项来自沙箱/平台限制（禁止写工作区外文件、禁止多进程命名管道、Windows 不允许删除已打开的文件），其余是真实待修项：行值 `(a,b) IN (SELECT x,y ...)`（现**显式报错**并提示改写成 `EXISTS`）、HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、WHERE 里的算术谓词、投影标量函数、OLAP 向量化路径受 COUNT 计 NULL/AVG 未实现限制、并行执行无加速、Cython 从未编译等。注意失败数会因环境性用例（`test_dashboard_generation`、`test_row_format_performance`、`test_federated_governance`、`test_where_after_join`、`test_react_agent`）逐次抖动 ±2，**判据是改动领域零失败 + 干净 HEAD 副本对照**。
+**测试套件**（2026-10-19 P0 安全修复后的基线）：**794 用例 = 746 通过 / 24 失败 / 23 跳过 / 1 xfailed**（本轮优化开始时是 150 通过 / 118 失败；P0 修复新增 33 例）。24 条失败与修复前对照后**没有一条由本次安全修复引入**（逐条分诊见 [docs/analysis_2026-10-19/04_verification.md](docs/analysis_2026-10-19/04_verification.md)）：其中约 2 条来自沙箱/平台限制（写 `~/.lightdb_studio`、`dashboards/` 被拒），其余是**既有**缺陷/未达成目标：行格式 DECIMAL 编解码、`SET @@var` 不支持、半同步/GRANT 语法未实现、`test_cli_tool` 的 readline 移植性、OLAP 列存 GROUP BY/压缩率/加速比未达标、`parser_v3b4`/虚拟表/联邦/Data API/数字孪生等历史模块、诊断 CLI 的 emoji/GBK 控制台问题。注意 `test_ipc_latency`、`test_diagnose_cli` 等环境敏感用例会逐次抖动（本次通过），**判据是改动领域零失败 + 干净 HEAD 副本对照**。
 
 **仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；行值 `(a,b) IN (SELECT x,y ...)` 与行值比较 `(a,b) = (1,2)`（现**显式报错**并给出 `EXISTS` 改写建议）、HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值、WHERE 里的算术谓词、投影标量函数、`FROM (子查询)` 之后直接 `JOIN` —— 以上均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；存储侧 `Database.vacuum()` 只释放槽位、不做页内紧凑，且旧 `.dat` 行头布局不兼容（需重建库）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 
