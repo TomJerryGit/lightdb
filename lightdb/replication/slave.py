@@ -53,13 +53,47 @@ SQL_STATE_CAUGHT_UP = 'Slave has read all relay log; waiting for more updates'
 def _errno_of(exc) -> int:
     """从异常里取真实的错误号（pymysql 异常的第一个参数就是 errno）
 
-    取不到时返回 0 —— MySQL 的 `Last_IO_Errno` / `Last_SQL_Errno` 用 0
-    表示"没有错误"，比编一个数字诚实。
+    取不到时返回 0 —— 但 `_record_sql_error` 不会再让"0 + 非空错误文本"
+    并存：MySQL 里 0 表示"没有错误"，有错误文本却报 0 是自相矛盾的状态
+    （见 `_infer_errno_from_text`）。
     """
     args = getattr(exc, 'args', ())
     if args and isinstance(args[0], int) and not isinstance(args[0], bool):
         return int(args[0])
     return 0
+
+
+def _infer_errno_from_text(text) -> int:
+    """错误号取不到时按错误文本推断 MySQL 语义码（E2）
+
+    为什么需要：SQL 线程重放的失败来自 `_apply_event` 抛出的内置异常
+    （`KeyError` / `SyntaxError` / `ValueError` / `RuntimeError`），它们
+    **没有 errno**，旧实现于是 `Last_SQL_Errno=0` 与 `Last_SQL_Error='...'`
+    并存 —— 客户端看到"错误文本非空但错误号 0"，与 MySQL 的「0 = 没有
+    错误」矛盾，也无法据此判断错误类别。
+
+    映射（与执行器 `_storage_errno` 的口径一致，但这里只有文本可用）：
+        缺表 / 表不存在 → 1146 (42S02)
+        语法错误        → 1064 (42000)
+        唯一/主键冲突   → 1062 (23000)
+        其它            → 1105 (HY000，通用错误，**不再是 0**)
+    空文本返回 0（确实没有错误）。
+    """
+    msg = str(text or '')
+    if not msg.strip():
+        return 0
+    low = msg.lower()
+    if ('不存在' in msg or "doesn't exist" in low or 'does not exist' in low
+            or 'unknown table' in low or 'no such table' in low
+            or 'not found' in low):
+        return 1146
+    if '语法' in msg or 'syntax' in low or 'parse error' in low \
+            or '无法解析' in msg:
+        return 1064
+    if ('重复' in msg or '主键冲突' in msg or 'duplicate' in low
+            or 'unique' in low or '唯一' in msg):
+        return 1062
+    return 1105
 
 
 def _fmt_ts(ts) -> str:
@@ -209,12 +243,24 @@ class SlaveReplicator:
             self.stats['last_error'] = str(exc)
 
     def _record_sql_error(self, exc):
+        """记录 SQL 线程重放失败（E2：保证「有错误文本 ⇒ Errno 非 0」）
+
+        `_errno_of` 只认 pymysql 形态的异常（args[0] 是 int）；重放失败更
+        常见的是内置异常（`KeyError` 缺表 / `SyntaxError` 语法 / `ValueError`
+        唯一冲突），它们没有 errno。旧实现直接写 0，导致
+        `Last_SQL_Errno=0` 与 `Last_SQL_Error` 非空并存（MySQL 0 = 无错误，
+        客户端会误判状态自相矛盾且无法归类）。现在按文本推断语义码。
+        """
         with self._lock:
-            self.last_sql_errno = _errno_of(exc)
-            self.last_sql_error = str(exc)
+            errno = _errno_of(exc)
+            text = str(exc)
+            if errno == 0 and text.strip():
+                errno = _infer_errno_from_text(text)
+            self.last_sql_errno = errno
+            self.last_sql_error = text
             self.last_sql_error_ts = time.time()
             self.stats['errors'] += 1
-            self.stats['last_error'] = str(exc)
+            self.stats['last_error'] = text
 
     def _refresh_master_status(self, cur):
         """读主库真实位点（`SHOW MASTER STATUS`）—— `Master_Log_File` 的来源

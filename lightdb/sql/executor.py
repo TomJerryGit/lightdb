@@ -6787,17 +6787,79 @@ class Executor:
                          'utf8mb4_general_ci'))
         return self._rs(cols, rows)
 
+    #: `SHOW TRIGGERS` 的列清单（MySQL 5.7/8.0 文档顺序）
+    _SHOW_TRIGGERS_COLUMNS = (
+        'Trigger', 'Event', 'Table', 'Statement', 'Timing', 'Created',
+        'sql_mode', 'Definer', 'character_set_client',
+        'collation_connection', 'Database Collation',
+    )
+
+    def _show_triggers(self, p, s):
+        """`SHOW TRIGGERS`（F2）—— 触发器的**真实**定义快照
+
+        旧实现完全没有这条 SHOW（1064），坏触发器建成功之后连"它长什么样"
+        都查不到。这里按 MySQL 列清单输出 `TriggerManager` 里真实持久化的
+        定义（名字/事件/表/体/时机/创建时间），GUI 的对象树
+        （`lightdb_studio/db/metadata.py`）也靠它列触发器。
+        本引擎没有独立 schema/definer 概念，Definer 如实写 `root@localhost`，
+        sql_mode 如实写引擎的默认严格模式。
+        """
+        mgr = self._trigger_mgr
+        rows = []
+        if mgr is not None:
+            for trig in sorted(mgr.list_all(), key=lambda t: t.name):
+                created = time.strftime(
+                    '%Y-%m-%d %H:%M:%S',
+                    time.localtime(getattr(trig, 'created_at', time.time())))
+                rows.append((
+                    trig.name, trig.event, trig.table, trig.body, trig.timing,
+                    created, 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES',
+                    'root@localhost', 'utf8mb4', 'utf8mb4_general_ci',
+                    'utf8mb4_general_ci'))
+        return self._rs(list(self._SHOW_TRIGGERS_COLUMNS), rows)
+
     def _cmd_create_trigger(self, p, s):
+        """`CREATE TRIGGER ...`（F2：坏体在定义期显式失败，不落库）
+
+        旧实现只把 body 存进 `_triggers.json`，坏体建触发器返回 OK；之后该表
+        任何写入都在触发路径解析失败 → 永久 1105，且没有 DROP TRIGGER 语法
+        可以自救。现在 `TriggerManager.create()` 在落库前校验（PL 结构 +
+        语句形态 + NEW/OLD 列引用）；这里把异常自带语义码透传给客户端：
+
+        * 触发器体语法/结构错误 → `TriggerBodyError`（1064 / 42000）；
+        * 引用了不存在的列 → `TriggerColumnError`（1054 / 42S22）；
+        * 同名触发器等旧错误 → 保持 MySQL 1359。
+        """
         if self._trigger_mgr is None:
             return self._err(1105, "触发器管理器不可用")
         if p.get('table') not in self.db.tables:
             return self._err(1146, f"表不存在: '{p.get('table')}'")
+        columns = [c['name'] for c in self.db.tables[p['table']].cols]
         try:
-            self._trigger_mgr.create(p['name'], p['table'], p['timing'],
-                                     p['event'], p['body'])
+            self._trigger_mgr.create(
+                p['name'], p['table'], p['timing'], p['event'], p['body'],
+                columns=columns)
         except ValueError as e:
-            return self._err(1359, str(e))
+            return self._err(
+                getattr(e, 'errno', None) or 1359, str(e),
+                sqlstate=getattr(e, 'sqlstate', None))
         return self._ok(message=f"Trigger '{p['name']}' created")
+
+    def _cmd_drop_trigger(self, p, s):
+        """`DROP TRIGGER [IF EXISTS] name`（F2）
+
+        MySQL 语义：不存在时 1360（`ER_TRG_DOES_NOT_EXIST`）；`IF EXISTS`
+        时把"不存在"当成功（恢复脚本/重复执行幂等）。
+        """
+        if self._trigger_mgr is None:
+            return self._err(1105, "触发器管理器不可用")
+        name = p.get('name')
+        if self._trigger_mgr.drop(name):
+            return self._ok(message=f"Trigger '{name}' dropped")
+        if p.get('if_exists'):
+            return self._ok(message=f"Unknown trigger '{name}'")
+        return self._err(1360, f"Trigger '{name}' does not exist",
+                         sqlstate='HY000')
 
     def _cmd_create_fulltext_index(self, p, s):
         try:

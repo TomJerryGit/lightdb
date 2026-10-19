@@ -21,6 +21,7 @@
 - **桌面端在 Python ≤ 3.11 无法启动**：`lightdb_studio/core/reports.py:172` 的 f-string 含反斜杠，属于 Python 3.12 才允许的语法。
 - **Web 版可运行**（17 个 API 端点，JWT 校验有效），但存在硬编码签名密钥与默认口令等问题，详见审计报告。
 - **文档中的性能数字未经仓库自身工具验证**：仓库内没有任何基准产物，`lightdb/benchmark/baseline.py:11` 指向的 `~/.lightdb_studio/benchmarks` 目录不存在；`tests/regression_v4/test_performance_v4.py:13-18` 中的 12000 / 80000 QPS 目标**从未被任何测试断言**。这些数字应视为设计目标，而非实测结果。
+- **复制（主从）不可用于生产（2026-10-19 E 项摘牌）**：`SlaveReplicator` 与 `SHOW SLAVE STATUS` 保留（状态语义为真），但复制链路是**实验性、单向、不可用于生产**的实现：位点来自"查询时重扫各表当前 WAL"的派生视图，**会回退**（ALTER / checkpoint 后重编号或归零）、**checkpoint 后事件丢失**、**DDL 不复制**，也没有 `START SLAVE` / `STOP SLAVE` / `CHANGE MASTER`；`MasterReplicator` / 半同步是死代码。**结论：不要把本引擎的复制当生产特性使用**，详见下文「🔁 复制支持边界」。
 
 ### 🔐 安全默认值（2026-10-19 P0 修复：认证 / Web / 连接限制）
 
@@ -54,7 +55,7 @@
 - **部署**：`docker/entrypoint*.sh` 在未提供 `LIGHTDB_ROOT_PASSWORD` / `LIGHTDB_WEB_USERS` 时生成随机口令并
   echo 一次（容器重启会变，生产请显式注入）。
 
-> 本次修复的详细证据、复现与仍未修复项（协议事务、类型校验、触发器、复制等）见
+> 本次修复的详细证据、复现与仍未修复项（复制仍为**实验性、不可用于生产**等）见
 > [docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md](docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md)。
 
 ### ⚠️ 性能声明状态说明（2026-10 阶段 0 收尾 + 阶段 2 第 6 项「摘牌」，**必读**）
@@ -171,6 +172,10 @@
   - **loser 前像重建**：撤销 loser 事务时不再把「带删除标记的旧版本」原样写回（那会让行头永久 `xmax != 0`、恢复后整表不可见），而是按原值重建 `xmax = 0` 的前像。
   - **真回滚**：`BEGIN; INSERT/UPDATE/DELETE; ROLLBACK` 三种场景回滚后表内容与事务前完全一致，且主键可再次插入（INSERT 路径原先根本不传事务号，已在 SQL 层修掉）。
   - **锁泄漏**：autocommit 语句改用合成事务号并在语句结束释放，`BEGIN; UPDATE` 同一主键不再 5 秒超时。
+- **DDL 假成功两项已修（F）**：
+  - **非整型主键定义期显式拒绝**：`CREATE TABLE vp (name VARCHAR(20) PRIMARY KEY)` 原先返回 OK，但该表之后**任何 INSERT 永久 1105**、SELECT 空集（主键 B+Tree 键按 uint32 落盘）。现在 `CREATE TABLE` 定义期直接 1064，报文说明「本引擎主键仅支持整数类型 INT/BIGINT/TINYINT/SMALLINT」并建议字符串列改 `UNIQUE`；整数主键不受影响。见上方「索引声明支持边界」。
+  - **触发器坏体不再锁表**：`CREATE TRIGGER ... FOR EACH ROW SET @x=1` 原先返回 OK，之后该表任何写入都在触发路径解析失败 → 永久 1105，且旧版没有 `DROP TRIGGER` 可自救。现在 `TriggerManager.create()` 在落库前用 `PLParser` + 触发器小解释器同一套规则校验（含 BEGIN/END 配对、`SET NEW/OLD.列`、IF/END IF、普通 SQL、NEW/OLD 列存在性），坏体定义期 1064/1054 **且不写入**；同时新增 `DROP TRIGGER [IF EXISTS]` 与 `SHOW TRIGGERS`。合法触发器（BEFORE/AFTER）仍正常触发。见上方「触发器支持边界」。
+- **复制状态语义修正（E2）**：SQL 线程重放失败时，错误号取不到（内置异常如 `KeyError`/`SyntaxError`）不再报 `Last_SQL_Errno=0`，改为按错误文本映射（缺表 1146 / 语法 1064 / 唯一冲突 1062 / 其它 1105），保证「有 `Last_SQL_Error` ⇒ `Last_SQL_Errno` 非 0」；复制能力本身仍为**实验性、不可用于生产**（见上方「复制支持边界」）。
 
 **事务实测**（Lead 亲自复核，非子代理自述）：初始 3 行 → 三种 ROLLBACK 后仍是 `[(1,'v1'),(2,'v2'),(3,'v3')]` → 连续重开 2 次行数不变（无重复行累积）→ 子进程 autocommit 写入后 `os._exit(1)` 硬杀，重开后该行仍在（日志 `崩溃恢复 t: redo 1 条, undo 0 条`）。
 
@@ -178,12 +183,36 @@
 
 | 声明 | 状态 |
 |---|---|
-| 表级 `PRIMARY KEY (col)`（单列） | ✅ 真正生效：成为主键 B+Tree，重复插入 **1062** |
+| 表级 `PRIMARY KEY (col)`（单列） | ✅ 真正生效：成为主键 B+Tree，重复插入 **1062** —— 但**仅限整数类主键列**（见下一行） |
+| **主键列类型** | ✅ 仅 `INT` / `BIGINT` / `TINYINT` / `SMALLINT`（含 `UNSIGNED`）可作主键；`VARCHAR(n)` / `CHAR` / `TEXT` / `JSON` / `DECIMAL` 等非整型声明 `PRIMARY KEY` 一律**定义期显式 1064**（报文说明原因：主键 B+Tree 的键按 uint32 落盘，非整型主键会让该表所有写入永久失败；字符串列请用 `UNIQUE` 约束代替） |
 | 表级 `UNIQUE KEY/INDEX [名字] (col...)`（单列/多列）、`CONSTRAINT <名字> UNIQUE` | ✅ 真正强制：INSERT / UPDATE 冲突 **1062**（报文含键名/值）；重启后仍强制；`SHOW CREATE TABLE` 往返；`SHOW INDEX` 列出但 `Index_type` 如实报 **`UNIQUE-CHECK`**（不谎称 BTREE） |
 | 非唯一 `KEY/INDEX`、`FULLTEXT`、`SPATIAL`、`FOREIGN KEY`、复合 `PRIMARY KEY (a, b)`、前缀/表达式索引、`USING BTREE\|HASH` | ❌ **显式 1064**（说明不支持原因/替代做法），绝不静默丢弃、不建出假列 |
 | 列级 `col ... UNIQUE` | ✅ 真正强制（单列）：按 MySQL 惯例注册成"索引名 = 列名"的唯一约束，INSERT / UPDATE 冲突 **1062**（如 `Duplicate entry '1' for key 'a'`）；多个 NULL 可共存；重启后仍强制；`SHOW CREATE TABLE` 内联 `UNIQUE` 并可往返；`SHOW INDEX` 列出且 `Index_type` 如实报 **`UNIQUE-CHECK`**（不谎称 BTREE） |
 
 > 表级与列级 UNIQUE 都**没有独立索引结构**，唯一性由写入路径（INSERT / UPDATE 的写入前整体检查）强制，因此 `SHOW INDEX` 的 `Index_type` 写 `UNIQUE-CHECK`，`Cardinality` 是真实的不同非 NULL 键值个数；多列 UNIQUE 支持，NULL 不参与唯一性判定。代价是每次写入做 **O(n) 全表扫描**（不是 B+Tree 点查）；逻辑备份 / 恢复会原样带回两类 UNIQUE 约束，老 `_meta.json` 里只有 `unique=true` 而没有 `unique_indexes` 条目的表，打开时会自动推导出列级唯一索引并继续强制。
+
+### 🪝 触发器支持边界（2026-10-19 F2 修复）
+
+| 能力 | 状态 |
+|---|---|
+| `CREATE TRIGGER 名 BEFORE|AFTER INSERT|UPDATE|DELETE ON 表 FOR EACH ROW <体>` | ✅ 可建；**落库前**校验触发器体，坏体**定义期显式失败且不写入**（不再出现"建成功、之后整表不可写"的假成功） |
+| 触发器体形态 | `SET NEW.列 = 表达式` / `SET OLD.列 = 表达式`（**仅 BEFORE** 可赋值）、`IF 条件 THEN ... [ELSE ...] END IF`、普通 SQL（`INSERT/UPDATE/DELETE/SELECT/CALL`）；`SET @变量`、`ELSEIF`、BEGIN/END 不配对、引用不存在的列 → 定义期显式报错（1064 / 1054），不再等到第一次写入才暴雷 |
+| `DROP TRIGGER [IF EXISTS] 名` | ✅ 可用（不存在时 1360；`IF EXISTS` 当成功），坏触发器可以自助清理 |
+| `SHOW TRIGGERS` | ✅ 结果集（`Trigger/Event/Table/Statement/Timing/Created/...`），反映真实持久化定义 |
+| 触发时机与事件 | BEFORE/AFTER + INSERT/UPDATE/DELETE；合法触发器在写入路径真实 fire（BEFORE 可改 NEW 行），执行失败显式报错 |
+
+> 触发器定义持久化在数据目录的 `_triggers.json`；`BEFORE INSERT/UPDATE` 里的 `SET NEW.列 = ...` 真的会改写即将写入的行。上述校验与运行期使用**同一套**语句切分/解释规则，避免"建的时候允许、跑的时候解析失败"。
+
+### 🔁 复制支持边界（实验性、单向、**不可用于生产**；2026-10-19 E1 摘牌）
+
+| 项 | 状态 / 结论 |
+|---|---|
+| 定位 | **实验性、单向（主 → 从）、不可用于生产**；与 OLAP/列存同一口径：不计入任何生产可用性声明 |
+| 位点语义 | ⚠️ `SHOW MASTER STATUS` / `SHOW BINLOG EVENTS` 来自"查询时重扫各表当前 WAL"的派生视图，**位点会回退**：ALTER 表（WAL 退休重编号）后共享位点可能变小；**checkpoint / WAL 轮转后旧事件被截断 → 该表事件归零、从库收不到** |
+| DDL | ❌ **不复制**（DDL 不进事件流；从库需预先建好同样的 schema） |
+| 控制语句 | ❌ 无 `START SLAVE` / `STOP SLAVE` / `CHANGE MASTER` / `RESET SLAVE`；`MasterReplicator` / `SemiSync*` 无调用者（死代码） |
+| 状态语义 | ✅ `SHOW SLAVE STATUS` 报**真实**运行状态/连接/位点/最近错误：未配置时 `Slave_IO_State='No replication configured'`、运行标志 `'No'`、连接与位点 NULL；有 `Last_SQL_Error` 时 `Last_SQL_Errno` **一定非 0**（缺表 1146 / 语法 1064 / 唯一冲突 1062 / 其它 1105） |
+| 结论 | **不要把复制当生产特性使用**。若确实需要主从复制，必须先完成"真正 append-only binlog（独立文件、单调位点、含 DDL、按事务成组）+ START SLAVE/CHANGE MASTER"改造（见 [docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md](docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md) §E 的中期方案） |
 
 **多进程模式实测**（`python -m lightdb.main --mode multi --workers 2` + 真实 pymysql）：
 

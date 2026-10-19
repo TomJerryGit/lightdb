@@ -314,6 +314,17 @@ class Parser:
         if sim:
             return self._show_result('INDEX', table=sim.group(1))
 
+        # ---- `SHOW TRIGGERS`：触发器的真实定义（F2）----
+        #
+        # 结果集回传：GUI 的对象树（`lightdb_studio/db/metadata.py`）与
+        # `SHOW TRIGGERS` 的 MySQL 客户端都靠它列触发器。支持 `FROM db`
+        # （本引擎单库，库名不参与过滤但与 MySQL 语法兼容）。
+        stm = re.match(
+            r'SHOW\s+TRIGGERS(?:\s+(?:FROM|IN)\s+[`"]?(\w+)[`"]?)?\s*$',
+            sql, re.IGNORECASE)
+        if stm:
+            return self._show_result('TRIGGERS', database=stm.group(1))
+
         # ---- 安全面 ----
         if upper in ('SHOW IP WHITELIST', 'SHOW IP WHITE LIST'):
             return self._show_result('IP_WHITELIST')
@@ -385,6 +396,15 @@ class Parser:
                     'args': [a for a in args if a]}
         if re.match(r'CREATE\s+TRIGGER\b', sql, re.IGNORECASE):
             return self._create_trigger(sql)
+        # `DROP TRIGGER [IF EXISTS] name`（F2）：旧实现没有该语法，坏触发器
+        # 一旦建成功就只能改数据目录自救。这里补上最小可用语法。
+        dtm = re.match(
+            r'DROP\s+TRIGGER\s+(IF\s+EXISTS\s+)?[`"]?(\w+)[`"]?\s*$',
+            sql, re.IGNORECASE)
+        if dtm:
+            return {'command': 'DROP TRIGGER',
+                    'name': dtm.group(2),
+                    'if_exists': bool(dtm.group(1))}
         if re.match(r'CREATE\s+FULLTEXT\s+INDEX\b', sql, re.IGNORECASE):
             return self._create_fulltext_index(sql)
         return None
@@ -1314,6 +1334,10 @@ class Parser:
                 'value': None,
             }
 
+        bt = self._parse_between_predicate(s)
+        if bt is not None:
+            return bt
+
         # IN (SELECT ...)
         im = re.match(
             r'[`"]?([\w.]+)[`"]?\s+(NOT\s+)?IN\s*\(\s*SELECT\s+(.+)\s*\)\s*$',
@@ -1345,6 +1369,33 @@ class Parser:
                 'against': fm.group('q').replace("''", "'"),
                 'mode': ' '.join(mode.split()),
             }
+
+        # IN (v1, v2) —— 左值是**非普通列**的形态（字面量 / 表达式）：
+        #   `1 IN ('1')`、`'a' IN ('a','b')`、`LENGTH(name) IN (3)`
+        # 既有 IN 解析只认 `[列名] IN (...)`，上面这些形态会把 `1` 当成
+        # 列名 "1"（随后报「列 1 不存在」）。这里编成表达式谓词，由共用的
+        # `eval_expr_predicate` 按 `_coerce_compare_pair` 的既有规则求值；
+        # NULL 三值语义也由同一处负责。普通列形态仍走下面的既有编码
+        # （存储层能下推 IN 等值链，保持性能与结果不变）。
+        imx = re.match(
+            r'^(.+?)\s+(NOT\s+)?IN\s*\(\s*(.+?)\s*\)\s*$',
+            s, re.IGNORECASE | re.DOTALL)
+        if imx and not re.match(
+                r'\s*SELECT\b', imx.group(3), re.IGNORECASE) \
+                and _column_ref_text(imx.group(1).strip()) is None:
+            left_text = imx.group(1).strip()
+            left = parse_scalar_expr(left_text)
+            raw_items = self._split_top_level(imx.group(3))
+            value_nodes = [parse_scalar_expr(v) for v in raw_items]
+            if left is not None and raw_items \
+                    and all(v is not None for v in value_nodes):
+                return {
+                    'expr_pred': {
+                        'left': left,
+                        'op': 'NOT IN' if imx.group(2) else 'IN',
+                        'values': value_nodes,
+                    }
+                }
 
         # IN (v1, v2)
         im2 = re.match(
@@ -1523,6 +1574,99 @@ class Parser:
                     return left, ('!=' if op == '<>' else op), right
         return None
 
+    @classmethod
+    def _find_top_level_word(cls, s: str, word: str):
+        """在括号 / 字符串字面量之外找第一个独立关键字 `word`
+
+        返回 `(start, end)`；找不到返回 None。`BETWEEN` / `AND` 这类
+        关键字两侧必须是标识符边界，避免切到 `between_col` 里。
+        """
+        want = str(word).upper()
+        depth = 0
+        i, n = 0, len(s)
+        while i < n:
+            ch = s[i]
+            if ch in ("'", '"', '`'):
+                j = i + 1
+                while j < n and s[j] != ch:
+                    j += 1
+                i = j + 1
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0 and (ch.isalpha() or ch == '_'):
+                if i > 0 and (s[i - 1].isalnum() or s[i - 1] == '_'):
+                    i += 1
+                    continue
+                j = i
+                while j < n and (s[j].isalnum() or s[j] == '_'):
+                    j += 1
+                if s[i:j].upper() == want:
+                    return i, j
+                i = j
+                continue
+            i += 1
+        return None
+
+    def _parse_between_predicate(self, s: str):
+        """把 `expr [NOT] BETWEEN low AND high` 编成表达式谓词节点
+
+        为什么复用 `expr_pred` 编码：WHERE / HAVING / JOIN ON 的三条求值
+        路径（`Executor._eval_condition`、`_base_rows_and_cols` 的逐行
+        兜底、`plan_executor._eval_condition`）都已经把 `expr_pred` 交给
+        `parser.eval_expr_predicate`，因此 BETWEEN 只需在这一份共用求值器
+        里实现一次，三处同时生效，且**绝不会**落到存储层 `_match` 的
+        「未知 op 静默返回 False」分支。
+
+        三值逻辑与闭区间语义由 `eval_expr_predicate` 按
+        `x >= low AND x <= high` 实现（NULL → UNKNOWN）。
+        """
+        found = self._find_top_level_word(s, 'BETWEEN')
+        if found is None:
+            return None
+        bstart, bend = found
+
+        left_text = s[:bstart].strip()
+        rest = s[bend:].strip()
+        neg = False
+        nm = re.search(r'(?<![A-Za-z0-9_])NOT\s*$', left_text,
+                       re.IGNORECASE)
+        if nm:
+            neg = True
+            left_text = left_text[:nm.start()].strip()
+        if not left_text:
+            raise SyntaxError(f"BETWEEN 缺少左操作数: {s}")
+
+        # BETWEEN 内部的 AND：取**第一个**顶层 AND 作分隔符；再出现顶层
+        # AND 说明外层切分逻辑没生效（或 SQL 本身有歧义），显式报错，
+        # 绝不猜一个边界的结束位置。
+        sep = self._find_top_level_word(rest, 'AND')
+        if sep is None:
+            raise SyntaxError(f"BETWEEN 缺少 AND: {s}")
+        low_text = rest[:sep[0]].strip()
+        high_text = rest[sep[1]:].strip()
+        if not low_text or not high_text:
+            raise SyntaxError(f"BETWEEN 的边界不能为空: {s}")
+        if self._find_top_level_word(high_text, 'AND') is not None:
+            raise SyntaxError(
+                f"BETWEEN 的高边界之后仍有多余的顶层 AND: {s}")
+
+        left = parse_scalar_expr(left_text)
+        low = parse_scalar_expr(low_text)
+        high = parse_scalar_expr(high_text)
+        if left is None or low is None or high is None:
+            raise SyntaxError(f"BETWEEN 的操作数无法解析: {s}")
+        return {
+            'expr_pred': {
+                'left': left,
+                'op': 'NOT BETWEEN' if neg else 'BETWEEN',
+                'low': low,
+                'high': high,
+            }
+        }
+
     def _parse_expr_predicate(self, s: str):
         """把 `表达式 比较 表达式` 解析成 `{'expr_pred': {...}}`
 
@@ -1690,6 +1834,21 @@ class Parser:
                     f"{table}（表级 PRIMARY KEY 引用了不存在的列）")
             hit[0]['primary'] = True
 
+        # ★ 修复 F1：非整型主键在**定义期**显式拒绝（1064）。
+        #
+        # 根因：主键 B+Tree 的键用 `struct.pack_into('<III', ...)` 按 uint32
+        # 落盘（`storage/btree.py`），`CREATE TABLE vp (name VARCHAR(20)
+        # PRIMARY KEY)` 能建成功，但之后该表**任何 INSERT 都永久 1105**
+        # （required argument is not an integer），SELECT 也空集 —— 典型的
+        # "DDL 假成功"。本引擎短期不改造 BTree 键编码（那是页格式大改），
+        # 因此按"要么真实、要么显式报错"的口径在定义期拒绝。
+        #
+        # 只校验**显式声明**的主键（列级 `PRIMARY KEY` / 表级
+        # `PRIMARY KEY (col)`）：下面那行 `cols[0]['primary'] = True` 是把
+        # 第一列当内部行键的隐式实现细节，不是用户声明的主键；若连它也
+        # 拒绝，所有"第一列是 VARCHAR 且没声明主键"的表都会建不出来。
+        self._validate_primary_key_types(table, cols)
+
         if not any(c.get('primary') for c in cols):
             cols[0]['primary'] = True
 
@@ -1721,6 +1880,40 @@ class Parser:
             'if_not_exists': bool(re.match(
                 r'CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b', sql, re.IGNORECASE)),
         }
+
+    #: 能作为主键的**整数类**类型（主键 B+Tree 的键按 uint32 存储）。
+    #: 解析器已把 INTEGER/SMALLINT/TINYINT/MEDIUMINT/SERIAL 归一成 INT，
+    #: 这里保留完整清单是为了对"未归一化"的旧元数据/CREATE 文本也给出
+    #: 正确的判定（宁可显式拒绝，也不建出写不进去的表）。
+    _INTEGER_PK_TYPES = frozenset((
+        'INT', 'BIGINT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'INTEGER',
+        'SERIAL',
+    ))
+
+    def _validate_primary_key_types(self, table: str, cols: List[Dict]):
+        """F1：主键列类型必须是整数类，否则定义期 SyntaxError（→ 1064）
+
+        为什么必须在这里（而不是等 INSERT 时才暴露）：`CREATE TABLE ...
+        PRIMARY KEY` 返回 OK 之后，该表的写入路径会因 B+Tree 键不是 uint32
+        而**永久失败**，用户拿到的却是"建表成功"；而且没有 DROP/ALTER 可以
+        自救（本引擎的 ALTER 只支持 ADD/DROP COLUMN/RENAME）。定义期拒绝
+        是唯一不撒谎的处理方式。
+        """
+        for c in cols:
+            if not c.get('primary'):
+                continue
+            raw = str(c.get('type') or '').strip().upper()
+            m = re.match(r'^([A-Z_][A-Z0-9_]*)', raw)
+            base = m.group(1) if m else ''
+            if base in self._INTEGER_PK_TYPES:
+                continue
+            raise SyntaxError(
+                f"本引擎主键仅支持整数类型 INT/BIGINT/TINYINT/SMALLINT："
+                f"表 {table} 的主键列 '{c['name']}' 声明为 "
+                f"{c.get('type') or '未知'}，无法作为主键"
+                f"（主键 B+Tree 的键按 uint32 存储，非整型主键会导致该表"
+                f"所有写入永久失败）。请改用整数主键；字符串列请用 UNIQUE "
+                f"约束代替（例如 id INT PRIMARY KEY, name VARCHAR(20) UNIQUE）")
 
     #: 表级键/索引声明的起始关键字（长的在前，避免 `UNIQUE KEY` 被
     #: `UNIQUE` 抢先匹配）。`\b` 保证 `KEYED` 这类标识符不会被误判。
@@ -2819,11 +3012,21 @@ class Parser:
         只切「圆括号深度 0 且不在字符串字面量里」的关键字，且关键字
         两侧必须是空白字符，避免切开 `band = 1` / `ORACLE` 这类标识符。
         未切到关键字时返回单元素列表（调用方据此判断是否有顶层运算符）。
+
+        ★ BETWEEN 的 `AND` 例外：`a BETWEEN 1 AND 2 AND b = 3` 里的
+        第一个顶层 AND 属于 BETWEEN 语法（`BETWEEN <low> AND <high>`），
+        不能当连接词切开。这里在 depth 0 看到 BETWEEN 关键字后进入
+        「等待 BETWEEN 的 AND」状态，吞掉紧随其后的第一个顶层 AND；
+        之后的 AND 才正常切分。效果：
+            a BETWEEN 1 AND 2 AND b = 3
+            -> ['a BETWEEN 1 AND 2', 'b = 3']   （不是 3 段）
+        `NOT BETWEEN` 同样适用（BETWEEN 关键字本身已足够识别）。
         """
         kw = kw.upper()
         klen = len(kw)
         parts, start = [], 0
         depth = 0
+        pending_between_and = False
         i, n = 0, len(s)
         while i < n:
             ch = s[i]
@@ -2838,10 +3041,27 @@ class Parser:
                 depth += 1
             elif ch == ')':
                 depth -= 1
+            elif depth == 0 and (ch.isalpha() or ch == '_'):
+                # 顶层关键字扫描：识别 BETWEEN（只对 AND 切分生效）
+                if i > 0 and (s[i - 1].isalnum() or s[i - 1] == '_'):
+                    i += 1
+                    continue
+                j = i
+                while j < n and (s[j].isalnum() or s[j] == '_'):
+                    j += 1
+                if kw == 'AND' and s[i:j].upper() == 'BETWEEN':
+                    pending_between_and = True
+                i = j
+                continue
             elif (depth == 0 and ch.isspace()
                     and s[i + 1:i + 1 + klen].upper() == kw
                     and i + 1 + klen < n
                     and s[i + 1 + klen].isspace()):
+                if kw == 'AND' and pending_between_and:
+                    # 这是 BETWEEN ... AND ... 的结构性 AND：不切分，吞掉
+                    pending_between_and = False
+                    i = i + 1 + klen
+                    continue
                 parts.append(s[start:i].strip())
                 start = i + 1 + klen
                 i = start
@@ -3331,10 +3551,44 @@ class _ExprParser:
         return None
 
     def parse(self):
-        node = self._expr()
+        node = self._between_expr()
         if node is None or self.pos != len(self.toks):
             return None
         return node
+
+    def _between_expr(self):
+        """`expr [NOT] BETWEEN low AND high`（BETWEEN 优先级最低）
+
+        BETWEEN 的 `AND` 是语法的一部分，不是布尔连接词；标量表达式里
+        不允许布尔 AND，因此这里吃完 high 后必须恰好结束（否则
+        `parse()` 发现剩余 token → None，由调用方显式报错）。
+        """
+        left = self._expr()
+        if left is None:
+            return None
+        neg = False
+        if self.peek() == ('ident', 'NOT') \
+                and self.pos + 1 < len(self.toks) \
+                and self.toks[self.pos + 1][0] == 'ident' \
+                and self.toks[self.pos + 1][1].upper() == 'BETWEEN':
+            self.pos += 1
+            neg = True
+        kind, val = self.peek()
+        if not (kind == 'ident' and str(val).upper() == 'BETWEEN'):
+            return left
+        self.pos += 1
+        low = self._expr()
+        if low is None:
+            return None
+        kind, val = self.peek()
+        if not (kind == 'ident' and str(val).upper() == 'AND'):
+            return None
+        self.pos += 1
+        high = self._expr()
+        if high is None:
+            return None
+        return {'kind': 'between', 'neg': neg, 'operand': left,
+                'low': low, 'high': high}
 
     def _expr(self):
         left = self._term()
@@ -3396,10 +3650,21 @@ class _ExprParser:
             up = val.upper()
             if self.peek() == ('op', '('):
                 self.pos += 1
+                # `COUNT(DISTINCT x)` / `COUNT(DISTINCT a, b)`：DISTINCT
+                # 是聚合函数的修饰符，不是列名。标量函数上的 DISTINCT
+                # 在求值时会显式报错（绝不静默忽略）。
+                distinct = False
+                dk, dv = self.peek()
+                if dk == 'ident' and str(dv).upper() == 'DISTINCT':
+                    self.pos += 1
+                    distinct = True
                 args = self._args()
                 if args is None:
                     return None
-                return {'kind': 'func', 'name': up, 'args': args}
+                node = {'kind': 'func', 'name': up, 'args': args}
+                if distinct:
+                    node['distinct'] = True
+                return node
             if up == 'NULL':
                 return {'kind': 'lit', 'value': None}
             if up == 'TRUE':
@@ -3409,7 +3674,7 @@ class _ExprParser:
             return self._qualified(val)
         if kind == 'op' and val == '(':
             self.pos += 1
-            node = self._expr()
+            node = self._between_expr()
             if node is None or self.accept_op(')') is None:
                 return None
             return node
@@ -3439,7 +3704,7 @@ class _ExprParser:
                 self.pos += 1
                 args.append({'kind': 'star'})
             else:
-                node = self._expr()
+                node = self._between_expr()
                 if node is None:
                     return None
                 args.append(node)
@@ -3498,10 +3763,16 @@ def render_scalar_expr(node) -> str:
         return (f"{render_scalar_expr(node.get('left'))} "
                 f"{node.get('op')} "
                 f"{render_scalar_expr(node.get('right'))}")
+    if kind == 'between':
+        neg = 'NOT ' if node.get('neg') else ''
+        return (f"{render_scalar_expr(node.get('operand'))} {neg}BETWEEN "
+                f"{render_scalar_expr(node.get('low'))} AND "
+                f"{render_scalar_expr(node.get('high'))}")
     if kind == 'func':
         args = ', '.join(render_scalar_expr(a)
                          for a in (node.get('args') or []))
-        return f"{node.get('name')}({args})"
+        distinct = 'DISTINCT ' if node.get('distinct') else ''
+        return f"{node.get('name')}({distinct}{args})"
     return str(node)
 
 
@@ -3515,6 +3786,24 @@ def expr_has_agg(node) -> bool:
         return any(expr_has_agg(a) for a in (node.get('args') or []))
     if node.get('kind') == 'arith':
         return expr_has_agg(node.get('left')) or expr_has_agg(node.get('right'))
+    if node.get('kind') == 'between':
+        return any(expr_has_agg(node.get(k))
+                   for k in ('operand', 'low', 'high'))
+    return False
+
+
+def expr_has_between(node) -> bool:
+    """表达式里是否出现 BETWEEN 谓词（投影路由用）"""
+    if not isinstance(node, dict):
+        return False
+    kind = node.get('kind')
+    if kind == 'between':
+        return True
+    if kind == 'arith':
+        return (expr_has_between(node.get('left'))
+                or expr_has_between(node.get('right')))
+    if kind == 'func':
+        return any(expr_has_between(a) for a in (node.get('args') or []))
     return False
 
 
@@ -3526,6 +3815,9 @@ def expr_has_func(node) -> bool:
         return True
     if node.get('kind') == 'arith':
         return expr_has_func(node.get('left')) or expr_has_func(node.get('right'))
+    if node.get('kind') == 'between':
+        return any(expr_has_func(node.get(k))
+                   for k in ('operand', 'low', 'high'))
     return False
 
 
@@ -3541,6 +3833,9 @@ def expr_column_names(node, out=None) -> list:
     elif kind == 'arith':
         expr_column_names(node.get('left'), out)
         expr_column_names(node.get('right'), out)
+    elif kind == 'between':
+        for key in ('operand', 'low', 'high'):
+            expr_column_names(node.get(key), out)
     elif kind == 'func':
         for a in (node.get('args') or []):
             expr_column_names(a, out)
@@ -3567,6 +3862,9 @@ def expr_columns_outside_agg(node, out=None) -> list:
     elif kind == 'arith':
         expr_columns_outside_agg(node.get('left'), out)
         expr_columns_outside_agg(node.get('right'), out)
+    elif kind == 'between':
+        for key in ('operand', 'low', 'high'):
+            expr_columns_outside_agg(node.get(key), out)
     elif kind == 'func':
         if str(node.get('name') or '').upper() in AGGREGATE_FUNCTION_NAMES:
             return out
@@ -3591,6 +3889,9 @@ def expr_bare_columns(node, out=None) -> list:
     elif kind == 'arith':
         expr_bare_columns(node.get('left'), out)
         expr_bare_columns(node.get('right'), out)
+    elif kind == 'between':
+        for key in ('operand', 'low', 'high'):
+            expr_bare_columns(node.get(key), out)
     elif kind == 'func':
         if node.get('name') in AGGREGATE_FUNCTION_NAMES:
             return out
@@ -3854,6 +4155,84 @@ def compare_values(left, op, right):
 _EXPR_MISSING = object()
 
 
+def _and3(a, b):
+    """SQL 三值 AND 的「真/假/UNKNOWN」版本（UNKNOWN 用 None 表示）"""
+    if a is False or b is False:
+        return False
+    if a is None or b is None:
+        return None
+    return True
+
+
+def _not3(a):
+    return None if a is None else (not a)
+
+
+def eval_between_truth(operand, low, high, neg=False):
+    """`operand [NOT] BETWEEN low AND high` 的三值求值
+
+    语义严格按 `operand >= low AND operand <= high`：
+    * 任一侧 NULL → 对应比较为 UNKNOWN，整体按三值 AND 收敛；
+    * 闭区间（lo == hi 时命中该值；等于两端也命中）；
+    * 类型不兼容由 `compare_values` 抛 ValueError（显式报错，不静默判假）。
+    返回 True / False / None。
+    """
+    if operand is None:
+        verdict = None
+    else:
+        ge = None if low is None else compare_values(operand, '>=', low)
+        le = None if high is None else compare_values(operand, '<=', high)
+        verdict = _and3(ge, le)
+    return _not3(verdict) if neg else verdict
+
+
+def eval_in_list_truth(value, values, neg=False):
+    """IN / NOT IN 字面量列表的三值求值（返回 True / False / None）
+
+    * 左值 NULL → UNKNOWN；
+    * 命中 → TRUE（NOT IN 时为 FALSE）；
+    * 未命中且列表含 NULL → UNKNOWN；
+    * NOT IN 对 UNKNOWN 取反仍是 UNKNOWN（绝不是 TRUE）。
+    """
+    if value is None:
+        return None
+    has_null = False
+    hit = False
+    for cand in values:
+        if cand is None:
+            has_null = True
+            continue
+        if compare_values(value, '=', cand):
+            hit = True
+            break
+    if hit:
+        verdict = True
+    elif has_null:
+        verdict = None
+    else:
+        verdict = False
+    return _not3(verdict) if neg else verdict
+
+
+def distinct_sql_values(vals):
+    """按 SQL 等值语义去重（保留首次出现顺序）
+
+    普通标量（int/str/...）走哈希；不可哈希值（JSON 对象等）退化为
+    逐项等值比较 —— 绝不因为「不可哈希」而丢掉行或抛 TypeError。
+    """
+    out, seen = [], set()
+    for v in vals:
+        try:
+            if v in seen:
+                continue
+            seen.add(v)
+        except TypeError:
+            if any(v == old for old in out):
+                continue
+        out.append(v)
+    return out
+
+
 def eval_expr_node(node, resolve, agg_values=None, position='', funcs=None):
     """求值标量表达式节点
 
@@ -3887,6 +4266,16 @@ def eval_expr_node(node, resolve, agg_values=None, position='', funcs=None):
         right = eval_expr_node(node.get('right'), resolve, agg_values, position,
                                funcs)
         return apply_arith_values(left, node.get('op'), right)
+    if kind == 'between':
+        operand = eval_expr_node(node.get('operand'), resolve, agg_values,
+                                 position, funcs)
+        low = eval_expr_node(node.get('low'), resolve, agg_values,
+                             position, funcs)
+        high = eval_expr_node(node.get('high'), resolve, agg_values,
+                              position, funcs)
+        verdict = eval_between_truth(operand, low, high, bool(node.get('neg')))
+        # MySQL 的布尔表达式在投影里返回 1 / 0（UNKNOWN 仍是 NULL）
+        return None if verdict is None else (1 if verdict else 0)
     if kind == 'func':
         name = str(node.get('name') or '').upper()
         if name in AGGREGATE_FUNCTION_NAMES:
@@ -3897,6 +4286,10 @@ def eval_expr_node(node, resolve, agg_values=None, position='', funcs=None):
                     f"取不到值：聚合值只在分组语境（GROUP BY / 整表聚合的"
                     f"SELECT 列表或 HAVING）里可用")
             return got
+        if node.get('distinct'):
+            raise ValueError(
+                f"标量函数 {name} 不支持 DISTINCT：DISTINCT 只能修饰聚合"
+                f"函数（COUNT / SUM / AVG / MIN / MAX 等）")
         values = [eval_expr_node(a, resolve, agg_values, position, funcs)
                   for a in (node.get('args') or [])]
         if name not in SCALAR_FUNCTION_ARITY:
@@ -3918,15 +4311,32 @@ def eval_expr_predicate(pred, resolve, agg_values=None, position='',
                         funcs=None):
     """求值 `表达式 比较 表达式` 谓词，返回 True / False / None(UNKNOWN)
 
+    除普通比较外，还负责两类扩展形态（解析器 `expr_pred` 编码）：
+    * `[NOT] BETWEEN low AND high`（`low` / `high` 键）；
+    * 左值非普通列的 `[NOT] IN (v1, v2, ...)`（`values` 键）。
+    三条执行路径（WHERE、HAVING、JOIN ON）共用本函数，因此三值语义
+    只有这一份实现。
+
     funcs：存储函数解析回调（契约见 `eval_expr_node`）。
     """
     if not isinstance(pred, dict):
         raise ValueError(f"{position} 里的表达式谓词形态不合法: {pred!r}")
+    op = str(pred.get('op') or '').upper()
     left = eval_expr_node(pred.get('left'), resolve, agg_values, position,
                           funcs)
+    if op in ('BETWEEN', 'NOT BETWEEN'):
+        low = eval_expr_node(pred.get('low'), resolve, agg_values, position,
+                             funcs)
+        high = eval_expr_node(pred.get('high'), resolve, agg_values, position,
+                              funcs)
+        return eval_between_truth(left, low, high, neg=(op == 'NOT BETWEEN'))
+    if op in ('IN', 'NOT IN') and 'values' in pred:
+        values = [eval_expr_node(v, resolve, agg_values, position, funcs)
+                  for v in (pred.get('values') or [])]
+        return eval_in_list_truth(left, values, neg=(op == 'NOT IN'))
     right = eval_expr_node(pred.get('right'), resolve, agg_values, position,
                            funcs)
-    return compare_values(left, pred.get('op'), right)
+    return compare_values(left, op, right)
 
 
 def aggregate_values(name, vals):
@@ -4012,6 +4422,18 @@ def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True,
                                         position, strict, funcs, agg_ctx,
                                         agg_eval)
         return apply_arith_values(left, node.get('op'), right)
+    if kind == 'between':
+        operand = eval_agg_expr_over_rows(
+            node.get('operand'), rows, resolve_row, position, strict, funcs,
+            agg_ctx, agg_eval)
+        low = eval_agg_expr_over_rows(
+            node.get('low'), rows, resolve_row, position, strict, funcs,
+            agg_ctx, agg_eval)
+        high = eval_agg_expr_over_rows(
+            node.get('high'), rows, resolve_row, position, strict, funcs,
+            agg_ctx, agg_eval)
+        verdict = eval_between_truth(operand, low, high, bool(node.get('neg')))
+        return None if verdict is None else (1 if verdict else 0)
     if kind == 'func':
         name = str(node.get('name') or '').upper()
         args = node.get('args') or []
@@ -4030,24 +4452,63 @@ def eval_agg_expr_over_rows(node, rows, resolve_row, position='', strict=True,
                 raise ValueError(
                     f"聚合函数 {name} 缺少参数（要写成 {name}(*) 或 "
                     f"{name}(列)）")
+            distinct = bool(node.get('distinct'))
             star = args[0].get('kind') == 'star'
+            if star:
+                if name == 'COUNT' and not distinct:
+                    return len(rows)
+                raise ValueError(
+                    f"聚合函数 {name} 不接受 `*` 参数"
+                    f"（COUNT(DISTINCT *) 也不合法：DISTINCT 需要具体表达式）")
 
-            def arg_of(row):
+            if name != 'COUNT' and len(args) != 1:
+                raise ValueError(
+                    f"聚合函数 {name} 只接受一个参数，实际给了 {len(args)} 个"
+                    f"（本引擎不静默忽略多出来的参数；"
+                    f"COUNT(DISTINCT a, b) 的多参数 DISTINCT 是唯一例外）")
+            if name == 'COUNT' and len(args) > 1 and not distinct:
+                raise ValueError(
+                    f"COUNT 只接受一个参数或 `*`，实际给了 {len(args)} 个"
+                    f"（多参数 COUNT 仅在 COUNT(DISTINCT a, b) 形态下支持）")
+
+            def arg_value(row, arg_node):
                 return eval_expr_node(
-                    args[0],
+                    arg_node,
                     lambda n, _r=row: resolve_row(_r, n),
                     None, position, funcs)
 
+            if distinct:
+                if name == 'COUNT':
+                    if len(args) > 1:
+                        combos = []
+                        for r in rows:
+                            vals = [arg_value(r, a) for a in args]
+                            if any(v is None for v in vals):
+                                continue      # 任一列为 NULL → 整行忽略
+                            combos.append(tuple(vals))
+                        return len(distinct_sql_values(combos))
+                    vals = [arg_value(r, args[0]) for r in rows]
+                    return len(distinct_sql_values(
+                        [v for v in vals if v is not None]))
+                vals = [arg_value(r, args[0]) for r in rows]
+                vals = distinct_sql_values(
+                    [v for v in vals if v is not None])
+                return aggregate_values(name, vals)
+
             if name == 'COUNT':
-                return len(rows) if star \
-                    else sum(1 for r in rows if arg_of(r) is not None)
-            if star:
-                raise ValueError(f"聚合函数 {name} 不接受 `*` 参数")
+                return sum(1 for r in rows
+                           if arg_value(r, args[0]) is not None)
             return aggregate_values(
-                name, [v for v in (arg_of(r) for r in rows) if v is not None])
+                name,
+                [v for v in (arg_value(r, args[0]) for r in rows)
+                 if v is not None])
         values = [eval_agg_expr_over_rows(a, rows, resolve_row, position,
                                           strict, funcs, agg_ctx, agg_eval)
                   for a in args]
+        if node.get('distinct'):
+            raise ValueError(
+                f"函数 {name} 不支持 DISTINCT：DISTINCT 只能修饰聚合函数"
+                f"（COUNT / SUM / AVG / MIN / MAX 等）")
         if name not in SCALAR_FUNCTION_ARITY:
             if funcs is not None:
                 has = getattr(funcs, 'has_function', None)
@@ -4082,15 +4543,26 @@ def expr_agg_texts(node, out=None) -> list:
     elif kind == 'arith':
         expr_agg_texts(node.get('left'), out)
         expr_agg_texts(node.get('right'), out)
+    elif kind == 'between':
+        for key in ('operand', 'low', 'high'):
+            expr_agg_texts(node.get(key), out)
     return out
 
 
 def expr_pred_agg_texts(pred) -> list:
-    """表达式谓词里的聚合文本（`{'expr_pred': {...}}` → ['SUM(v)']）"""
+    """表达式谓词里的聚合文本（`{'expr_pred': {...}}` → ['SUM(v)']）
+
+    覆盖普通比较的 left/right、BETWEEN 的 left/low/high，以及
+    表达式左值 IN 的 left + values —— HAVING 里的这些位置若漏收集，
+    分组时就不会预先算聚合值，求值阶段会取不到（或整条条件失效）。
+    """
     if not isinstance(pred, dict):
         return []
     out = []
-    for node in (pred.get('left'), pred.get('right')):
+    for node in (pred.get('left'), pred.get('right'),
+                 pred.get('low'), pred.get('high')):
+        expr_agg_texts(node, out)
+    for node in (pred.get('values') or []):
         expr_agg_texts(node, out)
     return out
 
