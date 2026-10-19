@@ -35,6 +35,7 @@ from .parser import (
     eval_expr_node as _eval_expr_node,
     eval_expr_predicate as _eval_expr_predicate,
     expr_has_agg as _expr_has_agg,
+    expr_has_between as _expr_has_between,
     expr_has_func as _expr_has_func,
     expr_columns_outside_agg as _expr_columns_outside_agg,
     expr_agg_texts as _expr_agg_texts,
@@ -579,7 +580,15 @@ class Executor:
                                time.time() - start)
             return result
         except ValueError as e:
-            result = self._err(self._storage_errno(e), str(e))
+            # 修复 C：存储层现在抛**带 errno/sqlstate 的专用异常**
+            # （`db/typecheck.py::TypeCheckError`：1264 越界 / 1406 超长 /
+            # 1292 非法日期 / 1366 类型错 / 1048 空值）。这里优先采用
+            # 异常自带的语义码，`_storage_errno` 只作为旧异常（没带码）的
+            # 兼容兜底 —— 不再按报文猜，避免措辞变化让错误码漂移。
+            result = self._err(
+                getattr(e, 'errno', None) or self._storage_errno(e),
+                str(e),
+                sqlstate=getattr(e, 'sqlstate', None))
             self._record_audit(parsed, session, result,
                                time.time() - start)
             return result
@@ -587,8 +596,13 @@ class Executor:
             logger.error(f"执行错误: {e}")
             # 语义码修正：此前一律 1105。存储层有些错误抛的是 TypeError
             # 或自定义异常（例如 "无法把 'abc' 转成 INT"），落到这里就被
-            # 说成"通用错误"。同样按报文归类，**不再一律 1105**。
-            result = self._err(self._storage_errno(e), str(e))
+            # 说成"通用错误"。同样优先取异常自带的 errno/sqlstate
+            # （修复 C 的 TypeCheckError 走 ValueError 分支，这里兜的是
+            # 其它自定义异常），没有才按报文归类，**不再一律 1105**。
+            result = self._err(
+                getattr(e, 'errno', None) or self._storage_errno(e),
+                str(e),
+                sqlstate=getattr(e, 'sqlstate', None))
             self._record_audit(parsed, session, result,
                                time.time() - start)
             return result
@@ -1190,6 +1204,12 @@ class Executor:
         # _project_rows 的 _parse_arith / _eval_arith 求值
         arith = any(self._arith_projection_expr(c) is not None
                     for c in (p.get('columns') or []) if c != '*')
+        # 投影里的 BETWEEN（`SELECT id BETWEEN 1 AND 3 FROM t`）：存储层
+        # 只认列名，下推会报「列 ... 不存在」。必须走投影表达式求值路径
+        # （`parser.eval_expr_node` 的 between 分支，返回 MySQL 的 1/0/NULL）。
+        proj_between = any(
+            self._projection_has_between(c)
+            for c in (p.get('columns') or []) if c != '*')
         # 投影列表里的标量子查询（`SELECT id, (SELECT COUNT(*) ...) AS cnt`）
         # ——必须走 _project_rows 的逐行求值路径，否则要么被存储层当未知列
         # （视有无点号）静默填 NULL，要么直接报"列不存在"。
@@ -1250,7 +1270,8 @@ class Executor:
             has_not = True
         if (p.get('windows') or p.get('group_by') or p.get('having')
                 or p.get('distinct') or qualified or literal or has_sub
-                or arith or proj_sub or scalar_func or has_not or has_null
+                or arith or proj_sub or proj_between or scalar_func
+                or has_not or has_null
                 or expr_pred or col_rhs or order_expr or aliased):
             return self._select_advanced(
                 p, tbl, read_view=rv, where=where, session=s)
@@ -1435,7 +1456,10 @@ class Executor:
         for a in cls._expr_agg_texts(pred):
             if a not in out:
                 out.append(a)
-        for node in (pred.get('left'), pred.get('right')):
+        for node in (pred.get('left'), pred.get('right'),
+                     pred.get('low'), pred.get('high')):
+            cls._all_agg_texts_in_node(node, out)
+        for node in (pred.get('values') or []):
             cls._all_agg_texts_in_node(node, out)
         return out
 
@@ -1652,7 +1676,10 @@ class Executor:
         # `expr_columns_outside_agg`：由残留检查兜底显式报错）。
         pred = where.get('expr_pred')
         if isinstance(pred, dict):
-            for node in (pred.get('left'), pred.get('right')):
+            for node in (pred.get('left'), pred.get('right'),
+                         pred.get('low'), pred.get('high')):
+                out.extend(_expr_columns_outside_agg(node))
+            for node in (pred.get('values') or []):
                 out.extend(_expr_columns_outside_agg(node))
         for key in ('and', 'or'):
             for c in (where.get(key) or []):
@@ -2336,6 +2363,13 @@ class Executor:
             return not re.match(r'^(\*|[\w.]+)$', arg)
         node = _parse_scalar_expr(e)
         return bool(node is not None and _expr_has_agg(node))
+
+    @classmethod
+    def _projection_has_between(cls, text) -> bool:
+        """投影项是否是含 BETWEEN 的表达式（`id BETWEEN 1 AND 3`）"""
+        expr, _ = cls._split_alias(str(text))
+        node = _parse_scalar_expr(expr)
+        return bool(node is not None and _expr_has_between(node))
 
     @classmethod
     def _arith_projection_expr(cls, text):

@@ -131,6 +131,7 @@ from ..storage.lock_manager import (
 from ..storage.mvcc import MVCCManager, UndoAction
 from ..logger import logger
 from .errors import DdlError
+from .typecheck import NotNullViolation, validate_value
 
 
 # 行头布局（见文件头说明）：
@@ -234,35 +235,54 @@ def _next_autocommit_tid() -> int:
         return _synth_tid
 
 
+class _OmittedDefault:
+    """内部哨兵：INSERT 列清单里**没给**、且该列也没有声明 DEFAULT
+
+    为什么需要它：修复 C 要求"主键收到 NULL → 1048"，而本引擎对
+    `INSERT INTO t (v) VALUES (...)`（省略 INT 主键）有**自取主键**的
+    既有能力（`_next_pk`，见 tests/test_insert_atomicity.py ⑤ 与
+    tests/test_metadata_honesty.py 的 AUTO_INCREMENT 用例）。两者在
+    `Table.insert` 的入参里都是 `None`，必须区分：
+
+    * `INSERT INTO t (v) VALUES (7)`：主键列**没出现**在列清单里 ——
+      executor 用 `Table._column_default()` 补位，这里返回本哨兵；
+    * `INSERT INTO t (id, v) VALUES (NULL, 7)` / `VALUES (NULL, 7)`：
+      用户**显式**写了 NULL —— 原样是 `None`，主键/NOT NULL 列拒绝。
+
+    哨兵在 `_insert_locked` 里、任何 WAL/页写入与生成列求值之前被解析成
+    `None`，因此不会进入行载荷、不会落盘、也不会出现在读路径。
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return '<OMITTED>'
+
+    def __str__(self) -> str:
+        # 只用于极端防御路径（有人把它当值展示）：语义上等价于 NULL。
+        return 'NULL'
+
+
+#: 单例哨兵（见 `_OmittedDefault`；只做身份比较 `is _OMITTED`）
+_OMITTED = _OmittedDefault()
+
+
 def coerce(value, col_type: str):
-    """类型转换
+    """类型转换 + 声明式类型约束校验（P1 修复 C）
 
     `col_type` 现在可能是**带参数**的真实类型（`VARCHAR(20)`、
     `DECIMAL(10,2)`、`INT(11) UNSIGNED`）——解析器不再把长度抹掉
-    （元数据诚实化的要求：`SHOW COLUMNS` 必须报真实声明）。因此比较前
-    先取基类型名：`VARCHAR(20)` → `VARCHAR`。
+    （元数据诚实化的要求：`SHOW COLUMNS` 必须报真实声明）。
+
+    旧实现只做 `int()/float()/bool()/str()`；现在把"范围 / 长度 / 日期 /
+    精度"规则集中到 `db/typecheck.py`（`validate_value`），这里保持薄：
+    合法值返回转换后的值（返回类型与旧实现一致），非法值抛
+    `TypeCheckError` —— 异常自带 `errno` / `sqlstate`（1264/1406/1292/
+    1366…），执行器据此返回**确定的**语义码，不再按报文猜。
     """
     if value is None:
         return None
-    raw = str(col_type or '').strip().upper()
-    m = re.match(r'^([A-Z_][A-Z0-9_]*)', raw)
-    if not m:
-        # 类型名本身无法解析：显式报错，不要掉进最后的 `return str(value)`
-        # 分支把任意值都当字符串接受（那是静默的类型欺骗）。
-        raise ValueError(f"无法识别的列类型: {col_type!r}")
-    t = m.group(1)
-    try:
-        if t in ('INT', 'BIGINT'):
-            return int(value)
-        if t in ('FLOAT', 'DOUBLE', 'DECIMAL'):
-            return float(value)
-        if t == 'BOOLEAN':
-            if isinstance(value, str):
-                return value.upper() in ('1', 'TRUE', 'YES', 'ON')
-            return bool(value)
-        return str(value)
-    except (ValueError, TypeError):
-        raise ValueError(f"无法将 {value!r} 转换为 {col_type}")
+    return validate_value(value, col_type)
 
 
 class UniqueViolationError(ValueError):
@@ -715,13 +735,27 @@ class Table:
         算出候选行 —— 否则 `UPDATE t SET a=1 WHERE a=2`（a 同时是主键
         与表级 UNIQUE 列）会先撞上"不允许修改主键"的 1105，把真正的
         唯一冲突（1062）盖掉，排障方向完全错。
+
+        ★ 修复 C：UPDATE 的 NOT NULL / 主键 NULL 校验也放在这里 ——
+        `UPDATE t SET v = NULL`（v 是 NOT NULL 列）原来会静默写入 NULL
+        （UPDATE 路径此前完全没有 NOT NULL 检查）。现在抛
+        `NotNullViolation`（1048/23000），且因为它发生在**写 WAL/改页
+        之前**（也在 `_validate_update_checks` / `_validate_unique_update`
+        的写入前整体校验里先被调用一次），不会留下部分更新。
         """
         new = list(old_row)
         for col, val in set_pairs.items():
             ci = self._col_idx(col)
+            c = self.cols[ci]
+            v = coerce(val, c['type'])
+            # 显式把 PK / NOT NULL 列改成 NULL：MySQL 是 1048，不是 1105。
+            # 排在"不允许修改主键"之前：`SET id = NULL` 的语义错误是
+            # "列不允许为空"，不是"不支持改主键"（后者是存储层限制）。
+            if v is None and (c.get('notnull') or c.get('primary')):
+                raise NotNullViolation(f"列 '{c['name']}' 不允许为空")
             if ci == self.pk_idx and not allow_pk_change:
                 raise ValueError("不允许修改主键")
-            new[ci] = coerce(val, self.cols[ci]['type'])
+            new[ci] = v
         return new
 
     def _validate_update_checks(self, pks, set_pairs, read_view):
@@ -1545,14 +1579,20 @@ class Table:
             logger.warn(f"checkpoint {self.name} 失败（忽略，WAL 保持原样）: {e}")
 
     def _column_default(self, col: dict):
-        """列的**真实**默认值（没有声明 DEFAULT 时为 None）
+        """列的**真实**默认值；没声明 DEFAULT 时返回内部哨兵 `_OMITTED`
 
         `cols[i]['default']` 由解析器按 MySQL 取值形态解析：
         数字存字符串（交给 `coerce` 按列类型转）、字符串是 Python str、
         当前时间函数存表达式原文（这里真的求值，不假装）。
+
+        ★ 修复 C：没有声明 DEFAULT 的列返回 `_OMITTED` 而不是 `None`。
+        调用方（`Executor._cmd_insert` 的列清单补位、`_insert_locked` 的
+        短列表补位）因此能区分"这一列没出现在 INSERT 里"（可自取主键）
+        与"用户显式写了 NULL"（PK / NOT NULL 列必须报 1048）。哨兵在
+        `_insert_locked` 里解析成 `None` 后才进入行载荷，不会落盘。
         """
         if not col.get('has_default'):
-            return None
+            return _OMITTED
         raw = col.get('default')
         if raw is None:
             return None
@@ -1587,28 +1627,51 @@ class Table:
         # 所以 `SHOW COLUMNS` 报出的 Default 必须真的会被用上；否则那张
         # 表就是"元数据说有默认值、引擎却不用"的又一处不诚实。显式传入
         # 的 NULL 仍然按原子值处理（MySQL：显式 NULL 不进默认值）。
+        #
+        # 没声明 DEFAULT 的列补的是 `_OMITTED` 哨兵（见 `_column_default`），
+        # 用来区分"列没出现在 INSERT 里"和"显式 NULL"。
         if len(values) < len(self.cols):
             values = list(values) + [
                 self._column_default(self.cols[i])
                 for i in range(len(values), len(self.cols))]
+        else:
+            values = list(values)
+
+        # 记录"哪些列是 INSERT 里没给的"（哨兵 -> None），然后立刻把哨兵
+        # 换成 None：生成列求值 / 类型转换 / 行载荷都只看见普通 NULL。
+        omitted = {i for i, v in enumerate(values) if v is _OMITTED}
+        if omitted:
+            values = [None if v is _OMITTED else v for v in values]
 
         # 生成列（GENERATED ALWAYS AS (...) STORED）：写入前按表达式真算，
         # 用户给的值被覆盖（MySQL 里给生成列赋值本来就是错误，这里不静默
         # 保留用户值，而是以表达式结果为准）。
         values = self._apply_generated(values)
 
-        # 类型转换 + 约束检查
+        # 类型转换 + 声明式类型约束 + NOT NULL 检查（修复 C）
+        #
+        # `coerce` 现在会按列声明校验范围/长度/日期/精度并抛带
+        # errno/sqlstate 的 TypeCheckError（1264/1406/1292/1366…），
+        # 不再静默入库；NOT NULL 违反抛 NotNullViolation（1048/23000）。
+        # 全部发生在拿锁 / 写 WAL 之前，因此不会留下半条记录。
         row = []
         for i, c in enumerate(self.cols):
             v = coerce(values[i], c['type'])
-            if c.get('notnull') and v is None:
-                raise ValueError(
-                    f"列 {c['name']} 不允许为空")
+            if v is None and c.get('notnull'):
+                raise NotNullViolation(
+                    f"列 '{c['name']}' 不允许为空")
             row.append(v)
 
-        # 主键
+        # 主键：**显式 NULL** → 1048（MySQL：PK 隐式 NOT NULL）；
+        # 只有"列清单里没给主键"（`_OMITTED`）才沿用本引擎的既有能力
+        # —— 自取下一个主键值（tests/test_insert_atomicity.py ⑤）。
+        # 没有声明主键的表（pk_idx 回退到 0，仅作内部行键）保持旧行为。
         pk = row[self.pk_idx]
         if pk is None:
+            pk_col = self.cols[self.pk_idx]
+            if pk_col.get('primary') and self.pk_idx not in omitted:
+                raise NotNullViolation(
+                    f"列 '{pk_col['name']}' 不允许为空")
             pk = self._next_pk
             row[self.pk_idx] = pk
 
@@ -2159,6 +2222,16 @@ class Table:
         result = []
         for col in columns:
             col = col.strip()
+            if re.match(r'\w+\s*\(\s*DISTINCT\b', col, re.IGNORECASE):
+                # 存储层聚合只认 `FN(单列)` / `FN(*)`。DISTINCT 的去重
+                # 语义在 SQL 执行器的聚合表达式求值器里（parser.
+                # eval_agg_expr_over_rows，两条执行路径共用）。走到这里
+                # 说明调用方绕过了执行器：显式报错，绝不静默忽略 DISTINCT
+                # （那会把 COUNT(DISTINCT x) 算成 COUNT(x)）。
+                raise ValueError(
+                    f"存储层聚合不支持 DISTINCT（{col}）："
+                    f"请通过 SQL 执行器路径执行，DISTINCT 的去重语义"
+                    f"不能退化成普通聚合")
             m = re.match(
                 r'(\w+)\s*\(\s*(\*|\w+)\s*\)',
                 col, re.IGNORECASE)
