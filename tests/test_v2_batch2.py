@@ -1,4 +1,4 @@
-"""v2.0 Batch 2 测试 - 质量/告警/地图/资产/深度血缘"""
+"""v2.0 Batch 2 测试 - 质量/告警/地图/资产"""
 import os
 import sys
 import time
@@ -285,78 +285,11 @@ def test_assets():
         cm.CATALOG_FILE = old
 
 
-def test_lineage_v2():
-    """测试5: 深度血缘"""
-    print("\n【测试5】深度血缘")
-    import lightdb_studio.core.lineage_v2 as lv
-    tmp = tempfile.mkdtemp()
-    old = lv.LINEAGE_V2_FILE
-    lv.LINEAGE_V2_FILE = Path(tmp) / 'lineage_deep.json'
-
-    try:
-        store = lv.DeepLineageStore()
-
-        # 注册视图
-        view_def = """
-        CREATE VIEW user_stats AS
-        SELECT u.id, u.name, COUNT(o.id) AS order_count
-        FROM users u
-        LEFT JOIN orders o ON u.id = o.user_id
-        GROUP BY u.id
-        """
-        store.register_view('user_stats', view_def, 'db')
-        print(f"  ✅ 注册视图，共 {len(store.edges)} 条边")
-
-        # 注册过程
-        proc_body = """
-        BEGIN
-            SELECT u.id FROM users u WHERE u.active = 1;
-            INSERT INTO user_log VALUES (1, 'active');
-            UPDATE stats SET count = count + 1;
-        END
-        """
-        store.register_procedure('sync_users', proc_body, 'db')
-        print(f"  ✅ 注册过程，共 {len(store.edges)} 条边")
-
-        # CTE
-        sql = """
-        WITH recent_orders AS (
-            SELECT * FROM orders WHERE created_at > '2024-01-01'
-        ),
-        user_totals AS (
-            SELECT user_id, SUM(amount) AS total
-            FROM recent_orders GROUP BY user_id
-        )
-        SELECT * FROM user_totals
-        """
-        store.register_ctes_from_sql(sql, target='user_summary')
-        print(f"  ✅ 提取 CTE: {len(store.ctes)} 个")
-        for cte in store.ctes:
-            print(f"    {cte['name']}: 源={cte['sources']}")
-
-        assert len(store.ctes) == 2
-
-        # 依赖分析
-        deps = store.dependencies_of('user_stats')
-        print(f"  → user_stats 依赖: {len(deps)} 个")
-        for d in deps[:3]:
-            print(f"    {d['from']} ({d['type']})")
-
-        # 反向依赖
-        dependents = store.dependents_of('users')
-        print(f"  → users 被依赖: {len(dependents)} 个")
-
-        # 统计
-        stats = store.stats()
-        print(f"  → 统计: {stats}")
-
-    finally:
-        lv.LINEAGE_V2_FILE = old
 
 
 def main():
     print("=" * 60)
-    print("  v2.0 Batch 2 测试 - 质量/告警/地图/资产/深度血缘")
+    print("  v2.0 Batch 2 测试 - 质量/告警/地图/资产")
     print("=" * 60)
 
     tests = [
@@ -364,7 +297,6 @@ def main():
         ('智能告警', test_alerts_engine),
         ('数据地图', test_data_map),
         ('资产报表', test_assets),
-        ('深度血缘', test_lineage_v2),
     ]
 
     passed = failed = 0

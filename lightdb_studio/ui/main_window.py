@@ -84,7 +84,6 @@ from .cloud_sync_dialog import CloudSyncDialog
 from .report_builder import ReportBuilder
 from .plugin_panel import PluginPanel
 from .audit_viewer import AuditViewer
-from .dashboard import DashboardWidget
 from .data_map_view import DataMapView
 
 # ---------- DB ----------

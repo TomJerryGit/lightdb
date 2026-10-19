@@ -1,15 +1,15 @@
-"""阶段 0 完整性锁测试：CHECK 约束 + 联邦策略 id
+"""阶段 0 完整性锁测试：CHECK 约束
 
-锁住 docs/review/04_ROADMAP.md 的 0.3 / 0.4 两项「假成功」缺陷：
+锁住 docs/review/04_ROADMAP.md 的 0.3「假成功」缺陷：
 
 * **CHECK 约束完全不生效** —— `CHECK (price > 0)` 拦不住 `price = -5`，
   SQL 路径与 `Table.insert` 直写两条路径都放行（建表时表达式被丢弃 /
-  从来没人读）；
-* **联邦策略 id 撞号** —— id 由毫秒时间戳取模生成，同一毫秒内两次
-  `add_policy` 撞号，`policies[id] = p` 把先前「禁止 DROP」的策略
-  **静默覆盖**，于是 `check_policy('DROP')` 放行。
+  从来没人读）。
 
 统一判据：**要么生效，要么显式报错，绝不静默放行**。
+
+（原「联邦策略 id 撞号」用例随 `lightdb_studio/core/federated_gov.py`
+在 2026-10-19 Studio 死代码清理中一并删除。）
 """
 import os
 import sys
@@ -278,107 +278,3 @@ def test_check_supported_expression_forms():
     db.shutdown()
 
 
-# ==================== B. 联邦治理策略 id ====================
-
-def _gov_env():
-    import lightdb_studio.core.federated_gov as fg
-
-    tmp = tempfile.mkdtemp()
-    old = fg.GOV_FILE
-    fg.GOV_FILE = Path(tmp) / 'gov.json'
-    return fg, tmp, old
-
-
-DROP_CTX = {'user': 'alice', 'action': 'DROP',
-            'resource': 'prod.users', 'connection': 'prod'}
-
-
-def _add_two(fg, gov):
-    p1 = gov.add_policy(
-        '禁止生产 DROP', 'access',
-        {'resource_pattern': 'prod.*', 'deny_actions': ['DROP', 'TRUNCATE']},
-        'connection', 'prod', priority=100)
-    p2 = gov.add_policy(
-        '工作时间限制', 'access',
-        {'resource_pattern': 'prod.*',
-         'time_windows': [{'start_hour': 0, 'end_hour': 24}]},
-        'global', '', priority=50)
-    return p1, p2
-
-
-def test_federated_policy_ids_do_not_collide():
-    """同毫秒连续 add_policy：两条策略都在，「禁止 DROP」仍生效"""
-    print("\n【B1】联邦策略 id 不撞号")
-    fg, tmp, old = _gov_env()
-    try:
-        gov = fg.FederatedGovernance()
-        p1, p2 = _add_two(fg, gov)
-        print(f"  → id#1={p1.policy_id[:20]}... id#2={p2.policy_id[:20]}...")
-        assert p1.policy_id != p2.policy_id
-        assert len(gov.policies) == 2
-        assert {p.name for p in gov.policies.values()} == \
-            {'禁止生产 DROP', '工作时间限制'}
-
-        res = gov.check_policy(dict(DROP_CTX))
-        assert not res['allowed'], res
-        print(f"  ✅ DROP 被拒（违规: {res['violations'][0]['detail']}）")
-
-        # 重开：策略持久化，历史策略没被覆盖，DROP 仍被拒
-        gov2 = fg.FederatedGovernance()
-        assert len(gov2.policies) == 2
-        assert not gov2.check_policy(dict(DROP_CTX))['allowed']
-        print("  ✅ 重开后 2 条策略都在，DROP 仍被拒")
-
-        # 同一毫秒批量添加：id 全唯一、一条都不丢
-        before = len(gov2.policies)
-        ids = set()
-        for i in range(50):
-            ids.add(gov2.add_policy(
-                f'批量 {i}', 'access', {'deny_actions': ['DROP']},
-                'global', '').policy_id)
-        assert len(ids) == 50
-        assert len(gov2.policies) == before + 50
-        assert not gov2.check_policy(dict(DROP_CTX))['allowed']
-        print(f"  ✅ 连续 50 次 add：唯一 id {len(ids)}/50，总策略 "
-              f"{len(gov2.policies)}（期望 {before + 50}）")
-    finally:
-        fg.GOV_FILE = old
-        safe_rmtree(tmp)
-
-
-def test_add_policy_never_silently_overwrites(monkeypatch):
-    """即使 id 生成退化成"恒返回同一个值"，也必须显式报错而不是覆盖"""
-    print("\n【B2】id 生成退化时不覆盖既有策略")
-    fg, tmp, old = _gov_env()
-    try:
-        monkeypatch.setattr(fg, 'new_policy_id', lambda: 'p_fixed')
-        gov = fg.FederatedGovernance()
-        gov.add_policy('禁止生产 DROP', 'access',
-                       {'resource_pattern': 'prod.*',
-                        'deny_actions': ['DROP']},
-                       'connection', 'prod', priority=100)
-        with pytest.raises(RuntimeError):
-            gov.add_policy('工作时间限制', 'access',
-                           {'resource_pattern': 'prod.*'},
-                           'global', '')
-        assert len(gov.policies) == 1
-        assert list(gov.policies.values())[0].name == '禁止生产 DROP'
-        assert not gov.check_policy(dict(DROP_CTX))['allowed']
-        print("  ✅ 撞号时显式 RuntimeError，既有策略仍在、DROP 仍被拒")
-    finally:
-        fg.GOV_FILE = old
-        safe_rmtree(tmp)
-
-
-def test_governance_load_failure_is_not_silent():
-    """策略库损坏时不许静默降级成"没有策略"（否则治理限制全部失效）"""
-    print("\n【B3】策略库损坏 → 显式报错（不 fail-open）")
-    fg, tmp, old = _gov_env()
-    try:
-        fg.GOV_FILE.write_text('{not json', encoding='utf-8')
-        with pytest.raises(RuntimeError):
-            fg.FederatedGovernance()
-        print("  ✅ 损坏的策略库显式 RuntimeError，未静默变成空策略集")
-    finally:
-        fg.GOV_FILE = old
-        safe_rmtree(tmp)
