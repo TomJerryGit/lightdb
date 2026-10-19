@@ -59,6 +59,11 @@ _ENV_MAP = {
     'LIGHTDB_WAL_ENABLED': ('wal_enabled', bool),
     'LIGHTDB_AUTOCOMMIT': ('autocommit', bool),
     'LIGHTDB_SHM_DIR': ('shm_dir', str),
+    # 真 · append-only binlog（决策 D 项）—— Database 直接读环境变量；
+    # 这里登记是为了让配置文件/环境变量两条入口都能解释同一批开关。
+    'LIGHTDB_BINLOG_ENABLED': ('binlog_enabled', bool),
+    'LIGHTDB_BINLOG_FSYNC': ('binlog_fsync', bool),
+    'LIGHTDB_BINLOG_MAX_BYTES': ('binlog_max_bytes', int),
 }
 
 
@@ -120,6 +125,16 @@ class Config:
 
     # ---------- 多进程 ----------
     shm_dir: str = ""                    # 空 = 默认 /dev/shm
+
+    # ---------- 真 · append-only binlog（决策 D 项） ----------
+    #: 是否启用独立 append-only binlog（`<data_dir>/binlog/binlog.000001`）。
+    #: 关闭时 `SHOW MASTER STATUS` 返回空结果集（MySQL log_bin=OFF 同语义），
+    #: 从库复制器拉不到事件；默认开启。
+    binlog_enabled: bool = True
+    #: 组提交是否 fsync（默认关闭，与引擎 autocommit 持久性档位一致）
+    binlog_fsync: bool = False
+    #: 单文件大小告警阈值（当前实现不做轮转，只告警；TODO 阶段 2）
+    binlog_max_bytes: int = 64 * 1024 * 1024
 
     # ==================== 加载 ====================
 

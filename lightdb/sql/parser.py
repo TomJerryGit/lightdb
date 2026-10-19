@@ -200,6 +200,52 @@ class Parser:
 
     # ============ 运维 / 复制 / 安全语句（MySQL 兼容面） ============
 
+    @staticmethod
+    def _change_master_literal(raw: str):
+        """CHANGE MASTER TO 的取值：'字符串' / 数字 / 裸值（去引号）"""
+        s = str(raw).strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            inner = s[1:-1]
+            return (inner.replace("''", "'") if s[0] == "'"
+                    else inner.replace('""', '"'))
+        if re.fullmatch(r'-?\d+', s):
+            return int(s)
+        return s
+
+    def _change_master(self, rest: str) -> Dict:
+        """`CHANGE MASTER TO MASTER_HOST='..', MASTER_PORT=.., ...`
+
+        只接受 MySQL 文档里的四个最小连接选项；其它选项（GTID/SSL/过滤）
+        本引擎没有对应实现 → **显式 SyntaxError**，不静默忽略。
+        """
+        mapping = {
+            'MASTER_HOST': 'master_host',
+            'MASTER_PORT': 'master_port',
+            'MASTER_USER': 'master_user',
+            'MASTER_PASSWORD': 'master_password',
+        }
+        out = {'command': 'CHANGE MASTER'}
+        seen = set()
+        for item in self._split_top_level(rest):
+            item = str(item).strip()
+            if not item:
+                continue
+            km = re.match(r'([A-Za-z_]\w*)\s*=\s*(.*)$', item, re.DOTALL)
+            if not km:
+                raise SyntaxError(
+                    f"CHANGE MASTER TO 选项语法错误: {item!r} "
+                    f"（形如 MASTER_HOST='127.0.0.1'）")
+            key = km.group(1).upper()
+            if key not in mapping:
+                raise SyntaxError(
+                    f"CHANGE MASTER TO 不支持的选项 {key!r}：本引擎只支持 "
+                    f"{', '.join(sorted(mapping))}")
+            out[mapping[key]] = self._change_master_literal(km.group(2))
+            seen.add(key)
+        if not seen:
+            raise SyntaxError("CHANGE MASTER TO 缺少选项")
+        return out
+
     def _show_result(self, show_stmt: str, **extra) -> Dict:
         """构造「以结果集回传的 SHOW/CHECK 类语句」
 
@@ -230,7 +276,29 @@ class Parser:
         if upper in ('SHOW SLAVE STATUS', 'SHOW REPLICA STATUS'):
             return self._show_result('SLAVE_STATUS')
         if upper.startswith('SHOW BINLOG EVENTS'):
-            return self._show_result('BINLOG_EVENTS')
+            # 支持 MySQL 可选子句：IN 'file' / FROM pos / LIMIT n
+            extra = {}
+            fm = re.search(r"\bIN\s+'([^']+)'", sql, re.IGNORECASE)
+            if fm:
+                extra['binlog_file'] = fm.group(1)
+            pm = re.search(r'\bFROM\s+(\d+)', sql, re.IGNORECASE)
+            if pm:
+                extra['from_pos'] = int(pm.group(1))
+            lm = re.search(r'\bLIMIT\s+(\d+)', sql, re.IGNORECASE)
+            if lm:
+                extra['limit'] = int(lm.group(1))
+            return self._show_result('BINLOG_EVENTS', **extra)
+
+        # ---- 复制控制语句（最小实现；配置/启动/停止）----
+        if upper in ('START SLAVE', 'START REPLICA'):
+            return {'command': 'START SLAVE'}
+        if upper in ('STOP SLAVE', 'STOP REPLICA'):
+            return {'command': 'STOP SLAVE'}
+        cm = re.match(
+            r'CHANGE\s+(?:MASTER|REPLICATION\s+SOURCE)\s+TO\b(.*)$',
+            sql, re.IGNORECASE | re.DOTALL)
+        if cm:
+            return self._change_master(cm.group(1))
 
         # ---- 存储引擎状态 ----
         em = re.match(

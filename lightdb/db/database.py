@@ -17,6 +17,7 @@
   （倒序回放 undo 镜像把旧行写回原页原槽位），再写 ABORT 记录、
   释放 MVCC 与锁。旧实现只丢版本链节点，页上数据不会回来。
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -244,7 +245,24 @@ class Database:
         # 逻辑 binlog（`replication/binlog.py::Binlog`）按需创建：只有真正
         # 用到的实例（MasterReplicator / 备份）才会有文件句柄，避免给每个
         # Database 都平白多一个常驻句柄（Windows 上会让数据目录删不掉）。
+        #
+        # 注意：这是**旧的演示实现**（JSONL、无 CRC、无事务边界）。真复制
+        # 日志是下面的 `binlog_log`（append-only + CRC + 组提交），
+        # `SHOW MASTER STATUS` / `SHOW BINLOG EVENTS` / `__BINLOG_FETCH__`
+        # 与从库复制器都只读那份；`self.binlog` 仅为兼容旧调用方保留。
         self._binlog = None
+
+        # ★ 真 · append-only binlog（决策 D 项）：
+        #   - 惰性创建：只有真正发生写/查复制位点的 Database 才会打开文件；
+        #   - 追加写、位点=真实字节偏移、只增不回退（不依赖表 WAL 轮转）；
+        #   - 提交钩子见 `commit()` / `commit_statement()` / `abort()`：
+        #     DML 行事件由执行器按事务/语句组缓冲，**提交时才**成组落盘。
+        self._binlog_log = None
+        self._binlog_log_lock = threading.RLock()
+        #: 重放从库事件时暂停本机 binlog 记录（避免从库把重放再记一遍）
+        self._binlog_suspend_depth = 0
+        #: binlog 记录失败计数（不静默：失败会告警并在 stats 里可见）
+        self._binlog_errors = 0
 
         # 挂在库上的审计器（`sql/executor.py::_AuditSink`）。审计批量落盘后，
         # `shutdown()` 是"正常停机 → 待落盘批一定写出去"的确定性落盘点：
@@ -1044,6 +1062,11 @@ class Database:
         self.lock_manager.release(tid)
         for tbl in self.tables.values():
             tbl._read_views.pop(tid, None)
+        # ★ 真 binlog 组提交：把本事务缓冲的行事件成组写成
+        #   BEGIN → 行事件… → COMMIT。写在 WAL COMMIT 之后、与提交同一
+        #   临界路径；失败只告警但计入 `_binlog_errors`（复制位点会缺事件，
+        #   不能静默——后续阶段 2 会改成"binlog 写失败则拒绝提交"）。
+        self._binlog_commit_txn(tid)
 
     def commit_statement(self, txn):
         """**语句级内部事务**的提交（autocommit 档持久性）
@@ -1075,6 +1098,8 @@ class Database:
         self.lock_manager.release(tid)
         for tbl in self.tables.values():
             tbl._read_views.pop(tid, None)
+        # 语句级内部事务也是"已提交"：同样成组写 binlog（BEGIN→rows→COMMIT）
+        self._binlog_commit_txn(tid)
 
     def abort(self, txn):
         """回滚事务：真正把数据改回去，再写 ABORT、放锁"""
@@ -1101,6 +1126,89 @@ class Database:
         self.lock_manager.release(tid)
         for tbl in self.tables.values():
             tbl._read_views.pop(tid, None)
+        # ★ 真 binlog：回滚的事务写 `BEGIN → ROLLBACK`（行事件从未落盘，
+        #   只记录被丢弃的条数，不伪造数据变更）
+        self._binlog_rollback_txn(tid)
+
+    # ==================== 真 · append-only binlog（决策 D 项）====================
+
+    @property
+    def binlog_log(self):
+        """本实例的 append-only binlog 读写器（`replication/append_only_binlog.py`）
+
+        * 惰性创建：第一次需要记录/查询时打开 `<data_dir>/binlog/binlog.000001`；
+        * 环境变量 `LIGHTDB_BINLOG_ENABLED=0` 时返回 None（调用方按
+          "本实例没有 binlog"处理：`SHOW MASTER STATUS` 返回空结果集）；
+        * 线程安全：同进程多连接共享同一个写器（内部 RLock 串行化组提交）。
+        """
+        if self._binlog_log is not None:
+            return self._binlog_log
+        with self._binlog_log_lock:
+            if self._binlog_log is not None:
+                return self._binlog_log
+            try:
+                from ..replication.append_only_binlog import (
+                    AppendOnlyBinlog, binlog_enabled)
+            except Exception as e:            # pragma: no cover - 导入防御
+                logger.error(f"加载 append-only binlog 失败: {e}")
+                self._binlog_errors += 1
+                return None
+            if not binlog_enabled():
+                return None
+            try:
+                self._binlog_log = AppendOnlyBinlog(str(self.data_dir))
+            except Exception as e:
+                logger.error(f"打开 binlog 文件失败: {e}")
+                self._binlog_errors += 1
+                return None
+            return self._binlog_log
+
+    @property
+    def binlog_suspended(self) -> bool:
+        """当前是否处于"暂停记录"区间（从库重放期间为 True）"""
+        return self._binlog_suspend_depth > 0
+
+    @contextlib.contextmanager
+    def suspend_binlog(self):
+        """在 with 块内暂停 binlog 记录（从库重放 DDL/DML 用）
+
+        从库把重放产生的事件再记进自己的 binlog 会造成回环/双写
+        （MySQL 默认 `log_slave_updates` 的行为由主库配置决定；本引擎
+        当前语义是"从库不记录重放事件"，如实写在这里）。
+        """
+        with self._binlog_log_lock:
+            self._binlog_suspend_depth += 1
+        try:
+            yield
+        finally:
+            with self._binlog_log_lock:
+                self._binlog_suspend_depth -= 1
+
+    def _binlog_commit_txn(self, txn_id: int):
+        if self.binlog_suspended:
+            return
+        try:
+            rec = self.binlog_log
+            if rec is None:
+                return
+            rec.commit_txn(txn_id)
+        except Exception as e:
+            self._binlog_errors += 1
+            logger.error(
+                f"binlog 组提交失败（事务 {txn_id}）：{e} —— "
+                f"WAL 已提交，但复制日志缺少本事务事件")
+
+    def _binlog_rollback_txn(self, txn_id: int):
+        if self.binlog_suspended:
+            return
+        try:
+            rec = self.binlog_log
+            if rec is None:
+                return
+            rec.rollback_txn(txn_id)
+        except Exception as e:
+            self._binlog_errors += 1
+            logger.error(f"binlog 回滚记录失败（事务 {txn_id}）：{e}")
 
     # ==================== 复制器注册（SHOW SLAVE STATUS 的数据源）====================
 
@@ -1265,6 +1373,12 @@ class Database:
         if self._binlog is not None:
             try:
                 self._binlog.close()
+            except Exception:
+                pass
+        # 真 binlog：停机是"正常落盘"的确定性时点（未提交的组不落盘）
+        if self._binlog_log is not None:
+            try:
+                self._binlog_log.close()
             except Exception:
                 pass
 

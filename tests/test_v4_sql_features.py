@@ -3285,8 +3285,12 @@ def _exec(e, sql):
 def test_show_master_status_reports_real_wal_position():
     """SHOW MASTER STATUS / SHOW SLAVE STATUS / __BINLOG_FETCH__
 
-    位点来自**真实 WAL 记录**（本引擎没有独立 binlog 文件），
-    不是硬编码常量：新增写入后位点必须继续增长。
+    决策 D 项（真 append-only binlog）后：
+    * `SHOW MASTER STATUS.Position` 是 **binlog 文件的真实字节位点**
+      （不再等于"数据事件条数"），每写一组 BEGIN/事件/COMMIT 都严格增长；
+    * `__BINLOG_FETCH__.pos` 仍是**数据事件逻辑序号**（1 起；旧复制接口
+      兼容），`lsn` 是真实字节偏移；数据事件含 DDL（真 binlog 会记录
+      CREATE TABLE，从库才能建表）。
     """
     with _Env() as e:
         r = _exec(e, 'SHOW MASTER STATUS')
@@ -3295,20 +3299,30 @@ def test_show_master_status_reports_real_wal_position():
                                 'Binlog_Ignore_DB', 'Executed_Gtid_Set']
         row = r['rows'][0]
         assert row[0] == 'binlog.000001'
-        # _Env 建了 8(emp)+3(users)+3(orders) = 14 条真实 INSERT
+        # _Env 建了 8(emp)+3(users)+3(orders) = 14 条真实 INSERT（另有建表 DDL）
         assert row[1] >= 14, row
+        # 位点与 binlog 文件大小一致（真实字节偏移，不是编造的序号）
+        binlog_path = os.path.join(str(e.db.data_dir), 'binlog',
+                                   'binlog.000001')
+        assert row[1] == os.path.getsize(binlog_path), row
         assert row[4] is None            # GTID 无对应概念 -> NULL
 
         ev = _exec(e, 'SELECT * FROM __BINLOG_FETCH__ WHERE pos >= 1 LIMIT 100')
         assert ev['type'] == 'resultset', ev
         assert [c for c in ev['columns']] == [
             'pos', 'lsn', 'txn_id', 'event_type', 'table_name', 'data']
-        assert len(ev['rows']) == row[1]
-        assert ev['rows'][0][3] == 'INSERT'
+        types = [x[3] for x in ev['rows']]
+        assert types.count('INSERT') == 14, types
+        assert 'DDL' in types            # 真 binlog 记录并复制 DDL
+        # pos 是数据事件序号（1..N 连续），lsn 是真实字节偏移（严格递增）
+        assert [x[0] for x in ev['rows']] == list(
+            range(1, len(ev['rows']) + 1))
+        lsn = [x[1] for x in ev['rows']]
+        assert all(b > a for a, b in zip(lsn, lsn[1:])), lsn
 
         _exec(e, "INSERT INTO emp VALUES (99, 'Zoe', 'Eng', 70)")
         pos2 = _exec(e, 'SHOW MASTER STATUS')['rows'][0][1]
-        assert pos2 == row[1] + 1, (row[1], pos2)
+        assert pos2 > row[1], (row[1], pos2)   # 字节位点严格前进
 
         r = _exec(e, 'SHOW SLAVE STATUS')
         assert r['type'] == 'resultset'
@@ -3690,8 +3704,8 @@ def test_show_slave_status_reflects_registered_replicator():
             try:
                 master_ex.execute_sql(
                     'CREATE TABLE repl_t (id INT PRIMARY KEY, v VARCHAR(20))', {})
-                _exec(e, 'CREATE TABLE repl_t (id INT PRIMARY KEY, '
-                         'v VARCHAR(20))')
+                # 决策 D 项后 CREATE TABLE 也进 binlog -> 从库由 DDL 事件建表，
+                # 不再需要（也不应该）在从库手工预建同构表
                 for i in range(1, 5):
                     master_ex.execute_sql(
                         f"INSERT INTO repl_t VALUES ({i}, 'v{i}')", {})
@@ -3707,15 +3721,17 @@ def test_show_slave_status_reflects_registered_replicator():
                         rep.relay.append(row)
                     return len(r['rows'])
 
-                assert feed(master_ex, 0) == 4
+                # 5 个数据事件 = CREATE TABLE(DDL) + 4×INSERT（决策 D 项：
+                # DDL 也进 binlog，从库靠 DDL 事件建表）
+                assert feed(master_ex, 0) == 5
                 assert wait_until(
-                    lambda: status_vals()['Exec_Master_Log_Pos'] == 4), \
+                    lambda: status_vals()['Exec_Master_Log_Pos'] == 5), \
                     status_vals()
                 vals = status_vals()
                 before_pos = (vals['Read_Master_Log_Pos'],
                               vals['Exec_Master_Log_Pos'],
                               vals['Relay_Log_Pos'])
-                assert vals['Exec_Master_Log_Pos'] == 4
+                assert vals['Exec_Master_Log_Pos'] == 5
                 assert vals['Relay_Log_File'] == 'relay.log'
                 assert vals['Relay_Log_Pos'] > 0
                 assert e.db.get_table('repl_t').row_count == 4
@@ -3723,12 +3739,12 @@ def test_show_slave_status_reflects_registered_replicator():
                 for i in range(5, 11):
                     master_ex.execute_sql(
                         f"INSERT INTO repl_t VALUES ({i}, 'v{i}')", {})
-                assert feed(master_ex, 4) == 6
+                assert feed(master_ex, 5) == 6
                 assert wait_until(
-                    lambda: status_vals()['Exec_Master_Log_Pos'] == 10), \
+                    lambda: status_vals()['Exec_Master_Log_Pos'] == 11), \
                     status_vals()
                 vals = status_vals()
-                assert vals['Exec_Master_Log_Pos'] == 10
+                assert vals['Exec_Master_Log_Pos'] == 11
                 assert e.db.get_table('repl_t').row_count == 10
                 # 位点与中继日志字节数都真的前进了（不是同一个常量）
                 assert vals['Exec_Master_Log_Pos'] > before_pos[1]
@@ -3746,7 +3762,7 @@ def test_show_slave_status_reflects_registered_replicator():
             assert vals['Seconds_Behind_Master'] is None
             assert vals['Slave_SQL_Running_State'] is None   # 线程没在跑 -> NULL
             assert vals['Master_Host'] == '127.0.0.1'
-            assert vals['Exec_Master_Log_Pos'] == 10
+            assert vals['Exec_Master_Log_Pos'] == 11
         finally:
             rep.stop()
             e.db.detach_replicator(rep)

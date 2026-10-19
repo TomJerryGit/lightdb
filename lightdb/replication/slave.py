@@ -130,8 +130,19 @@ class RelayLog:
     def file_name(self) -> str:
         return self.path.name
 
+    def _ensure_open(self):
+        """STOP SLAVE 关闭句柄后，START SLAVE 需要能继续追加（同一实例）"""
+        if self.fh is None or getattr(self.fh, 'closed', True):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fh = open(self.path, 'a', encoding='utf-8')
+            try:
+                self.size = self.path.stat().st_size
+            except OSError:
+                self.size = 0
+
     def append(self, event_tuple) -> int:
         with self.lock:
+            self._ensure_open()
             line = json.dumps(event_tuple, ensure_ascii=False, default=str)
             self.queue.append(event_tuple)
             self.fh.write(line + '\n')
@@ -159,7 +170,16 @@ class RelayLog:
 
 
 class SlaveReplicator:
-    """从库侧"""
+    """从库侧
+
+    ★ 持久化位点（决策 D 项）：构造时从 `<data_dir>/master.info` 读取上次
+    的 read/exec 位点与主库配置，重启后**从持久位点续传**（不重复拉取，
+    也不从头重放）。位点写回时机：io 线程每拉一批、sql 线程每应用一批、
+    STOP SLAVE 时（原子替换写，见 `_save_master_info`）。
+    """
+
+    #: 持久化位点文件名（仿 MySQL 的 master.info；JSON 形态）
+    INFO_FILE = 'master.info'
 
     def __init__(self, db, master_host: str, master_port: int,
                  user: str = 'root', password: str = ''):
@@ -173,19 +193,25 @@ class SlaveReplicator:
         self.started = False            # 是否启动过（区分"没启动"与"停了"）
         self.io_thread = None
         self.sql_thread = None
-        self.last_pos = 0               # 已应用的最大事件序号（Exec_Master_Log_Pos）
+        self.last_pos = 0               # 已应用的数据事件逻辑序号（Exec_Master_Log_Pos）
         self.relay = RelayLog(str(db.data_dir))
 
         self.reconnect_delay = RECONNECT_DELAY
 
         # ★ 真实跟踪到的复制状态（全部由 io/sql 线程写入，show_status 只读快照）
         self._lock = threading.RLock()
-        self.read_master_log_pos = 0    # io 线程已拉到的事件序号
+        self.read_master_log_pos = 0    # io 线程已拉到的数据事件逻辑序号
         self.master_log_file = None     # 主库 SHOW MASTER STATUS 的 File（没读到就是 None）
-        self.master_pos = None          # 主库最新位点（没读到就是 None）
+        self.master_pos = None          # 主库最新**字节**位点（没读到就是 None）
         self.relay_master_log_file = None   # 已应用位点所属的主库日志文件
+        # 真实字节位点（持久化续传用；逻辑序号用于 MySQL 兼容的状态列显示）
+        self.read_byte_pos = 0
+        self.exec_byte_pos = 0
         self.io_connected = False
         self.io_ever_connected = False
+        #: io 线程是否已确认"拉到了主库当前末尾"（Seconds_Behind_Master 判定）
+        self._caught_up = False
+        self._info_loaded = False
         self.io_connects = 0
         self.last_io_errno = 0
         self.last_io_error = ''
@@ -193,6 +219,7 @@ class SlaveReplicator:
         self.last_sql_errno = 0
         self.last_sql_error = ''
         self.last_sql_error_ts = 0
+        self._ddl_executor = None
 
         self.stats = {
             'io_events': 0,
@@ -202,10 +229,76 @@ class SlaveReplicator:
             'last_sync_ts': 0,
         }
 
+        # ★ 重启续传：先读持久位点，再注册到 Database（否则 SHOW SLAVE
+        #   STATUS 在启动瞬间会报 0）
+        self._load_master_info()
+
         # ★ 把自己注册到 Database：执行器靠这条通道拿到真实状态
         attach = getattr(db, 'attach_replicator', None)
         if callable(attach):
             attach(self)
+
+    # ==================== 持久化位点（master.info）====================
+    def _info_path(self):
+        from pathlib import Path
+        return Path(self.db.data_dir) / self.INFO_FILE
+
+    def _load_master_info(self):
+        """读取上次的位点/配置（文件不存在或损坏 → 从头开始，不伪造位点）"""
+        path = self._info_path()
+        if not path.exists():
+            return False
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+        except Exception as e:
+            logger.warn(f"master.info 读取失败（从头开始复制）: {e}")
+            return False
+        if not isinstance(raw, dict):
+            return False
+        try:
+            self.read_master_log_pos = int(raw.get('read_pos') or 0)
+            self.last_pos = int(raw.get('exec_pos') or 0)
+            self.read_byte_pos = int(raw.get('read_byte_pos') or 0)
+            self.exec_byte_pos = int(raw.get('exec_byte_pos') or 0)
+            if raw.get('master_log_file'):
+                self.master_log_file = str(raw['master_log_file'])
+                self.relay_master_log_file = str(raw['master_log_file'])
+            # 从库重启后：位点已知 → 状态列按"已连接过"如实报（而不是 NULL）
+            if self.read_master_log_pos > 0:
+                self.io_ever_connected = True
+        except (TypeError, ValueError) as e:
+            logger.warn(f"master.info 字段非法（忽略，从头开始）: {e}")
+            return False
+        self._info_loaded = True
+        logger.info(
+            f"从库复制从持久位点续传: read_pos={self.read_master_log_pos} "
+            f"exec_pos={self.last_pos} file={self.master_log_file}")
+        return True
+
+    def _save_master_info(self):
+        """原子写回位点（tmp + replace；失败只告警，不影响复制线程）"""
+        from pathlib import Path
+        path = self._info_path()
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                data = {
+                    'master_host': self.master_host,
+                    'master_port': self.master_port,
+                    'master_user': self.user,
+                    'master_log_file': self.master_log_file,
+                    'read_pos': self.read_master_log_pos,
+                    'exec_pos': self.last_pos,
+                    'read_byte_pos': self.read_byte_pos,
+                    'exec_byte_pos': self.exec_byte_pos,
+                    'saved_at': time.time(),
+                }
+            tmp = Path(str(path) + '.tmp')
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                           encoding='utf-8')
+            tmp.replace(path)
+        except Exception as e:                   # pragma: no cover - 磁盘故障
+            logger.warn(f"master.info 写入失败（位点持久化降级）: {e}")
 
     # ============ 生命周期 ============
     def start(self):
@@ -213,6 +306,8 @@ class SlaveReplicator:
             return
         self.running = True
         self.started = True
+        self.relay._ensure_open()
+        self._save_master_info()
         self.io_thread = threading.Thread(target=self._io_loop, daemon=True,
                                           name='SlaveIO')
         self.sql_thread = threading.Thread(target=self._sql_loop, daemon=True,
@@ -229,6 +324,7 @@ class SlaveReplicator:
             self.sql_thread.join(timeout=3)
         with self._lock:
             self.io_connected = False
+        self._save_master_info()
         self.relay.close()
         logger.info("从库复制已停止")
 
@@ -316,20 +412,35 @@ class SlaveReplicator:
                         break
 
                     for r in rows:
-                        # r = (pos, lsn, txn_id, event_type, table_name, data)
+                        # r = (pos=逻辑序号, lsn=真实字节偏移, txn_id,
+                        #      event_type, table_name, data)
                         self.relay.append(r)
                         try:
                             pos = int(r[0])
                         except (TypeError, ValueError):
                             continue
+                        try:
+                            byte_pos = int(r[1])
+                        except (TypeError, ValueError):
+                            byte_pos = self.read_byte_pos
                         with self._lock:
                             if pos > self.read_master_log_pos:
                                 self.read_master_log_pos = pos
+                            if byte_pos > self.read_byte_pos:
+                                self.read_byte_pos = byte_pos
+                            self._caught_up = False
                             self.stats['io_events'] += 1
+
+                    if rows:
+                        # 位点持久化：每拉一批写一次 master.info（原子替换）
+                        self._save_master_info()
 
                     if not rows:
                         # 空闲时顺便刷新主库位点（Seconds_Behind_Master 判定用）
                         self._refresh_master_status(cur)
+                        with self._lock:
+                            self._caught_up = True
+                        self._save_master_info()
                         time.sleep(0.1)
 
             except Exception as e:
@@ -354,6 +465,7 @@ class SlaveReplicator:
                 time.sleep(0.05)
                 continue
 
+            applied = 0
             for ev in events:
                 try:
                     pos = self._apply_event(ev)
@@ -361,21 +473,46 @@ class SlaveReplicator:
                     self._record_sql_error(e)
                     logger.error(f"从库重放失败 pos={ev[0] if ev else '?'}: {e}")
                     continue
+                byte_pos = 0
+                try:
+                    byte_pos = int(ev[1])
+                except (TypeError, ValueError, IndexError):
+                    byte_pos = 0
                 with self._lock:
                     if pos is not None and pos >= self.last_pos:
                         self.last_pos = pos
+                    if byte_pos > self.exec_byte_pos:
+                        self.exec_byte_pos = byte_pos
                     self.relay_master_log_file = self.master_log_file
                     self.stats['sql_events'] += 1
                     self.stats['last_sync_ts'] = time.time()
+                applied += 1
+            if applied:
+                # 已应用位点持久化（重启续传的 exec_pos）
+                self._save_master_info()
+
+    def _get_ddl_executor(self):
+        """DDL 重放用的执行器（复用同一个，避免每次建审计/策略对象）"""
+        if self._ddl_executor is None:
+            from ..sql.executor import Executor
+            self._ddl_executor = Executor(self.db)
+        return self._ddl_executor
 
     def _apply_event(self, ev):
         """重放一条从主库拉到的事件（`__BINLOG_FETCH__` 的 6 列），返回事件位点
 
         `__BINLOG_FETCH__` 的列序是
-        `(pos, lsn, txn_id, event_type, table_name, data)`
-        —— 这里必须按 6 列解包（旧实现按 5 列解包，任何事件都会
-        `ValueError: too many values to unpack`，复制一行都同步不了）。
-        同时兼容 5 列的旧形态 `(pos, txn_id, event_type, table_name, data)`。
+        `(pos=逻辑序号, lsn=真实字节偏移, txn_id, event_type, table_name, data)`
+        —— 这里必须按 6 列解包（V4 旧实现按 5 列解包，任何事件都会
+        `ValueError: too many values to unpack`）。同时兼容 5 列的旧形态。
+
+        重放语义（决策 D 项）：
+        * DML 直写存储层（行镜像来自主库 binlog，要求两边 schema 一致）；
+        * DDL 交给执行器重放；**解析失败/执行报错会显式抛出**，由
+          `_record_sql_error` 记成非 0 的 `Last_SQL_Errno`（沿用 E2 语义），
+          绝不静默跳过；
+        * 重放期间 `db.suspend_binlog()`：从库不把重放产生的事件再记一遍；
+        * 未知事件类型 → 显式 RuntimeError（不静默）。
         """
         if isinstance(ev, dict):
             pos = ev.get('pos')
@@ -393,48 +530,72 @@ class SlaveReplicator:
         data = json.loads(payload) if isinstance(payload, str) else payload
         etype = str(etype or '').upper()
 
+        if etype in ('FORMAT_DESCRIPTION', 'BEGIN', 'COMMIT'):
+            # 事务边界/格式事件：不改变数据（`__BINLOG_FETCH__` 也默认
+            # 不返回它们，这里只是防御性兼容）
+            return pos
+
+        if etype == 'ROLLBACK':
+            # 主库已回滚的事务不会出现在 fetch 的数据事件里；若真收到，
+            # 不做任何数据变更（回滚事件本身不携带行镜像）
+            return pos
+
         if etype == 'INSERT':
             tbl = self.db.get_table(table)
             row = (data or {}).get('row', [])
             try:
-                tbl.insert(row, txn_id=0)
+                with self.db.suspend_binlog():
+                    tbl.insert(row, txn_id=0)
             except ValueError:
-                # 主键已存在（重复投递）——幂等跳过
+                # 主键已存在（重复投递/从持久位点重放边界）——幂等跳过。
+                # 注意：只有"主键重复"这类 ValueError 才跳过；其它异常
+                # 由外层记录为 SQL 错误（不静默）。
                 pass
 
         elif etype == 'UPDATE':
             tbl = self.db.get_table(table)
+            cols = (data or {}).get('cols')
             pk = data['pk']
             new = data.get('new', [])
-            # 生成 set_pairs（除主键外的所有列）
             set_pairs = {}
             for i, c in enumerate(tbl.cols):
                 if i != tbl.pk_idx and i < len(new):
                     set_pairs[c['name']] = new[i]
-            tbl.update(set_pairs,
-                       {'column': tbl.pk_col, 'op': '=', 'value': pk},
-                       txn_id=0)
+            with self.db.suspend_binlog():
+                tbl.update(set_pairs,
+                           {'column': tbl.pk_col, 'op': '=', 'value': pk},
+                           txn_id=0)
 
         elif etype == 'DELETE':
             tbl = self.db.get_table(table)
             pk = data['pk']
-            tbl.delete({'column': tbl.pk_col, 'op': '=', 'value': pk},
-                       txn_id=0)
+            with self.db.suspend_binlog():
+                tbl.delete({'column': tbl.pk_col, 'op': '=', 'value': pk},
+                           txn_id=0)
 
         elif etype == 'DDL':
-            sql = (data or {}).get('sql', '')
+            sql = str((data or {}).get('sql', '') or '').strip()
+            if not sql:
+                raise RuntimeError(
+                    "DDL 事件缺少 sql 文本：无法重放（拒绝静默跳过）")
             from ..sql.parser import parser
-            from ..sql.executor import Executor
             try:
                 p = parser.parse(sql)
-                if p:
-                    ex = Executor(self.db)
-                    ex.execute(p, {})
             except Exception as e:
-                logger.warn(f"DDL 重放失败: {e}")
-
-        elif etype in ('COMMIT', 'BEGIN'):
-            pass
+                raise RuntimeError(
+                    f"DDL 重放解析失败（拒绝静默跳过）: {sql[:200]}: {e}")
+            if not p:
+                raise RuntimeError(
+                    f"DDL 重放无法解析（拒绝静默跳过）: {sql[:200]}")
+            with self.db.suspend_binlog():
+                result = self._get_ddl_executor().execute(p, {})
+            if isinstance(result, dict) and result.get('type') == 'error':
+                raise RuntimeError(
+                    f"DDL 重放失败（拒绝静默跳过）: errno="
+                    f"{result.get('code')} {result.get('message')}；"
+                    f"sql={sql[:200]}")
+        else:
+            raise RuntimeError(f"未知 binlog 事件类型 {etype!r}（拒绝静默跳过）")
 
         return pos
 
@@ -487,22 +648,20 @@ class SlaveReplicator:
         """`Seconds_Behind_Master`：能算就返回秒数，算不出返回 None
 
         本引擎的 WAL 事件**没有时间戳**，因此无法像 MySQL 那样用
-        "最后一个已应用事件的主库时间 - 现在"算延迟。这里只用**真实位点**
-        做判定：
-        * SQL 线程没在跑 / 主库位点未知 -> None（MySQL 同样给 NULL）；
-        * 已应用位点 >= 主库最新位点 -> 0（真的追平了）；
-        * 落后但事件无时间戳 -> None（**不编造**一个秒数）；
+        "最后一个已应用事件的主库时间 - 现在"算延迟。决策 D 项后的判定：
+        * SQL 线程没在跑 / io 没连上 / 中继队列还有待应用事件 -> None
+          （确实无法断言"追平了"，不编造 0）；
+        * io 线程已确认拉到主库当前末尾（`_caught_up`）且队列为空 -> 0；
+        * 落后但事件时间戳口径不可靠 -> None（**不编造**秒数）。
         """
         if not self.running or self.sql_running() != 'Yes':
             return None
         with self._lock:
-            master_pos = self.master_pos
-            exec_pos = self.last_pos
-        if master_pos is None:
-            return None
-        if exec_pos >= master_pos:
-            return 0
-        return None
+            if not self.io_connected:
+                return None
+            if self.relay.pending():
+                return None
+            return 0 if self._caught_up else None
 
     def _exec_master_log_pos(self):
         """已应用位点；还没应用过任何事件时 None（不是 0 的"假位点"）"""
@@ -567,7 +726,8 @@ class SlaveReplicator:
                 'Slave_SQL_Running_State': self.sql_state(),
                 'Master_Server_Id': None,
                 'Master_UUID': None,
-                'Master_Info_File': None,
+                # 决策 D 项后本引擎**真的**有持久化位点文件了：如实报路径
+                'Master_Info_File': str(self._info_path()),
                 'Master_Retry_Count': None,
                 'Retrieved_Gtid_Set': None,
                 'Executed_Gtid_Set': None,

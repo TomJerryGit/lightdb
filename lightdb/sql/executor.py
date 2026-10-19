@@ -514,6 +514,7 @@ class Executor:
         # 由这里兜底，避免子查询在无事务上下文里重新执行。
         prev_session = getattr(self, '_active_session', None)
         self._active_session = session
+        result = None
         try:
             if isinstance(parsed, dict) and parsed.get('ctes'):
                 result = self._execute_with_ctes(parsed, session)
@@ -607,6 +608,12 @@ class Executor:
                                time.time() - start)
             return result
         finally:
+            # ★ 真 binlog 收尾：autocommit 组提交/丢弃、DDL 事件。
+            #   放在 finally 里保证错误返回/异常分支同样执行（失败不落盘）。
+            try:
+                self._binlog_finish(session, parsed, result)
+            except Exception as e:              # pragma: no cover - 防御
+                logger.error(f"binlog 收尾失败: {e}")
             self._active_session = prev_session
 
     def _use_session(self, session):
@@ -738,6 +745,135 @@ class Executor:
             # 其余路径的返回结构保持不变。
             out['sqlstate'] = sqlstate
         return out
+
+    # ==================== 真 · append-only binlog（决策 D 项） ====================
+    #
+    # 记录时机（与 MySQL 语义对齐：binlog 记的是"已提交的变更"）：
+    #   * DML：执行器把行镜像（INSERT 的 row；UPDATE 的 old/pk/new；DELETE 的
+    #     old/pk）缓冲到当前组（显式事务用事务号，autocommit 语句用一次性
+    #     组 id），**提交时**由 `Database.commit()` / `commit_statement()`
+    #     成组写成 `BEGIN → rows… → COMMIT`；
+    #   * DDL：执行器成功返回后写一组 `BEGIN → DDL → COMMIT`
+    #     （DDL 自带隐式提交；分组只为统一读取端边界语义）；
+    #   * 回滚：`Database.abort()` 写 `BEGIN → ROLLBACK`（行事件从未落盘，
+    #     只记 discarded 条数，不伪造变更）。
+    #
+    # 已知边界（TODO 阶段 2）：UPDATE/DELETE 为拿行镜像会在执行前多一次
+    # SELECT（大表 UPDATE 的额外扫描成本）；直接写存储层的调用不经过
+    # 执行器，因此不产生 binlog 事件。
+
+    _BINLOG_DML_COMMANDS = frozenset({'INSERT', 'UPDATE', 'DELETE'})
+    _BINLOG_DDL_COMMANDS = frozenset({
+        'CREATE TABLE', 'DROP TABLE', 'ALTER TABLE', 'TRUNCATE',
+        'CREATE FULLTEXT INDEX'})
+
+    def _binlog_writer(self):
+        """当前库的真 binlog 写器；未启用/不可用时 None（不抛异常）"""
+        try:
+            return self.db.binlog_log
+        except Exception:                       # pragma: no cover - 防御
+            return None
+
+    def _binlog_record_enabled(self) -> bool:
+        if getattr(self.db, 'binlog_suspended', False):
+            return False
+        return self._binlog_writer() is not None
+
+    def _binlog_group(self, s):
+        """返回本次语句的行事件组 id
+
+        * 显式事务 / 语句级内部事务：`('txn', txn_id)`，由 Database 的
+          提交/回滚钩子负责组提交；
+        * autocommit 单条语句：会话上挂一个一次性组 id，语句成功返回时
+          由 `execute()` 的 finally 统一组提交（失败则丢弃，不落盘）。
+        """
+        rec = self._binlog_writer()
+        if rec is None:
+            return None
+        txn = s.get('txn') if isinstance(s, dict) else None
+        if txn:
+            return rec.txn_group_id(txn['txn_id'])
+        if isinstance(s, dict):
+            gid = s.get('_binlog_gid')
+            if gid is None:
+                gid = rec.new_group_id()
+                s['_binlog_gid'] = gid
+            return gid
+        return rec.new_group_id()
+
+    def _binlog_record(self, s, event_type: str, table, data: dict):
+        """缓冲一条行变更事件（提交时才落盘）"""
+        if not self._binlog_record_enabled():
+            return
+        try:
+            gid = self._binlog_group(s)
+            rec = self._binlog_writer()
+            txn = s.get('txn') if isinstance(s, dict) else None
+            txn_id = txn['txn_id'] if txn else 0
+            rec.record(gid, event_type, table, data, txn_id=txn_id)
+        except Exception as e:
+            self.db._binlog_errors = getattr(self.db, '_binlog_errors', 0) + 1
+            logger.error(f"binlog 行事件缓冲失败（{event_type} {table}）: {e}")
+
+    @staticmethod
+    def _binlog_coerce_row(tbl, row):
+        """按列声明把行值转成真实类型（binlog 存**实际写入的值**）
+
+        解析器的字面量是原文（`'1'` 而不是 `1`）；行镜像若原样存字符串，
+        从库虽能再 coerce 一次，但"binlog 内容 = 实际落盘值"更忠实
+        （对照 MySQL 行格式复制存的是列值本身）。转不了的值保留原样
+        （例如函数默认值），不因 binlog 记录失败而中断业务语句。
+        """
+        from ..db.table import coerce
+        out = []
+        for i, v in enumerate(row):
+            try:
+                ctype = str(tbl.cols[i]['type'])
+            except (IndexError, KeyError, TypeError):
+                out.append(v)
+                continue
+            try:
+                out.append(coerce(v, ctype))
+            except Exception:
+                out.append(v)
+        return out
+
+    def _binlog_finish(self, s, parsed, result):
+        """语句收尾：autocommit 组提交/丢弃 + DDL 事件写入
+
+        由 `execute()` 的 finally 统一调用（任何返回路径都会经过这里，
+        包括错误字典返回与异常分支），因此"失败语句不落 binlog"有保证。
+        """
+        rec = self._binlog_writer()
+        if rec is None or not isinstance(s, dict):
+            return
+        cmd = str(parsed.get('command') or '') if isinstance(parsed, dict) else ''
+        ok = not (isinstance(result, dict) and result.get('type') == 'error')
+        # 只有 DML/DDL 语句才"收尾"自己的组。SELECT / SHOW 等（包括触发器里
+        # 嵌套执行的 SELECT）绝不能 pop 掉外层 DML 正在缓冲的组 —— 否则
+        # 先扣住的行事件会被静默丢弃（触发器体里 SELECT 在 DML 之间的场景）。
+        is_dml = cmd in self._BINLOG_DML_COMMANDS
+        is_ddl = cmd in self._BINLOG_DDL_COMMANDS
+        if not (is_dml or is_ddl):
+            return
+        gid = s.pop('_binlog_gid', None)
+        try:
+            if gid is not None and rec is not None:
+                if ok and is_dml:
+                    rec.commit_group(gid)
+                else:
+                    rec.discard_group(gid)
+        except Exception as e:
+            self.db._binlog_errors = getattr(self.db, '_binlog_errors', 0) + 1
+            logger.error(f"binlog 语句组提交失败（{cmd}）: {e}")
+        # DDL：成功的 DDL 才记录（失败/不支持的分支不回 OK，因此不落）
+        if ok and is_ddl:
+            try:
+                sql = parsed.get('source_sql') or ''
+                rec.write_ddl(sql, table=parsed.get('table'))
+            except Exception as e:
+                self.db._binlog_errors = getattr(self.db, '_binlog_errors', 0) + 1
+                logger.error(f"binlog DDL 事件写入失败（{cmd}）: {e}")
 
     # ==================== DDL ====================
 
@@ -990,6 +1126,10 @@ class Executor:
                 self._fire_triggers('BEFORE', 'INSERT', p['table'],
                                     new_row=row, session=s)
                 tbl.insert(row, txn_id=tid, read_view=rv)
+                self._binlog_record(
+                    s, 'INSERT', p['table'],
+                    {'cols': [c['name'] for c in tbl.cols],
+                     'row': self._binlog_coerce_row(tbl, row)})
                 n += 1
                 self._fire_triggers('AFTER', 'INSERT', p['table'],
                                     new_row=row, session=s)
@@ -5620,8 +5760,12 @@ class Executor:
 
         before = self._triggers_for(p['table'], 'BEFORE', 'UPDATE')
         after = self._triggers_for(p['table'], 'AFTER', 'UPDATE')
+        # binlog 需要 UPDATE 的行镜像（old/new/pk）：没有触发器时也要先
+        # 把命中行读出来（TODO 阶段 2：大表可改为从 undo/行锁信息取镜像，
+        # 省掉这次额外扫描）
+        need_binlog = self._binlog_record_enabled()
         old_cols, old_rows = (None, [])
-        if before or after:
+        if before or after or need_binlog:
             old_cols, old_rows = tbl.select(['*'], where, read_view=rv)
             for r in old_rows:
                 row = [self._set_value(p['set'], old_cols, r, c)
@@ -5637,6 +5781,21 @@ class Executor:
         n = tbl.update(
             p['set'], where,
             txn_id=tid, read_view=rv)
+
+        if need_binlog and old_rows:
+            bl_cols = ([str(c) for c in old_cols] if old_cols
+                       else [c['name'] for c in tbl.cols])
+            pk_name = str(tbl.pk_col)
+            pk_idx = (bl_cols.index(pk_name)
+                      if pk_name in bl_cols else int(tbl.pk_idx))
+            for r in old_rows:
+                new_row = [self._set_value(p['set'], bl_cols, r, c)
+                           for c in bl_cols]
+                new_row = self._binlog_coerce_row(tbl, new_row)
+                self._binlog_record(
+                    s, 'UPDATE', p['table'],
+                    {'cols': bl_cols, 'pk': r[pk_idx],
+                     'old': list(r), 'new': new_row})
 
         if after:
             for r in old_rows:
@@ -5676,75 +5835,71 @@ class Executor:
                 or self._where_has_column_rhs(where):
             where = self._where_to_pk_equalities(tbl, where, rv)
 
-        if self._triggers_for(p['table'], 'BEFORE', 'DELETE') \
-                or self._triggers_for(p['table'], 'AFTER', 'DELETE'):
+        has_triggers = bool(
+            self._triggers_for(p['table'], 'BEFORE', 'DELETE')
+            or self._triggers_for(p['table'], 'AFTER', 'DELETE'))
+        need_binlog = self._binlog_record_enabled()
+        old_rows = []
+        if has_triggers or need_binlog:
             _, old_rows = tbl.select(['*'], where, read_view=rv)
-            for r in old_rows:
-                self._fire_triggers('BEFORE', 'DELETE', p['table'],
-                                    old_row=list(r), session=s)
-        else:
-            old_rows = []
+            if has_triggers:
+                for r in old_rows:
+                    self._fire_triggers('BEFORE', 'DELETE', p['table'],
+                                        old_row=list(r), session=s)
 
         n = tbl.delete(
             where, txn_id=tid, read_view=rv)
 
-        for r in old_rows:
-            self._fire_triggers('AFTER', 'DELETE', p['table'],
-                                old_row=list(r), session=s)
+        if need_binlog and old_rows:
+            bl_cols = [c['name'] for c in tbl.cols]
+            pk_name = str(tbl.pk_col)
+            pk_idx = (bl_cols.index(pk_name)
+                      if pk_name in bl_cols else int(tbl.pk_idx))
+            for r in old_rows:
+                self._binlog_record(
+                    s, 'DELETE', p['table'],
+                    {'cols': bl_cols, 'pk': r[pk_idx], 'old': list(r)})
+
+        if has_triggers:
+            for r in old_rows:
+                self._fire_triggers('AFTER', 'DELETE', p['table'],
+                                    old_row=list(r), session=s)
         self.stats['rows'] += n
         return self._ok(
             affected=n, message=f"{n} row(s) deleted")
 
     # ============ MySQL 兼容：复制 / 运维 / 安全 / 存储程序 ============
 
-    # ---------- 复制位点：真实 WAL 派生的逻辑 binlog ----------
+    # ---------- 复制位点：真 · append-only binlog（决策 D 项） ----------
 
-    _WAL_CONTROL_TYPES = ('COMMIT', 'ABORT', 'CHECKPOINT', 'BEGIN')
+    def _binlog_reader(self):
+        """本库的 append-only binlog 读写器（`Database.binlog_log`）
 
-    def _binlog_events(self):
-        """把各表真实 WAL 里的**数据记录**汇总成一条「逻辑 binlog」事件流
-
-        本引擎没有独立的 binlog 文件：唯一的重做 / 复制日志就是每张表的 WAL
-        （docs/FAILURE_TRIAGE.md §8.1 核对过句柄与落盘路径）。因此复制位点与
-        事件流都取自**真实 WAL 记录**，不是硬编码：
-
-        * 事件顺序：先按表名，再按该表 WAL 内的 lsn（同表内严格递增）；
-        * `pos`：从 1 开始的事件序号（MySQL 的 Position 是 binlog 文件字节
-          偏移；本引擎按「事件序号」给位点，单调可比较，语义等价）；
-        * 文件名：本引擎只有一个逻辑日志流、没有日志轮转 → 固定
-          `binlog.000001`，不假装存在多个文件；
-        * 控制记录（COMMIT/ABORT 等）不进事件流，与 MySQL binlog 只记数据
-          变更一致。
+        未启用（`LIGHTDB_BINLOG_ENABLED=0`）或打开失败时为 None，调用方按
+        "本实例没有 binlog"如实处理（空结果集），**不编造位点**。
         """
-        events = []
-        for name in sorted(self.db.tables):
-            tbl = self.db.tables[name]
-            try:
-                recs = tbl.wal.read_all()
-            except Exception as e:
-                raise RuntimeError(f"读取表 {name} 的 WAL 失败: {e}")
-            for rec in recs:
-                rtype = str(getattr(rec, 'type', '') or '').upper()
-                if rtype in self._WAL_CONTROL_TYPES:
-                    continue
-                events.append({
-                    'pos': len(events) + 1,
-                    'lsn': getattr(rec, 'lsn', None),
-                    'txn_id': getattr(rec, 'txn_id', None),
-                    'type': rtype,
-                    'table': name,
-                    'data': getattr(rec, 'data', None),
-                })
-        return events
+        return self._binlog_writer()
 
     def _binlog_relation(self):
-        """`__BINLOG_FETCH__` 虚拟表（从库 io 线程拉事件用的接口）"""
+        """`__BINLOG_FETCH__` 虚拟表：直接读 append-only binlog 文件
+
+        列保持从库接口的 6 列兼容形态：
+
+        * ``pos``        = 数据事件逻辑序号（1 起；沿用旧从库 watermark 语义）
+        * ``lsn``        = 该事件在 binlog 文件里的**真实字节偏移**
+        * ``txn_id``     = 事务号（autocommit 语句为 0）
+        * ``event_type`` = INSERT / UPDATE / DELETE / DDL
+        * ``table_name`` = 表名（DDL 未解析出表名时为 NULL）
+        * ``data``       = 事件 payload 的 data 字段（JSON 文本）
+
+        文件损坏/截断时**显式报错**（`BinlogCorrupted` / `BinlogTruncated`
+        会向上抛，最终由 `execute()` 统一成错误结果），绝不静默返回空流。
+        """
         cols = ['pos', 'lsn', 'txn_id', 'event_type', 'table_name', 'data']
-        rows = [
-            (e['pos'], e['lsn'], e['txn_id'], e['type'], e['table'],
-             json.dumps(e['data'], ensure_ascii=False, default=str))
-            for e in self._binlog_events()
-        ]
+        rec = self._binlog_reader()
+        if rec is None:
+            return _CTERelation('__BINLOG_FETCH__', cols, [])
+        rows = rec.fetch_rows(0)
         return _CTERelation('__BINLOG_FETCH__', cols, rows)
 
     # ---------- SHOW 系列（结果集回传） ----------
@@ -5758,16 +5913,27 @@ class Executor:
         return handler(p, s)
 
     def _show_master_status(self, p, s):
-        """SHOW MASTER STATUS —— 位点来自真实 WAL 事件流（见 _binlog_events）
+        """SHOW MASTER STATUS —— 来自真 append-only binlog 文件
 
-        列名沿用 MySQL（File / Position / Binlog_Do_DB / Binlog_Ignore_DB /
-        Executed_Gtid_Set）；GTID 在本引擎没有对应概念 → NULL（不编造）。
+        * `File`     = 当前 binlog 文件名（`binlog.000001`，本实现无轮转）
+        * `Position` = **真实字节位点**（文件末尾，即下一条记录的起始偏移；
+          单调递增，不随任何表 WAL 的 checkpoint/ALTER 回退）
+        * `Binlog_Do_DB` / `Binlog_Ignore_DB` = ''（未配置过滤，MySQL 同）
+        * `Executed_Gtid_Set` = NULL（本引擎无 GTID 概念，不编造）
+
+        binlog 未启用（`LIGHTDB_BINLOG_ENABLED=0`）时返回**空结果集**
+        （MySQL `log_bin=OFF` 时 SHOW MASTER STATUS 也是空结果集）。
         """
-        events = self._binlog_events()
-        return self._rs(
-            ['File', 'Position', 'Binlog_Do_DB', 'Binlog_Ignore_DB',
-             'Executed_Gtid_Set'],
-            [('binlog.000001', len(events), '', '', None)])
+        cols = ['File', 'Position', 'Binlog_Do_DB', 'Binlog_Ignore_DB',
+                'Executed_Gtid_Set']
+        rec = self._binlog_reader()
+        if rec is None:
+            return self._rs(cols, [])
+        try:
+            return self._rs(cols, [(rec.current_file, rec.current_pos,
+                                    '', '', None)])
+        except Exception as e:
+            return self._err(1105, f"读取 binlog 位点失败: {e}")
 
     #: MySQL `SHOW SLAVE STATUS` 的列清单（**严格按文档顺序**）
     #
@@ -5938,18 +6104,52 @@ class Executor:
         return self._rs(list(self._SLAVE_STATUS_COLUMNS), [row])
 
     def _show_binlog_events(self, p, s):
-        """SHOW BINLOG EVENTS —— 逐个真实 WAL 事件（列名沿用 MySQL）"""
+        """SHOW BINLOG EVENTS —— 逐条真实记录（含事务边界/格式事件）
+
+        列保持 MySQL 兼容形态：`Log_name / Pos / Event_type / Server_id /
+        End_log_pos / Info`。`Pos` 是**真实字节偏移**（记录起始），
+        `End_log_pos` 是记录结束偏移；`Info` 是一行真实摘要（表名/行镜像/
+        SQL/事务号），不是占位文本。
+
+        支持 MySQL 的可选子句（parser 解析进 AST）：
+        ``SHOW BINLOG EVENTS [IN 'file'] [FROM pos] [LIMIT n]``。
+
+        文件损坏/截断 → 1105 显式报错（拒绝静默跳过）。
+        """
         cols = ['Log_name', 'Pos', 'Event_type', 'Server_id',
                 'End_log_pos', 'Info']
-        rows = []
-        for e in self._binlog_events():
-            rows.append((
-                'binlog.000001', e['pos'], e['type'],
-                None,               # Server_id：本引擎没有 server_id 概念
-                e['pos'],
-                f"table={e['table']} lsn={e['lsn']} "
-                f"data={json.dumps(e['data'], ensure_ascii=False, default=str)[:200]}",
-            ))
+        rec = self._binlog_reader()
+        if rec is None:
+            return self._rs(cols, [])
+        requested_file = p.get('binlog_file')
+        if requested_file and requested_file != rec.current_file:
+            # 本实现没有轮转（只有 binlog.000001）：请求别的文件要显式
+            # 报错，而不是悄悄把当前文件的事件当作那个文件返回。
+            return self._err(
+                1105, f"SHOW BINLOG EVENTS IN '{requested_file}' 不支持："
+                      f"本实现无 binlog 轮转，当前只有 "
+                      f"'{rec.current_file}'（TODO 阶段 2：多文件/索引）")
+        start = p.get('from_pos')
+        try:
+            start = int(start) if start is not None else 16
+        except (TypeError, ValueError):
+            return self._err(1064, f"SHOW BINLOG EVENTS 的 FROM 位点非法: "
+                                   f"{p.get('from_pos')!r}")
+        limit = p.get('limit')
+        try:
+            limit = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        try:
+            records = rec.read_from(max(16, start), limit)
+        except Exception as e:
+            return self._err(
+                1105, f"读取 binlog 失败（拒绝静默跳过损坏记录）: {e}")
+        rows = [
+            (rec.current_file, r.pos, r.type_name, r.server_id,
+             r.end_pos, r.summary())
+            for r in records
+        ]
         return self._rs(cols, rows)
 
     def _show_engine(self, p, s):
@@ -6000,11 +6200,21 @@ class Executor:
                 f'TABLE {name}: rows={rows} heap_pages={pages} '
                 f'btree_height={height} wal_records={wal_records} '
                 f'pk={tbl.pk_col} cols={len(tbl.cols)}')
-        events = self._binlog_events()
+        brec = self._binlog_reader()
         lines.append('--- LOG ---')
-        lines.append(f'Log sequence number: {events[-1]["lsn"] if events else 0}'
-                     f' (WAL lsn)')
-        lines.append(f'Log records (data events): {len(events)}')
+        if brec is None:
+            lines.append('binlog: 未启用（LIGHTDB_BINLOG_ENABLED=0）')
+        else:
+            try:
+                # 保持旧的 Info 行名（Log records (data events)），但数值
+                # 现在来自**真 append-only binlog** 而不是各表 WAL 扫描
+                lines.append(
+                    f'Log records (data events): {brec.data_event_count}')
+                lines.append(f'binlog file: {brec.current_file}')
+                lines.append(
+                    f'binlog position (bytes): {brec.current_pos}')
+            except Exception as e:
+                lines.append(f'binlog: 读取失败 ({e})')
         lines.append('--- TRANSACTIONS / LOCKS ---')
         try:
             lines.append(f'MVCC: {self.db.mvcc.stats()}')
@@ -8162,6 +8372,85 @@ class Executor:
             return self._ok(
                 message=f"Rolled back (id={txn['txn_id']})")
         return self._ok(message="Rolled back")
+
+    # ==================== 复制控制语句（最小实现） ====================
+
+    #: MySQL `ER_SLAVE_NOT_CONFIGURED`：STOP/START SLAVE 时没有配置主库
+    _ER_SLAVE_NOT_CONFIGURED = 1190
+
+    def _replication_not_configured(self, action: str):
+        return self._err(
+            self._ER_SLAVE_NOT_CONFIGURED,
+            f"Slave is not configured or failed to initialize properly. "
+            f"{action} requires CHANGE MASTER TO first "
+            f"（本引擎：先执行 CHANGE MASTER TO MASTER_HOST='..', "
+            f"MASTER_PORT=..，再 START SLAVE）")
+
+    def _cmd_start_slave(self, p, s):
+        """`START SLAVE` / `START REPLICA`：启动已配置的从库复制器
+
+        未配置（`Database.replicator` 为 None）→ 显式 1190，不伪装成功。
+        """
+        rep = getattr(self.db, 'replicator', None)
+        if rep is None:
+            return self._replication_not_configured('START SLAVE')
+        try:
+            rep.start()
+        except Exception as e:
+            return self._err(1105, f"START SLAVE 失败: {e}")
+        return self._ok(message='Slave started')
+
+    def _cmd_stop_slave(self, p, s):
+        """`STOP SLAVE` / `STOP REPLICA`：停止复制线程，保留配置与位点"""
+        rep = getattr(self.db, 'replicator', None)
+        if rep is None:
+            return self._replication_not_configured('STOP SLAVE')
+        try:
+            rep.stop()
+        except Exception as e:
+            return self._err(1105, f"STOP SLAVE 失败: {e}")
+        return self._ok(message='Slave stopped')
+
+    def _cmd_change_master(self, p, s):
+        """`CHANGE MASTER TO MASTER_HOST=.., MASTER_PORT=.., MASTER_USER=..,
+        MASTER_PASSWORD=..`：登记/替换主库配置（构造从库复制器，不自动启动）
+
+        语义照 MySQL：CHANGE MASTER 只改配置；要开始复制需再 `START SLAVE`。
+        参数缺失/非法 → 1064 显式报错（不静默用默认值蒙混）。
+        """
+        host = p.get('master_host')
+        port = p.get('master_port')
+        if not host or str(host).strip() == '':
+            return self._err(
+                1064, "CHANGE MASTER TO 缺少 MASTER_HOST='主机'")
+        try:
+            port = int(port if port is not None else 3306)
+        except (TypeError, ValueError):
+            return self._err(
+                1064, f"CHANGE MASTER TO 的 MASTER_PORT 非法: {port!r}")
+        if not (0 < port < 65536):
+            return self._err(
+                1064, f"CHANGE MASTER TO 的 MASTER_PORT 越界: {port}")
+        user = p.get('master_user')
+        password = p.get('master_password')
+        if user is None:
+            # MySQL：未指定 MASTER_USER 时使用当前连接用户
+            user = (s.get('user') if isinstance(s, dict) else None) or 'root'
+        try:
+            from ..replication.slave import SlaveReplicator
+            old = getattr(self.db, 'replicator', None)
+            if old is not None:
+                try:
+                    old.stop()
+                except Exception as e:         # pragma: no cover - 防御
+                    logger.warn(f"替换主库配置时停止旧复制器失败: {e}")
+            SlaveReplicator(self.db, str(host), int(port),
+                            user=str(user), password=str(password or ''))
+        except Exception as e:
+            return self._err(1105, f"CHANGE MASTER TO 失败: {e}")
+        return self._ok(
+            message=f"Master changed to {host}:{port} (user={user}); "
+                    f"run START SLAVE to begin replication")
 
     def _cmd_use(self, p, s):
         """`USE <库>` —— **校验**后切换（不存在 → 1049）
