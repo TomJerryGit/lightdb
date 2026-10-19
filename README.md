@@ -114,10 +114,9 @@
   [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
   顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
 
-- 一次完整测试运行的结果（2026-10-19，含 P0 安全修复新增 33 个用例）：**794 个用例中
-  **746 通过 / 24 失败 / 23 跳过 / 1 xfailed**。24 条失败均为**既有**问题（9 条
-  `test_batch*`/`test_v2_*`/`test_v3_*` 历史模块缺陷、2 条环境权限限制、若干 OLAP/列存
-  设计目标未达成与既有平台问题）；分诊与逐条根因见
+- 一次完整测试运行的结果（2026-10-19，P0/P1 修复后新增 64 个用例）：**825 个用例中
+  777 通过 / 24 失败 / 23 跳过 / 1 xfailed**。24 条失败与 P0 修复前对照**逐条相同**（无任何
+  本次修复引入的失败）；分诊与逐条根因见
   [docs/analysis_2026-10-19/04_verification.md](docs/analysis_2026-10-19/04_verification.md)。
 
 ### ✅ 本次会话已修复（2026-10，含实测验证）
@@ -172,12 +171,16 @@
   - **loser 前像重建**：撤销 loser 事务时不再把「带删除标记的旧版本」原样写回（那会让行头永久 `xmax != 0`、恢复后整表不可见），而是按原值重建 `xmax = 0` 的前像。
   - **真回滚**：`BEGIN; INSERT/UPDATE/DELETE; ROLLBACK` 三种场景回滚后表内容与事务前完全一致，且主键可再次插入（INSERT 路径原先根本不传事务号，已在 SQL 层修掉）。
   - **锁泄漏**：autocommit 语句改用合成事务号并在语句结束释放，`BEGIN; UPDATE` 同一主键不再 5 秒超时。
+- **经 MySQL 协议的事务已真实生效（B，2026-10-19）**：此前 `net/server.py` **每条语句新建 session dict**，`BEGIN` 写入的 txn 下一条语句就丢 → `BEGIN;INSERT;ROLLBACK` 不回滚、未提交行其他连接可见、断连泄漏 MVCC active。现在改为**连接级 session**（`user/database/txn/autocommit/variables/user_vars`），事务句柄跨语句存活；断连自动回滚；`SET autocommit=0/1`、`SET NAMES`、`SET @var` 真实生效（`SELECT @@autocommit`/`SHOW VARIABLES` 可观察，OK/EOF 包带真实 autocommit/in-trans 状态位）；执行错误的 **SQLSTATE 按真实语义回传**（1146→42S02、1054→42S22、1062/1048→23000 等，不再一律 HY000）。见 `tests/test_wire_transaction.py`（9 例）。
+- **声明式类型约束已真正生效（C，2026-10-19，行为变更）**：原先 `INT` 越界（`2147483648`）、`VARCHAR(3)` 超长（`'abcdef'`）、非法 `DATETIME`（`'not-a-date'`）全部静默入库。现按列声明校验并返回 MySQL 语义码：整数/`DECIMAL(p,s)` 越界 → **1264**、`VARCHAR(n)`/`CHAR(n)` 按字符数超长 → **1406**、非法日期/时间 → **1292**、无法转整数 → **1366**；PK / `NOT NULL` 列显式 NULL → **1048**（省略主键仍保留本引擎的自动取号能力）。见 `tests/test_type_constraints.py`（10 例）。
 - **DDL 假成功两项已修（F）**：
   - **非整型主键定义期显式拒绝**：`CREATE TABLE vp (name VARCHAR(20) PRIMARY KEY)` 原先返回 OK，但该表之后**任何 INSERT 永久 1105**、SELECT 空集（主键 B+Tree 键按 uint32 落盘）。现在 `CREATE TABLE` 定义期直接 1064，报文说明「本引擎主键仅支持整数类型 INT/BIGINT/TINYINT/SMALLINT」并建议字符串列改 `UNIQUE`；整数主键不受影响。见上方「索引声明支持边界」。
   - **触发器坏体不再锁表**：`CREATE TRIGGER ... FOR EACH ROW SET @x=1` 原先返回 OK，之后该表任何写入都在触发路径解析失败 → 永久 1105，且旧版没有 `DROP TRIGGER` 可自救。现在 `TriggerManager.create()` 在落库前用 `PLParser` + 触发器小解释器同一套规则校验（含 BEGIN/END 配对、`SET NEW/OLD.列`、IF/END IF、普通 SQL、NEW/OLD 列存在性），坏体定义期 1064/1054 **且不写入**；同时新增 `DROP TRIGGER [IF EXISTS]` 与 `SHOW TRIGGERS`。合法触发器（BEFORE/AFTER）仍正常触发。见上方「触发器支持边界」。
 - **复制状态语义修正（E2）**：SQL 线程重放失败时，错误号取不到（内置异常如 `KeyError`/`SyntaxError`）不再报 `Last_SQL_Errno=0`，改为按错误文本映射（缺表 1146 / 语法 1064 / 唯一冲突 1062 / 其它 1105），保证「有 `Last_SQL_Error` ⇒ `Last_SQL_Errno` 非 0」；复制能力本身仍为**实验性、不可用于生产**（见上方「复制支持边界」）。
 
 **事务实测**（Lead 亲自复核，非子代理自述）：初始 3 行 → 三种 ROLLBACK 后仍是 `[(1,'v1'),(2,'v2'),(3,'v3')]` → 连续重开 2 次行数不变（无重复行累积）→ 子进程 autocommit 写入后 `os._exit(1)` 硬杀，重开后该行仍在（日志 `崩溃恢复 t: redo 1 条, undo 0 条`）。
+
+**协议层事务实测**（P1-B，真实 `MySQLServer` + pymysql，`tests/test_wire_transaction.py`）：`BEGIN;INSERT;ROLLBACK` 后本连接与另一连接均 0 行；`BEGIN;INSERT;COMMIT` 后均 1 行；未提交行对另一连接不可见；`SET autocommit=0;INSERT;ROLLBACK` 回滚、`COMMIT` 提交；断连未提交自动回滚且 MVCC active 不增长。
 
 ### 🔑 索引声明支持边界（`CREATE TABLE` 内）
 
@@ -229,7 +232,7 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**（2026-10-19 P0 安全修复后的基线）：**794 用例 = 746 通过 / 24 失败 / 23 跳过 / 1 xfailed**（本轮优化开始时是 150 通过 / 118 失败；P0 修复新增 33 例）。24 条失败与修复前对照后**没有一条由本次安全修复引入**（逐条分诊见 [docs/analysis_2026-10-19/04_verification.md](docs/analysis_2026-10-19/04_verification.md)）：其中约 2 条来自沙箱/平台限制（写 `~/.lightdb_studio`、`dashboards/` 被拒），其余是**既有**缺陷/未达成目标：行格式 DECIMAL 编解码、`SET @@var` 不支持、半同步/GRANT 语法未实现、`test_cli_tool` 的 readline 移植性、OLAP 列存 GROUP BY/压缩率/加速比未达标、`parser_v3b4`/虚拟表/联邦/Data API/数字孪生等历史模块、诊断 CLI 的 emoji/GBK 控制台问题。注意 `test_ipc_latency`、`test_diagnose_cli` 等环境敏感用例会逐次抖动（本次通过），**判据是改动领域零失败 + 干净 HEAD 副本对照**。
+**测试套件**（2026-10-19 P0/P1 修复后的基线）：**825 用例 = 777 通过 / 24 失败 / 23 跳过 / 1 xfailed**（本轮优化开始时是 150 通过 / 118 失败；P0/P1 修复新增 64 例）。24 条失败与修复前对照**逐条相同** —— 没有一条由本轮修复引入（逐条分诊见 [docs/analysis_2026-10-19/04_verification.md](docs/analysis_2026-10-19/04_verification.md)）：其中约 2 条来自沙箱/平台限制（写 `~/.lightdb_studio`、`dashboards/` 被拒），其余是**既有**缺陷/未达成目标：行格式 DECIMAL 编解码、`SET @@var` 不支持、半同步/GRANT 语法未实现、`test_cli_tool` 的 readline 移植性、OLAP 列存 GROUP BY/压缩率/加速比未达标、`parser_v3b4`/虚拟表/联邦/Data API/数字孪生等历史模块、诊断 CLI 的 emoji/GBK 控制台问题。注意 `test_ipc_latency`、`test_diagnose_cli` 等环境敏感用例会逐次抖动（本次通过），**判据是改动领域零失败 + 干净 HEAD 副本对照**。
 
 **仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；行值 `(a,b) IN (SELECT x,y ...)` 与行值比较 `(a,b) = (1,2)`（现**显式报错**并给出 `EXISTS` 改写建议）、HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值、WHERE 里的算术谓词、投影标量函数、`FROM (子查询)` 之后直接 `JOIN` —— 以上均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；存储侧 `Database.vacuum()` 只释放槽位、不做页内紧凑，且旧 `.dat` 行头布局不兼容（需重建库）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
 

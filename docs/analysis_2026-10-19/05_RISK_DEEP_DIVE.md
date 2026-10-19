@@ -27,16 +27,20 @@
 
 ## 0.1 修复状态（2026-10-19）
 
-> 用户确认后已实施 **A（默认认证/监听/连接限制）+ D（Web 安全四项与连接管理）**，其余项未动。
+> 用户确认后依次实施：**A（默认认证/监听/连接限制）+ D（Web 安全四项与连接管理）**，
+> 随后继续 **B（协议层事务）+ C（类型约束）**；F/E 随后跟进。
 
 | 编号 | 状态 | 说明 |
 |---|---|---|
-| A 默认认证/监听/连接限制 | ✅ **已修复** | `lightdb/db/database.py`（随机口令 + 旧库迁移）、`lightdb/config.py`（host 默认回环 + 2 个新配置字段）、`lightdb/main.py`/`main_v4.py`（`--root-password`/`--allow-empty-password`）、`lightdb/net/master.py`/`worker.py`（host 兜底与配置透传）、`lightdb/net/server.py`（`verify_request/shutdown_request` 准入：总量/per-IP/白名单 + 失败登录延迟）、`tests/conftest.py`（显式降级 env）、新增 `tests/test_auth_defaults.py`（11 例）、`run_studio.*`（本地 demo 显式降级）、`docker/entrypoint*.sh`（随机口令生成/输出一次） |
-| D Web 安全四项 + 连接管理 | ✅ **已修复** | `web/auth.py`（SECRET 改为 env/持久化/随机 + alg/exp 校验）、`web/server.py`（删默认用户、用户来源 env/参数/自动随机、CORS 白名单、`/metrics` 挂载、连接文件）、`web/api.py`（`_ident` 标识符白名单覆盖 db/table/order_by/列名、`POST /connections`、`/connections/test` 仅 admin + 主机白名单、登录常量时间 + 延迟）、`web/start.py`（默认回环、`--connections-file`/`--admin-password`）、新增 `tests/test_web_security.py`（22 例） |
-| B 协议事务失效 | ⏳ 未修 | 见 §B（下一优先级） |
-| C 类型约束不校验 | ⏳ 未修 | 见 §C |
-| E 复制不可用 | ⏳ 未修 | 见 §E（建议先摘牌） |
-| F DDL 假成功（VARCHAR PK / 触发器） | ⏳ 未修 | 见 §F |
+| A 默认认证/监听/连接限制 | ✅ **已修复**（commit `15476dc`） | `lightdb/db/database.py`（随机口令 + 旧库迁移）、`lightdb/config.py`（host 默认回环 + 2 个新配置字段）、`lightdb/main.py`/`main_v4.py`（`--root-password`/`--allow-empty-password`）、`lightdb/net/master.py`/`worker.py`（host 兜底与配置透传）、`lightdb/net/server.py`（`verify_request/shutdown_request` 准入：总量/per-IP/白名单 + 失败登录延迟）、`tests/conftest.py`（显式降级 env）、新增 `tests/test_auth_defaults.py`（11 例）、`run_studio.*`（本地 demo 显式降级）、`docker/entrypoint*.sh`（随机口令生成/输出一次） |
+| D Web 安全四项 + 连接管理 | ✅ **已修复**（commit `9bf0486`） | `web/auth.py`（SECRET 改为 env/持久化/随机 + alg/exp 校验）、`web/server.py`（删默认用户、用户来源 env/参数/自动随机、CORS 白名单、`/metrics` 挂载、连接文件）、`web/api.py`（`_ident` 标识符白名单覆盖 db/table/order_by/列名、`POST /connections`、`/connections/test` 仅 admin + 主机白名单、登录常量时间 + 延迟）、`web/start.py`（默认回环、`--connections-file`/`--admin-password`）、新增 `tests/test_web_security.py`（22 例） |
+| B 协议事务失效 | ✅ **已修复**（commit `ec41025`） | `lightdb/net/server.py`：连接级 session（txn/autocommit/variables/user_vars）替代每语句临时 dict、断连 `db.abort` 回滚、`SET autocommit/NAMES/@var` 真实生效、OK/EOF 状态位、SQLSTATE 透传与 errno 映射；新增 `tests/test_wire_transaction.py`（9 例） |
+| C 类型约束不校验 | ✅ **已修复**（commit `1c26527`） | 新增 `lightdb/db/typecheck.py`（1264/1406/1292/1366/1048/3140 带 errno+sqlstate）；`db/table.py` 的 `coerce` 委托校验、INSERT/UPDATE 补 PK/NOT NULL（用 `_OMITTED` 哨兵区分省略与显式 NULL）；`sql/executor.py` 错误分支优先取异常 errno/sqlstate；新增 `tests/test_type_constraints.py`（10 例） |
+| E 复制不可用 | ✅ **已摘牌 + 状态语义修正**（commit `59783e7`） | README 新增「🔁 复制支持边界」（实验性/单向/位点会回退/checkpoint 丢事件/DDL 不复制/无 START SLAVE/不可用于生产）；`replication/slave.py` 新增 `_infer_errno_from_text`，保证「有 `Last_SQL_Error` ⇒ `Last_SQL_Errno` 非 0」；新增 `tests/test_replication_honesty.py`（6 例）。**未做真 binlog 重写**（需 1–2 周，见 §E 中期方案） |
+| F DDL 假成功（VARCHAR PK / 触发器） | ✅ **已修复**（commit `59783e7`） | parser 定义期拒绝非整型主键（1064）；`sql/trigger.py` 新增 `validate_trigger_body`（PLParser + 运行期同套语句形态 + NEW/OLD 列存在性），CREATE 落库前校验、坏体 1064/1054 不写入；新增 `DROP TRIGGER [IF EXISTS]` 与 `SHOW TRIGGERS`；新增 `tests/test_ddl_fakesuccess.py`（6 例） |
+
+**B/C 修复后 Lead 验收**：`tests/test_wire_transaction.py` + `tests/test_type_constraints.py` = **19 passed**；
+B 专项回归 143 passed（另 8 个线协议文件 55 passed / 5 failed 均既有）；C 专项 234 passed、额外回归 114 passed。
 
 **Lead 独立验收（A）**：
 ```
@@ -455,7 +459,7 @@ python -m benchmarks.run --suite quick --gate
 
 ---
 
-## I. A/D 修复后的实测结果（2026-10-19）
+## I. A/D + B/C/F/E 修复后的实测结果（2026-10-19）
 
 ### I.1 全量测试（修复后，与修复前对照）
 
@@ -509,17 +513,53 @@ python -m benchmarks.run --suite quick --gate
   默认口令 401、标识符注入 400、CORS 白名单、`/metrics` 挂载、`POST /connections`
   仅 admin、未配置连接 404 语义保持等。
 
-### I.4 修复后的残余风险（已记录，未在本次范围内解决）
+### I.4 P1（B/C/F/E）修复后的实测结果
 
-1. **协议事务仍失效（B）**、**类型约束仍不校验（C）**、**复制仍不可用（E）**、
-   **DDL 假成功（F：VARCHAR PK / 触发器）** —— 这四项按用户选择留待后续。
-2. 多进程 Worker 自 accept 循环未接入准入检查（限流/白名单只在单进程路径生效；认证在
+```powershell
+python -m pytest tests -q -p no:cacheprovider
+# → 24 failed, 777 passed, 23 skipped, 1 xfailed, 1 warning in 694.54s
+python -m benchmarks.run --suite quick --gate      # → PASS 5/5
+```
+
+| 指标 | P0 后（A/D） | P1 后（B/C/F/E） | 说明 |
+|---|---:|---:|---|
+| 用例总数 | 794 | **825** | +31（B 9 + C 10 + F 6 + E 6） |
+| passed | 746 | **777** | +31，新增用例全部通过 |
+| failed | 24 | **24** | 与 P0 后**逐条相同**（集合对比：new-only=[]、gone=[]）→ 零回归 |
+| skipped / xfailed | 23 / 1 | 23 / 1 | — |
+
+**性能门禁（P1 后）**：PASS 5/5 —— 逐行 INSERT 3,928 rows/s（门槛 1,000；比 P0 后的 6,118
+低，属类型校验开销 + 同机漂移，仍远高于门槛）、批量/逐行 1.512×（≥1.2）、点查 1,404 q/s
+（≥600）、WAL 468.6 KB（≤32 MB）、崩溃恢复 0.543 s（<5 s）、丢/漏行 0。
+
+**B 验收**（Lead 复跑）：`tests/test_wire_transaction.py` 9 例全绿；`BEGIN;INSERT;ROLLBACK`
+后两连接 0 行、`COMMIT` 后 1 行、未提交互不可见、`SET autocommit=0/1` 生效、断连回滚、
+`test_mysql_connect` 等 143 例回归通过。
+**C 验收**：`tests/test_type_constraints.py` 10 例全绿；指定 234 例 + 额外 114 例回归通过。
+**F 验收**：`tests/test_ddl_fakesuccess.py` 6 例全绿；batch7/8+ddl_p1 73 例、v4_sql_features
+130 例回归通过；非整型 PK 定义期 1064、坏触发器定义期失败且表可写、`DROP TRIGGER` 可用。
+**E 验收**：`tests/test_replication_honesty.py` 6 例全绿（`Last_SQL_Errno` 语义）；README
+复制段已摘牌且文档门禁 `test_olap_not_wired.py` 全绿。
+
+### I.5 修复后的残余风险（记录，未在本轮解决）
+
+1. **BIGINT 主键仍受 uint32 限制**：F1 允许 `BIGINT` 作主键，但主键 B+Tree 键仍按 uint32
+   落盘，取值 > 4,294,967,295 时 INSERT 仍会 1105（显式报错，非静默）；根治需改键编码。
+2. **Python API 建表未加同级校验**：`db.create_table(cols=[...primary=True])` 不走 SQL 解析器，
+   非整型主键不会被定义期拒绝（仅 SQL 路径生效）。
+3. **旧数据目录中的坏触发器不会自动禁用**：升级前已落库的坏体触发器在首次触发时仍报错，
+   需用新增的 `DROP TRIGGER` 自助清理（文档已说明）。
+4. **复制仍为实验性**：本轮只做摘牌 + 状态语义，未做 append-only binlog（1–2 周工程）。
+5. 多进程 Worker 自 accept 循环未接入准入检查（限流/白名单只在单进程路径生效；认证在
    握手阶段、多进程同样生效）。
-3. Windows 上 `chmod 0600` 无实际效果；`root.password` 等文件依赖目录 ACL。
-4. `docker-compose.v4/multi` 绕过 entrypoint 直接启动服务：随机口令只落数据卷，需
+6. Windows 上 `chmod 0600` 无实际效果；`root.password` 等文件依赖目录 ACL。
+7. `docker-compose.v4/multi` 绕过 entrypoint 直接启动服务：随机口令只落数据卷，需
    `docker exec` 读取或显式注入环境变量。
-5. Web 前端已去掉预填默认口令与旧测试账号提示；若部署方未配置 `LIGHTDB_WEB_USERS`，
-   需按启动日志给出的 `web_admin.txt` 路径读取随机口令。
+8. Web 前端已去掉预填默认口令与旧测试账号提示；未配置 `LIGHTDB_WEB_USERS` 时需读取
+   `web_admin.txt`。
+9. B 的遗留：`executor._active_session` 仍为全局共享（并发嵌套子查询的会话串用风险，既有）；
+   无事务 SELECT 的 read view 不主动释放属 executor/db 层既有泄漏；`SET PASSWORD POLICY`
+   经协议仍 ACK 不生效（保持旧行为）。
 
 ---
 
