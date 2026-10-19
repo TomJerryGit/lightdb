@@ -621,6 +621,9 @@ class PlanExecutor:
         elif kind == 'arith':
             PlanExecutor._check_expr_functions(node.get('left'), position)
             PlanExecutor._check_expr_functions(node.get('right'), position)
+        elif kind == 'between':
+            for key in ('operand', 'low', 'high'):
+                PlanExecutor._check_expr_functions(node.get(key), position)
 
     @staticmethod
     def _row_agg_values(cols, row):
@@ -637,7 +640,7 @@ class PlanExecutor:
         cols, rows = self.execute(node.children[0])
 
         from .parser import (parse_scalar_expr, expr_has_func,
-                             _split_select_alias)
+                             expr_has_between, _split_select_alias)
 
         target_idx = []
         raw_cols = []
@@ -681,7 +684,9 @@ class PlanExecutor:
                     # 标量函数 / 含函数或嵌套的算术（`LOWER(u.name)`、
                     # `o.amt * 2 + 1`）：逐行用表达式求值器算
                     fnode = parse_scalar_expr(expr_text)
-                    if fnode is None or not (expr_has_func(fnode) or alias):
+                    if fnode is None or not (
+                            expr_has_func(fnode)
+                            or expr_has_between(fnode) or alias):
                         raise
                     self._check_expr_functions(fnode, '投影')
                     target_idx.append(-2)
