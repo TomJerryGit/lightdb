@@ -324,20 +324,12 @@ def test_execute_sql_error_path_with_fake_connection(studio_window, monkeypatch)
     assert shown.strip() != '错误'
 
 
-@pytest.mark.xfail(strict=False, reason=(
-    '已知缺陷（只记录、不修）：ResultTable.show_message() 漏调 '
-    '_hide_error_view()，上一次错误的错误视图会一直留在结果区'))
-def test_known_defect_show_message_keeps_stale_error(studio_window):
-    """已知缺陷（**只记录、不修**）：`show_message` 不清错误视图。
+def test_show_message_hides_stale_error(studio_window):
+    """P0-6：`show_message` 必须收起上一次错误的错误视图。
 
     `ResultTable.show_message()`（改完 INSERT/UPDATE 之类无结果集的语句
-    走这条）没有调用 `_hide_error_view()`，于是上一次错误的错误视图会
-    **一直留在结果区**，而 `table` 仍是隐藏的：用户看到的报错已经过期。
-    `show_result()`/`clear()` 都调用了 `_hide_error_view()`，只有
-    `show_message()` 漏了。
-
-    这里以 xfail 记录（strict=False）：修好之后会变成 xpass，不会卡门禁；
-    没修也不会污染门禁，但缺陷留在案。
+    走这条）此前漏调 `_hide_error_view()`，上一次错误的错误视图会一直留在
+    结果区（旧 xfail 记录）。P0 已修复：错误视图收起、表格恢复显示。
     """
     _require_gui()
     result = _result(studio_window)

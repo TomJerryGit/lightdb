@@ -59,26 +59,14 @@ def __getattr__(name):
     """
     PEP 562 延迟导入。
     这样 `import lightdb_studio` 不会拉起 PySide6 / FastAPI。
+
+    注意：**不能**写 `from . import config`。在包内有 `__getattr__` 时，
+    外层 `from lightdb_studio import config` 会先触发本函数，而函数内部的
+    `from . import config` 又走一次 fromlist 处理 → 相互递归
+    （RecursionError）。用 `importlib.import_module` 直接导入子模块，
+    导入完成后 Python 会自动把它 setattr 到包上。
     """
-    if name == 'app':
-        from . import app
-        return app
-    if name == 'config':
-        from . import config
-        return config
-    if name == 'core':
-        from . import core
-        return core
-    if name == 'ui':
-        from . import ui
-        return ui
-    if name == 'db':
-        from . import db
-        return db
-    if name == 'net':
-        from . import net
-        return net
-    if name == 'utils':
-        from . import utils
-        return utils
+    import importlib
+    if name in ('app', 'config', 'core', 'ui', 'db', 'net', 'utils'):
+        return importlib.import_module(f'.{name}', __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

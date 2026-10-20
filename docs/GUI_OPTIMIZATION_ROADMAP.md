@@ -44,7 +44,7 @@
 4. **不重复实现引擎语义**：事务/权限/SQL 语义仍在引擎；GUI 只做展示、交互与安全存储。
 5. **不加"演示性假功能"**：现有未接线面板宁可隐藏/降级，也不要伪造数据。
 
-## 2. P0 —— 正确性与安全快赢（1–2 周，建议先做）
+## 2. P0 —— 正确性与安全快赢（✅ 2026-10-20 已完成，见 §9）
 
 | 项 | 做法 | 涉及文件 | 验收 | 估算 |
 |---|---|---|---|---|
@@ -124,3 +124,24 @@
 - Studio/Web 分析：[03_studio_web.md](analysis_2026-10-19/03_studio_web.md)
 - 可复用 GUI 驱动：`_analysis_tmp/gui_full/gui_driver.py`（45 场景真实 UI 路径）
 - 截图证据：`_analysis_tmp/gui_full/shots/`（77 张）
+
+## 9. 实施记录：P0 已完成（2026-10-20）
+
+六项全部落地，新增/修改文件与验收证据如下（真实 GUI 路径 + offscreen 测试）：
+
+| P0 项 | 实现 | 验收证据 |
+|---|---|---|
+| 数值/日期感知排序 | `ui/result_table.py`：单元格保存原始值（`Qt.UserRole`），`sort_by()` 类型化 key 重排；NULL 恒排末尾；表头点击双向 | 88.5<270.5、负数/小数、NULL 固定、表头 QTest 点击；`tests/test_studio_p0_ui.py`（12 例） |
+| 结果过滤条 | 输入框 + 列下拉 + 大小写 + 清空 + "显示 X/Y 行"；行级 `setRowHidden`（不查库）；空态提示 | `paid` → 300/1200 行、**40.6ms**、清空恢复、排序叠加；同 12 例测试 |
+| 快照唯一性/去重 | `core/snapshot.py`：同名自动 `_2/_3` 并返回实际名；`remove` 删全部同名；`list_all()` 去重；旧索引迁移（文件保留）并告警 | p0_snap / p0_snap_2；`tests/test_snapshot_unique.py`（10 例） |
+| 本地口令加密 | 新增 `core/credentials.py`：Windows DPAPI（ctypes，无新依赖）/非 Windows Fernet 回退/显式 plain 回退；`config.save()` 加密、`load()` 解密 + 旧明文自动迁移 | `tests/test_studio_credentials.py`（8 例：往返/落盘无明文/迁移/损坏保留连接） |
+| 连接测试 + 密码显示 | `ui/connection_dialog.py`：已有"测试连接"（复用 2003/1045 可行动错误提示）；新增显示/隐藏切换 | 对话框 offscreen 测试；`1045→权限、2003→连接` 分类复用 |
+| 错误面板统一 | `ui/result_table.py`：查询/权限/连接三类分类 + 复制按钮（写入剪贴板）；顺带修复 `show_message()` 陈旧错误视图缺陷（旧 xfail 转正） | `tests/test_studio_p0_ui.py` + `tests/test_studio_smoke.py`（xfail 移除） |
+| 附带修复 | `lightdb_studio/__init__.py` PEP 562 `__getattr__` 用 `from . import X` 会 RecursionError（被 `from lightdb_studio import config` 触发）→ 改 `importlib.import_module` | `test_package_lazy_import_fromlist_does_not_recurse` |
+
+**验证汇总**：P0 新增测试 **30 passed**；Studio/snapshot 回归 **104 passed + 1 xpassed**（原 xfail 已转正）；
+真实 GUI + 8898 端到端 `p0_ui_check.py` **4/4 PASS**、10 张截图（`_analysis_tmp/gui_full/shots_p0/`）；
+全量 pytest 见 README 测试基线。遗留风险：ResultTable 不再走 Qt 内置排序（外部直接调
+`table.sortItems()` 仍是文本序，代码内已改为 `sort_by`）；旧索引迁移同名保留最新、旧 .sql 文件
+仍留盘（UI 告警）；非 Windows 平台无 cryptography 时退化为显式 `plain:` 并告警。
+

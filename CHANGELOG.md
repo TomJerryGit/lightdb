@@ -70,6 +70,22 @@
   排序、无过滤 UI、快照同名不去重）与 2 条已知引擎限制（标量子查询比较右值、
   触发器 NEW 列数值表达式）——均显式报错、不静默错答。报告见
   [`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`](docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md)。
+- **GUI 优化路线 P0 已实施（2026-10-20，用户要求）**：六项正确性/安全快赢全部落地：
+  ① 结果表**数值/日期感知排序**（NULL 恒末尾，表头双向，88.5<270.5）；
+  ② **结果过滤条**（列选择+大小写+清空+空态，1200 行过滤 40.6ms，不查库）；
+  ③ **快照唯一性**（同名自动 `_2/_3` 并返回实际名、remove 删除全部同名、list_all
+  去重、旧索引迁移告警）；
+  ④ **本地口令加密**（新增 `core/credentials.py`：Windows DPAPI ctypes / 非 Windows
+  Fernet / 显式 plain 回退；`connections.json` 不再明文，旧明文首次加载自动迁移，
+  解密失败保留连接并显式告警）；
+  ⑤ 连接对话框**口令显示/隐藏**（“测试连接”沿用 2003/1045 可行动错误提示）；
+  ⑥ **错误面板统一**（查询/权限/连接分类 + 复制按钮），并修复 `show_message()`
+  陈旧错误视图（旧 xfail 转正）；附带修复 `lightdb_studio/__init__.py` 包级延迟导入
+  `from . import X` 的 RecursionError。
+  新增 `lightdb_studio/core/credentials.py` 与
+  `tests/test_studio_credentials.py`（8）/`tests/test_studio_p0_ui.py`（12）/
+  `tests/test_snapshot_unique.py`（10）；真实 GUI 端到端 4/4 PASS、10 张截图。
+  路线图与验收记录见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §9。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

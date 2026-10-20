@@ -169,17 +169,80 @@ class SnapshotManager:
     def _load_index(self):
         if not self._index_path().exists():
             return
+        path = self._index_path()
         try:
-            with open(self._index_path(), 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            for s in data.get('snapshots', []):
-                self.snapshots.append(Snapshot(**s))
         except Exception as exc:
             # 索引损坏属于非关键路径（不影响新建快照），但绝不能静默：
             # 记进可读的告警清单并打印到 stderr，避免"快照列表空了"却无人知道。
-            msg = f"快照索引 {self._index_path()} 读取失败: {exc}"
+            msg = f"快照索引 {path} 读取失败: {exc}"
             self.index_warnings.append(msg)
             print(f"[snapshot] WARN {msg}", file=sys.stderr)
+            return
+
+        loaded: List[Snapshot] = []
+        for s in data.get('snapshots', []):
+            try:
+                loaded.append(Snapshot(**s))
+            except Exception as exc:
+                msg = f"快照索引条目无法解析，已跳过: {s!r} ({exc})"
+                self.index_warnings.append(msg)
+                print(f"[snapshot] WARN {msg}", file=sys.stderr)
+
+        # 旧索引迁移（P0-3）：历史上同名快照会累积重复索引项。这里按
+        # 「同名只保留 created_at 最新的一条」合并索引；**磁盘文件一律保留**，
+        # 不做删除（文件可能被用户引用/手工管理）。
+        migrated = self._migrate_snapshots(loaded)
+        merged = len(loaded) - len(migrated)
+        if merged:
+            msg = (f"旧快照索引迁移：合并 {merged} 条重复记录"
+                   f"（同名保留最新；{len(migrated)} 条入索引，文件均保留）")
+            self.index_warnings.append(msg)
+            print(f"[snapshot] WARN {msg}", file=sys.stderr)
+        self.snapshots = migrated
+        if merged:
+            try:
+                self._save_index()
+            except Exception as exc:
+                msg = f"旧快照索引迁移写回失败: {exc}"
+                self.index_warnings.append(msg)
+                print(f"[snapshot] WARN {msg}", file=sys.stderr)
+
+    @staticmethod
+    def _migrate_snapshots(snapshots: List[Snapshot]) -> List[Snapshot]:
+        """旧索引迁移：同名重复项保留 created_at 最新一条，文件不动。"""
+        by_name = {}
+        order = []
+        for s in snapshots:
+            if s.name not in by_name:
+                by_name[s.name] = s
+                order.append(s.name)
+            elif s.created_at >= by_name[s.name].created_at:
+                by_name[s.name] = s
+        return [by_name[n] for n in order]
+
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        """快照名只能是单层文件名：去掉路径分隔符/上级引用等。"""
+        base = str(name or '').strip()
+        if not base:
+            base = f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}"
+        for ch in ('/', '\\', ':', '*', '?', '"', '<', '>', '|'):
+            base = base.replace(ch, '_')
+        base = base.replace('..', '_').strip('. ')
+        return base or f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    def _unique_name(self, name: str) -> str:
+        """同名已存在（索引或文件）时自动加 `_2`/`_3`… 后缀。"""
+        name = self._sanitize_name(name)
+        existing = {s.name for s in self.snapshots}
+        candidate = name
+        i = 2
+        while candidate in existing or (self.dir / f"{candidate}.sql").exists():
+            candidate = f"{name}_{i}"
+            i += 1
+        return candidate
 
     def _save_index(self):
         data = {'snapshots': [asdict(s) for s in self.snapshots]}
@@ -232,9 +295,16 @@ class SnapshotManager:
         返回 `SnapshotResult` 而不是抛异常，是为了让 GUI 能逐条展示失败清单；
         失败细节一律不丢。`strict=False` 保留旧调用习惯，返回 `Snapshot`
         （失败时抛 `RuntimeError`，绝不返回"成功"的快照对象）。
+
+        同名处理（P0-3）：请求的名字已被占用（索引里有同名条目，或目录里已有
+        同名 `.sql`）时，自动改用 `name_2`/`name_3`… 唯一名；**实际名字**在
+        `result.snapshot.name`（`strict=False` 时即返回的 Snapshot.name）。
         """
         if not name:
             name = f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}"
+        # P0-3：同名自动加唯一后缀（旧行为会覆盖 .sql 文件并累积重复索引）
+        requested_name = name
+        name = self._unique_name(name)
 
         failures: List[SnapshotFailure] = []
         incomplete: List[str] = []
@@ -676,29 +746,51 @@ class SnapshotManager:
             result['error'] = f"{failed} 张表克隆失败（成功 {ok} 张）"
         return result
 
-    def remove(self, name: str):
-        for i, s in enumerate(self.snapshots):
-            if s.name == name:
-                try:
-                    if os.path.exists(s.file):
-                        os.unlink(s.file)
-                except Exception as exc:
-                    # 非关键路径：删除失败必须让调用方知道，不能"假装删掉了"
-                    self.index_warnings.append(
-                        f"删除快照文件失败 {s.file}: {exc}")
-                    print(f"[snapshot] WARN 删除快照文件失败 {s.file}: {exc}",
-                          file=sys.stderr)
-                    return False
-                del self.snapshots[i]
-                self._save_index()
-                return True
-        return False
+    def remove(self, name: str) -> bool:
+        """删除**所有**同名快照（索引项 + 磁盘文件）。
 
-    def get(self, name: str) -> Optional[Snapshot]:   # ★ 修复：Optional 已 import
-        for s in self.snapshots:
-            if s.name == name:
-                return s
-        return None
+        旧实现只删第一个同名条目，重复索引会残留；P0-3 起全部删除。
+        返回 True = 全部索引项已移除且文件都删成功/原本不存在；
+        False = 没有任何同名条目，或有文件删除/索引写回失败（告警里留痕）。
+        """
+        matches = [s for s in self.snapshots if s.name == name]
+        if not matches:
+            return False
+        ok = True
+        for s in matches:
+            try:
+                if s.file and os.path.exists(s.file):
+                    os.unlink(s.file)
+            except Exception as exc:
+                # 非关键路径：删除失败必须让调用方知道，不能"假装删掉了"
+                ok = False
+                msg = f"删除快照文件失败 {s.file}: {exc}"
+                self.index_warnings.append(msg)
+                print(f"[snapshot] WARN {msg}", file=sys.stderr)
+        self.snapshots = [s for s in self.snapshots if s.name != name]
+        try:
+            self._save_index()
+        except Exception as exc:
+            ok = False
+            msg = f"删除快照后写索引失败: {exc}"
+            self.index_warnings.append(msg)
+            print(f"[snapshot] WARN {msg}", file=sys.stderr)
+        return ok
+
+    def get(self, name: str) -> Optional[Snapshot]:
+        """按名字取快照；同名多条时返回 created_at 最新的一条。"""
+        matches = [s for s in self.snapshots if s.name == name]
+        if not matches:
+            return None
+        return max(matches, key=lambda s: s.created_at)
 
     def list_all(self) -> List[Snapshot]:
-        return sorted(self.snapshots, key=lambda x: -x.created_at)
+        """按创建时间倒序列出快照；**同名只返回最新一条**（防重复索引）。"""
+        seen = set()
+        out: List[Snapshot] = []
+        for s in sorted(self.snapshots, key=lambda x: -x.created_at):
+            if s.name in seen:
+                continue
+            seen.add(s.name)
+            out.append(s)
+        return out

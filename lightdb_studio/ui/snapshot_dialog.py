@@ -47,6 +47,13 @@ class SnapshotDialog(QDialog):
         self.list_widget.itemSelectionChanged.connect(self._on_select)
         sl.addWidget(self.list_widget)
 
+        # 旧索引迁移/删除失败等告警（P0-3）：不静默，显示在列表上方。
+        self.index_warn_label = QLabel("")
+        self.index_warn_label.setWordWrap(True)
+        self.index_warn_label.setStyleSheet("color: #d7ba7d;")
+        self.index_warn_label.setVisible(False)
+        sl.insertWidget(sl.indexOf(self.list_widget), self.index_warn_label)
+
         row = QHBoxLayout()
 
         create_btn = QPushButton("➕ 创建快照")
@@ -104,6 +111,14 @@ class SnapshotDialog(QDialog):
     def _refresh_list(self):
         snaps = self.mgr.list_all()
         self.list_widget.setRowCount(len(snaps))
+        # P0-3：旧索引迁移/删除失败等告警显示在列表上方，不静默。
+        warnings = list(getattr(self.mgr, 'index_warnings', []))[-3:]
+        if warnings:
+            self.index_warn_label.setText(
+                "⚠ 快照索引告警：" + "；".join(warnings))
+            self.index_warn_label.setVisible(True)
+        else:
+            self.index_warn_label.setVisible(False)
         for r, s in enumerate(snaps):
             self.list_widget.setItem(r, 0, QTableWidgetItem(s.name))
             self.list_widget.setItem(r, 1, QTableWidgetItem(s.connection))
@@ -145,6 +160,7 @@ class SnapshotDialog(QDialog):
             text=f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         if not ok or not name.strip():
             return
+        requested_name = name.strip()
 
         progress = QProgressDialog("创建快照...", "取消", 0, 100, self)
         progress.setWindowModality(Qt.WindowModal)
@@ -155,7 +171,7 @@ class SnapshotDialog(QDialog):
 
         try:
             result = self.mgr.create_snapshot(
-                conn, name.strip(), progress_cb=cb)
+                conn, requested_name, progress_cb=cb)
             progress.close()
         except Exception as e:
             progress.close()
@@ -172,9 +188,16 @@ class SnapshotDialog(QDialog):
             return
 
         snap = result.snapshot
+        # P0-3：同名时 core 会自动加 _2/_3 后缀，这里把**实际名字**告诉用户
+        actual_name = snap.name
+        prefix = ""
+        if actual_name != requested_name:
+            prefix = (f"同名快照「{requested_name}」已存在，"
+                      f"已自动命名为「{actual_name}」。\n\n")
         QMessageBox.information(
             self, "完成",
-            f"快照已创建:\n{snap.file}\n"
+            prefix + f"快照已创建:\n{snap.file}\n"
+            f"名称: {actual_name}\n"
             f"大小: {snap.size / 1024:.1f} KB\n"
             f"表数: {len(snap.tables)}")
         self._refresh_list()
@@ -227,9 +250,18 @@ class SnapshotDialog(QDialog):
         if not snap:
             return
         ret = QMessageBox.question(
-            self, "确认", f"删除快照 '{snap.name}'？")
+            self, "确认",
+            f"删除快照 '{snap.name}'？\n（同名重复条目会被一并删除）")
         if ret == QMessageBox.Yes:
-            self.mgr.remove(snap.name)
+            removed = self.mgr.remove(snap.name)
+            if not removed:
+                # remove 返回 False 可能是"没有该条目"，也可能是文件/索引写回失败；
+                # 具体原因在 mgr.index_warnings 里（界面尽量不静默）。
+                QMessageBox.warning(
+                    self, "删除未完全成功",
+                    "快照条目未全部删除或文件删除/索引写回失败，"
+                    "详情见程序 stderr 告警。\n"
+                    + "\n".join(self.mgr.index_warnings[-3:]))
             self._refresh_list()
 
     def _clone(self):

@@ -94,7 +94,17 @@ class ConnectionDialog(QDialog):
         self.pwd_edit = QLineEdit()
         self.pwd_edit.setEchoMode(QLineEdit.Password)
         self.pwd_edit.setPlaceholderText("（可空）")
-        form.addRow("密码:", self.pwd_edit)
+        self.pwd_edit.setObjectName('pwd_edit')
+        pwd_row = QHBoxLayout()
+        pwd_row.setContentsMargins(0, 0, 0, 0)
+        pwd_row.addWidget(self.pwd_edit, 1)
+        self.pwd_toggle_btn = QPushButton("显示")
+        self.pwd_toggle_btn.setCheckable(True)
+        self.pwd_toggle_btn.setFixedWidth(52)
+        self.pwd_toggle_btn.setToolTip("显示/隐藏口令（只影响本对话框显示）")
+        self.pwd_toggle_btn.toggled.connect(self._toggle_password_visibility)
+        pwd_row.addWidget(self.pwd_toggle_btn)
+        form.addRow("密码:", pwd_row)
 
         self.db_edit = QLineEdit()
         self.db_edit.setPlaceholderText("（可空）")
@@ -281,6 +291,12 @@ class ConnectionDialog(QDialog):
             charset=self.charset_combo.currentText(),
             ssl=self.ssl_check.isChecked(),
         )
+
+    def _toggle_password_visibility(self, visible: bool):
+        """显示/隐藏口令。只改输入框回显方式，不改变保存值。"""
+        self.pwd_edit.setEchoMode(
+            QLineEdit.Normal if visible else QLineEdit.Password)
+        self.pwd_toggle_btn.setText("隐藏" if visible else "显示")
 
     def _test_connection(self):
         info = self._collect()

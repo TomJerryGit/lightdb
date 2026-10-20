@@ -102,22 +102,58 @@ class AppConfig:
     def load(self):
         if not CONFIG_FILE.exists():
             return
+        migrate = False
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             for c in data.get('connections', []):
                 try:
-                    self.connections.append(_connection_from_dict(c))
+                    conn = _connection_from_dict(c)
+                    stored = conn.password or ''
+                    if stored:
+                        try:
+                            from .core.credentials import (
+                                decrypt_password, is_encrypted)
+                            conn.password = decrypt_password(stored)
+                            if not is_encrypted(stored):
+                                # 旧版明文：迁移标记（load 结束后统一重写加密）
+                                migrate = True
+                        except Exception as e:     # noqa: BLE001
+                            # 解密失败（换 Windows 用户/换机器/密文损坏）：
+                            # 保留连接、口令置空，并**显式告警**；不静默丢弃
+                            # 整条连接，也不静默当"口令正确但为空"。
+                            print(f"连接 {conn.name!r} 的口令无法解密，"
+                                  f"已置空（请重新输入）: {e}",
+                                  file=sys.stderr)
+                            conn.password = ''
+                    self.connections.append(conn)
                 except Exception as e:            # noqa: BLE001
                     # 单条写坏不该拖垮其余连接（以前是整份配置全丢）
                     print(f"跳过无法解析的连接配置 {c!r}: {e}", file=sys.stderr)
             self.last_connection = data.get('last_connection', '')
         except Exception as e:
             print(f"加载配置失败: {e}", file=sys.stderr)
+            return
+        if migrate:
+            try:
+                self.save()
+                print('已将旧版明文连接口令迁移为加密存储', file=sys.stderr)
+            except Exception as e:                # noqa: BLE001
+                print(f"口令加密迁移失败（保留旧明文文件）: {e}",
+                      file=sys.stderr)
 
     def save(self):
+        from .core.credentials import encrypt_password
+        serialized = []
+        for c in self.connections:
+            d = asdict(c)
+            # 落盘前加密；空口令保持空串（不制造无意义密文）。
+            # schema 仍是原 8 键（password 字段存密文），cloud_sync 等
+            # 既有读取方不会被新键破坏。
+            d['password'] = encrypt_password(c.password or '')
+            serialized.append(d)
         data = {
-            'connections': [asdict(c) for c in self.connections],
+            'connections': serialized,
             'last_connection': self.last_connection,
         }
         tmp = CONFIG_FILE.with_suffix('.tmp')

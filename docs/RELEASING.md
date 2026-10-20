@@ -22,7 +22,7 @@
 
 | 步骤 | 命令/步骤 | 结果 |
 |---|---|---|
-| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1029 用例 = 988 passed / 0 failed / 39 skipped / 2 xfailed**（12:44；纯 Python Cython 回退） |
+| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1059 用例 = 1018 passed / 0 failed / 39 skipped / 1 xfailed / 1 xpassed**（17:30；纯 Python Cython 回退；GUI P0 后） |
 | 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致） |
 | 打包检查 | `python scripts/check_packaging.py` | PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源） |
 | 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS（提交 GUI 验证报告后复跑通过） |

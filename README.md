@@ -153,6 +153,11 @@
   引擎限制。详见 [`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`](docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md)；
   GUI 后续优化路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md)
   （P0 正确性/安全 → P1 响应性 → P2 功能深度 → P3 工程质量）。
+- **GUI P0 已实施（2026-10-20）**：结果表**数值/日期感知排序**（NULL 恒末尾）、**结果过滤条**
+  （1200 行 40.6ms、不查库）、**快照同名自动唯一 + 旧索引迁移**、**连接口令本地加密**
+  （Windows DPAPI；`connections.json` 不再明文，旧明文自动迁移）、连接对话框**口令显示/隐藏**、
+  **错误面板分类 + 复制**（查询/权限/连接），并修复 `show_message()` 陈旧错误视图与包级
+  延迟导入 RecursionError。P0 新测试 30 passed，真实 GUI 端到端 4/4 PASS；详见路线图 §9。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip
@@ -220,10 +225,10 @@
   [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
   顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
 
-- 一次完整测试运行的结果（2026-10-20，dispatch 默认开启 + Cython 回退 + 全量验证修复之后）：
-  **1029 个用例中 988 通过 / 0 失败 / 39 跳过 / 2 xfailed**（12:44，纯 Python 回退运行时；
-  较上一轮 +13 例：UNION 协议回归 2 例、Cython 编译对拍 8 例（无产物环境自动 skip）、
-  dispatch 默认开启契约 3 例），skip/xfail 均带明确原因，见下方「测试套件」说明与
+- 一次完整测试运行的结果（2026-10-20，GUI P0 + dispatch 默认开启 + Cython 回退之后）：
+  **1059 个用例中 1018 通过 / 0 失败 / 39 跳过 / 1 xfailed / 1 xpassed**（17:30，
+  纯 Python 回退运行时；较上一轮 +30 例：GUI P0 新增测试，1 条旧 xfail 已修复转正），
+  skip/xfail 均带明确原因，见下方「测试套件」说明与
   [docs/analysis_2026-10-19/06_ROADMAP.md](docs/analysis_2026-10-19/06_ROADMAP.md) §1）。
 
 ### ✅ 本次会话已修复（2026-10，含实测验证）
@@ -342,7 +347,7 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**（2026-10-20 dispatch 默认开启/全量验证后的门禁基线）：**1029 用例 = 988 通过 / 0 失败 / 39 跳过 / 2 xfailed**（12:44；纯 Python Cython 回退运行时；本轮优化开始时是 150 通过 / 118 失败）。**失败数保持 0**——原 24 条失败按根因处置：
+**测试套件**（2026-10-20 GUI P0/全量验证后的门禁基线）：**1059 用例 = 1018 通过 / 0 失败 / 39 跳过 / 1 xfailed / 1 xpassed**（17:30；纯 Python Cython 回退运行时；本轮优化开始时是 150 通过 / 118 失败）。**失败数保持 0**——原 24 条失败按根因处置：
 - **真实缺陷已修**：`row_format` DECIMAL 编码 TypeError、CLI `-h/--host` 与 argparse 内建 `-h` 冲突（Windows CLI 必崩）、诊断 CLI 的 emoji 在 GBK 控制台崩溃；权限体系（GRANT/REVOKE/鉴权，已接线，2 条 GRANT 用例恢复为正式测试）；半同步死代码已删除（原 xfail 移除）；
 - **OLAP 4A.5 门禁化**：原 3 条性能类 skip 换成实测基线阈值并恢复正式测试（编码压缩率 2.5x vs 实测 2.78x；OLAP 聚合 2.0M rows/s vs 实测 2.72M；并行 1.2x vs 实测 2.75x，<4 核环境按 reason skip）；新增并行 GROUP BY 门禁与 dispatch 对拍门禁；
 - **带明确 reason 的 skip/xfail**（不是无声绿）：`parser_v3b4` 死代码（×2）、`row_format` 实验格式性能目标、沙箱写权限（×2）、诊断子进程 `DuplicateHandle` 沙箱限制、IPC 延迟阈值防抖、`lineage_enhanced` 列级血缘已知缺陷、mysql-connector 未安装时的端到端 skip；

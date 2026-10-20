@@ -92,6 +92,11 @@ ORDER BY+LIMIT）。
 
 ## 5. Studio UI 缺陷（本轮只登记，未修）
 
+> **后续（2026-10-20 同日）**：这 3 条已在 GUI 路线图 P0 中修复（数值感知排序、
+> 结果过滤条、快照唯一/去重），实现与验收记录见
+> [`../GUI_OPTIMIZATION_ROADMAP.md`](../GUI_OPTIMIZATION_ROADMAP.md) §9；本节保留
+> 验证时的原始记录以便对照。
+
 1. **结果表数值列按字符串字典序排序**：ResultTable 用 `QTableWidgetItem` 文本
    排序，`88.5` 会排在 `270.5` 之前；排序动作本身可用（表头点击有效）。
 2. **结果表无过滤 UI**：仅支持排序；原 `data_grid_enhanced.column_filter` 已随
