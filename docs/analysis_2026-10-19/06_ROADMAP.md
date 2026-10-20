@@ -46,7 +46,9 @@
 | 阶段 0.4/0.5 收尾 | ✅ 发版材料（CHANGELOG/RELEASING/版本标记一致）、仓库卫生（data_* / worktree / 双 LICENSE / 调试产物 / .gitattributes）、`ci.ps1` 可执行性 | commit `d7988b3`；`scripts/check_repo_hygiene.py` PASS |
 | **阶段 1.1 授权体系** | ✅ 已完成（GRANT/REVOKE/SHOW GRANTS + 执行期鉴权 1142/1044/1227 + 协议层元数据过滤；真实 pymysql 端到端） | commit `bb2dce5`；`tests/test_privileges.py` 12 例 |
 | **阶段 1 协议项（COM_STMT）** | ✅ 已完成（PREPARE/EXECUTE/CLOSE/RESET、二进制参数/结果集、1210/1243/1235、PREPARE 鉴权） | commit `02a4e2c`；`tests/test_prepared_statements.py` 16 例 |
-| **决策 2 OLAP 4A.1** | ✅ 正确性止血完成（12 类缺陷 + 91 例对拍矩阵；取消 2 个 skip） | commit `d6170b1`；4A.2 接线待做 |
+| **决策 2 OLAP 4A.1** | ✅ 正确性止血完成（12 类缺陷 + 91 例对拍矩阵；取消 2 个 skip） | commit `d6170b1` |
+| **决策 2 OLAP 4A.2/4A.3** | ✅ 列存/OLAP **显式接入 SQL 路径**（默认关闭 + crosscheck + dispatch_stats；63 例端到端对拍）+ 并行分片重做（GROUP BY w2 实测 2.75x） | commit `d26b7ee` |
+| **决策 2 OLAP 4A.5** | ✅ 两条门禁（并行 GROUP BY ≥1.2x、dispatch 对拍不一致=0）；3 条性能类 skip 换成实测基线阈值并恢复正式测试；quick 门禁由 5 项扩到 7 项 | 本次提交（benchmarks/cases.py + gate.py + tests/regression_v4） |
 | 决策 3 Studio 删除 | ✅ 已完成（134→90 文件；39,256→23,532 行；悬空 import=0） | commit `32f479f` |
 | **决策 4 真 binlog** | ✅ **阶段 1+2 完成**（文件/CRC/位点/SHOW/主从闭环 + 轮转/严格提交/UPDATE·DELETE 镜像快路径；GTID 不做、半同步移除） | commits `903d8e4`、`3b48126`；`test_binlog_append_only.py` 16 + `test_binlog_phase2.py` 19 |
 
@@ -127,13 +129,13 @@
 目标：把 `lightdb/olap/**`、`lightdb/columnar/**`、`lightdb/parallel/**`、`lightdb/cython/**`
 **真正接入 SQL 执行路径**，并把性能数字变成可复跑门禁（不再只是设计目标）。分 5 步：
 
-| 步骤 | 内容 | 验收 |
+| 步骤 | 内容 | 状态 / 验收 |
 |---|---|---|
-| 4A.1 正确性止血 | 修 OLAP 聚合的已知错值：`COUNT` 计 NULL 语义、`AVG` 未实现、`int32` 溢出、列存 `GROUP BY` 返回 0 行、`VectorizedFilter` 列映射；每项加对拍测试（行存结果 == 列存结果） | 对拍矩阵全绿；错误值不再可能进入查询路径 |
-| 4A.2 显式 dispatch | 在 `optimizer`/`plan_executor` 增加**明确的**接入点（按表存储格式/聚合形态），并保证默认行为不变（行存）；`status()` 如实报告哪条路径生效；删除任何"悄悄走到向量化"的分派 | `Executor`/`plan_executor` 对 olap/columnar 有真实引用；查询计划可解释 |
-| 4A.3 并行修正 | 修 `parallel/executor.py` 的负加速（0.55×）：要么做有意义的并行分片（I/O 与解析分离、每表分片），要么**删除并行执行并如实声明单线程**；不允许保留"并行"标签但实测更慢 | 基准同窗成对：并行 ≥1.2× 或彻底移除 |
-| 4A.4 Cython 可验证 | CI 可选安装 Cython + 编译器跑 `build_ext`；无编译器环境显式回退并在 `status()`/日志标明（当前 `any_accelerated=False` 已诚实，但仍未验证过编译） | 至少一次 CI 编译产物成功；回退路径有测试 |
-| 4A.5 门禁化 | 为 OLAP/列存设定**可辩护**阈值（同窗成对、基于实测基线，而非白皮书数字），纳入 `benchmarks.run --gate`；取消本轮为实验性打的 skip | 门禁 PASS 且包含至少 1 项 OLAP/列存指标 |
+| 4A.1 正确性止血 | 修 OLAP 聚合的已知错值：`COUNT` 计 NULL 语义、`AVG` 未实现、`int32` 溢出、列存 `GROUP BY` 返回 0 行、`VectorizedFilter` 列映射；每项加对拍测试 | ✅ 完成：12 类缺陷 + 91 例对拍（`d6170b1`） |
+| 4A.2 显式 dispatch | 在 `optimizer`/`plan_executor` 增加**明确的**接入点（按表存储格式/聚合形态），并保证默认行为不变（行存）；`status()` 如实报告哪条路径生效；删除任何"悄悄走到向量化"的分派 | ✅ 完成：`sql_dispatch.try_vectorized_select` + Executor 钩子（默认关闭、白名单、crosscheck、`dispatch_stats`），63 例对拍（`d26b7ee`）；✅ 不支持形态一律回退行存 |
+| 4A.3 并行修正 | 修 `parallel/executor.py` 的负加速：做有意义的并行分片，或删除并行并如实声明单线程 | ✅ 完成：向量化聚合 64K 分片 + 线程池；GROUP BY w2 2.75x；纯 SUM 加速不足 1.2x → 自动档串行（结果逐值一致） |
+| 4A.4 Cython 可验证 | CI 可选安装 Cython + 编译器跑 `build_ext`；无编译器环境显式回退并在 status/日志标明 | ⏳ 未做（本机无 Cython/编译器；仍是纯 Python 回退，不计入性能声明） |
+| 4A.5 门禁化 | 为 OLAP/列存设定**可辩护**阈值（同窗成对、基于实测基线），纳入 `benchmarks.run --gate`；取消实验性 skip | ✅ 完成：`olap_parallel_groupby_speedup ≥1.2x`、`olap_dispatch_crosscheck_mismatches ==0`；3 条 skip 换实测阈值恢复；quick PASS 7/7（30.6s） |
 
 ### 2.6 真复制专项计划（决策 4：1–2 周，进行中）
 
@@ -169,35 +171,34 @@
 
 ## 4. 建议的"下一个 3 个动作"
 
-> 2026-10-20 中午更新：阶段 0 全部收尾、阶段 1（授权 + COM_STMT）、OLAP 4A.1、真 binlog 阶段 2
-> 均已完成（`d7988b3`/`bb2dce5`/`d6170b1`/`3b48126`/`02a4e2c`）。现在的下一步：
+> 2026-10-20 下午更新：阶段 0/1、OLAP 4A.1–4A.5、真 binlog 阶段 2 均已完成。现在的下一步：
 
-1. **OLAP 4A.2 接线**（决策 2）：把列存/OLAP 接入 `plan_executor`/`optimizer` 的显式 dispatch
-   （默认仍走行存），做"同一 SQL 行存/列存结果一致"的端到端对拍；再按 4A.3 重做并行、
-   4A.5 性能门禁化（当前 3 个性能类 skip 需替换为可辩护阈值）。
-2. **阶段 2 存储可靠性**：WAL 行级 CRC + 损坏检测、COMMIT 只刷参与表（当前 O(表数) fsync）、
+1. **阶段 2 存储可靠性**：WAL 行级 CRC + 损坏检测、COMMIT 只刷参与表（当前 O(表数) fsync）、
    隔离级别诚实化（实现 RC 或如实报 RR）、EXPLAIN 真实访问路径、生成列重算、页回收/vacuum。
-3. **阶段 1 收尾 + 交付验证**：`SET PASSWORD POLICY` 落地、审计越权保护；把仓库推到 GitHub
-   让 `.github/workflows/ci.yml` 真实触发（当前无远端，本地 CI 已实跑）；随后进入阶段 3
-   Studio/Web 可用性收口（QThread/分页/凭据加密/Web 前端连接表单）。
+2. **阶段 1 收尾 + 交付验证**：`SET PASSWORD POLICY` 落地、审计越权保护；把仓库推到 GitHub
+   让 `.github/workflows/ci.yml` 真实触发（当前无远端，本地 CI 已实跑）；补 4A.4（Cython
+   编译验证，需可编译环境）。
+3. **阶段 3 Studio/Web 可用性收口**：QThread/分页/读超时、连接密码加密、Web 前端连接表单、
+   按用户历史；之后进入阶段 4 架构项（三条 SELECT 路径统一 / 紧凑二进制行格式 / 并发定位）。
 
 ## 5. KPI（每次阶段收口测一次）
 
-| 指标 | 当前（2026-10-20） | 阶段 0 目标 | 阶段 1 | 阶段 2 | 阶段 3 |
+| 指标 | 当前（2026-10-20 下午） | 阶段 0 目标 | 阶段 1 | 阶段 2 | 阶段 3 |
 |---|---:|---:|---:|---:|---:|
 | 用例通过 / 失败 | 见下方"实测基线"（0 failed；skip/xfail 全部带 reason） | ✅ 失败=0（显式 skip 除外） | ✅ 权限/预编译已完成；审计部分 | 存储故障注入通过 | GUI 行为测试进 CI |
 | 打包 | ✅ wheel 含引擎 + 3 入口（venv 实测） | ✅ 已修 | — | — | GUI/Web 可安装 |
-| 基准门禁 | PASS 5/5 | ✅ 保持 | ✅ 保持 | COMMIT 延迟 O(参与表) | — |
+| 基准门禁 | **PASS 7/7**（含 2 条 OLAP 门禁） | ✅ 已修 | ✅ 保持 | COMMIT 延迟 O(参与表) | — |
 | 安全项 | ✅ P0/P1 六项 + 授权体系 + COM_STMT 闭环 | — | 审计/`SET PASSWORD POLICY` 仍缺 | — | 凭据加密 |
-| 死代码行占比 | Studio 不可达已清零；引擎仍有 ~74 模块零引用 | — | — | — | 引擎 <10% |
-| 文档-实现一致 | README/CHANGELOG/roadmap 已同步授权/OLAP/复制/协议状态 | ✅ 打包声明成真 | 协议文档 | 存储边界文档 | 功能表 100% 真实 |
+| OLAP 接线/门禁 | ✅ 4A.1–4A.3+4A.5 完成（默认关闭；并行 GROUP BY 2.75x、对拍 0 不一致；dispatch 当前无收益） | — | — | — | — |
+| 死代码行占比 | Studio 不可达已清零；引擎仍有部分零引用模块 | — | — | — | 引擎 <10% |
+| 文档-实现一致 | README/CHANGELOG/roadmap/benchmarks 已同步 OLAP 接线与门禁状态 | ✅ 打包声明成真 | 协议文档 | 存储边界文档 | 功能表 100% 真实 |
 
-### 实测基线（2026-10-20 中午，全量 pytest + benchmark）
+### 实测基线（2026-10-20 下午，全量 pytest + benchmark）
 
-- 全量 pytest：**949 用例 = 913 passed / 0 failed / 34 skipped / 2 xfailed**（11:51；
-  较上轮 +35 例：binlog 阶段 2 19 + COM_STMT 16；1 个半同步 xfail 移除、+1 个 mysql-connector skip）；
-- `benchmarks.run --suite quick --gate`：**PASS 5/5**（逐行 INSERT 3,829 rows/s、批量/逐行 2.043×、
-  点查 901.7 q/s、WAL 468.6 KB、崩溃恢复 0.570 s、丢/漏行 0）；
+- 全量 pytest：**1016 用例 = 983 passed / 0 failed / 31 skipped / 2 xfailed**（12:21；
+  较上轮 +67 例：OLAP 接线/对拍 63 + 契约；3 条性能类 skip 换实测阈值后恢复）；
+- `benchmarks.run --suite quick --gate`：**PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、
+  dispatch 对拍不一致=0；quick 墙钟 ~30.6 s）；
 - `scripts/check_packaging.py`：PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源）；
   `scripts/check_repo_hygiene.py`：PASS。
 

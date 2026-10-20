@@ -640,6 +640,30 @@ python -m benchmarks.run --suite quick --gate      # → PASS 5/5
    PREPARE 不做语法校验（EXECUTE 回 1064）。
 3. 授权/OLAP/Cython/桌面端残余同 §II.1。
 
+### II.3 2026-10-20 下午追加：OLAP 4A.2 接线 + 4A.3 并行 + 4A.5 门禁化
+
+| 工作项 | 结果 | 提交 |
+|---|---|---|
+| **4A.2 显式接入** | 新增 `lightdb/olap/sql_dispatch.py::try_vectorized_select`：单表 + COUNT/SUM/AVG/MIN/MAX + 简单 WHERE（AND/IS NULL/字符串）+ GROUP BY 1-2 列 + ORDER BY/LIMIT；**默认关闭**（`LIGHTDB_OLAP_DISPATCH=1`），`min_rows=1000`；crosscheck 模式同跑行存逐行比对，不一致显式报错；`dispatch_stats()` 记录 attempted/dispatched/fallback/crosscheck；`Executor._cmd_select` 加钩子，开关关闭时不 import 任何 OLAP 引擎模块 | `d26b7ee` |
+| **对拍** | `tests/test_olap_wired.py` 63 例：42 条支持查询逐行一致（每条断言 dispatched==1）+ 11 条不支持形态（JOIN/OR/子查询/HAVING/窗口/DISTINCT/表达式等必须 dispatched==0 且回退）；NULL/全 NULL/大整数/负数/浮点/中文/空表/单行/重复、ORDER BY/LIMIT/别名；不设 env 时结果一致且不加载引擎 | 同上 |
+| **4A.3 并行** | `VectorizedAggregateSet` 64K 分片 + 线程池、`VectorizedGroupBy(workers>1)` 局部 dict 有序合并；单/多线程逐值一致；实测 1M 行 GROUP BY w1 24.2s → w2 10.6s（**2.28x**）、w4 13.9s；纯 SUM 1M 行加速不足 1.2x → 自动档保持串行（`AUTO_PARALLEL_WORKERS=1`） | 同上 |
+| **4A.5 门禁化** | 加 `benchmarks/gate.py` 两条门禁：`olap_parallel_groupby_speedup ≥1.2x`（100k 行实测 2.75x，门禁实测 2.03–2.14x）、`olap_dispatch_crosscheck_mismatches ==0`；quick 套件新增 3 case（并行加速、对拍、dispatch A/B 仅报告），quick 墙钟 ~30.6s；把 3 条性能类 skip 替换为实测基线阈值并恢复正式测试：编码压缩率 3x→2.5x（实测 2.78x）、OLAP 聚合 20M→2.0M rows/s（实测 2.72M）、并行 1.5x→1.2x（换用新分片路径，实测 2.75x，需 ≥4 核） | 本次 |
+
+**2026-10-20 下午门禁**：
+
+- 全量 pytest：**1016 用例 = 983 passed / 0 failed / 31 skipped / 2 xfailed**（12:21）；
+- `benchmarks.run --suite quick --gate`：**PASS 7/7**（原 5 条 + OLAP 2 条；quick 30.6–38.8s）；
+- `scripts/check_packaging.py` / `scripts/check_repo_hygiene.py`：PASS；
+- `scripts/ci.ps1 -SkipInstall` 一次跑通 **`CI: ALL CHECKS PASSED`**（pytest 13:43 + bench + packaging）。
+
+**残余风险（更新）**：
+1. dispatch **默认关闭**且当前无性能收益（实测 0.44–1.10x）：不做"SQL 已加速"的宣称；
+   是否在生产开启需更大数据量/更优列格式的实测。
+2. 4A.3 并行对纯 SUM 无稳定加速（自动档串行）；GROUP BY 4 线程较 2 线程回退
+   （w2 2.28x vs w4 1.74x）；float SUM/AVG 分片合并理论末位差异（crosscheck 兜底）。
+3. 明确未支持：JOIN/OR/子查询/HAVING/窗口/CTE/DISTINCT/表达式投影走行存；
+   parallel test 在 <4 核 CI 上按环境 skip（显式 reason）。
+
 ---
 
 ## 附：本文证据脚本与来源

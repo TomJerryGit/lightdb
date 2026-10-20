@@ -16,14 +16,14 @@
   git push -u origin main --tags
   ```
 
-### 本地 CI 实跑记录（2026-10-20 中午，`scripts/ci.ps1 -SkipInstall` 一次跑通）
+### 本地 CI 实跑记录（2026-10-20 下午，`scripts/ci.ps1 -SkipInstall` 一次跑通）
 
 | 步骤 | 命令/步骤 | 结果 |
 |---|---|---|
 | 全量 CI | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ci.ps1 -SkipInstall > ci.log 2>&1` | **`CI: ALL CHECKS PASSED`（exit 0）** |
-| compileall | ci.ps1 内（`PYTHONPYCACHEPREFIX` 重定向，兼容受限 sandbox） | PASS（6.5s） |
-| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **949 用例 = 913 passed / 0 failed / 34 skipped / 2 xfailed**（9:50） |
-| 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 5/5**（逐行 INSERT 2,628.9 rows/s、批量/逐行 2.130×、点查 1,251.4 q/s、WAL 468.6 KB、崩溃恢复 0.373 s） |
+| compileall | ci.ps1 内（`PYTHONPYCACHEPREFIX` 重定向，兼容受限 sandbox） | PASS（7.1s） |
+| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1016 用例 = 983 passed / 0 failed / 31 skipped / 2 xfailed**（13:43） |
+| 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致；quick ~39 s） |
 | 打包检查 | `python scripts/check_packaging.py` | PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源） |
 | 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS |
 

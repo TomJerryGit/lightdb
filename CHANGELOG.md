@@ -26,10 +26,18 @@
   （`Database.users[user]['privs']`）；执行期按会话 user 鉴权，拒绝返回 1142/1044/1227
   （SQLSTATE 42000）；协议层 `SHOW TABLES`/`DESC`/`KILL`/`PROCESSLIST`/`SHOW DATABASES`
   同一权限模型；`tests/test_privileges.py`（12 例，含真实 pymysql 端到端）。
+- **OLAP 接入 4A.2/4A.3/4A.5（决策 2）**：`lightdb/olap` 与 `lightdb/columnar` **显式接入**
+  SQL 执行路径（单表聚合/分组 + 简单 WHERE/ORDER BY/LIMIT 白名单；**默认关闭**，
+  `LIGHTDB_OLAP_DISPATCH=1` 开启；crosscheck 逐行比对，不一致显式报错；开关关闭时
+  不加载 OLAP 引擎模块）。新增 63 例端到端对拍 + 契约测试。并行分片重做：GROUP BY
+  100k 行 w1→w2 实测 **2.75x**（纯 SUM 加速不足 1.2x，自动档保持串行）。**4A.5 门禁化**：
+  `benchmarks/gate.py` 新增 `olap_parallel_groupby_speedup ≥1.2x` 与
+  `olap_dispatch_crosscheck_mismatches ==0` 两条门禁；3 条性能类 skip 换成实测基线阈值
+  并恢复正式测试（压缩率 2.5x、聚合 2.0M rows/s、并行 1.2x）。**dispatch 当前无性能收益
+  （实测 0.44–1.10x），不据此宣称 SQL 加速。**
 - **OLAP 接入 4A.1（正确性）**：修复编码器类型不对称/Dict NULL 错位/Delta 负数/BitPack
   负数/列存统计丢失/GroupBy COUNT(*)=0/AVG 崩溃/Filter 缺 IS NULL/优化器丢 OR/并行
   丢 where 等 12 类缺陷；新增 `tests/test_olap_correctness.py`（91 例行存↔列存对拍）。
-  **尚未接入 SQL 路径**（4A.2），性能目标未达（仍 skip）。
 - **真 binlog 阶段 2（决策 D）**：`max_bytes` 真实**日志轮转**（旧文件只读、跨文件全局
   lsn、从库跨轮转续传）；**binlog 写失败即拒绝提交**（回滚事务 + 1180/HY000，
   `LIGHTDB_BINLOG_STRICT=0` 可退化排障）；`SHOW MASTER STATUS` 报当前文件名+文件内位点、
@@ -71,8 +79,10 @@
   `PREPARE` 不做语法校验（在 EXECUTE 回 1064）。
 - 授权：账号 host 维度未建模（用户名唯一）；多进程 worker 本地内置分支未本地鉴权；
   PL/触发器按调用者权限执行（比 MySQL DEFINER 严格）；`SHOW VARIABLES`/`SELECT @@var` 未限制。
-- OLAP/列存/并行/Cython：正确性已修，但**未接入 SQL 路径**；性能目标（压缩率 3x、
-  聚合 20M rows/s、并行 1.5x）未达标；Cython 从未编译。
+- OLAP/列存/并行/Cython：**已显式接入 SQL 路径**（4A.2，默认关闭）；dispatch 当前无
+  性能收益（0.44–1.10x），不默认开启；GROUP BY 并行 w2 实测 2.75x，但纯 SUM 加速
+  不足 1.2x（自动档串行）；float SUM/AVG 分片合并理论末位差异（crosscheck 兜底）；
+  Cython 从未编译（纯 Python 回退）。
 - 查询执行单线程；多进程仅连接层并行；`COMMIT` 为 O(表数) fsync。
 - WAL 无 CRC、无日志轮转；`vacuum` 不做页内紧凑。
 - 桌面端：无 QThread、大结果集同步 `fetchall` 会冻结 UI；连接密码本地明文存储。
