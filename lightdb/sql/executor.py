@@ -487,6 +487,30 @@ class Executor:
         self._binlog_table_locks = {}
         self._binlog_locks_guard = threading.Lock()
 
+        # ★ 决策 2 / 4A.2：OLAP 向量化**显式分派**开关（默认关闭）。
+        #   只在开关打开时才会延迟 import `lightdb/olap/sql_dispatch.py`；
+        #   默认路径不加载任何 OLAP/列存引擎模块（测试用 import 钩子锁住）。
+        #   取值来源：环境变量（LIGHTDB_OLAP_*）→ Config 默认值；测试可直接
+        #   改实例属性（如 `ex.olap_dispatch = True`）。
+        try:
+            from ..config import Config
+            _olap_cfg = Config.from_env()
+            self.olap_dispatch = bool(
+                getattr(_olap_cfg, 'olap_dispatch', False))
+            self.olap_dispatch_min_rows = int(
+                getattr(_olap_cfg, 'olap_dispatch_min_rows', 1000))
+            self.olap_crosscheck = bool(
+                getattr(_olap_cfg, 'olap_crosscheck', False))
+            self.olap_parallel_workers = int(
+                getattr(_olap_cfg, 'olap_parallel_workers', 0))
+        except Exception:                     # pragma: no cover - 防御
+            self.olap_dispatch = False
+            self.olap_dispatch_min_rows = 1000
+            self.olap_crosscheck = False
+            self.olap_parallel_workers = 0
+        #: crosscheck 参考执行期间置 True，防止行存参考路径再次分派（递归）
+        self._olap_bypass = False
+
     # ==================== 主入口 ====================
 
     # ★ GROUP BY 严格模式开关（逃生口，与 MySQL 的 ONLY_FULL_GROUP_BY 等价）
@@ -1715,6 +1739,25 @@ class Executor:
         # ★ GROUP BY 严格校验放在最前面（静态判定，见 _check_strict_group_by）
         self._check_strict_group_by(p)
         table = p['table']
+
+        # ★ 决策 2 / 4A.2：OLAP 向量化**显式分派**（默认关闭）。
+        #   只对白名单语法（单表聚合/分组 + 简单 WHERE/ORDER BY/LIMIT）
+        #   尝试派发；`try_vectorized_select` 返回 None 表示「不派发」，
+        #   继续走下方行存原路径。分派内部异常也显式回退行存（warn）。
+        #   可见性：`lightdb.olap.sql_dispatch.dispatch_stats()` 计数 +
+        #   INFO 日志（每次命中/回退都有记录，禁止静默改道）。
+        #   `_olap_bypass` 只在对拍（crosscheck）跑行存参考时置位。
+        if self.olap_dispatch and not self._olap_bypass:
+            try:
+                from ..olap.sql_dispatch import try_vectorized_select
+            except Exception as _olap_imp_err:   # pragma: no cover - 防御
+                logger.warn(
+                    f"OLAP dispatch 模块不可用，回退行存: {_olap_imp_err}")
+                try_vectorized_select = None
+            if try_vectorized_select is not None:
+                _olap_res = try_vectorized_select(self, p, s)
+                if _olap_res is not None:
+                    return _olap_res
 
         # WHERE 里的字面量 IN 列表（`id IN (1,2,NULL)`）解析出来是
         # {'values': [...]}，存储层的 _match / 统一投影都不认这种形态

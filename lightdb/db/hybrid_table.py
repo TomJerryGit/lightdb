@@ -31,23 +31,21 @@ from ..logger import logger
 from ..columnar.column_store import ColumnStore
 from ..olap.olap_optimizer import OLAPOptimizer
 from ..olap.status import (
-    ensure_not_requested_via_sql, raise_experimental_unwired,
-    STATUS_LABEL, WIRED_TO_SQL_PATH, BENCH_REFERENCE)
+    raise_experimental_unwired, WIRED_TO_SQL_PATH, BENCH_REFERENCE)
 
 
 def _entrypoint_status(what: str, hint: str = '') -> None:
-    """对外分析入口的统一状态检查。
+    """对外分析入口的统一状态检查（4A.2 后：**始终显式报错**）。
 
-    * 正常情况下（`WIRED_TO_SQL_PATH is False`）：**显式报错**，报文含
-      「实验性 / 未接入 SQL 路径 / 不计入性能声明」，让调用方无法把
-      「走通了但没接线」误读成「已支持」；
-    * 若哪天有人真把它接进 SQL 路径（常量被改成 True），这里改为放行，
-      但 `ensure_not_requested_via_sql` 会先要求同步文档与基准口径。
+    `WIRED_TO_SQL_PATH=True` 表示「SQL 路径已有显式 dispatch」，但
+    `HybridTable` 的这两个历史入口**不是** SQL dispatch 路径：它们没有
+    行存语义保证、也没有被 `Executor` 调用。因此这里保持 4A.1 的铁律：
+    触达即显式报错，报文指向新的 SQL 入口 `olap_dispatch`（默认关闭）。
     """
-    ensure_not_requested_via_sql(what, hint=hint)
-    if not WIRED_TO_SQL_PATH:
-        raise_experimental_unwired(
-            f'HybridTable.{what}', hint=hint or f'（状态：{STATUS_LABEL}）')
+    raise_experimental_unwired(
+        f'HybridTable.{what}',
+        hint=hint or ('SQL 路径请使用 `olap_dispatch`（默认关闭，'
+                      'config.olap_dispatch / LIGHTDB_OLAP_DISPATCH=1）'))
 
 
 def _entrypoint_notice(what: str) -> None:
@@ -56,27 +54,28 @@ def _entrypoint_notice(what: str) -> None:
     `HybridTable.olap_aggregate` 是唯一这种情况 ——
     `tests/test_v4_batch4.py::test_hybrid_table` 直接调它（既有断言不得
     改动）。因此这里按「显式化」的另一半处理：**每次调用都打一条带状态
-    标签的告警日志**，让「走通了但未接线」不可能被当成「已支持」；
-    真正接入 SQL 路径之前，它依旧不计入性能声明。
+    标签的告警日志**，且报文指向新的 SQL 入口 `olap_dispatch`（默认关闭）。
+    它依旧不计入性能声明。
     """
-    if not WIRED_TO_SQL_PATH:
-        logger.warn(
-            f'HybridTable.{what} 被调用：实验性接口，未接入 SQL 路径，'
-            f'不计入性能声明（实测对照见 {BENCH_REFERENCE}）。'
-            f'请勿在生产查询路径使用。')
+    logger.warn(
+        f'HybridTable.{what} 被调用：实验性入口（非 SQL dispatch 路径）；'
+        f'SQL 路径请用 `olap_dispatch`（默认关闭，'
+        f'config.olap_dispatch / LIGHTDB_OLAP_DISPATCH=1）；'
+        f'不计入性能声明（实测对照见 {BENCH_REFERENCE}）。')
 
 
 class HybridTable:
     """
     混合表：行存 + 列存
 
-    **实验性**：`olap_scan` / `olap_aggregate` 未接入 SQL 路径，不计入性能
-    声明；`olap_scan` 触达即**显式报错**，`olap_aggregate` 有既有测试调用
-    故改为**每次调用显式留痕**（告警日志），两者都不静默（口径见
-    `lightdb/olap/status.py` 与 `benchmarks/README.md`）。
+    **实验性历史入口**：4A.2 起 SQL 路径的 OLAP 入口是
+    `lightdb/olap/sql_dispatch.py`（`olap_dispatch`，默认关闭）；
+    `olap_scan` 触达即**显式报错**，`olap_aggregate` 有既有测试调用
+    故改为**每次调用显式留痕**（告警日志），两者都不静默，也都不计入
+    性能声明（口径见 `lightdb/olap/status.py` 与 `benchmarks/README.md`）。
     """
 
-    #: OLAP / 列存层是否接入 SQL 路径（恒为 False，见 `lightdb/olap/status.py`）
+    #: SQL 路径是否已有 OLAP 显式 dispatch（True；但默认关闭，见 status）
     WIRED_TO_SQL_PATH = WIRED_TO_SQL_PATH
 
     def __init__(self, name: str, cols: List[dict],
@@ -162,24 +161,25 @@ class HybridTable:
     # ==================== 查询（OLAP，实验性）====================
 
     def olap_scan(self, columns: List[str] = None) -> Dict[str, List]:
-        """列扫描（**实验性：未接入 SQL 路径，触达即显式报错**）"""
+        """列扫描（**实验性入口，触达即显式报错**；SQL 请用 `olap_dispatch`）"""
         _entrypoint_status(
             'olap_scan',
-            hint='SQL 路径请用普通 SELECT（行存 lightdb/db/table.py::Table）；'
-                 '该接口既不参与性能声明，也不保证 SQL 语义兼容。')
+            hint='SQL 路径请使用 `olap_dispatch`（默认关闭，'
+                 'config.olap_dispatch / LIGHTDB_OLAP_DISPATCH=1）；'
+                 '该历史入口不参与性能声明，也不保证 SQL 语义兼容。')
         # 先同步待处理的行
         self.sync_now()
         return self.column_store.scan(columns)
 
     def olap_aggregate(self, query: Dict) -> List:
         """
-        执行分析查询（**实验性：未接入 SQL 路径，每次调用显式留痕**）
+        执行分析查询（**实验性入口；每次调用显式留痕**）
 
-        为什么不直接抛异常：`tests/test_v4_batch4.py::test_hybrid_table`
-        直接调用本方法（既有断言不得改动），因此这里采取「显式留痕 +
-        状态常量」而不是抛错；抛错的入口是 `olap_scan`（无既有调用方）。
-        两者都在 `lightdb/olap/status.py` 登记为未接线；本方法**不**计入
-        任何性能声明。
+        4A.2 后 SQL 路径的分析查询入口是 `lightdb/olap/sql_dispatch.py`
+        的 `olap_dispatch`（默认关闭）；本方法是没有行存语义保证的历史
+        实验入口，只保留给既有测试/演示使用（`tests/test_v4_batch4.py::
+        test_hybrid_table` 直接调用，既有断言不得改动），**不计入任何
+        性能声明**。
 
         query: {
             'columns': [...],

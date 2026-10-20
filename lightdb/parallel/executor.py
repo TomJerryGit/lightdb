@@ -168,14 +168,14 @@ class ParallelExecutor:
     """
     并行执行器
 
-    `WIRED_TO_SQL_PATH`：本并行执行器接的是**调用方给的只读列式视图**，
-    与实验性的 `lightdb/olap/**` / `lightdb/columnar/**` 没有实现依赖
-    （见模块 docstring），因此 OLAP/列存层未接入 SQL 路径这一状态不受
-    本模块影响。
+    `WIRED_TO_SQL_PATH`：4A.2 起 OLAP/列存层已**显式接入** SQL 路径
+    （`Executor` 的 SELECT 分支有 dispatch 钩子，默认关闭）；本并行执行器
+    接的仍是**调用方给的只读列式视图**，与 `lightdb/olap/**` /
+    `lightdb/columnar/**` 没有实现依赖（见模块 docstring）。
     """
 
-    #: OLAP / 列存层是否接入 SQL 路径（阶段 2 第 6 项摘牌依据，恒为 False）
-    WIRED_TO_SQL_PATH = False
+    #: OLAP / 列存层是否接入 SQL 路径（4A.2 起为 True；默认开关关闭）
+    WIRED_TO_SQL_PATH = True
 
     def __init__(self, max_workers: int = None):
         self.max_workers = max_workers or 8
@@ -641,15 +641,20 @@ class ParallelExecutor:
         实现：NULL 聚合值忽略、COUNT(*) 计行、AVG = sum/count、返回
         `[分组键..., 聚合值...]`。
 
-        最后走一次状态检查点 `ensure_not_requested_via_sql`：如果哪天
-        有人把 OLAP/列存真接进 SQL 路径，这里会**显式报错**并指向
-        `benchmarks/README.md`，而不是让这条回退路径悄悄改变语义。
+        最后再走一次状态检查点 `ensure_not_requested_via_sql`：该函数在
+        4A.2 起是**状态自检空操作**（OLAP 已显式接入 SQL 路径，本回退
+        路径仍然不依赖 olap/列存实现）。下面的断言把「status 常量」与
+        「本文件不引用 olap 实现」两件事锁在一起：若哪天 status 被改回
+        False、或本文件又悄悄引用 olap 实现，这里会显式失败。
         """
         ensure_not_requested_via_sql('ParallelExecutor._serial_group_by')
-        assert _OLAP_WIRED_TO_SQL is False, (
-            'lightdb/olap/status.py 声称 OLAP 已接入 SQL 路径，但 '
-            'lightdb/parallel/executor.py 已不引用 olap/列存实现；'
-            '请同步两者（口径见 benchmarks/README.md）')
+        # 状态一致性：SQL 路径已有显式 dispatch（status.WIRED_TO_SQL_PATH
+        # =True），而本文件仍不引用 olap/列存实现。两者必须同时成立，
+        # 否则说明「状态 / 实现 / 接线」三者漂移。
+        assert _OLAP_WIRED_TO_SQL is True, (
+            'lightdb/olap/status.py 声称 OLAP 未接入 SQL 路径，但 '
+            'Executor 的 SELECT 分支已有 dispatch 钩子（4A.2）；'
+            '请同步两者（口径见 lightdb/olap/status.py）')
 
         for a in aggs or []:
             if str(a.get('func', '')).upper() not in SUPPORTED_AGGS:

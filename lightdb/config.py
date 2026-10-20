@@ -58,6 +58,11 @@ _ENV_MAP = {
     'LIGHTDB_WAL_ENABLED': ('wal_enabled', bool),
     'LIGHTDB_AUTOCOMMIT': ('autocommit', bool),
     'LIGHTDB_SHM_DIR': ('shm_dir', str),
+    # OLAP / 列存显式接线（决策 2）
+    'LIGHTDB_OLAP_DISPATCH': ('olap_dispatch', bool),
+    'LIGHTDB_OLAP_DISPATCH_MIN_ROWS': ('olap_dispatch_min_rows', int),
+    'LIGHTDB_OLAP_CROSSCHECK': ('olap_crosscheck', bool),
+    'LIGHTDB_OLAP_PARALLEL_WORKERS': ('olap_parallel_workers', int),
     # 真 · append-only binlog（决策 D 项）—— Database 直接读环境变量；
     # 这里登记是为了让配置文件/环境变量两条入口都能解释同一批开关。
     'LIGHTDB_BINLOG_ENABLED': ('binlog_enabled', bool),
@@ -96,6 +101,26 @@ class Config:
     max_allowed_packet: int = 16777216
     parallel_workers: int = 4
     workers: int = 0                     # 0 = 自动（CPU 核数）
+
+    # ---------- OLAP / 列存接线（决策 2，4A.2/4A.3） ----------
+    #: 是否允许 SQL 执行器把「单表白名单聚合/分组查询」派发给向量化引擎。
+    #: **默认 False**（默认行为与接线前逐字节一致，仍走行存）；只有显式开启
+    #: 或设置 `LIGHTDB_OLAP_DISPATCH=1` 才会派发。派发规则见
+    #: `lightdb/olap/sql_dispatch.py::try_vectorized_select`（白名单语法，
+    #: 其余一律返回 None 走行存，绝不静默改道）。
+    olap_dispatch: bool = False
+    #: 派发的最小表行数（低于该值不派发：小表上向量化的固定开销大于收益，
+    #: 且默认 1000 能保证「小库行为完全不变」）。env `LIGHTDB_OLAP_DISPATCH_MIN_ROWS`。
+    olap_dispatch_min_rows: int = 1000
+    #: 是否同时跑行存/向量化并逐行比对（对拍/排障用，默认 False）。
+    #: 不一致时显式报错（RuntimeError），绝不静默返回其中一份结果。
+    #: env `LIGHTDB_OLAP_CROSSCHECK=1`。
+    olap_crosscheck: bool = False
+    #: 向量化聚合/分组的并行线程数。0 = 自动；当前自动档取
+    #: `lightdb/olap/vectorized_engine.AUTO_PARALLEL_WORKERS`（实测加速比
+    #: 不足 1.2x 时为 1，即默认关闭并行；显式设 2/4 可强制开启）。
+    #: env `LIGHTDB_OLAP_PARALLEL_WORKERS`。
+    olap_parallel_workers: int = 0
 
     # ---------- 日志 ----------
     log_level: str = "INFO"
@@ -286,6 +311,20 @@ class Config:
         if self.parallel_workers < 1:
             errors.append(
                 f"parallel_workers 必须 >= 1: {self.parallel_workers}")
+
+        # ---------- OLAP 接线 ----------
+        if self.olap_dispatch_min_rows < 0:
+            errors.append(
+                f"olap_dispatch_min_rows 不能为负: "
+                f"{self.olap_dispatch_min_rows}")
+        if self.olap_parallel_workers < 0:
+            errors.append(
+                f"olap_parallel_workers 不能为负: "
+                f"{self.olap_parallel_workers}")
+        if self.olap_parallel_workers > max(1, os.cpu_count() or 4) * 4:
+            errors.append(
+                f"olap_parallel_workers 过大（>4x CPU）: "
+                f"{self.olap_parallel_workers}")
 
         valid_iso = ('READ COMMITTED', 'READ UNCOMMITTED',
                      'REPEATABLE READ', 'SERIALIZABLE')

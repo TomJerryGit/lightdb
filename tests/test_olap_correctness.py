@@ -834,15 +834,16 @@ def test_parallel_aggregate_unsupported_is_explicit(big_store):
         ex.shutdown()
 
 
-# ==================== 10. 实验性边界未改变 ====================
+# ==================== 10. 接线状态（4A.2 起契约更新） ====================
 
-def test_wiring_status_unchanged():
-    """本任务不接线：状态常量必须保持「未接入 SQL 路径」"""
+def test_wiring_status_matches_4a2_contract():
+    """4A.2 起：已接线（WIRED=True）但**默认关闭**；性能声明仍待 4A.5"""
     from lightdb.olap import status
-    assert status.WIRED_TO_SQL_PATH is False
+    assert status.WIRED_TO_SQL_PATH is True
+    assert status.DEFAULT_ENABLED is False
     assert status.COUNTS_FOR_PERFORMANCE_CLAIMS is False
     from lightdb.parallel.executor import ParallelExecutor
-    assert ParallelExecutor.WIRED_TO_SQL_PATH is False
+    assert ParallelExecutor.WIRED_TO_SQL_PATH is True
 
 
 # ==================== 11. 微基准（只报告，不设门禁）====================
