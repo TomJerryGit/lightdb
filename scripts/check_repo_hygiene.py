@@ -22,8 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 #: 允许存在的未跟踪目录（分析证据/临时工作区；发布时可清理，不影响仓库卫生判定）
 ALLOWED_UNTRACKED_PREFIXES = (
     '_analysis_tmp/', '_engine_probe/', '_studio_web_tmp/', '_vb_tmp/',
-    '_gap_data/', '_gap_after.txt', 'tmp_service_security/',
+    '_gap_data/', '_gap_after.txt', '_olap_probe/', 'tmp_service_security/',
     'docs/analysis_2026-10-19/logs/', 'docs/analysis_2026-10-19/tmp/',
+    'pytest-of-', 'tmp',
 )
 
 #: 根目录一次性产物模式（被跟踪即告警）

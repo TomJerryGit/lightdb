@@ -592,6 +592,33 @@ python -m benchmarks.run --suite quick --gate      # → PASS 5/5
 3. CI 尚未在 GitHub 实跑（本地 `scripts/ci.ps1` 已验证）；Linux/macOS 路径未验证。
 4. OLAP/列存/并行接入未启动（决策 2，下一阶段）。
 
+### II.1 2026-10-20 上午追加：阶段 0 收尾 + 阶段 1.1 授权 + OLAP 4A.1
+
+| 工作项 | 结果 | 提交 |
+|---|---|---|
+| **阶段 0.4/0.5 收尾** | CHANGELOG（v4.0.0-beta.1）+ `docs/RELEASING.md` + `scripts/check_repo_hygiene.py`（PASS）+ `.gitattributes`（`* -text` 避免巨量行尾 diff）；README 版本徽章/简介/状态对齐；删除旧调试产物 `bench_summary.json`/`result_after.json`、重复 `LICENSE.txt`、遗留 worktree `_wt_head`、57 个 `data_*` 残留目录；`scripts/ci.ps1` 改 ASCII-only 并修复受限沙箱下 compileall 的 pycache 权限问题（本地已实跑） | `d7988b3` |
+| **阶段 1.1 授权体系** | GRANT/REVOKE/SHOW GRANTS 真正生效并持久化（`Database.users[user]['privs']`，root `ALL`）；执行期鉴权矩阵（读/DML/DDL/DCL/fail-closed），拒绝 1142/1044/1227 + SQLSTATE 42000；协议层元数据按权限过滤（SHOW TABLES/DESC/COM_INIT_DB/COM_FIELD_LIST/KILL/PROCESSLIST/SHOW DATABASES）；`tests/test_privileges.py` 12 例（含真实 pymysql 端到端），`test_batch9` 两条 GRANT 去 xfail | `bb2dce5` |
+| **OLAP 4A.1 正确性** | 修 12 类正确性缺陷（编码器类型不对称/Dict NULL 错位/Delta 负数/BitPack 负数/列存统计丢失/GroupBy COUNT(*)=0/AVG 崩溃/Filter 缺 IS NULL/优化器丢 OR/并行丢 where 等）；新增 91 例"行存↔列存"对拍矩阵（3.7s）；取消 2 个 skip（GROUP BY、编码器选择）；修正一个"永远通过"的假测试 | `d6170b1` |
+| **决策 2 剩余** | 4A.2 SQL 路径接线（dispatch）、4A.3 并行重做、4A.4 Cython 编译验证、4A.5 性能门禁化：未开始 | — |
+
+**2026-10-20 门禁（最终验证）**：
+
+- 全量 pytest：**914 用例 = 878 passed / 0 failed / 33 skipped / 3 xfailed**（12:34）；
+- `benchmarks.run --suite quick --gate`：**PASS 5/5**（逐行 INSERT 3,829 rows/s、批量/逐行 2.043×、
+  点查 901.7 q/s、WAL 468.6 KB、崩溃恢复 0.570 s、丢/漏行 0）；
+- `scripts/check_packaging.py`：PASS（版本 4.0.0 单一来源）；`scripts/check_repo_hygiene.py`：PASS
+  （清理后 0 个 data_* 残留、1 个 worktree、无重复 LICENSE）。
+
+**新增/更新的残余风险**：
+1. 授权：账号 host 维度未建模（用户名唯一）；多进程 worker 的本地内置分支（SHOW TABLES/
+   PROCESSLIST/KILL/COM_INIT_DB）未本地鉴权（主 SQL 在 Master 执行器鉴权）；PL/触发器按
+   调用者权限执行（比 MySQL DEFINER 严格）；`SHOW VARIABLES`/`SELECT @@var` 未限制。
+2. OLAP/列存/并行：正确性已修、对拍全绿，但**仍未接入 SQL 路径**；性能目标未达
+   （压缩率 2.8x<3x、聚合 1.5–6M<20M rows/s、并行 0.58–0.82x<1.5x）；Cython 从未编译。
+3. CI 尚未在 GitHub 实跑（本地 `scripts/ci.ps1` 的 compileall + packaging 已实跑通过）；
+   Linux/macOS 路径未验证。
+4. 预编译语句（COM_STMT_*）仍缺；`SET PASSWORD POLICY` 经协议 ACK 不生效（阶段 1 剩余项）。
+
 ---
 
 ## 附：本文证据脚本与来源

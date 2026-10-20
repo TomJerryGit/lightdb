@@ -66,6 +66,30 @@
 > 本次修复的详细证据、复现与仍未修复项见
 > [docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md](docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md)。
 
+### 🛡️ 授权体系（阶段 1.1，2026-10-20：GRANT/REVOKE 真正生效）
+
+> 此前「登录即全权」：GRANT/REVOKE 语法 1064、权限检查为零。现在权限模型已接线并持久化：
+
+- **权限模型**：`Database.users[user]['privs']`（随 `_meta.json` 持久化）；root 保持 `['ALL']`；
+  支持 `ALL`、`SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/INDEX`、`*.*` 与 `db.*`；
+  列级 / 表级 / `WITH GRANT OPTION` 显式 1064（不支持）。
+- **SQL**：`GRANT <privs> ON *.*|db.* TO '<u>'[@'host']`、`REVOKE ... FROM`、
+  `SHOW GRANTS [FOR '<u>' | CURRENT_USER]`；授权/回收即时生效。
+- **执行期鉴权**：`Executor.execute()` 分发前按会话 user 检查（读→SELECT、DML→对应权限、
+  DDL→对应权限、DCL/管理→ALL/root、未知命令 **fail-closed**）；拒绝错误码
+  **1142**（表级）/ **1044**（库级）/ **1227**（管理），SQLSTATE 42000；
+  `information_schema`、binlog/复制、内部服务身份保持最小可用集合。
+- **协议层**：握手把 user 与 host 写入连接级 session；`SHOW TABLES` / `DESC` /
+  `COM_INIT_DB` / `COM_FIELD_LIST` / `KILL` / `SHOW PROCESSLIST` / `SHOW DATABASES`
+  接入同一模型（非管理员只看到自己的线程与有权限的库）。
+- **验收**：`tests/test_privileges.py`（12 例，含真实 MySQLServer + pymysql 端到端）+
+  原 `test_batch9` 两条 GRANT 用例恢复为正式测试；覆盖权限矩阵、GRANT→读/写、REVOKE 复拒、
+  `SHOW GRANTS`（自己/root/他人/不存在）、库级 ALL 非管理员、持久化重开、UNION/JOIN、
+  解析拒绝、内部身份、1045/KILL/PROCESSLIST 过滤。
+- **仍有限制**：账号 host 维度未建模（用户名唯一）；多进程 worker 的本地内置分支未本地鉴权
+  （主 SQL 仍在 Master 执行器鉴权）；PL/触发器按调用者权限执行（比 MySQL DEFINER 严格）；
+  `SHOW VARIABLES` / `SELECT @@var` 未限制。
+
 ### 🧱 工程化与发布（2026-10-19 阶段 0 + 四项决策执行）
 
 > 用户决策（2026-10-19）：①产品定位 = **数据库可交付产品**；②OLAP/列存/并行/Cython **接入 SQL 路径**；
@@ -82,8 +106,10 @@
 - **真复制已落地（决策 4 阶段 1）**：独立 append-only binlog + CRC32 + 真实字节位点 + DDL 复制 +
   从库持久位点续传 + START/STOP SLAVE/CHANGE MASTER，见上文「复制支持边界」；专项测试 16 例。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
-  其余改为**带明确 reason 的 skip/xfail**（授权体系、半同步、OLAP 未接线、死模块、沙箱权限、flaky 阈值）。
-- **版本状态诚实化**：`Development Status` 从 `Production/Stable` 改为 **`4 - Beta`**（复制/OLAP/授权仍在补）。
+  其余改为**带明确 reason 的 skip/xfail**（半同步、OLAP 未接线、死模块、沙箱权限、flaky 阈值）。
+  授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试。
+- **版本状态诚实化**：`Development Status` 从 `Production/Stable` 改为 **`4 - Beta`**（复制性能与
+  OLAP 接入仍在补；安全/授权/打包/CI 已收口）。
 
 ### ⚠️ 性能声明状态说明（2026-10 阶段 0 收尾 + 阶段 2 第 6 项「摘牌」，**必读**）
 
@@ -141,8 +167,9 @@
   [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
   顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
 
-- 一次完整测试运行的结果（2026-10-19 决策执行后）：**811 个用例中
-  771 通过 / 0 失败 / 35 跳过 / 5 xfailed**（门禁已清零；skip/xfail 均带明确原因，
+- 一次完整测试运行的结果（2026-10-20，阶段 1.1 授权 + OLAP 4A.1 之后）：**914 个用例中
+  878 通过 / 0 失败 / 33 跳过 / 3 xfailed**（门禁保持全绿；新增 103 例：权限 12 例 +
+  OLAP 行存↔列存对拍 91 例；4 个原 skip/xfail 恢复为正式测试），skip/xfail 均带明确原因，
   见下方「测试套件」说明与 [docs/analysis_2026-10-19/06_ROADMAP.md](docs/analysis_2026-10-19/06_ROADMAP.md) §1）。
 
 ### ✅ 本次会话已修复（2026-10，含实测验证）
@@ -260,9 +287,9 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**（2026-10-19 决策执行后的门禁基线）：**811 用例 = 771 通过 / 0 失败 / 35 跳过 / 5 xfailed**（本轮优化开始时是 150 通过 / 118 失败）。**失败数已清零**——原 24 条失败按根因处置：
-- **真实缺陷已修**：`row_format` DECIMAL 编码 TypeError、CLI `-h/--host` 与 argparse 内建 `-h` 冲突（Windows CLI 必崩）、诊断 CLI 的 emoji 在 GBK 控制台崩溃；
-- **带明确 reason 的 skip/xfail**（不是无声绿）：授权体系未接线（GRANT ×2，路线图阶段 1）、半同步死代码、OLAP/列存/并行实验性未接线（×5，决策 2 将接入）、`parser_v3b4` 死代码（×2）、`row_format` 实验格式性能目标、沙箱写权限（×2）、诊断子进程 `DuplicateHandle` 沙箱限制、IPC 延迟阈值防抖、`lineage_enhanced` 列级血缘已知缺陷；
+**测试套件**（2026-10-20 阶段 1.1 + OLAP 4A.1 后的门禁基线）：**914 用例 = 878 通过 / 0 失败 / 33 跳过 / 3 xfailed**（本轮优化开始时是 150 通过 / 118 失败；较上一轮 +103 例）。**失败数保持 0**——原 24 条失败按根因处置：
+- **真实缺陷已修**：`row_format` DECIMAL 编码 TypeError、CLI `-h/--host` 与 argparse 内建 `-h` 冲突（Windows CLI 必崩）、诊断 CLI 的 emoji 在 GBK 控制台崩溃；权限体系（GRANT/REVOKE/鉴权，2026-10-20 已接线，2 条 GRANT 用例恢复为正式测试）；
+- **带明确 reason 的 skip/xfail**（不是无声绿）：半同步死代码、OLAP/列存/并行未接入 SQL 路径与性能目标未达（3 条性能类 skip）、`parser_v3b4` 死代码（×2）、`row_format` 实验格式性能目标、沙箱写权限（×2）、诊断子进程 `DuplicateHandle` 沙箱限制、IPC 延迟阈值防抖、`lineage_enhanced` 列级血缘已知缺陷；
 - 并发用例去掉已删除的 `query_cache` 断言、QPS 阈值降为防抖健全性检查（吞吐门禁在 `benchmarks/`）。
 
 **仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；行值 `(a,b) IN (SELECT x,y ...)` 与行值比较 `(a,b) = (1,2)`（现**显式报错**并给出 `EXISTS` 改写建议）、HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值、WHERE 里的算术谓词、投影标量函数、`FROM (子查询)` 之后直接 `JOIN` —— 以上均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；存储侧 `Database.vacuum()` 只释放槽位、不做页内紧凑，且旧 `.dat` 行头布局不兼容（需重建库）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。

@@ -36,17 +36,18 @@
 | 3 | **Studio 死代码：批量删除** | ✅ **已执行**（commit `32f479f`）：删除 44 个死模块（15,728 行）+ 6 个死测试文件；`lightdb_studio` 134 文件/39,256 行 → **90 文件/23,532 行**。阶段 3 只剩"保留功能的可用性收口" |
 | 4 | **复制：投入 1–2 周做真 append-only binlog** | 由"摘牌或 1–2 周二选一"改为**立即投入**，见 §2.6「真复制专项计划」；`semi_sync` 死代码在 M4 决策删除 |
 
-### 执行进度（截至 2026-10-19 晚）
+### 执行进度（截至 2026-10-20 上午）
 
 | 工作项 | 状态 | 证据 |
 |---|---|---|
 | 阶段 0.1 打包修复 | ✅ 已完成（wheel 含引擎包/3 入口/版本单一来源；venv 实测 `lightdb-server --version`） | `pyproject.toml`、`scripts/check_packaging.py` |
-| 阶段 0.2 CI | ✅ 已落地（本地 `scripts/ci.ps1` + GitHub Actions） | `.github/workflows/ci.yml` |
+| 阶段 0.2 CI | ✅ 已落地（本地 `scripts/ci.ps1` + GitHub Actions；本地已实跑验证） | `.github/workflows/ci.yml`、`d7988b3` |
 | 阶段 0.3 失败测试清零 | ✅ 已完成（真实缺陷修复 + 带 reason 的 skip/xfail；24 → 0） | `tests/regression/*`、`test_batch9/10/14`、`test_v3_batch*`、`test_v4_batch*` 等 |
+| 阶段 0.4/0.5 收尾 | ✅ 发版材料（CHANGELOG/RELEASING/版本标记一致）、仓库卫生（data_* / worktree / 双 LICENSE / 调试产物 / .gitattributes）、`ci.ps1` 可执行性 | commit `d7988b3`；`scripts/check_repo_hygiene.py` PASS |
+| **阶段 1.1 授权体系** | ✅ 已完成（GRANT/REVOKE/SHOW GRANTS + 执行期鉴权 1142/1044/1227 + 协议层元数据过滤；真实 pymysql 端到端） | commit `bb2dce5`；`tests/test_privileges.py` 12 例 |
+| **决策 2 OLAP 4A.1** | ✅ 正确性止血完成（12 类缺陷 + 91 例对拍矩阵；取消 2 个 skip） | commit `d6170b1`；4A.2 接线待做 |
 | 决策 3 Studio 删除 | ✅ 已完成（134→90 文件；39,256→23,532 行；悬空 import=0） | commit `32f479f` |
 | 决策 4 真 binlog | ✅ **阶段 1 完成**（文件/CRC/位点/SHOW/主从闭环/续传/控制语句；16 例 + 166 回归） | commit `903d8e4`；阶段 2 TODO 见 §2.6 |
-| 决策 2 OLAP 接入 | ⏳ 待启动（阶段 2 之后，1–2 个月） | 见 §2.5 |
-| 仓库卫生/版本发布 | ⏳ 阶段 0 收尾项（data_* 目录/遗留 worktree/双 LICENSE/`.gitattributes`） | 见 §2 阶段 0.4/0.5 |
 
 ---
 
@@ -167,25 +168,36 @@
 
 ## 4. 建议的"下一个 3 个动作"
 
-> 2026-10-19 更新：原第 1/3 项已执行（打包+CI 落地 `9c108f0`、门禁清零同提交；Studio 删除 `32f479f`），
+> 2026-10-20 更新：阶段 0 全部收尾、阶段 1.1 授权、OLAP 4A.1 已完成（`d7988b3`/`bb2dce5`/`d6170b1`）。
 > 现在的下一步：
 
-1. **真 binlog 阶段 2**（决策 4 收尾）：日志轮转 / binlog 写失败即拒绝提交 / GTID·半同步决策 /
-   DDL 完整重放；完成后把 README「复制支持边界」从 beta 升级为正式可用并进 CI。
-2. **权限体系接线**（阶段 1.1）：最后一个安全 P1（登录即全权），并把 2 条 GRANT xfail 恢复为正式测试。
-3. **启动 OLAP 接入 4A.1**（决策 2）：先做正确性止血 + 行存/列存对拍矩阵，再改 planner dispatch；
-   同时把仓库卫生/`.gitattributes`/版本发布等阶段 0 收尾项清掉。
+1. **OLAP 4A.2 接线**（决策 2）：把列存/OLAP 接入 `plan_executor`/`optimizer` 的显式 dispatch
+   （默认仍走行存），做"同一 SQL 行存/列存结果一致"的端到端对拍；再按 4A.3 重做并行。
+2. **真 binlog 阶段 2**（决策 4 收尾）：日志轮转 / binlog 写失败即拒绝提交 / GTID·半同步决策 /
+   `UPDATE`/`DELETE` 镜像少一次 SELECT；完成后把 README「复制支持边界」从 beta 升级为正式可用并进 CI。
+3. **阶段 1 剩余协议项**：预处理语句（COM_STMT_*）、`SET PASSWORD POLICY` 落地、审计越权保护；
+   之后进入阶段 2 存储可靠性（WAL CRC / COMMIT O(参与表) / 隔离级别诚实化 / EXPLAIN 真实路径）。
 
 ## 5. KPI（每次阶段收口测一次）
 
-| 指标 | 当前 | 阶段 0 目标 | 阶段 1 | 阶段 2 | 阶段 3 |
+| 指标 | 当前（2026-10-20） | 阶段 0 目标 | 阶段 1 | 阶段 2 | 阶段 3 |
 |---|---:|---:|---:|---:|---:|
-| 用例通过 / 失败 | 777 passed / 24 failed（门禁清零后失败=0，余为带 reason skip/xfail） | 失败=0（显式 skip 除外） | 全部安全用例通过 | 存储故障注入通过 | GUI 行为测试进 CI |
-| 打包 | wheel 缺引擎 | ✅ 已修（待复验） | — | — | GUI/Web 可安装 |
-| 基准门禁 | PASS 5/5 | 保持 | 保持 | COMMIT 延迟 O(参与表) | — |
-| 安全项 | P0/P1 六项闭环 | — | 权限/审计/预编译完成 | — | 凭据加密 |
-| 死代码行占比 | Studio 已删 36.5%→0（不可达）；引擎仍有 ~74 模块零引用 | — | — | — | 引擎 <10% |
-| 文档-实现一致 | README 已对齐 P0/P1；Studio 删除后同步 | 打包声明成真 | 权限/协议文档 | 存储边界文档 | 功能表 100% 真实 |
+| 用例通过 / 失败 | 见下方"实测基线"（0 failed；skip/xfail 全部带 reason） | ✅ 失败=0（显式 skip 除外） | ✅ 权限/审计/**预编译未完成** | 存储故障注入通过 | GUI 行为测试进 CI |
+| 打包 | ✅ wheel 含引擎 + 3 入口（venv 实测） | ✅ 已修 | — | — | GUI/Web 可安装 |
+| 基准门禁 | PASS 5/5 | ✅ 保持 | ✅ 保持 | COMMIT 延迟 O(参与表) | — |
+| 安全项 | ✅ P0/P1 六项 + 授权体系闭环 | — | 审计/预编译仍缺 | — | 凭据加密 |
+| 死代码行占比 | Studio 不可达已清零；引擎仍有 ~74 模块零引用 | — | — | — | 引擎 <10% |
+| 文档-实现一致 | README/CHANGELOG/roadmap 已同步授权/OLAP/复制状态 | ✅ 打包声明成真 | 协议文档 | 存储边界文档 | 功能表 100% 真实 |
+
+### 实测基线（2026-10-20 上午，全量 pytest + benchmark）
+
+- 全量 pytest：**914 用例 = 878 passed / 0 failed / 33 skipped / 3 xfailed**（12:34；
+  较上轮 +103 例：权限 12 + OLAP 对拍 91；4 个原 skip/xfail 恢复为正式测试）；
+- `benchmarks.run --suite quick --gate`：**PASS 5/5**（逐行 INSERT 3,829 rows/s、批量/逐行 2.043×、
+  点查 901.7 q/s、WAL 468.6 KB、崩溃恢复 0.570 s、丢/漏行 0）；
+- `scripts/check_packaging.py`：PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源）；
+  `scripts/check_repo_hygiene.py`：PASS。
+
 
 ---
 
