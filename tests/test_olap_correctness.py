@@ -837,10 +837,10 @@ def test_parallel_aggregate_unsupported_is_explicit(big_store):
 # ==================== 10. 接线状态（4A.2 起契约更新） ====================
 
 def test_wiring_status_matches_4a2_contract():
-    """4A.2/4A.5 起：已接线（WIRED=True）、默认关闭、有基准门禁（COUNTS=True）"""
+    """4A.2/4A.5 起：已接线（WIRED=True）、默认开启（2026-10-20）、有基准门禁"""
     from lightdb.olap import status
     assert status.WIRED_TO_SQL_PATH is True
-    assert status.DEFAULT_ENABLED is False
+    assert status.DEFAULT_ENABLED is True, '2026-10-20 起默认开启'
     assert status.COUNTS_FOR_PERFORMANCE_CLAIMS is True, '4A.5 已加基准门禁'
     from lightdb.parallel.executor import ParallelExecutor
     assert ParallelExecutor.WIRED_TO_SQL_PATH is True

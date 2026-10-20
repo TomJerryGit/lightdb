@@ -1122,12 +1122,15 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 self._send_packet(self._ok_packet())
             return
 
-        if cmd in ('SELECT', 'SELECT VARIABLES'):
+        if cmd in ('SELECT', 'SELECT VARIABLES', 'UNION'):
             # `SELECT @x`（用户变量）与普通 SELECT 一样必须把结果集发回去。
             # 旧实现只认 cmd == 'SELECT'，于是 `SELECT @x` 落到"其他"分支回
             # OK 包（pymysql 的 description=None、fetchall() 空）—— 用户变量
             # 经协议永远读不到。连接级 session 修好后它读的是本连接
             # `session['user_vars']`，这里补上结果集序列化路径。
+            # `UNION` 同理：执行器返回 resultset，但协议层没登记这个 command，
+            # 经真实 MySQL 协议查询会得到 OK/0 行（pymysql description=None）。
+            # 2026-10-20 全量 GUI/DB 验证发现，补上。
             if result.get('type') != 'resultset':
                 self._send_packet(self._ok_packet())
                 return

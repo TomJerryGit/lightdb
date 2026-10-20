@@ -40,12 +40,13 @@ def _entrypoint_status(what: str, hint: str = '') -> None:
     `WIRED_TO_SQL_PATH=True` 表示「SQL 路径已有显式 dispatch」，但
     `HybridTable` 的这两个历史入口**不是** SQL dispatch 路径：它们没有
     行存语义保证、也没有被 `Executor` 调用。因此这里保持 4A.1 的铁律：
-    触达即显式报错，报文指向新的 SQL 入口 `olap_dispatch`（默认关闭）。
+    触达即显式报错，报文指向新的 SQL 入口 `olap_dispatch`（默认开启，
+    可用 LIGHTDB_OLAP_DISPATCH=0 关闭）。
     """
     raise_experimental_unwired(
         f'HybridTable.{what}',
-        hint=hint or ('SQL 路径请使用 `olap_dispatch`（默认关闭，'
-                      'config.olap_dispatch / LIGHTDB_OLAP_DISPATCH=1）'))
+        hint=hint or ('SQL 路径请使用 `olap_dispatch`（默认开启，'
+                      'LIGHTDB_OLAP_DISPATCH=0 可关闭）'))
 
 
 def _entrypoint_notice(what: str) -> None:
@@ -54,13 +55,12 @@ def _entrypoint_notice(what: str) -> None:
     `HybridTable.olap_aggregate` 是唯一这种情况 ——
     `tests/test_v4_batch4.py::test_hybrid_table` 直接调它（既有断言不得
     改动）。因此这里按「显式化」的另一半处理：**每次调用都打一条带状态
-    标签的告警日志**，且报文指向新的 SQL 入口 `olap_dispatch`（默认关闭）。
-    它依旧不计入性能声明。
+    标签的告警日志**，且报文指向新的 SQL 入口 `olap_dispatch`（默认开启，
+    可用 LIGHTDB_OLAP_DISPATCH=0 关闭）。它依旧不计入性能声明。
     """
     logger.warn(
         f'HybridTable.{what} 被调用：实验性入口（非 SQL dispatch 路径）；'
-        f'SQL 路径请用 `olap_dispatch`（默认关闭，'
-        f'config.olap_dispatch / LIGHTDB_OLAP_DISPATCH=1）；'
+        f'SQL 路径请用 `olap_dispatch`（默认开启，LIGHTDB_OLAP_DISPATCH=0 可关闭）；'
         f'不计入性能声明（实测对照见 {BENCH_REFERENCE}）。')
 
 
@@ -69,13 +69,14 @@ class HybridTable:
     混合表：行存 + 列存
 
     **实验性历史入口**：4A.2 起 SQL 路径的 OLAP 入口是
-    `lightdb/olap/sql_dispatch.py`（`olap_dispatch`，默认关闭）；
+    `lightdb/olap/sql_dispatch.py`（`olap_dispatch`，默认开启，
+    LIGHTDB_OLAP_DISPATCH=0 可关闭）；
     `olap_scan` 触达即**显式报错**，`olap_aggregate` 有既有测试调用
     故改为**每次调用显式留痕**（告警日志），两者都不静默，也都不计入
     性能声明（口径见 `lightdb/olap/status.py` 与 `benchmarks/README.md`）。
     """
 
-    #: SQL 路径是否已有 OLAP 显式 dispatch（True；但默认关闭，见 status）
+    #: SQL 路径是否已有 OLAP 显式 dispatch（True；默认开启，见 status）
     WIRED_TO_SQL_PATH = WIRED_TO_SQL_PATH
 
     def __init__(self, name: str, cols: List[dict],
@@ -164,8 +165,8 @@ class HybridTable:
         """列扫描（**实验性入口，触达即显式报错**；SQL 请用 `olap_dispatch`）"""
         _entrypoint_status(
             'olap_scan',
-            hint='SQL 路径请使用 `olap_dispatch`（默认关闭，'
-                 'config.olap_dispatch / LIGHTDB_OLAP_DISPATCH=1）；'
+            hint='SQL 路径请使用 `olap_dispatch`（默认开启，'
+                 'LIGHTDB_OLAP_DISPATCH=0 可关闭）；'
                  '该历史入口不参与性能声明，也不保证 SQL 语义兼容。')
         # 先同步待处理的行
         self.sync_now()
@@ -176,7 +177,8 @@ class HybridTable:
         执行分析查询（**实验性入口；每次调用显式留痕**）
 
         4A.2 后 SQL 路径的分析查询入口是 `lightdb/olap/sql_dispatch.py`
-        的 `olap_dispatch`（默认关闭）；本方法是没有行存语义保证的历史
+        的 `olap_dispatch`（默认开启，LIGHTDB_OLAP_DISPATCH=0 可关闭）；
+        本方法是没有行存语义保证的历史
         实验入口，只保留给既有测试/演示使用（`tests/test_v4_batch4.py::
         test_hybrid_table` 直接调用，既有断言不得改动），**不计入任何
         性能声明**。

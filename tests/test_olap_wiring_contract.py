@@ -6,10 +6,11 @@ OLAP」当作事实锁住。4A.2 起**真的接线**了，契约随之变化：
 
 1. **已接线**：`olap.status.WIRED_TO_SQL_PATH is True`，且
    `Executor._cmd_select` 里确实有 dispatch 钩子（源码级检查）；
-2. **默认关闭**：`DEFAULT_ENABLED is False`；不显式开启时：
-   * 执行器 `olap_dispatch=False`，`dispatch_stats()['attempted'] == 0`；
-   * SQL 查询不 import OLAP/列存引擎模块（延迟 import 锁）；
-   * 结果与行存逐字节一致（默认行为不变）。
+2. **默认开启（2026-10-20 起）**：`DEFAULT_ENABLED is True`；可用
+   `LIGHTDB_OLAP_DISPATCH=0` / `Config(olap_dispatch=False)` 显式关闭：
+   * 显式关闭后执行器 `olap_dispatch=False`，`dispatch_stats()['attempted'] == 0`；
+   * 关闭时 SQL 查询不 import OLAP/列存引擎模块（延迟 import 锁）；
+   * 默认（开启）时白名单查询真的走向量化（dispatch 计数 >0），结果与行存逐行一致。
 3. **开关生效**：显式打开后白名单查询真的走向量化（dispatch 计数 >0），
    结果仍与行存逐行一致。
 4. **只走白名单 / 无静默改道**：OR、JOIN、子查询、HAVING、窗口、
@@ -47,7 +48,7 @@ def _context(tmp_path):
 def test_status_constants_match_reality():
     from lightdb.olap import status
     assert status.WIRED_TO_SQL_PATH is True, '已接线：状态必须如实为 True'
-    assert status.DEFAULT_ENABLED is False, '接线默认关闭'
+    assert status.DEFAULT_ENABLED is True, '2026-10-20 起默认开启'
     # 4A.5：已有可辩护的基准门禁，状态必须与 benchmarks/gate.py 的事实一致
     assert status.COUNTS_FOR_PERFORMANCE_CLAIMS is True, '4A.5 已加基准门禁'
     from benchmarks import gate as bench_gate
@@ -58,14 +59,14 @@ def test_status_constants_match_reality():
     assert bench_gate.target_of('olap_dispatch_crosscheck_10000') == \
         'olap_dispatch_crosscheck_mismatches'
     assert '已接线' in status.STATUS_LABEL
-    assert '默认关闭' in status.STATUS_LABEL
+    assert '默认开启' in status.STATUS_LABEL
     assert status.PARALLEL_AUTO_WORKERS >= 1
     dispatch_path = os.path.join(ROOT, status.DISPATCH_MODULE.replace('/', os.sep))
     assert os.path.exists(dispatch_path), dispatch_path
 
 
-def test_executor_has_dispatch_hook_and_default_is_off(tmp_path):
-    """源码级：SELECT 分支有 dispatch 钩子；运行期：默认不派发"""
+def test_executor_has_dispatch_hook_and_default_is_on(tmp_path):
+    """源码级：SELECT 分支有 dispatch 钩子；运行期：默认开启、显式可关"""
     import inspect
     from lightdb.olap import sql_dispatch
     from lightdb.sql.executor import Executor
@@ -76,22 +77,33 @@ def test_executor_has_dispatch_hook_and_default_is_off(tmp_path):
 
     db, ex, session = _context(tmp_path)
     try:
-        assert ex.olap_dispatch is False
+        assert ex.olap_dispatch is True, '2026-10-20 起默认开启'
         assert ex.olap_dispatch_min_rows == 1000
+        # 默认开启：白名单查询会尝试分派（小表低于阈值 → 只尝试不派发）
         sql_dispatch.reset_dispatch_stats()
         for q in ('SELECT COUNT(*), SUM(v) FROM c',
                   'SELECT g, COUNT(*) FROM c GROUP BY g',
                   'SELECT AVG(v) FROM c WHERE v > 0'):
             r = ex.execute_sql(q, session)
             assert r.get('type') == 'resultset', (q, r)
-        assert sql_dispatch.dispatch_stats()['attempted'] == 0, (
-            '默认关闭时不应尝试分派')
+        st = sql_dispatch.dispatch_stats()
+        assert st['attempted'] == 3, st
+        assert st['dispatched'] == 0, '小表低于 min_rows 应回退行存'
+
+        # 显式关闭：不尝试分派
+        ex.olap_dispatch = False
+        sql_dispatch.reset_dispatch_stats()
+        for q in ('SELECT COUNT(*), SUM(v) FROM c',
+                  'SELECT g, COUNT(*) FROM c GROUP BY g'):
+            assert ex.execute_sql(q, session).get('type') == 'resultset'
+        assert sql_dispatch.dispatch_stats()['attempted'] == 0
     finally:
         db.shutdown()
 
 
-def test_default_off_does_not_import_olap_engines(tmp_path):
-    """默认关闭时 SQL 查询不加载 OLAP/列存引擎（延迟 import）"""
+def test_explicit_off_does_not_import_olap_engines(tmp_path, monkeypatch):
+    """显式关闭时 SQL 查询不加载 OLAP/列存引擎（延迟 import）"""
+    monkeypatch.setenv('LIGHTDB_OLAP_DISPATCH', '0')
 
     class _Block:
         def __init__(self):
@@ -214,7 +226,7 @@ def test_hybrid_table_entrypoints_point_to_dispatch(tmp_path):
             table.olap_scan(['city'])
         msg = str(ei.value)
         assert 'olap_dispatch' in msg, msg
-        assert '默认关闭' in msg, msg
+        assert '默认开启' in msg, msg
 
         for i in range(3):
             table.insert([i, 'c%d' % i, i * 10])

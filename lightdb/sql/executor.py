@@ -487,16 +487,17 @@ class Executor:
         self._binlog_table_locks = {}
         self._binlog_locks_guard = threading.Lock()
 
-        # ★ 决策 2 / 4A.2：OLAP 向量化**显式分派**开关（默认关闭）。
-        #   只在开关打开时才会延迟 import `lightdb/olap/sql_dispatch.py`；
-        #   默认路径不加载任何 OLAP/列存引擎模块（测试用 import 钩子锁住）。
+        # ★ 决策 2 / 4A.2：OLAP 向量化**显式分派**开关（默认开启，
+        #   2026-10-20 用户要求；LIGHTDB_OLAP_DISPATCH=0 可关闭）。
+        #   仅在开关打开时才延迟 import `lightdb/olap/sql_dispatch.py`；
+        #   关闭时 SQL 路径不加载任何 OLAP/列存引擎模块（测试用 import 钩子锁住）。
         #   取值来源：环境变量（LIGHTDB_OLAP_*）→ Config 默认值；测试可直接
-        #   改实例属性（如 `ex.olap_dispatch = True`）。
+        #   改实例属性（如 `ex.olap_dispatch = False`）。
         try:
             from ..config import Config
             _olap_cfg = Config.from_env()
             self.olap_dispatch = bool(
-                getattr(_olap_cfg, 'olap_dispatch', False))
+                getattr(_olap_cfg, 'olap_dispatch', True))
             self.olap_dispatch_min_rows = int(
                 getattr(_olap_cfg, 'olap_dispatch_min_rows', 1000))
             self.olap_crosscheck = bool(
@@ -504,7 +505,7 @@ class Executor:
             self.olap_parallel_workers = int(
                 getattr(_olap_cfg, 'olap_parallel_workers', 0))
         except Exception:                     # pragma: no cover - 防御
-            self.olap_dispatch = False
+            self.olap_dispatch = True
             self.olap_dispatch_min_rows = 1000
             self.olap_crosscheck = False
             self.olap_parallel_workers = 0
@@ -6035,7 +6036,10 @@ class Executor:
                         deduped.append(row)
                 result = deduped
 
-        return self._rs(out_cols or [], result)
+        # 整份 UNION 结果再应用 ORDER BY / LIMIT / OFFSET（SQL 语义：
+        # 它们作用在合并后的结果上，而不是最后一个分支）。parser 已把
+        # 末尾的 order_by/limit/offset 提升到 union 层。
+        return self._finish_select(p, out_cols or [], result)
 
     def _exec_join_query(self, p, s):
         """多表 JOIN

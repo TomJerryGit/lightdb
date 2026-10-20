@@ -12,14 +12,15 @@
 None 走行存。因此：
 
 * `WIRED_TO_SQL_PATH = True`：接线是真实存在的（不是文档口径）；
-* `DEFAULT_ENABLED = False`：**默认关闭**。不设 `LIGHTDB_OLAP_DISPATCH=1`
-  或 `Config(olap_dispatch=True)` 时，SQL 执行与接线前完全一致（行存），
-  且不会 import 任何 OLAP/列存引擎模块（延迟 import）；
+* `DEFAULT_ENABLED = True`：**默认开启**（2026-10-20 按用户要求）。可设
+  `LIGHTDB_OLAP_DISPATCH=0` 或 `Config(olap_dispatch=False)` 显式关闭；
+  关闭时不会 import 任何 OLAP/列存引擎模块（延迟 import）。
 * `COUNTS_FOR_PERFORMANCE_CLAIMS = True`（4A.5 起）：该层已有**可辩护的基准
   门禁**（`benchmarks/gate.py: olap_parallel_groupby_speedup` 并行加速比、
   `olap_dispatch_crosscheck_mismatches` 对拍不一致数=0），且实测数字写在
   `benchmarks/README.md`；对外只允许引用这些实测/门禁数字，不得引用白皮书
-  设计目标。dispatch 本身当前无性能收益（默认关闭），不得据此宣称加速；
+  设计目标。dispatch 当前**无显著性能收益**（实测开关比 0.44–1.10x），
+  默认开启是为了接线可用性，不得据此宣称"SQL 查询已获得向量化加速"；
 * `PARALLEL_AUTO_WORKERS`：`config.olap_parallel_workers = 0`（自动）时
   向量化聚合/分组实际使用的线程数。4A.3 实测 1M 行纯 SUM 加速不足 1.2x，
   自动档保持 1（默认关闭并行）；100k 行 GROUP BY w1→w2 实测 2.75x，
@@ -34,14 +35,14 @@ from typing import NoReturn
 #: 4A.2 起为 True（真实接线；默认开关关闭，见 `DEFAULT_ENABLED`）。
 WIRED_TO_SQL_PATH = True
 
-#: 接线是否**默认开启**。False = 默认行存，必须显式打开
-#: `config.olap_dispatch` / env `LIGHTDB_OLAP_DISPATCH=1` 才会派发。
-DEFAULT_ENABLED = False
+#: 接线是否**默认开启**。True = 默认开启（2026-10-20 用户要求）；
+#: 可用 `LIGHTDB_OLAP_DISPATCH=0` / `Config(olap_dispatch=False)` 显式关闭。
+DEFAULT_ENABLED = True
 
 #: 该层是否参与对外性能声明。4A.5 起为 True：已存在可辩护的基准门禁
 #: （并行 GROUP BY 加速比 ≥1.2x、dispatch 对拍不一致数 ==0），实测数字见
-#: `benchmarks/README.md`。注意：dispatch 默认关闭且当前无性能收益，
-#: 不得据此宣称"SQL 查询已获得向量化加速"。
+#: `benchmarks/README.md`。注意：dispatch 无显著性能收益，不得据此宣称
+#: "SQL 查询已获得向量化加速"。
 COUNTS_FOR_PERFORMANCE_CLAIMS = True
 
 #: `olap_parallel_workers = 0`（自动）时向量化并行档位。
@@ -54,7 +55,8 @@ PARALLEL_AUTO_WORKERS = 1
 DISPATCH_MODULE = 'lightdb/olap/sql_dispatch.py'
 
 #: 该层的状态标签（文档与错误报文共用同一份口径）。
-STATUS_LABEL = '已接线、默认关闭、有基准门禁（实测对照见 benchmarks/README.md）'
+STATUS_LABEL = ('已接线、默认开启（可用 LIGHTDB_OLAP_DISPATCH=0 关闭）、'
+                '有基准门禁（实测对照见 benchmarks/README.md）')
 
 #: 实测对照表的位置（所有性能口径都指向它）。
 BENCH_REFERENCE = 'benchmarks/README.md'

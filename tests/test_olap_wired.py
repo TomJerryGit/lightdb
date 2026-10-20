@@ -4,8 +4,8 @@
 契约（见 `lightdb/olap/status.py` 与 `lightdb/olap/sql_dispatch.py`）：
 
 * `WIRED_TO_SQL_PATH=True`：SQL 执行器里**真的有**分派钩子；
-* `DEFAULT_ENABLED=False`：默认走行存；只有 `config.olap_dispatch=True`
-  （或 env `LIGHTDB_OLAP_DISPATCH=1`）才会走向量化；
+* `DEFAULT_ENABLED=True`：2026-10-20 起默认开启（用户要求）；显式关闭用
+  `config.olap_dispatch=False` 或 env `LIGHTDB_OLAP_DISPATCH=0`；
 * 分派只走白名单语法，其余返回 None 走行存（禁止静默改道）；
 * 开关前后 `columns`/`rows` **逐行一致**；每类断言同时校验「确实发生了
   分派」（`dispatch_stats()`），避免「没走也通过」。
@@ -327,7 +327,7 @@ def test_parallel_workers_same_result_as_serial(db_exec, dispatch):
             [list(r) for r in b.get('rows') or []], (q, a, b)
 
 
-# ==================== 默认关闭：不加载 OLAP 引擎模块 ====================
+# ==================== 显式关闭：不加载 OLAP 引擎模块 ====================
 
 class _BlockOlapEngineImports:
     """meta_path 阻断器：让 `lightdb.olap` / `lightdb.columnar` 引擎 import 硬失败"""
@@ -346,12 +346,13 @@ class _BlockOlapEngineImports:
         return None
 
 
-def test_default_off_does_not_load_olap_engines(monkeypatch):
-    """默认（不设 env）时 SQL 查询不得 import/加载 OLAP/列存引擎模块"""
+def test_explicit_off_does_not_load_olap_engines(monkeypatch):
+    """显式关闭（LIGHTDB_OLAP_DISPATCH=0）时 SQL 查询不得 import OLAP 引擎模块"""
     import tempfile
     from lightdb.db.database import Database
     from lightdb.sql.executor import Executor
 
+    monkeypatch.setenv('LIGHTDB_OLAP_DISPATCH', '0')
     blocker = _BlockOlapEngineImports()
     with tempfile.TemporaryDirectory() as tmp:
         with pytest.MonkeyPatch.context() as mp:
@@ -364,7 +365,8 @@ def test_default_off_does_not_load_olap_engines(monkeypatch):
             sys.meta_path.insert(0, blocker)
             try:
                 db = Database(os.path.join(tmp, 'db'))
-                ex = Executor(db)              # 默认 olap_dispatch=False
+                ex = Executor(db)              # env=0 → olap_dispatch=False
+                assert ex.olap_dispatch is False
                 session = {}
                 ex.execute_sql(_DDL, session)
                 ex.execute_sql('INSERT INTO t VALUES (1, \'a\', 5, 1.5, \'x\')',
@@ -383,25 +385,63 @@ def test_default_off_does_not_load_olap_engines(monkeypatch):
                 sys.meta_path.remove(blocker)
 
 
+def test_default_on_dispatches_whitelist_and_matches_row_path(tmp_path):
+    """默认（不设 env）时白名单查询**确实**走向量化，且结果与行存一致"""
+    from lightdb.db.database import Database
+    from lightdb.olap import sql_dispatch
+    from lightdb.sql.executor import Executor
+
+    db = Database(str(tmp_path / 'db'))
+    ex = Executor(db)                        # 默认 olap_dispatch=True
+    session = {}
+    try:
+        assert ex.olap_dispatch is True, '2026-10-20 起默认开启'
+        ex.execute_sql(_DDL, session)
+        for i in range(50):
+            ex.execute_sql(
+                "INSERT INTO t VALUES (%d, 'g%d', %d, %s, 'x')"
+                % (i, i % 3, i - 10, 'NULL' if i % 7 == 0 else i * 0.5),
+                session)
+        q = 'SELECT g, COUNT(*), SUM(v), AVG(f) FROM t GROUP BY g'
+        ex.olap_dispatch = False
+        ref = ex.execute_sql(q, session)
+        ex.olap_dispatch = True
+        ex.olap_dispatch_min_rows = 0        # 小表也派发（单独覆盖阈值语义）
+        sql_dispatch.reset_dispatch_stats()
+        got = ex.execute_sql(q, session)
+        assert sql_dispatch.dispatch_stats()['dispatched'] >= 1
+        assert [list(r) for r in got.get('rows') or []] == \
+            [list(r) for r in ref.get('rows') or []]
+    finally:
+        db.shutdown()
+
+
 # ==================== config / status 契约 ====================
 
 def test_config_fields_and_env_mapping(monkeypatch):
     from lightdb.config import Config
     cfg = Config()
-    assert cfg.olap_dispatch is False
+    assert cfg.olap_dispatch is True, '2026-10-20 起默认开启'
     assert cfg.olap_dispatch_min_rows == 1000
     assert cfg.olap_crosscheck is False
     assert cfg.olap_parallel_workers == 0
+
+    # env 显式关闭（0/false 一律关闭）
+    monkeypatch.setenv('LIGHTDB_OLAP_DISPATCH', '0')
+    assert Config.from_env().olap_dispatch is False
+    monkeypatch.delenv('LIGHTDB_OLAP_DISPATCH')
+    cfg2 = Config.from_env()
+    assert cfg2.olap_dispatch is True
 
     monkeypatch.setenv('LIGHTDB_OLAP_DISPATCH', '1')
     monkeypatch.setenv('LIGHTDB_OLAP_DISPATCH_MIN_ROWS', '77')
     monkeypatch.setenv('LIGHTDB_OLAP_CROSSCHECK', 'true')
     monkeypatch.setenv('LIGHTDB_OLAP_PARALLEL_WORKERS', '4')
-    cfg2 = Config.from_env()
-    assert cfg2.olap_dispatch is True
-    assert cfg2.olap_dispatch_min_rows == 77
-    assert cfg2.olap_crosscheck is True
-    assert cfg2.olap_parallel_workers == 4
+    cfg3 = Config.from_env()
+    assert cfg3.olap_dispatch is True
+    assert cfg3.olap_dispatch_min_rows == 77
+    assert cfg3.olap_crosscheck is True
+    assert cfg3.olap_parallel_workers == 4
     assert not cfg2.validate()          # 配置合法
 
 
@@ -418,6 +458,20 @@ def test_env_enables_executor_dispatch(monkeypatch, tmp_path):
         ex = Executor(db)
         assert ex.olap_dispatch is True
         assert ex.olap_dispatch_min_rows == 0
+        db.shutdown()
+
+
+def test_env_disables_executor_dispatch(monkeypatch, tmp_path):
+    """env LIGHTDB_OLAP_DISPATCH=0 → 新建 Executor 关闭分派"""
+    import tempfile
+    from lightdb.db.database import Database
+    from lightdb.sql.executor import Executor
+
+    monkeypatch.setenv('LIGHTDB_OLAP_DISPATCH', '0')
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(os.path.join(tmp, 'db'))
+        ex = Executor(db)
+        assert ex.olap_dispatch is False
         db.shutdown()
 
 

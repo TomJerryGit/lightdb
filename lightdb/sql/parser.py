@@ -801,13 +801,26 @@ class Parser:
                 raise SyntaxError(f"UNION 子查询解析失败: {sql[:40]}")
             segments.append(p)
             all_flags.append(bool(all_flag))
+        # SQL 语义：UNION 末尾的 ORDER BY / LIMIT / OFFSET 作用于**整份
+        # 合并结果**。拆分时它们会落在最后一个 segment 的解析结果里，这里
+        # 提升到 union 层，并在执行器 `_cmd_union` 合并后统一应用。
+        # （2026-10-20 全量验证发现：`SELECT ... UNION ... ORDER BY id LIMIT 1`
+        #  原先 ORDER BY/LIMIT 被最后一段静默吞掉/只作用于最后一段。）
+        hoisted = {}
+        if segments:
+            last = segments[-1]
+            for key in ('order_by', 'limit', 'offset'):
+                if last.get(key) is not None:
+                    hoisted[key] = last.pop(key)
         # unions_all[i] 表示 segments[i] 与 segments[i+1] 之间是 UNION ALL
         # （原实现把 all_flag 丢掉了，导致 UNION ALL 被当成 UNION 去重）
-        return {
+        out = {
             'command': 'UNION',
             'segments': segments,
             'unions_all': all_flags[:max(0, len(segments) - 1)],
         }
+        out.update(hoisted)
+        return out
 
     # ==================== CTE ====================
 

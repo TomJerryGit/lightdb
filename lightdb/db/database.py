@@ -315,7 +315,7 @@ class Database:
             SYNTHETIC_TXN_FLOOR = 0xF0000000
 
         max_tid = 0
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 for pid in range(1, tbl.bp.total_pages()):
                     page = tbl.bp.get_page(pid)
@@ -478,7 +478,7 @@ class Database:
 
     def _recover(self):
         total = 0
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 total += tbl.recover_from_wal()
             except Exception as e:
@@ -499,7 +499,7 @@ class Database:
                     # 表级约束在这里）。没有它，重启后表级 CHECK 就消失，
                     # 违规数据会被静默写进来。
                     'checks': getattr(t, '_checks', None)}
-                for n, t in self.tables.items()
+                for n, t in list(self.tables.items())
             },
             'users': self.users,
             # ★ 进行中的结构变更（崩溃恢复的唯一依据）。它有值 = "结构变更
@@ -1070,7 +1070,7 @@ class Database:
                     logger.error(
                         f"binlog 提交失败后回滚事务 {tid} 失败: {e2}")
                 raise
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 # 1) 写 COMMIT 并 fsync —— 掉电后靠它判定事务已提交
                 tbl.wal.commit(tid)
@@ -1082,7 +1082,7 @@ class Database:
                 logger.error(f"提交 {tbl.name} 失败: {e}")
         self.mvcc.release(tid, committed=True)
         self.lock_manager.release(tid)
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             tbl._read_views.pop(tid, None)
         if not strict:
             # 非 strict（排障模式）：WAL 已提交后再补 binlog，失败只告警
@@ -1123,14 +1123,14 @@ class Database:
                     logger.error(
                         f"binlog 提交失败后回滚语句事务 {tid} 失败: {e2}")
                 raise
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 tbl.wal.commit_autocommit(tid)
             except Exception as e:
                 logger.warn(f"语句级 COMMIT 写入失败 {tbl.name}: {e}")
         self.mvcc.release(tid, committed=True)
         self.lock_manager.release(tid)
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             tbl._read_views.pop(tid, None)
         if not strict:
             # 语句级内部事务也是"已提交"：非 strict 模式补写 binlog
@@ -1139,13 +1139,13 @@ class Database:
     def abort(self, txn):
         """回滚事务：真正把数据改回去，再写 ABORT、放锁"""
         tid = txn['txn_id']
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 # ★ 物理回滚：倒序把旧行写回原页原槽位
                 tbl.abort_txn(tid)
             except Exception as e:
                 logger.error(f"回滚 {tbl.name} 失败: {e}")
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 tbl.wal.abort(tid)
                 tbl.flush()
@@ -1159,7 +1159,7 @@ class Database:
         # 释放 MVCC + 锁
         self.mvcc.release(tid, committed=False)
         self.lock_manager.release(tid)
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             tbl._read_views.pop(tid, None)
         # ★ 真 binlog：回滚的事务写 `BEGIN → ROLLBACK`（行事件从未落盘，
         #   只记录被丢弃的条数，不伪造数据变更）
@@ -1374,7 +1374,7 @@ class Database:
         """
         if horizon is None:
             horizon = self.mvcc.oldest_active_txn()
-            for tbl in self.tables.values():
+            for tbl in list(self.tables.values()):
                 try:
                     h = tbl._vacuum_horizon()
                     if h < horizon:
@@ -1382,7 +1382,7 @@ class Database:
                 except Exception:
                     pass
         total = 0
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 total += tbl.vacuum(horizon)
             except Exception as e:
@@ -1392,7 +1392,7 @@ class Database:
     def vacuum_stats(self) -> dict:
         """所有表最近一次 vacuum 的页级统计汇总（供 `VACUUM` 结果集/巡检）"""
         out = {}
-        for name, tbl in self.tables.items():
+        for name, tbl in list(self.tables.items()):
             try:
                 out[name] = tbl.vacuum_stats()
             except Exception:
@@ -1414,7 +1414,7 @@ class Database:
         也不会丢数据（WAL 已空时只是再刷一次页）。
         """
         n = 0
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 if tbl.checkpoint(force=force):
                     n += 1
@@ -1430,7 +1430,7 @@ class Database:
                 sink.close()
             except Exception as e:                # pragma: no cover - 防御
                 logger.warn(f"停机时审计落盘失败: {e}")
-        for tbl in self.tables.values():
+        for tbl in list(self.tables.values()):
             try:
                 tbl.close()
             except Exception:
@@ -1460,7 +1460,7 @@ class Database:
     def stats(self) -> dict:
         return {
             'tables': {
-                n: t.stats() for n, t in self.tables.items()
+                n: t.stats() for n, t in list(self.tables.items())
             },
             'locks': self.lock_manager.stats(),
             'mvcc': self.mvcc.stats(),

@@ -104,13 +104,14 @@ class Config:
 
     # ---------- OLAP / 列存接线（决策 2，4A.2/4A.3） ----------
     #: 是否允许 SQL 执行器把「单表白名单聚合/分组查询」派发给向量化引擎。
-    #: **默认 False**（默认行为与接线前逐字节一致，仍走行存）；只有显式开启
-    #: 或设置 `LIGHTDB_OLAP_DISPATCH=1` 才会派发。派发规则见
-    #: `lightdb/olap/sql_dispatch.py::try_vectorized_select`（白名单语法，
-    #: 其余一律返回 None 走行存，绝不静默改道）。
-    olap_dispatch: bool = False
+    #: **默认 True**（2026-10-20 按用户要求默认开启）；不满足白名单/行数阈值
+    #: 时一律返回 None 走行存，绝不静默改道。可用 `LIGHTDB_OLAP_DISPATCH=0`
+    #: 或 `Config(olap_dispatch=False)` 显式关闭（关闭时不会 import 任何
+    #: OLAP/列存引擎模块）。派发规则见
+    #: `lightdb/olap/sql_dispatch.py::try_vectorized_select`。
+    olap_dispatch: bool = True
     #: 派发的最小表行数（低于该值不派发：小表上向量化的固定开销大于收益，
-    #: 且默认 1000 能保证「小库行为完全不变」）。env `LIGHTDB_OLAP_DISPATCH_MIN_ROWS`。
+    #: 默认 1000 保证「小表行为不变」）。env `LIGHTDB_OLAP_DISPATCH_MIN_ROWS`。
     olap_dispatch_min_rows: int = 1000
     #: 是否同时跑行存/向量化并逐行比对（对拍/排障用，默认 False）。
     #: 不一致时显式报错（RuntimeError），绝不静默返回其中一份结果。

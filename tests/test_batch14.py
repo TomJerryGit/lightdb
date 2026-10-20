@@ -166,6 +166,11 @@ def test_parallel_count():
     t1 = time.time()
     print(f"  → 插入耗时: {t1-t0:.2f}s")
 
+    # 本用例验证的是旧 `Executor.parallel` 执行器的统计；OLAP dispatch 自
+    # 2026-10-20 起默认开启，会先接管大表聚合（结果相同但 parallel 统计为 0）。
+    # 这里显式关闭 dispatch，保留原用例对 parallel 路径的断言。
+    ex.olap_dispatch = False
+
     # 串行 COUNT
     t0 = time.time()
     cur.execute("SELECT COUNT(*) FROM big")

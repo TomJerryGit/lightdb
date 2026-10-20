@@ -3,8 +3,9 @@
 
 设计原则（与项目「不静默」铁律一致）：
 
-1. **默认关闭**：`config.olap_dispatch=False` 时 SQL 执行器根本不 import
-   本模块（`Executor._cmd_select` 里按开关延迟 import），默认行为与接线前
+1. **默认开启（可关闭）**：`config.olap_dispatch` 默认 True（2026-10-20
+   用户要求）；`LIGHTDB_OLAP_DISPATCH=0` 关闭时 SQL 执行器根本不 import
+   本模块（`Executor._cmd_select` 里按开关延迟 import），行为与接线前
    逐字节一致（行存）。
 2. **白名单分派**：只处理单表 + 聚合（COUNT/SUM/AVG/MIN/MAX）+ 简单
    WHERE（列 op 字面量，AND 组合）+ GROUP BY（1-2 列）+ 简单 ORDER BY /
@@ -22,7 +23,7 @@
      不一致抛 `RuntimeError`（显式失败，不静默选一侧）。
 
 本模块顶层**不 import** `lightdb.olap.*` 引擎模块（延迟 import），保证
-默认关闭时 SQL 路径不加载列存/向量化代码。
+关闭时 SQL 路径不加载列存/向量化代码。
 """
 import re
 import threading
