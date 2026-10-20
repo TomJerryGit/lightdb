@@ -8,6 +8,7 @@ LightDB MySQL 兼容服务器（修复版）
 - SHOW STATUS / SHOW VARIABLES / SHOW PROCESSLIST / KILL
 - 查询语句识别更严谨
 """
+import math
 import os
 import re
 import socket
@@ -30,6 +31,12 @@ from . import mysql_protocol as mp
 #: 登录失败后的固定延迟（秒）。它让暴力破解/口令扫描变慢，同时不改变
 #: 正确登录路径的耗时。0.5s 足够拖垮在线爆破，又不会影响人的交互体验。
 LOGIN_FAILURE_DELAY = 0.5
+
+
+#: 单连接 prepared statement 数量上限（对应 MySQL 的
+#: `max_prepared_stmt_count` 语义；这里按连接计，防止恶意/失控客户端只
+#: PREPARE 不 CLOSE 把服务端内存吃光 —— 每条语句都保存一份 SQL 原文）。
+MAX_PREPARED_STMTS = 4096
 
 
 #: 错误码 → SQLSTATE 兜底映射。
@@ -183,6 +190,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         self.db = self.server.db
         self.executor = self.server.executor
         self.connected_at = time.time()
+        # ★ 连接级预处理语句注册表（COM_STMT_*）：statement_id 从 1 递增。
+        # 与 MySQL 一致，prepared statement 是 **per-connection** 的：
+        # 断连即全部释放（见 handle() 的 finally），不能用全局表。
+        self.prepared_stmts = {}
+        self._next_stmt_id = 1
 
     # ==================== 包收发 ====================
 
@@ -346,6 +358,8 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             # 回滚"，这里用 `db.abort(txn)` 走与 ROLLBACK 相同的物理撤销路径。
             self._rollback_session_txn()
             self._clear_connection_session()
+            # 预处理语句也是连接级资源：断连必须全部释放（不跨连接泄漏）
+            self.prepared_stmts.clear()
             _remove_session(self.server_id)
             logger.info(
                 f"用户 {self.user} 断开连接 "
@@ -449,6 +463,34 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
         elif cmd == mp.COM_FIELD_LIST:
             self._handle_field_list(body)
+
+        # ---------- 预处理语句（COM_STMT_*） ----------
+        elif cmd == mp.COM_STMT_PREPARE:
+            self._handle_stmt_prepare(body)
+
+        elif cmd == mp.COM_STMT_EXECUTE:
+            self._handle_stmt_execute(body)
+
+        elif cmd == mp.COM_STMT_CLOSE:
+            # 协议规定 COM_STMT_CLOSE **没有响应包**（客户端发完不读）：
+            # 这里绝不能回 OK，否则下一个命令的响应会和这个多余 OK 错位。
+            self._handle_stmt_close(body)
+
+        elif cmd == mp.COM_STMT_RESET:
+            self._handle_stmt_reset(body)
+
+        elif cmd == mp.COM_STMT_SEND_LONG_DATA:
+            # 未实现：按协议该命令无响应。这里只登记"本语句收到过长数据"，
+            # 后续 EXECUTE 显式报 1235（而不是拿着缺失/半截参数静默写错）。
+            self._handle_stmt_send_long_data(body)
+
+        elif cmd == mp.COM_STMT_FETCH:
+            # 游标（cursor）未实现：EXECUTE 从不返回 CURSOR_EXISTS，客户端
+            # 正常情况下不会发 FETCH。显式报 1235 而不是回错包/静默忽略。
+            self._send_packet(mp.make_err_packet(
+                1235, '42000',
+                'COM_STMT_FETCH（游标）暂不支持：本引擎的预处理语句'
+                '在 EXECUTE 时直接返回全量结果集（未实现 CURSOR 形态）'))
 
         else:
             self._send_packet(mp.make_err_packet(
@@ -630,6 +672,20 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         # ---------- 通用 SQL ----------
+        self._execute_sql_text(sql)
+
+    def _execute_sql_text(self, sql: str, send_result=None):
+        """解析并执行一条 SQL（**文本协议与预处理 EXECUTE 共用**）
+
+        文本协议（COM_QUERY）与预处理语句（COM_STMT_EXECUTE 把参数安全内联
+        之后）在执行语义上必须完全一致：同一份 parser、同一份事务边界处理
+        （`_prepare_transaction`）、同一个连接级 session、同一份权限/错误契约。
+        因此这里把"解析 → 事务预处理 → 执行 → 回包"抽成一条公共路径。
+
+        `send_result`：可选回包函数 `(result, parsed) -> None`。文本协议用
+        `_send_execution_result`（文本结果集）；预处理语句用
+        `_send_prepared_result`（二进制结果集，EXECUTE 协议要求）。
+        """
         try:
             from ..sql.parser import parser
             parsed = parser.parse(sql)
@@ -678,7 +734,10 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self.session['database'] = self.database
             self._update_session(db=self.database)
 
-        self._send_execution_result(result, parsed)
+        if send_result is None:
+            self._send_execution_result(result, parsed)
+        else:
+            send_result(result, parsed)
 
     def _update_session(self, **kwargs):
         with _sessions_lock:
@@ -1513,6 +1572,506 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                         self._mysql_len_for(c['type'])))
 
         self._send_packet(mp.make_eof_packet())
+
+    # ==================== 预处理语句（COM_STMT_*） ====================
+    #
+    # 设计要点（阶段 1 协议补齐）：
+    # * **连接级注册表**：statement_id 从 1 递增，CLOSE/断连即释放
+    #   （MySQL 的 prepared statement 也是 per-connection 的）。
+    # * PREPARE 只做**静态**分析：数 `?` 占位符（跳过字符串/反引号/注释），
+    #   并对 SELECT 给出结果列元数据（表列类型来自 engine 的真实列定义）。
+    #   绝不为了拿元数据执行 DML —— PREPARE 一个 INSERT 不会写入任何行。
+    # * EXECUTE 把二进制参数按 MySQL 文本语义**安全内联**成 SQL 字面量，
+    #   再走与文本协议**完全相同**的 parser/executor/事务/权限路径
+    #   （执行器没有参数化接口，内联是唯一不改执行器的做法）。
+    # * 返回**二进制结果集**（EXECUTE 协议要求）；DML/DDL 回 OK；错误回 ERR
+    #   （沿用 `_send_execution_result` 的 errno/SQLSTATE 契约）。
+    # * 未实现边界：COM_STMT_SEND_LONG_DATA 只做登记（该命令按协议无响应），
+    #   随后 EXECUTE 显式报 1235；游标（CURSOR flag / COM_STMT_FETCH）不支持
+    #   —— EXECUTE 直接回全量结果集，绝不伪装成"游标已打开"。
+
+    @staticmethod
+    def _iter_sql_chars(sql: str):
+        """逐字符产出 `(下标, 字符, 是否在"可执行代码"区)`
+
+        引号（`'` / `"` / 反引号）、`#` / `-- ` 行注释、`/* */` 块注释里的
+        字符 `is_code=False`。字符串转义遵循**本引擎解析器**的语义：
+        只有成对引号是转义（`''`），反斜杠按字面保留 —— 这样"引号外的
+        `?`"与执行器真正的占位位置一致。
+        """
+        i, n = 0, len(sql)
+        state = None            # None=代码区；否则是当前引号/注释状态
+        while i < n:
+            ch = sql[i]
+            if state is not None:
+                yield i, ch, False
+                if state in ("'", '"', '`'):
+                    if ch == state:
+                        if i + 1 < n and sql[i + 1] == state:
+                            # `''` / `""` / ``` `` ```：成对引号 = 一个字面引号
+                            yield i + 1, sql[i + 1], False
+                            i += 1
+                        else:
+                            state = None
+                elif state == '/*':
+                    if ch == '*' and sql.startswith('*/', i):
+                        yield i + 1, '/', False
+                        i += 1
+                        state = None
+                else:           # '#' / '-- ' 行注释：到行尾结束
+                    if ch in '\r\n':
+                        state = None
+                i += 1
+                continue
+
+            # ---- 正常代码区 ----
+            if ch in ("'", '"', '`'):
+                state = ch
+                yield i, ch, False
+            elif ch == '#':
+                state = '#'
+                yield i, ch, False
+            elif ch == '/' and sql.startswith('/*', i):
+                state = '/*'
+                yield i, ch, False
+            elif (ch == '-' and sql.startswith('--', i)
+                  and (i + 2 >= n or sql[i + 2] in ' \t\r\n')):
+                state = '--'
+                yield i, ch, False
+            else:
+                yield i, ch, True
+            i += 1
+
+    @classmethod
+    def _count_placeholders(cls, sql: str) -> int:
+        """统计 `?` 占位符个数（引号/注释里的 `?` 不算）"""
+        return sum(1 for _i, ch, is_code in cls._iter_sql_chars(sql)
+                   if is_code and ch == '?')
+
+    @staticmethod
+    def _quote_sql_string(text: str) -> str:
+        """把 Python 字符串内联成 SQL 字面量（无注入面）
+
+        优先选一种**值里不存在**的引号包裹；两种引号都有时用单引号并把
+        `'` 写成 `''`（本引擎解析器的成对引号转义）。反斜杠不做转义
+        （引擎按字面保留），因此值不会被改写。
+        """
+        if "'" not in text:
+            return "'" + text + "'"
+        if '"' not in text:
+            return '"' + text + '"'
+        return "'" + text.replace("'", "''") + "'"
+
+    def _sql_literal(self, value):
+        """把 EXECUTE 解出的一个参数值内联成 SQL 字面量
+
+        支持 int / float / str / bytes(UTF-8) / None；其它（含 NaN/Inf 与
+        非 UTF-8 二进制）显式报 1235，绝不静默转成"看起来像"的值。
+        """
+        if value is None:
+            return 'NULL'
+        if isinstance(value, bool):
+            return '1' if value else '0'
+        if isinstance(value, int):
+            return str(int(value))
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                raise mp.StmtProtocolError(
+                    1235, 'NaN/Infinity 不能作为 SQL 参数（MySQL 文本协议'
+                          '没有对应字面量）')
+            return repr(float(value))
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                text = bytes(value).decode('utf-8')
+            except UnicodeDecodeError:
+                raise mp.StmtProtocolError(
+                    1235, 'BLOB 参数不是合法 UTF-8 文本：本引擎以文本字面量'
+                          '内联参数，二进制内容无法无损表达（暂不支持）')
+            return self._quote_sql_string(text)
+        if isinstance(value, str):
+            return self._quote_sql_string(value)
+        raise mp.StmtProtocolError(
+            1235, f'不支持的参数值类型: {type(value).__name__}')
+
+    def _substitute_prepared_params(self, sql: str, values) -> str:
+        """把 SQL 里引号/注释之外的 `?` 依次替换成参数的字面量"""
+        out = []
+        index = 0
+        total = len(values)
+        for _pos, ch, is_code in self._iter_sql_chars(sql):
+            if is_code and ch == '?':
+                if index >= total:
+                    raise mp.StmtProtocolError(
+                        1210, '参数个数与占位符不匹配'
+                              '（SQL 里的 `?` 多于提供的参数）')
+                out.append(self._sql_literal(values[index]))
+                index += 1
+            else:
+                out.append(ch)
+        if index != total:
+            raise mp.StmtProtocolError(
+                1210, '参数个数与占位符不匹配'
+                      '（提供的参数多于 SQL 里的 `?`）')
+        return ''.join(out)
+
+    # ---------- PREPARE：静态元数据（绝不执行语句） ----------
+
+    @classmethod
+    def _find_top_level_keyword(cls, text: str, keyword: str):
+        """在顶层（引号/括号之外）找关键字位置；找不到返回 None"""
+        kw = keyword.upper()
+        depth = 0
+        n = len(text)
+        for i, _ch, is_code in cls._iter_sql_chars(text):
+            if not is_code:
+                continue
+            ch = text[i]
+            if ch == '(':
+                depth += 1
+                continue
+            if ch == ')':
+                depth = max(0, depth - 1)
+                continue
+            if depth != 0 or ch.upper() != kw[0]:
+                continue
+            if text[i:i + len(kw)].upper() != kw:
+                continue
+            before = text[i - 1] if i > 0 else ' '
+            after = text[i + len(kw)] if i + len(kw) < n else ' '
+            if (not (before.isalnum() or before == '_')
+                    and not (after.isalnum() or after == '_')):
+                return i
+        return None
+
+    @staticmethod
+    def _split_select_item(item: str):
+        """把 SELECT 列表里的一个项拆成 `(表达式, 别名)`"""
+        item = item.strip()
+        if not item:
+            return '', None
+        m = re.match(
+            r'(?is)^(.*?)\s+AS\s+[`"]?([\w$]+)[`"]?\s*$', item)
+        if m:
+            return m.group(1).strip(), m.group(2)
+        # 无 AS 的尾部别名（`COUNT(*) cnt` / `id x`）：别名前必须有空白
+        m = re.match(
+            r'(?is)^(.*\S)\s+[`"]?([A-Za-z_$][\w$]*)[`"]?\s*$', item)
+        if m:
+            return m.group(1).strip(), m.group(2)
+        return item, None
+
+    @staticmethod
+    def _column_display_name(expr: str) -> str:
+        """结果列名：裸列取列名（去掉表限定/反引号），表达式取原文"""
+        text = str(expr or '').strip()
+        if re.fullmatch(r'[`"]?[\w$]+(?:\.[`"]?[\w$]+[`"]?)*', text):
+            return text.split('.')[-1].strip('`"')
+        return (text[:64] if text else '?')
+
+    def _prepared_table_columns(self, table):
+        """真实表 → `[(列名, 协议类型, 显示长度)]`；不是真实表返回 None"""
+        name = str(table or '').strip().strip('`"')
+        if '.' in name:
+            name = name.split('.')[-1]
+        table_obj = None
+        try:
+            table_obj = self.db.tables.get(name)
+        except Exception:                     # pragma: no cover - 防御
+            table_obj = None
+        if table_obj is None:
+            return None
+        try:
+            cols = describe_columns(table_obj)
+        except Exception:                     # pragma: no cover - 防御
+            return None
+        return [(c['name'], self._mysql_type_for(c['type']),
+                 self._mysql_len_for(c['type'])) for c in cols]
+
+    def _prepared_result_metadata(self, sql: str):
+        """静态提取 SELECT 的结果列元数据 → `(columns, table)`
+
+        * 简单单表 SELECT：列类型来自表定义（不取数据、不执行语句）；
+        * FROM 子句复杂（多表/JOIN/子查询）或 `SELECT *` 无法静态展开：
+          返回 0 列 —— 协议允许 PREPARE 报 0 列，客户端以 EXECUTE 时的
+          实际列定义为准；
+        * 非 SELECT（INSERT/UPDATE/DDL…）：0 列、table=None。
+        """
+        m = re.match(r'(?is)^\s*SELECT\s+(.*)$', sql)
+        if not m:
+            return [], None
+        rest = m.group(1)
+        table = None
+        from_idx = self._find_top_level_keyword(rest, 'FROM')
+        if from_idx is None:
+            select_part = rest
+        else:
+            select_part = rest[:from_idx]
+            after = rest[from_idx + len('FROM'):].strip()
+            if not after.startswith('('):
+                tm = re.match(r'[`"]?([A-Za-z_][\w.$]*)[`"]?', after)
+                table = tm.group(1) if tm else None
+                # `FROM a, b` / `FROM a JOIN b`：不静态展开列（避免报错元数据）
+                if (self._find_top_level_keyword(after, 'JOIN') is not None
+                        or len(self._split_set_assignments(after)) > 1):
+                    table = None
+        table_cols = self._prepared_table_columns(table) if table else None
+        by_name = ({c[0]: (c[1], c[2]) for c in table_cols}
+                   if table_cols else {})
+        select_part = select_part.strip()
+        if not select_part:
+            return [], None
+        out = []
+        for item in self._split_set_assignments(select_part):
+            expr, alias = self._split_select_item(item)
+            if not expr:
+                continue
+            if expr == '*' or expr.endswith('.*'):
+                if table_cols is None:
+                    return [], None       # 无法静态展开 → 回 0 列
+                out.extend(table_cols)
+                continue
+            bare = None
+            # 裸列名 / 限定列名（`t.id`）：取最后一节去匹配表定义（类型/长度
+            # 与真实列一致，SQL 里写 `t.id` 不代表结果值变成字符串）
+            bm = re.fullmatch(
+                r'[`"]?([A-Za-z_][\w$]*)[`"]?'
+                r'(?:\.[`"]?([A-Za-z_][\w$]*)[`"]?)?', expr)
+            if bm:
+                bare = bm.group(2) or bm.group(1)
+            name = alias or (bare or self._column_display_name(expr))
+            if bare and bare in by_name:
+                ctype, length = by_name[bare]
+            elif expr in by_name:
+                ctype, length = by_name[expr]
+            elif re.fullmatch(r'-?\d+', expr):
+                ctype, length = mp.MYSQL_TYPE_LONGLONG, 20
+            elif re.fullmatch(r'-?\d+\.\d+', expr):
+                ctype, length = mp.MYSQL_TYPE_DOUBLE, 22
+            else:
+                ctype, length = mp.MYSQL_TYPE_VAR_STRING, 255
+            out.append((name, ctype, length))
+            if len(out) > 4096:           # 防滥用（协议列数上限 2^16）
+                return [], None
+        return out, table
+
+    # ---------- COM_STMT_PREPARE / EXECUTE / CLOSE / RESET ----------
+
+    def _handle_stmt_prepare(self, body: bytes):
+        sql = body.decode('utf-8', errors='replace').strip()
+        while sql.endswith(';'):
+            sql = sql[:-1].rstrip()
+        if not sql:
+            self._send_packet(mp.make_err_packet(
+                1064, '42000', '预处理语句为空'))
+            return
+
+        num_params = self._count_placeholders(sql)
+        columns, table = self._prepared_result_metadata(sql)
+
+        # 连接级数量上限（防"只 PREPARE 不 CLOSE"把服务端内存吃光）
+        if len(self.prepared_stmts) >= MAX_PREPARED_STMTS:
+            self._send_packet(mp.make_err_packet(
+                1461, '42000',
+                f"Can't create more than max_prepared_stmt_count "
+                f"statements ({MAX_PREPARED_STMTS})"))
+            return
+
+        # 权限：能静态识别出 SELECT 的表时，PREPARE 阶段就先做一次
+        # SELECT 鉴权 —— 否则受限用户可以通过 PREPARE 拿到他没有权限的
+        # 表的列名（元数据泄露），与文本协议 SHOW COLUMNS 的鉴权口径不符。
+        if table:
+            access_err = self._access_error_packet('SELECT', table=table)
+            if access_err is not None:
+                self._send_packet(access_err)
+                return
+
+        stmt_id = self._next_stmt_id
+        self._next_stmt_id += 1
+        self.prepared_stmts[stmt_id] = {
+            'id': stmt_id,
+            'sql': sql,
+            'num_params': num_params,
+            # 参数类型缓存：客户端第二次 EXECUTE 可以 new_params_bound_flag=0
+            # 复用上一次的类型（MySQL 协议允许），RESET 会清掉。
+            'param_types': None,
+            # COM_STMT_SEND_LONG_DATA 是否收到过（未实现累积 → EXECUTE 报 1235）
+            'long_data': False,
+            'columns': columns,
+            'num_columns': len(columns),
+            'exec_count': 0,
+        }
+
+        self._send_packet(mp.make_prepare_ok_packet(
+            stmt_id, len(columns), num_params))
+        # 参数列定义（客户端执行前只知道个数；类型在执行时才绑定）
+        if num_params > 0:
+            for _ in range(num_params):
+                self._send_packet(mp.make_column_definition(
+                    '?', mp.MYSQL_TYPE_VAR_STRING, 255))
+            self._send_packet(
+                mp.make_eof_packet(status_flags=self._status_flags()))
+        # 结果列定义（简单 SELECT 才静态给出；复杂查询为 0 列）
+        if columns:
+            for name, ctype, length in columns:
+                self._send_packet(
+                    mp.make_column_definition(name, ctype, length))
+            self._send_packet(
+                mp.make_eof_packet(status_flags=self._status_flags()))
+
+    def _handle_stmt_execute(self, body: bytes):
+        if len(body) < 4:
+            self._send_packet(mp.make_err_packet(
+                1210, 'HY000',
+                'Incorrect arguments to mysqld_stmt_execute'
+                '（EXECUTE 包体缺少 statement_id）'))
+            return
+        stmt_id = struct.unpack_from('<I', body, 0)[0]
+        stmt = self.prepared_stmts.get(stmt_id)
+        if stmt is None:
+            self._send_packet(mp.make_err_packet(
+                1243, 'HY000',
+                f'Unknown prepared statement handler ({stmt_id}) '
+                f'given to mysqld_stmt_execute'))
+            return
+
+        # 客户端用过 COM_STMT_SEND_LONG_DATA（长数据流式传参）：本引擎没有
+        # 累积长数据，参数值会缺失 —— 显式报 1235，绝不拿半截数据执行。
+        if stmt.get('long_data'):
+            stmt['long_data'] = False       # 语义上本次长数据已被"消费"
+            self._send_packet(mp.make_err_packet(
+                1235, '42000',
+                'COM_STMT_SEND_LONG_DATA（长数据参数）暂不支持：'
+                '本引擎的预处理语句在 EXECUTE 包里一次性接收参数，'
+                '不做流式累积；请改用普通文本参数发送'))
+            return
+
+        try:
+            req = mp.StmtExecuteRequest(
+                body, stmt['num_params'], stmt.get('param_types'))
+        except mp.StmtProtocolError as e:
+            self._send_packet(mp.make_err_packet(
+                e.errno, e.sqlstate, e.message[:200]))
+            return
+        # 缓存本次绑定的参数类型（下次 new_params_bound_flag=0 时复用）
+        stmt['param_types'] = req.param_types
+        stmt['exec_count'] = int(stmt.get('exec_count') or 0) + 1
+
+        try:
+            sql = self._substitute_prepared_params(
+                stmt['sql'], req.params)
+        except mp.StmtProtocolError as e:
+            self._send_packet(mp.make_err_packet(
+                e.errno, e.sqlstate, e.message[:200]))
+            return
+
+        # 与文本协议一样登记"正在执行"状态（SHOW PROCESSLIST 的
+        # Command/Info/Time 必须同口径真实）。Info 用**带占位符的原文**，
+        # 不把展开后的参数值暴露给能看 PROCESSLIST 的其它会话。
+        self._update_session(command='Query', info=stmt['sql'][:200],
+                             stmt_started=time.time())
+        try:
+            self._execute_sql_text(sql, send_result=self._send_prepared_result)
+        finally:
+            self._update_session(command='Sleep', info='',
+                                 stmt_started=None)
+
+    def _handle_stmt_close(self, body: bytes):
+        """COM_STMT_CLOSE：释放语句，**无响应包**（协议规定）"""
+        if len(body) >= 4:
+            stmt_id = struct.unpack_from('<I', body, 0)[0]
+            self.prepared_stmts.pop(stmt_id, None)
+
+    def _handle_stmt_send_long_data(self, body: bytes):
+        """COM_STMT_SEND_LONG_DATA：未实现累积，只登记以便 EXECUTE 显式报错
+
+        协议上该命令**没有响应包**（客户端发完不读），因此这里不发任何包。
+        """
+        if len(body) < 4:
+            return
+        stmt_id = struct.unpack_from('<I', body, 0)[0]
+        stmt = self.prepared_stmts.get(stmt_id)
+        if stmt is not None:
+            stmt['long_data'] = True
+
+    def _handle_stmt_reset(self, body: bytes):
+        """COM_STMT_RESET：清掉绑定参数类型缓存（回到 PREPARE 后状态）"""
+        if len(body) < 4:
+            self._send_packet(mp.make_err_packet(
+                1210, 'HY000',
+                'Incorrect arguments to mysqld_stmt_reset'
+                '（RESET 包体缺少 statement_id）'))
+            return
+        stmt_id = struct.unpack_from('<I', body, 0)[0]
+        stmt = self.prepared_stmts.get(stmt_id)
+        if stmt is None:
+            self._send_packet(mp.make_err_packet(
+                1243, 'HY000',
+                f'Unknown prepared statement handler ({stmt_id}) '
+                f'given to mysqld_stmt_reset'))
+            return
+        stmt['param_types'] = None
+        stmt['long_data'] = False
+        self._send_packet(self._ok_packet())
+
+    # ---------- 预处理结果回包（EXECUTE 用二进制结果集） ----------
+
+    def _send_prepared_result(self, result, parsed):
+        """EXECUTE 回包：结果集用**二进制行格式**，DML/DDL 用 OK，错误用 ERR"""
+        if isinstance(result, dict) and result.get('type') == 'resultset':
+            cols, rows = self._extract_result(result, parsed)
+            self._send_binary_resultset(cols, rows)
+            return
+        # 非结果集路径与文本协议完全一致（affected rows / OK / ERR + SQLSTATE）
+        self._send_execution_result(result, parsed)
+
+    def _binary_columns(self, columns, rows):
+        """把结果列推断成**全行一致**的协议类型（二进制行按此编码）
+
+        不能用 `_infer_columns` 的"采样首值"推断：若某列前 100 行是 int、
+        后面混入 str，声明成 LONG 却按字符串编码会让客户端字节错位。
+        这里对**所有**非 NULL 值做一致性判断，混类型一律降级 VAR_STRING。
+        """
+        out = []
+        n = len(columns)
+        for ci in range(n):
+            values = [r[ci] for r in rows
+                      if ci < len(r) and r[ci] is not None]
+            name = columns[ci]
+            if not values:
+                out.append((name, mp.MYSQL_TYPE_VAR_STRING, 255))
+                continue
+            if all(isinstance(v, bool) for v in values):
+                out.append((name, mp.MYSQL_TYPE_TINY, 1))
+            elif all(isinstance(v, int) and not isinstance(v, bool)
+                     for v in values):
+                if all(-2147483648 <= v <= 2147483647 for v in values):
+                    out.append((name, mp.MYSQL_TYPE_LONG, 11))
+                else:
+                    out.append((name, mp.MYSQL_TYPE_LONGLONG, 20))
+            elif all(isinstance(v, float) for v in values):
+                out.append((name, mp.MYSQL_TYPE_DOUBLE, 22))
+            elif all(isinstance(v, (bytes, bytearray)) for v in values):
+                out.append((name, mp.MYSQL_TYPE_BLOB, 65535))
+            else:
+                max_len = max((len(str(v)) for v in values), default=0)
+                out.append((name, mp.MYSQL_TYPE_VAR_STRING,
+                            min(max(max_len * 4, 64), 65535)))
+        return out
+
+    def _send_binary_resultset(self, columns, rows):
+        """二进制结果集：列数 + 列定义 + EOF + 二进制行 + EOF"""
+        meta = self._binary_columns(columns, rows)
+        self._send_packet(mp.write_lenenc_int(len(meta)))
+        for name, ctype, length in meta:
+            self._send_packet(
+                mp.make_column_definition(name, ctype, length))
+        self._send_packet(
+            mp.make_eof_packet(status_flags=self._status_flags()))
+        for row in rows:
+            self._send_packet(
+                mp.make_binary_row(list(row), meta))
+        self._send_packet(
+            mp.make_eof_packet(status_flags=self._status_flags()))
 
     #: 本引擎类型 → MySQL 协议列类型（`COM_FIELD_LIST` 用）。
     #: 只映射真实知道的类型；认不出就如实报 VAR_STRING（宽字符），
