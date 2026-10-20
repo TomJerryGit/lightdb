@@ -150,7 +150,9 @@
   `QT_QPA_PLATFORM=windows` 真实窗口探针通过）。验证发现并修复 3 个真实缺陷
   （UNION 经 MySQL 文本协议返回 OK/0 行、UNION 级 ORDER BY/LIMIT 被丢弃、并发 DDL
   时 `dictionary changed size during iteration`）；登记 3 条 Studio UI 缺陷与 2 条已知
-  引擎限制。详见 [`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`](docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md)。
+  引擎限制。详见 [`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`](docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md)；
+  GUI 后续优化路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md)
+  （P0 正确性/安全 → P1 响应性 → P2 功能深度 → P3 工程质量）。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip
