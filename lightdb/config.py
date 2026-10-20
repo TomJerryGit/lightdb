@@ -45,7 +45,6 @@ _ENV_MAP = {
     'LIGHTDB_MAX_ALLOWED_PACKET': ('max_allowed_packet', int),
     'LIGHTDB_SSL_ENABLED': ('ssl_enabled', bool),
     'LIGHTDB_AUDIT_LEVEL': ('audit_level', str),
-    'LIGHTDB_SEMI_SYNC_ENABLED': ('semi_sync_enabled', bool),
     'LIGHTDB_MAX_CONN_PER_IP': ('max_conn_per_ip', int),
     'LIGHTDB_IP_WHITELIST_ENABLED': ('ip_whitelist_enabled', bool),
     # root 初始口令：环境变量优先于「首次启动自动生成随机口令」。
@@ -64,6 +63,8 @@ _ENV_MAP = {
     'LIGHTDB_BINLOG_ENABLED': ('binlog_enabled', bool),
     'LIGHTDB_BINLOG_FSYNC': ('binlog_fsync', bool),
     'LIGHTDB_BINLOG_MAX_BYTES': ('binlog_max_bytes', int),
+    # 阶段 2：binlog 写失败是否拒绝提交（默认 True；=0 退化为告警）
+    'LIGHTDB_BINLOG_STRICT': ('binlog_strict', bool),
 }
 
 
@@ -103,7 +104,7 @@ class Config:
     # ---------- 安全 ----------
     ssl_enabled: bool = False
     audit_level: str = "DDL"
-    semi_sync_enabled: bool = False
+    # 决策 D 阶段 2：半同步复制**不实现**（死代码已移除，不再有该配置项）。
 
     # root 初始口令（空 = 未显式指定）。
     # 优先级：LIGHTDB_ROOT_PASSWORD / --root-password > 首次启动随机生成。
@@ -133,8 +134,14 @@ class Config:
     binlog_enabled: bool = True
     #: 组提交是否 fsync（默认关闭，与引擎 autocommit 持久性档位一致）
     binlog_fsync: bool = False
-    #: 单文件大小告警阈值（当前实现不做轮转，只告警；TODO 阶段 2）
-    binlog_max_bytes: int = 64 * 1024 * 1024
+    #: 单文件轮转阈值（默认 32MB）：超过后切换到 binlog.000002、000003…，
+    #: 旧文件只读保留；`__BINLOG_FETCH__.lsn` 用跨文件全局字节偏移保证
+    #: 轮转后从库位点仍单调可续传。`LIGHTDB_BINLOG_MAX_BYTES` 可配。
+    binlog_max_bytes: int = 32 * 1024 * 1024
+    #: 阶段 2：binlog 写失败（write/flush/fsync/轮转建文件）是否**拒绝提交**。
+    #: True（默认）：先组提交 binlog，失败回滚事务并向客户端报 1180；
+    #: False：只告警（排障用；复制位点可能缺事件）。
+    binlog_strict: bool = True
 
     # ==================== 加载 ====================
 

@@ -81,28 +81,22 @@ def test_relay_log():
     relay.close()
 
 
-def test_semi_sync():
-    """半同步"""
-    print("\n【半同步】")
-    from lightdb.replication.semi_sync import SemiSyncMaster
-    import threading
+def test_semi_sync_removed():
+    """半同步已移除（决策 D 阶段 2 —— 不实现）
 
-    class FakeBinlog:
-        def current_pos(self): return 0
+    原 `test_semi_sync` 实例化的是死代码（无任何生产调用者）；阶段 2 按
+    决策删除该类与导出。这里锁住"不再暴露"：包上无 SemiSync 类、
+    历史模块路径导入显式报 ImportError。
+    """
+    print("\n【半同步已移除】")
+    import pytest
+    import lightdb.replication as rep_pkg
 
-    m = SemiSyncMaster(FakeBinlog(), timeout=0.5, required_acks=1)
-    m.enable()
-    m.register_slave('s1')
-
-    # 异步 ACK
-    def ack():
-        time.sleep(0.1)
-        m.ack('s1', 100)
-
-    threading.Thread(target=ack, daemon=True).start()
-    ok = m.wait_for_ack(100)
-    assert ok is True
-    print("  ✅ 半同步：收到 ACK")
+    assert not hasattr(rep_pkg, 'SemiSyncMaster')
+    assert not hasattr(rep_pkg, 'SemiSyncSlave')
+    with pytest.raises(ImportError):
+        from lightdb.replication import semi_sync  # noqa: F401
+    print("  ✅ 半同步死代码已移除（决策：不实现）")
 
 
 def main():
@@ -114,7 +108,7 @@ def main():
         test_binlog_write,
         test_binlog_rotation,
         test_relay_log,
-        test_semi_sync,
+        test_semi_sync_removed,
     ]
 
     passed = failed = 0

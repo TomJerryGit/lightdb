@@ -1046,8 +1046,30 @@ class Database:
         return txn
 
     def commit(self, txn):
-        """提交事务（COMMIT 落盘是持久化点，必须先于脏页刷盘）"""
+        """提交事务（COMMIT 落盘是持久化点，必须先于脏页刷盘）
+
+        阶段 2（决策 D）：`binlog_strict`（默认 True）下**先**提交 binlog
+        组（`BEGIN → rows… → COMMIT`），失败则物理回滚本事务并把
+        `BinlogWriteError`（1180/HY000）抛给上层 → 客户端看到显式错误、
+        数据不可见（可重试）。`LIGHTDB_BINLOG_STRICT=0` 时退化为旧行为：
+        WAL 先提交，binlog 失败只告警（排障用）。
+        """
         tid = txn['txn_id']
+        strict = self._binlog_strict_active()
+        if strict:
+            try:
+                self._binlog_commit_txn_strict(tid)
+            except Exception as e:
+                self._binlog_errors += 1
+                logger.error(
+                    f"binlog 组提交失败，拒绝提交事务 {tid}: {e}")
+                # 回滚：物理撤销 + 释放 MVCC/锁/读视图，保证"未提交"状态
+                try:
+                    self.abort(txn)
+                except Exception as e2:          # pragma: no cover - 防御
+                    logger.error(
+                        f"binlog 提交失败后回滚事务 {tid} 失败: {e2}")
+                raise
         for tbl in self.tables.values():
             try:
                 # 1) 写 COMMIT 并 fsync —— 掉电后靠它判定事务已提交
@@ -1062,11 +1084,9 @@ class Database:
         self.lock_manager.release(tid)
         for tbl in self.tables.values():
             tbl._read_views.pop(tid, None)
-        # ★ 真 binlog 组提交：把本事务缓冲的行事件成组写成
-        #   BEGIN → 行事件… → COMMIT。写在 WAL COMMIT 之后、与提交同一
-        #   临界路径；失败只告警但计入 `_binlog_errors`（复制位点会缺事件，
-        #   不能静默——后续阶段 2 会改成"binlog 写失败则拒绝提交"）。
-        self._binlog_commit_txn(tid)
+        if not strict:
+            # 非 strict（排障模式）：WAL 已提交后再补 binlog，失败只告警
+            self._binlog_commit_txn(tid)
 
     def commit_statement(self, txn):
         """**语句级内部事务**的提交（autocommit 档持久性）
@@ -1089,6 +1109,20 @@ class Database:
            重放或撤销。
         """
         tid = txn['txn_id']
+        strict = self._binlog_strict_active()
+        if strict:
+            try:
+                self._binlog_commit_txn_strict(tid)
+            except Exception as e:
+                self._binlog_errors += 1
+                logger.error(
+                    f"binlog 组提交失败，拒绝语句级提交（txn {tid}）: {e}")
+                try:
+                    self.abort(txn)
+                except Exception as e2:          # pragma: no cover - 防御
+                    logger.error(
+                        f"binlog 提交失败后回滚语句事务 {tid} 失败: {e2}")
+                raise
         for tbl in self.tables.values():
             try:
                 tbl.wal.commit_autocommit(tid)
@@ -1098,8 +1132,9 @@ class Database:
         self.lock_manager.release(tid)
         for tbl in self.tables.values():
             tbl._read_views.pop(tid, None)
-        # 语句级内部事务也是"已提交"：同样成组写 binlog（BEGIN→rows→COMMIT）
-        self._binlog_commit_txn(tid)
+        if not strict:
+            # 语句级内部事务也是"已提交"：非 strict 模式补写 binlog
+            self._binlog_commit_txn(tid)
 
     def abort(self, txn):
         """回滚事务：真正把数据改回去，再写 ABORT、放锁"""
@@ -1183,6 +1218,36 @@ class Database:
         finally:
             with self._binlog_log_lock:
                 self._binlog_suspend_depth -= 1
+
+    def _binlog_strict_active(self) -> bool:
+        """当前事务提交是否受"binlog 写失败即拒绝提交"约束
+
+        * 从库重放期间（`suspend_binlog`）不写 binlog，自然不约束；
+        * `LIGHTDB_BINLOG_STRICT=0` 时退化为旧告警行为（排障用）。
+        """
+        if self.binlog_suspended:
+            return False
+        try:
+            from ..replication.append_only_binlog import binlog_strict
+            return binlog_strict()
+        except Exception:                        # pragma: no cover - 防御
+            return False
+
+    def _binlog_commit_txn_strict(self, txn_id: int):
+        """严格组提交：写失败抛 `BinlogWriteError`（1180/HY000）
+
+        binlog 被显式关闭（`LIGHTDB_BINLOG_ENABLED=0`）时不约束提交；
+        启用但打开失败 → 视为写路径不可用，同样拒绝提交（不静默降级）。
+        """
+        from ..replication.append_only_binlog import (
+            BinlogWriteError, binlog_enabled)
+        if not binlog_enabled():
+            return
+        rec = self.binlog_log
+        if rec is None:
+            raise BinlogWriteError(
+                'binlog 不可用（打开失败），按 strict 语义拒绝提交')
+        rec.commit_txn(txn_id)
 
     def _binlog_commit_txn(self, txn_id: int):
         if self.binlog_suspended:

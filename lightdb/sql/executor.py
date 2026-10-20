@@ -7,6 +7,7 @@ SQL 执行器 - 结构化结果（修复版）
 - 加 stats_manager
 """
 import atexit
+import contextlib
 import json
 import os
 import re
@@ -479,6 +480,12 @@ class Executor:
         # 退回串行。
         self.parallel_enabled = True
         self._parallel = None
+
+        # ★ 阶段 2：UPDATE/DELETE 的 binlog 镜像改为从 WAL 增量取（少一次
+        #   SELECT）。autocommit 路径需要"表级语句锁"把一段 WAL 记录圈定为
+        #   本语句所有（见 `_binlog_table_guard`）；锁按表惰性创建。
+        self._binlog_table_locks = {}
+        self._binlog_locks_guard = threading.Lock()
 
     # ==================== 主入口 ====================
 
@@ -1154,9 +1161,8 @@ class Executor:
     #   * 回滚：`Database.abort()` 写 `BEGIN → ROLLBACK`（行事件从未落盘，
     #     只记 discarded 条数，不伪造变更）。
     #
-    # 已知边界（TODO 阶段 2）：UPDATE/DELETE 为拿行镜像会在执行前多一次
-    # SELECT（大表 UPDATE 的额外扫描成本）；直接写存储层的调用不经过
-    # 执行器，因此不产生 binlog 事件。
+    # 已知边界（TODO 阶段 2）：直接写存储层的调用不经过执行器，因此不产生
+    # binlog 事件。
 
     _BINLOG_DML_COMMANDS = frozenset({'INSERT', 'UPDATE', 'DELETE'})
     _BINLOG_DDL_COMMANDS = frozenset({
@@ -1174,6 +1180,17 @@ class Executor:
         if getattr(self.db, 'binlog_suspended', False):
             return False
         return self._binlog_writer() is not None
+
+    @staticmethod
+    def _binlog_wal_images_enabled() -> bool:
+        """UPDATE/DELETE 镜像是否走 WAL 增量（阶段 2 优化，默认开）
+
+        ``LIGHTDB_BINLOG_MIRROR=legacy`` 可退回"语句前 SELECT 取旧行"的
+        阶段 1 行为——仅用于 A/B 计时对照与排障；生产默认走 WAL（少一次
+        全表扫描）。两种模式产出的 binlog 镜像内容一致（同一批存储层行）。
+        """
+        raw = str(os.environ.get('LIGHTDB_BINLOG_MIRROR', '') or '').strip()
+        return raw.lower() != 'legacy'
 
     def _binlog_group(self, s):
         """返回本次语句的行事件组 id
@@ -1210,6 +1227,79 @@ class Executor:
         except Exception as e:
             self.db._binlog_errors = getattr(self.db, '_binlog_errors', 0) + 1
             logger.error(f"binlog 行事件缓冲失败（{event_type} {table}）: {e}")
+
+    def _wal_dml_images(self, tbl, lsn_start, lsn_end, kind: str,
+                        txn_id: int = None):
+        """从本表 WAL 增量里取本次 UPDATE/DELETE 产生的行镜像
+
+        阶段 2 优化（少一次 SELECT）：`Table.update/delete` 在写路径上已经
+        把每个受影响行的 `old`/`new`/`pk` 镜像写进本表 WAL（崩溃恢复与
+        undo 都依赖它）。执行器记录 binlog 行镜像时直接读这段**增量**
+        （`WAL.read_from_lsn` 走文件增量缓存，不重扫数据页），因此语句
+        执行前不再需要一次 `SELECT` 取旧行 —— 大表 UPDATE/DELETE 少一整
+        趟全表扫描。
+
+        正确性边界：
+        * 显式事务：只取 `txn_id` 匹配的记录（同一事务内顺序执行，不会
+          混入别的语句/会话）；
+        * autocommit：`txn_id=None`，由调用方持有**表级语句锁**
+          （`_binlog_table_guard`）保证这一段 WAL 只属于本语句，再按
+          `[lsn_start+1, lsn_end]` + 表名 + 记录类型过滤；
+        * `lsn_start` 为空（读不到）时返回空，调用方回退到"预先 SELECT"
+          的旧路径（安全降级）。
+
+        返回 ``[(record_type, data_dict), ...]``，data 里含 pk/old/new，
+        与手工 SELECT 得到的是同一批行（同一存储层快照）。语句结束后
+        未提交的 WAL 记录即本语句的变更（提交语义由 Database 负责）。
+        """
+        if lsn_start is None:
+            return []
+        try:
+            recs = tbl.wal.read_from_lsn(int(lsn_start) + 1)
+        except Exception as e:                   # pragma: no cover - 防御
+            logger.warn(f"读取 WAL 增量失败（binlog 镜像回退到 SELECT）: {e}")
+            return []
+        want = str(kind or '').upper()
+        out = []
+        for rec in recs:
+            try:
+                if lsn_end is not None and int(getattr(rec, 'lsn', 0)) > int(lsn_end):
+                    break
+            except (TypeError, ValueError):
+                pass
+            if txn_id is not None:
+                try:
+                    if int(getattr(rec, 'txn_id', -1) or -1) != int(txn_id):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            rtype = str(getattr(rec, 'type', '') or '').upper()
+            if rtype != want:
+                continue
+            data = dict(getattr(rec, 'data', None) or {})
+            if data.get('table') not in (None, tbl.name):
+                continue
+            out.append((rtype, data))
+        return out
+
+    @contextlib.contextmanager
+    def _binlog_table_guard(self, table_name: str):
+        """语句级表锁（只在 autocommit + WAL 镜像路径使用）
+
+        作用域只覆盖"读 WAL 增量取镜像"这条路径：保证从 `lsn_start` 到
+        `lsn_end` 之间该表的 WAL 记录**只属于本语句**（不会被另一个连接
+        的 UPDATE/DELETE 插进来）。显式事务不需要它（按 txn_id 过滤）。
+
+        已知边界：绕过执行器直接写存储层（`Table.insert` 等）仍可能插入
+        记录；这是本引擎既有的"binlog 只记执行器路径"边界（见模块说明）。
+        """
+        with self._binlog_locks_guard:
+            lock = self._binlog_table_locks.get(table_name)
+            if lock is None:
+                lock = threading.RLock()
+                self._binlog_table_locks[table_name] = lock
+        with lock:
+            yield
 
     @staticmethod
     def _binlog_coerce_row(tbl, row):
@@ -1260,8 +1350,14 @@ class Executor:
                 else:
                     rec.discard_group(gid)
         except Exception as e:
+            # 注意（阶段 2 残余边界，如实说明）：单行 autocommit 的数据持久
+            # 点在 Table 内部（合成事务），这里 binlog 写失败时数据已提交，
+            # 无法再回滚 —— 只告警并计数。strict 的"写失败拒绝提交"覆盖的是
+            # Database.commit / commit_statement（显式事务、多值语句）。
             self.db._binlog_errors = getattr(self.db, '_binlog_errors', 0) + 1
-            logger.error(f"binlog 语句组提交失败（{cmd}）: {e}")
+            logger.error(
+                f"binlog 语句组提交失败（{cmd}，autocommit 单语句："
+                f"数据已提交，复制日志缺少该事件）: {e}")
         # DDL：成功的 DDL 才记录（失败/不支持的分支不回 OK，因此不落）
         if ok and is_ddl:
             try:
@@ -6156,31 +6252,52 @@ class Executor:
 
         before = self._triggers_for(p['table'], 'BEFORE', 'UPDATE')
         after = self._triggers_for(p['table'], 'AFTER', 'UPDATE')
-        # binlog 需要 UPDATE 的行镜像（old/new/pk）：没有触发器时也要先
-        # 把命中行读出来（TODO 阶段 2：大表可改为从 undo/行锁信息取镜像，
-        # 省掉这次额外扫描）
+        has_triggers = bool(before or after)
         need_binlog = self._binlog_record_enabled()
+
+        # 两套镜像来源（阶段 2）：
+        #  * **WAL 增量**（无触发器 且 where 非空）：语句前不 SELECT，写完
+        #    后从本表 WAL 增量读 old/new/pk（见 `_wal_dml_images`）。
+        #    显式事务按 txn_id 过滤；autocommit 用表级语句锁圈定 WAL 区间。
+        #  * **预先 SELECT**（有触发器，或 where 为空 = 可能整表更新，或
+        #    `LIGHTDB_BINLOG_MIRROR=legacy` 排障模式）：本来就要扫全表/
+        #    触发器需要 OLD 行，旧行直接复用（不再多扫一趟）。
+        wal_mode = self._binlog_wal_images_enabled()
+        use_wal = bool(need_binlog and not has_triggers
+                       and where is not None and wal_mode)
+        prefetch = bool(has_triggers or
+                        (need_binlog and (where is None or not wal_mode)))
         old_cols, old_rows = (None, [])
-        if before or after or need_binlog:
+        if prefetch:
             old_cols, old_rows = tbl.select(['*'], where, read_view=rv)
-            for r in old_rows:
-                row = [self._set_value(p['set'], old_cols, r, c)
-                       for c in old_cols]
-                self._fire_triggers('BEFORE', 'UPDATE', p['table'],
-                                    old_row=list(r), new_row=row, session=s)
-                for i, c in enumerate(old_cols):
-                    if row[i] != r[i]:
-                        # BEFORE UPDATE 里 `SET NEW.c = ...` 的改动合并进
-                        # 真正的 SET 列表（否则触发器算了不用 = 静默丢弃）
-                        p['set'][c] = row[i]
+            if has_triggers:
+                for r in old_rows:
+                    row = [self._set_value(p['set'], old_cols, r, c)
+                           for c in old_cols]
+                    self._fire_triggers('BEFORE', 'UPDATE', p['table'],
+                                        old_row=list(r), new_row=row,
+                                        session=s)
+                    for i, c in enumerate(old_cols):
+                        if row[i] != r[i]:
+                            # BEFORE UPDATE 里 `SET NEW.c = ...` 的改动合并进
+                            # 真正的 SET 列表（否则触发器算了不用 = 静默丢弃）
+                            p['set'][c] = row[i]
 
-        n = tbl.update(
-            p['set'], where,
-            txn_id=tid, read_view=rv)
+        lsn_start = getattr(tbl.wal, 'lsn', None) if use_wal else None
+        guard = (self._binlog_table_guard(tbl.name)
+                 if (use_wal and txn is None) else contextlib.nullcontext())
+        with guard:
+            n = tbl.update(p['set'], where, txn_id=tid, read_view=rv)
+            if use_wal:
+                lsn_end = getattr(tbl.wal, 'lsn', None)
+                images = self._wal_dml_images(
+                    tbl, lsn_start, lsn_end, 'UPDATE',
+                    txn_id=(tid if txn is not None else None))
+                self._record_update_images(s, tbl, images, n)
 
-        if need_binlog and old_rows:
-            bl_cols = ([str(c) for c in old_cols] if old_cols
-                       else [c['name'] for c in tbl.cols])
+        # 预先 SELECT 已拿到旧行：镜像直接复用（有触发器 / where 为空的路径）
+        if need_binlog and prefetch and old_rows:
+            bl_cols = [str(c) for c in old_cols]
             pk_name = str(tbl.pk_col)
             pk_idx = (bl_cols.index(pk_name)
                       if pk_name in bl_cols else int(tbl.pk_idx))
@@ -6203,6 +6320,29 @@ class Executor:
         self.stats['rows'] += n
         return self._ok(
             affected=n, message=f"{n} row(s) updated")
+
+    def _record_update_images(self, s, tbl, images, affected):
+        """把 WAL 增量里的 UPDATE 镜像写进 binlog 缓冲（内容与手工 SELECT 一致）
+
+        WAL 里的 `old` 是行前像（已 coerce），`new` 是 SET 之后的意图值
+        （可能仍是解析器原文，如 `'999'`）；这里按列类型 coerce 一次，
+        保证 binlog 镜像与"手工 SELECT 出来的值"逐列相等（从库重放也用
+        实际落盘值）。
+        """
+        cols = [c['name'] for c in tbl.cols]
+        for _rtype, d in images:
+            old = self._binlog_coerce_row(tbl, list(d.get('old') or []))
+            new = self._binlog_coerce_row(tbl, list(d.get('new') or []))
+            self._binlog_record(
+                s, 'UPDATE', tbl.name,
+                {'cols': cols, 'pk': d.get('pk'),
+                 'old': old, 'new': new})
+        if affected and len(images) != affected:
+            # 如实告警：镜像条数与 affected 不一致（正常不应发生；不阻塞
+            # 语句，但把差异暴露出来，避免静默的记录缺失）
+            logger.warn(
+                f"binlog UPDATE 镜像条数 {len(images)} != affected "
+                f"{affected}（表 {tbl.name}）—— 请检查 WAL 增量读取")
 
     @staticmethod
     def _set_value(set_pairs, cols, row, col):
@@ -6235,18 +6375,47 @@ class Executor:
             self._triggers_for(p['table'], 'BEFORE', 'DELETE')
             or self._triggers_for(p['table'], 'AFTER', 'DELETE'))
         need_binlog = self._binlog_record_enabled()
+
+        # 阶段 2：镜像来源与 UPDATE 同理 —— 无触发器且 where 非空时用 WAL
+        # 增量（语句前不 SELECT）；有触发器/where 为空/legacy 对照时预先
+        # SELECT 并复用。
+        wal_mode = self._binlog_wal_images_enabled()
+        use_wal = bool(need_binlog and not has_triggers
+                       and where is not None and wal_mode)
+        prefetch = bool(has_triggers or
+                        (need_binlog and (where is None or not wal_mode)))
         old_rows = []
-        if has_triggers or need_binlog:
+        if prefetch:
             _, old_rows = tbl.select(['*'], where, read_view=rv)
             if has_triggers:
                 for r in old_rows:
                     self._fire_triggers('BEFORE', 'DELETE', p['table'],
                                         old_row=list(r), session=s)
 
-        n = tbl.delete(
-            where, txn_id=tid, read_view=rv)
+        lsn_start = getattr(tbl.wal, 'lsn', None) if use_wal else None
+        guard = (self._binlog_table_guard(tbl.name)
+                 if (use_wal and txn is None) else contextlib.nullcontext())
+        with guard:
+            n = tbl.delete(where, txn_id=tid, read_view=rv)
+            if use_wal:
+                lsn_end = getattr(tbl.wal, 'lsn', None)
+                images = self._wal_dml_images(
+                    tbl, lsn_start, lsn_end, 'DELETE',
+                    txn_id=(tid if txn is not None else None))
+                col_names = [c['name'] for c in tbl.cols]
+                for _rtype, d in images:
+                    old = self._binlog_coerce_row(
+                        tbl, list(d.get('old') or []))
+                    self._binlog_record(
+                        s, 'DELETE', p['table'],
+                        {'cols': col_names, 'pk': d.get('pk'),
+                         'old': old})
+                if n and len(images) != n:
+                    logger.warn(
+                        f"binlog DELETE 镜像条数 {len(images)} != affected "
+                        f"{n}（表 {tbl.name}）—— 请检查 WAL 增量读取")
 
-        if need_binlog and old_rows:
+        if need_binlog and prefetch and old_rows:
             bl_cols = [c['name'] for c in tbl.cols]
             pk_name = str(tbl.pk_col)
             pk_idx = (bl_cols.index(pk_name)
@@ -6311,11 +6480,14 @@ class Executor:
     def _show_master_status(self, p, s):
         """SHOW MASTER STATUS —— 来自真 append-only binlog 文件
 
-        * `File`     = 当前 binlog 文件名（`binlog.000001`，本实现无轮转）
-        * `Position` = **真实字节位点**（文件末尾，即下一条记录的起始偏移；
-          单调递增，不随任何表 WAL 的 checkpoint/ALTER 回退）
+        * `File`     = **当前可写** binlog 文件名（轮转后为 `binlog.00000N`；
+          旧文件只读保留，可用 `SHOW BINLOG EVENTS IN '...'` 读取）
+        * `Position` = **该文件内**的真实字节位点（文件末尾，即下一条记录
+          的起始偏移；MySQL 语义。单调递增，不随任何表 WAL 的
+          checkpoint/ALTER 回退；跨文件的全局位点在 `__BINLOG_FETCH__.lsn`）
         * `Binlog_Do_DB` / `Binlog_Ignore_DB` = ''（未配置过滤，MySQL 同）
-        * `Executed_Gtid_Set` = NULL（本引擎无 GTID 概念，不编造）
+        * `Executed_Gtid_Set` = NULL —— **决策：不实现 GTID**，复制按
+          "文件 + 位点"进行（不冒充 MySQL 的 GTID 语义）
 
         binlog 未启用（`LIGHTDB_BINLOG_ENABLED=0`）时返回**空结果集**
         （MySQL `log_bin=OFF` 时 SHOW MASTER STATUS 也是空结果集）。
@@ -6503,12 +6675,17 @@ class Executor:
         """SHOW BINLOG EVENTS —— 逐条真实记录（含事务边界/格式事件）
 
         列保持 MySQL 兼容形态：`Log_name / Pos / Event_type / Server_id /
-        End_log_pos / Info`。`Pos` 是**真实字节偏移**（记录起始），
-        `End_log_pos` 是记录结束偏移；`Info` 是一行真实摘要（表名/行镜像/
-        SQL/事务号），不是占位文本。
+        End_log_pos / Info`。`Pos`/`End_log_pos` 是**该文件内**的真实字节偏移
+        （MySQL 语义）；`Info` 是一行真实摘要（表名/行镜像/SQL/事务号），
+        不是占位文本。
 
         支持 MySQL 的可选子句（parser 解析进 AST）：
-        ``SHOW BINLOG EVENTS [IN 'file'] [FROM pos] [LIMIT n]``。
+        ``SHOW BINLOG EVENTS [IN 'file'] [FROM pos] [LIMIT n]``：
+
+        * 不写 `IN` → 读**当前可写文件**；
+        * `IN 'binlog.00000N'` → 读指定历史文件（轮转后旧文件只读保留，
+          位点 `FROM pos` 是该文件内的偏移）；
+        * 文件不存在 → 1105 显式报错（不悄悄换成别的文件）。
 
         文件损坏/截断 → 1105 显式报错（拒绝静默跳过）。
         """
@@ -6517,14 +6694,12 @@ class Executor:
         rec = self._binlog_reader()
         if rec is None:
             return self._rs(cols, [])
-        requested_file = p.get('binlog_file')
-        if requested_file and requested_file != rec.current_file:
-            # 本实现没有轮转（只有 binlog.000001）：请求别的文件要显式
-            # 报错，而不是悄悄把当前文件的事件当作那个文件返回。
+        requested_file = p.get('binlog_file') or rec.current_file
+        if requested_file not in rec.file_names():
             return self._err(
-                1105, f"SHOW BINLOG EVENTS IN '{requested_file}' 不支持："
-                      f"本实现无 binlog 轮转，当前只有 "
-                      f"'{rec.current_file}'（TODO 阶段 2：多文件/索引）")
+                1105, f"SHOW BINLOG EVENTS IN '{requested_file}' 失败："
+                      f"binlog 文件不存在（现有: "
+                      f"{', '.join(rec.file_names())}）")
         start = p.get('from_pos')
         try:
             start = int(start) if start is not None else 16
@@ -6537,12 +6712,12 @@ class Executor:
         except (TypeError, ValueError):
             limit = None
         try:
-            records = rec.read_from(max(16, start), limit)
+            records = rec.read_file(requested_file, max(16, start), limit)
         except Exception as e:
             return self._err(
                 1105, f"读取 binlog 失败（拒绝静默跳过损坏记录）: {e}")
         rows = [
-            (rec.current_file, r.pos, r.type_name, r.server_id,
+            (requested_file, r.pos, r.type_name, r.server_id,
              r.end_pos, r.summary())
             for r in records
         ]

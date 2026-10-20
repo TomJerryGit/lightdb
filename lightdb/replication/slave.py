@@ -16,9 +16,11 @@
   - `Exec_Master_Log_Pos`  = sql 线程真正重放完的事件序号；
   - `Relay_Log_Pos` / `Relay_Log_Space` = 中继日志文件真实字节数；
   - `Master_Log_File`      = 从主库 `SHOW MASTER STATUS` 读到的文件名。
-* 取不到的（GTID、server_uuid、master.info 路径、事件时间戳换算的
-  `Seconds_Behind_Master`）一律 `None`，并在 `show_status()` 的注释里
-  逐项说明原因，**绝不编造**。
+* 取不到的（GTID、server_uuid、事件时间戳换算的 `Seconds_Behind_Master`）
+  一律 `None`，并在 `show_status()` 的注释里逐项说明原因，**绝不编造**。
+* 决策记录（决策 D 阶段 2）：**GTID 不实现** —— 复制只按
+  "binlog 文件 + 位点"进行；`Retrieved_Gtid_Set` / `Executed_Gtid_Set`
+  保持 NULL（不冒充 MySQL 语义）。**半同步不实现**（死代码已删除）。
 """
 import json
 import threading

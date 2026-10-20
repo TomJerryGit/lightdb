@@ -72,7 +72,7 @@ METRIC_DEFINITIONS = [
     Metric('lightdb_disk_read_iops', '读 IOPS', 'gauge'),
     Metric('lightdb_disk_write_iops', '写 IOPS', 'gauge'),
 
-    # ============ Binlog / 复制（6 个）============
+    # ============ Binlog / 复制（5 个）============
     Metric('lightdb_binlog_bytes_total', 'Binlog 字节数', 'counter',
            unit='bytes'),
     Metric('lightdb_binlog_position', 'Binlog 位置', 'gauge'),
@@ -80,8 +80,8 @@ METRIC_DEFINITIONS = [
     Metric('lightdb_slave_sql_running', '从库 SQL 线程', 'gauge'),
     Metric('lightdb_slave_lag_seconds', '从库延迟', 'gauge',
            unit='seconds'),
-    Metric('lightdb_semi_sync_avg_wait_ms', '半同步平均等待', 'gauge',
-           unit='milliseconds'),
+    # 决策 D 阶段 2：半同步复制**不实现**（死代码已移除），
+    # 因此不再暴露 semi_sync 指标（不编造恒 0 的假指标）。
 
     # ============ 表级（4 个）============
     Metric('lightdb_table_rows', '表行数', 'gauge',

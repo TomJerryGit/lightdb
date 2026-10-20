@@ -1,4 +1,4 @@
-"""Batch 14 测试 - 半同步 + SSL + 并行 + 审计"""
+"""Batch 14 测试 - 半同步（已移除）/ SSL / 并行 / 审计"""
 import os
 import pytest
 import shutil
@@ -23,7 +23,7 @@ def reset():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def start_server(port, ssl=False, semi_sync=False, audit_level='DDL'):
+def start_server(port, ssl=False, audit_level='DDL'):
     from lightdb.config import Config
     from lightdb.db.database import Database
     from lightdb.sql.executor import Executor
@@ -33,7 +33,6 @@ def start_server(port, ssl=False, semi_sync=False, audit_level='DDL'):
     cfg.host = '127.0.0.1'
     cfg.port = port
     cfg.ssl_enabled = ssl
-    cfg.semi_sync_enabled = semi_sync
     cfg.audit_level = audit_level
     db = track(Database(DATA_DIR))
     ex = track(Executor(db))
@@ -44,94 +43,20 @@ def start_server(port, ssl=False, semi_sync=False, audit_level='DDL'):
     return srv, db, ex
 
 
-def test_semi_sync_controller():
-    """测试1: 半同步控制器（直接调用）"""
-    print("\n【测试1】半同步控制器")
-    from lightdb.replication.semi_sync import SemiSyncMaster
-
-    class FakeBinlog:
-        def current_pos(self): return 0
-
-    m = SemiSyncMaster(FakeBinlog(), timeout=0.5, required_acks=1)
-    m.enable()
-    m.register_slave('s1')
-    print("  ✅ 启用半同步 + 注册 s1")
-
-    # 模拟异步确认
-    def delayed_ack():
-        time.sleep(0.1)
-        m.ack('s1', 100)
-
-    threading.Thread(target=delayed_ack, daemon=True).start()
-
-    start = time.time()
-    ok = m.wait_for_ack(100)
-    elapsed = (time.time() - start) * 1000
-    print(f"  → wait_for_ack = {ok}, 等待 {elapsed:.0f}ms")
-    assert ok, "应该成功收到 ACK"
-
-    # 超时场景
-    m.ack_map.clear()
-    start = time.time()
-    ok2 = m.wait_for_ack(200)
-    elapsed2 = (time.time() - start) * 1000
-    print(f"  → 无 ACK 时 wait_for_ack = {ok2}, 等待 {elapsed2:.0f}ms")
-    assert not ok2, "应该超时"
-    assert elapsed2 >= 400, "应该等待约 500ms"
-
-    st = m.status()
-    print(f"  → 状态: {st}")
-    assert st['sync_ok'] == 1
-    assert st['sync_timeout'] == 1
-    print("  ✅ 半同步控制器正常")
-
-
-@pytest.mark.xfail(
-    reason="半同步复制为死代码（SemiSyncMaster/Slave 无调用者）；真 binlog 复制在路线图阶段 2/4",
-    strict=False)
-def test_semi_sync_sql():
-    """测试2: SQL 协议半同步"""
-    print("\n【测试2】SQL 协议半同步")
-    reset()
-    srv, db, ex = start_server(PORT, semi_sync=True)
-
-    import pymysql
-    conn = track(pymysql.connect(host='127.0.0.1', port=PORT, user='root',
-                                 autocommit=True))
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR)")
-    print("  ✅ 建表")
-
-    # 注册一个伪从库
-    cur.execute("__SEMI_SYNC_REGISTER__ slave_test")
-    print("  ✅ 注册从库")
-
-    # 插入（主库会等待）
-    def auto_ack():
-        time.sleep(0.1)
-        import pymysql as pm
-        c2 = pm.connect(host='127.0.0.1', port=PORT, user='root', autocommit=True)
-        cu2 = c2.cursor()
-        cu2.execute("__SEMI_SYNC_ACK__ slave_test 5")
-        c2.close()
-
-    threading.Thread(target=auto_ack, daemon=True).start()
-
-    t0 = time.time()
-    cur.execute("INSERT INTO t VALUES (1, 'a')")
-    t1 = time.time()
-    print(f"  → INSERT 耗时 {(t1-t0)*1000:.0f}ms（等待 ACK）")
-
-    cur.execute("SHOW STATUS LIKE 'Rpl_semi_sync%'")
-    rows = cur.fetchall()
-    print("  → 半同步状态:")
-    for r in rows:
-        print(f"    {r[0]} = {r[1]}")
-
-    conn.close()
-    srv.shutdown()
-    db.shutdown()
-    time.sleep(0.3)
+def test_semi_sync_removed():
+    """测试1: 半同步已移除（决策 D 阶段 2 —— 不实现）"""
+    print("\n【测试1】半同步已移除（决策：不实现）")
+    import lightdb.replication as rep_pkg
+    # 导出已清理：包上不再有半同步类
+    assert not hasattr(rep_pkg, 'SemiSyncMaster')
+    assert not hasattr(rep_pkg, 'SemiSyncSlave')
+    # 历史模块已物理删除：导入会显式报 ImportError（不是悄悄给空壳）
+    with pytest.raises(ImportError):
+        from lightdb.replication import semi_sync  # noqa: F401
+    # 配置项已删除（不再有"配了却没人用"的半同步开关）
+    from lightdb.config import Config
+    assert not hasattr(Config(), 'semi_sync_enabled')
+    print("  ✅ 半同步死代码/导出/配置项均已移除，包导入无残留")
 
 
 def test_audit():
@@ -317,23 +242,21 @@ def test_config_new_fields():
     cfg = Config()
     assert hasattr(cfg, 'ssl_enabled')
     assert hasattr(cfg, 'audit_level')
-    assert hasattr(cfg, 'semi_sync_enabled')
+    assert not hasattr(cfg, 'semi_sync_enabled')   # 决策 D 阶段 2：已移除
     assert hasattr(cfg, 'parallel_workers')
     print(f"  → ssl_enabled = {cfg.ssl_enabled}")
     print(f"  → audit_level = {cfg.audit_level}")
-    print(f"  → semi_sync_enabled = {cfg.semi_sync_enabled}")
     print(f"  → parallel_workers = {cfg.parallel_workers}")
-    print("  ✅ 配置字段就绪")
+    print("  ✅ 配置字段就绪（半同步配置项已按决策移除）")
 
 
 def main():
     print("=" * 60)
-    print("  Batch 14 测试 - 半同步 + SSL + 并行 + 审计")
+    print("  Batch 14 测试 - 半同步（已移除）/ SSL / 并行 / 审计")
     print("=" * 60)
 
     tests = [
-        ('半同步控制器', test_semi_sync_controller),
-        ('SQL层半同步', test_semi_sync_sql),
+        ('半同步已移除', test_semi_sync_removed),
         ('审计日志', test_audit),
         ('SSL连接', test_ssl),
         ('并行 COUNT', test_parallel_count),

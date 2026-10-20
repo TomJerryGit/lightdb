@@ -477,7 +477,6 @@ def _handle_connection(worker_id: int, conn, addr, ctx: dict):
             # MySQLHandler 可能引用的可选字段
             self.query_cache = None
             self.pool = None
-            self.semi_sync = None
             self.ssl_mgr = None
             self.ssl_enabled = False
 
