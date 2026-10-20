@@ -62,8 +62,9 @@ class ColumnChunk:
         # 更新统计
         self._compute_stats()
 
-        # 编码
-        self.encoded_data = encoder.encode(self.values)
+        # 编码（必须把声明类型传给编码器：编/解码按同一份类型规则，
+        # 否则「FLOAT 列里出现整数」「INT 列里出现 1.0」会静默错值）
+        self.encoded_data = encoder.encode(self.values, self.col_type)
         self.encoding = encoder.encoding_id
         self.compressed_size = len(self.encoded_data)
 
@@ -72,20 +73,42 @@ class ColumnChunk:
         return header + self.encoded_data
 
     def decode(self, raw: bytes) -> List:
-        """解码"""
+        """解码
+
+        ★ 正确性修复：除 values 外，**统计信息也随块头一起还原**
+        （min/max/null_count/distinct_count/sum/total）。旧实现把块头的
+        stats JSON 解析出来后直接丢弃，于是 `ColumnStore.flush()` 再
+        `__init__()` 重载之后 `get_column_stats()` 的 min/max 变成 None、
+        null_count 变成 0、sum 变成 0 —— 与行存/内存态语义不一致，且
+        优化器的 `can_skip_scan` 会因此失效。
+        """
         header, data = self._parse_header(raw)
         self.encoding = header['encoding']
-        self.stats.null_count = header['null_count']
-        self.stats.total_count = header['count']
+        self.compressed_size = len(raw)
+        stats = header.get('stats') or {}
+        self.stats.null_count = int(stats.get('null', header['null_count']) or 0)
+        self.stats.total_count = int(
+            stats.get('count', header['count']) or header['count'])
+        self.stats.min_value = stats.get('min')
+        self.stats.max_value = stats.get('max')
+        self.stats.distinct_count = int(stats.get('distinct', 0) or 0)
+        self.stats.sum_value = stats.get('sum', 0) or 0
+        self.stats.is_sorted = bool(stats.get('sorted', False))
 
         encoder = EncoderRegistry.get_by_id(self.encoding)
         self.values = encoder.decode(data, self.col_type)
+        if len(self.values) != header['count']:
+            raise ValueError(
+                f"列块 {self.column_name} 解码长度不符: "
+                f"头部 {header['count']} 行，实际 {len(self.values)} 行")
         return self.values
 
     def _build_header(self) -> bytes:
-        """块头部"""
-        # 布局:
-        # [4B magic][4B count][1B encoding][4B data_len][8B stats_json_len]
+        """块头部
+
+        布局: [4B magic][4B count][1B encoding][4B data_len]
+              [2B name_len][name][4B stats_json_len][stats_json]
+        """
         name_bytes = self.column_name.encode('utf-8')
         stats_json = _stats_to_json(self.stats).encode('utf-8')
 
@@ -100,32 +123,49 @@ class ColumnChunk:
         return header
 
     def _parse_header(self, raw: bytes):
-        """解析头部"""
-        assert raw[:4] == b'CDCH'
+        """解析头部（显式校验 magic/长度，损坏数据抛 ValueError 而不是 assert）"""
+        import json
+        if len(raw) < 4 or raw[:4] != b'CDCH':
+            raise ValueError(
+                f"列块头 magic 非法: {raw[:4]!r}（表 {self.column_name}）")
         offset = 4
-        count = struct.unpack_from('<I', raw, offset)[0]
-        offset += 4
-        encoding = raw[offset]
-        offset += 1
-        data_len = struct.unpack_from('<I', raw, offset)[0]
-        offset += 4
-        name_len = struct.unpack_from('<H', raw, offset)[0]
-        offset += 2
-        name = raw[offset:offset+name_len].decode('utf-8')
-        offset += name_len
-        stats_len = struct.unpack_from('<I', raw, offset)[0]
-        offset += 4
-        stats_json = raw[offset:offset+stats_len].decode('utf-8')
-        offset += stats_len
-
-        # 剩余为数据
-        data = raw[offset:]
+        try:
+            count = struct.unpack_from('<I', raw, offset)[0]
+            offset += 4
+            encoding = raw[offset]
+            offset += 1
+            data_len = struct.unpack_from('<I', raw, offset)[0]
+            offset += 4
+            name_len = struct.unpack_from('<H', raw, offset)[0]
+            offset += 2
+            if offset + name_len > len(raw):
+                raise ValueError("列块头 name 越界")
+            name = raw[offset:offset+name_len].decode('utf-8')
+            offset += name_len
+            stats_len = struct.unpack_from('<I', raw, offset)[0]
+            offset += 4
+            if offset + stats_len > len(raw):
+                raise ValueError("列块头 stats 越界")
+            stats_json = raw[offset:offset+stats_len].decode('utf-8')
+            offset += stats_len
+        except struct.error as e:
+            raise ValueError(f"列块头损坏: {e}") from e
+        try:
+            stats = json.loads(stats_json) if stats_json else {}
+        except ValueError:
+            stats = {}
+        data = raw[offset:offset + data_len]
+        if len(data) != data_len:
+            raise ValueError(
+                f"列块 {name} 数据长度不符: 头声明 {data_len}，"
+                f"实际 {len(data)}")
         return ({
             'count': count,
             'encoding': encoding,
             'data_len': data_len,
             'name': name,
-            'null_count': 0,
+            'null_count': int(stats.get('null', 0) or 0),
+            'stats': stats,
         }, data)
 
     # ==================== 统计 ====================

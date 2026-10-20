@@ -34,24 +34,39 @@ def test_all_encoders_roundtrip():
         BitPackEncoder(),
     ]
 
+    # 整数专用编码器遇到 VARCHAR 必须**显式报错**（诚实契约），
+    # 不能像旧实现那样吞掉异常；其余组合必须逐值往返一致。
+    integer_only = {'DeltaEncoder', 'BitPackEncoder'}
+    failures = []
     for col_type, values in datasets:
         for enc in encoders:
-            try:
-                data = enc.encode(values)
-                decoded = enc.decode(data, col_type)
-                if decoded != values:
-                    print(f"  ❌ {enc.__class__.__name__} "
-                          f"对 {col_type} 失败")
-                    return
-            except Exception:
+            name = enc.__class__.__name__
+            if col_type == 'VARCHAR' and name in integer_only:
+                try:
+                    enc.encode(values, col_type)
+                except ValueError:
+                    pass                       # 期望：显式拒绝
+                else:
+                    failures.append(f'{name}/{col_type}: 应显式报错却静默接受')
                 continue
+            try:
+                data = enc.encode(values, col_type)
+                decoded = enc.decode(data, col_type)
+                if list(decoded) != list(values):
+                    failures.append(f'{name}/{col_type}: 往返不一致')
+            except Exception as e:            # noqa: BLE001
+                failures.append(f'{name}/{col_type}: {type(e).__name__}: {e}')
+    # 旧实现这里用 return / except: continue，任何失败都被吞掉 → 永远"通过"。
+    # 现在失败必须显式冒泡，才配叫回归测试。
+    assert not failures, f'编码器往返失败: {failures}'
 
-    print(f"  ✅ 所有编码器往返一致")
+    print(f"  ✅ 所有编码器往返一致（整数专用编码器对 VARCHAR 显式拒绝）")
 
 
 @pytest.mark.skip(
-    reason="列存是实验性实现、未接入 SQL 执行路径；用户已决定接入（路线图阶段 4），"
-           "接入并纳入基准门禁后取消 skip")
+    reason="压缩率性能项未达标：Dict 编码实测 2.8x < 断言 3x；编码正确性已由 "
+           "test_all_encoders_roundtrip + test_olap_correctness 覆盖，"
+           "格式改进列入 OLAP 接入 4A.5")
 def test_encoder_compression():
     """测试：压缩率"""
     print("\n【压缩率验证】")
@@ -123,8 +138,6 @@ def test_columnar_large_scale():
         print(f"  ✅ 列式大数据通过")
 
 
-@pytest.mark.skip(
-    reason="列存 GROUP BY 仍返回 0 行（实验性、未接线）；随 OLAP/列存接入 SQL 路径一并修复")
 def test_olap_groupby():
     """测试：OLAP 分组"""
     print("\n【OLAP 分组】")

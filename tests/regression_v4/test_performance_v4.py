@@ -96,8 +96,8 @@ def test_olap_scan_performance():
 
 
 @pytest.mark.skip(
-    reason="OLAP 向量化是实验性实现、未接入 SQL 执行路径；20M rows/s 是设计目标而非"
-           "实测。用户已决定接入（路线图阶段 4），接入后改为正式基准门禁")
+    reason="OLAP 聚合性能目标未达标：正确性问题已在 4A.1 修复（91 例对拍全绿），"
+           "实测 1.5–6M rows/s < 设计目标 20M rows/s；性能目标随 4A.5 门禁化重定")
 def test_olap_aggregate_performance():
     """测试：OLAP 聚合性能"""
     print("\n【OLAP 聚合性能】")
@@ -132,8 +132,8 @@ def test_olap_aggregate_performance():
 
 
 @pytest.mark.skip(
-    reason="并行执行仅覆盖单表裸 COUNT，GIL 下实测负加速（<1x），不满足 1.5x 目标；"
-           "并行/OLAP 编排随路线图阶段 4 一并重做")
+    reason="并行加速未达标：正确性（where/COUNT/AVG/分片失败）已在 4A.1 修复，"
+           "但 GIL 下实测 0.58–0.82x 负加速，不满足 1.5x 目标；并行编排随 4A.3 重做")
 def test_parallel_speedup():
     """测试：并行加速比"""
     print("\n【并行加速比】")

@@ -1,7 +1,19 @@
 """
-结果合并
+结果合并（正确性止血版，2026-10）
+
+修复：
+- `merge_aggregations` / `merge_group_bys` 对**不支持的聚合函数**以前返回
+  None / 静默填 None；现在显式 ValueError。
+- 分组 AVG 以前是 `pass`（合并阶段直接丢掉），AVG 列恒为 None。现在用
+  fragment 里保存的 `{'sum','count'}` 合并出真实平均值（全 NULL 分组
+  仍为 None）。
+- `merge_scan_results` 对失败分片（`error`）以前静默跳过 —— 结果行数
+  变少但调用方看不出来。现在只要有一个失败分片就显式 RuntimeError；
+  分片失败由 Executor 在调用本函数之前负责。
 """
 from typing import Any, Dict, List
+
+SUPPORTED_AGGS = ('SUM', 'AVG', 'COUNT', 'MIN', 'MAX')
 
 
 class ResultMerger:
@@ -16,16 +28,25 @@ class ResultMerger:
         if not results:
             return {}
 
-        merged = {c: [] for c in columns} if columns else {}
+        # 失败分片必须显式失败：静默丢掉一整个范围会返回短结果集
+        bad = [r for r in results if getattr(r, 'error', '')]
+        if bad:
+            raise RuntimeError(
+                "并行扫描存在失败分片，结果不完整: "
+                + "; ".join(
+                    f"fragment {getattr(r, 'fragment_id', '?')}: {r.error}"
+                    for r in bad))
+
+        merged = {c: [] for c in (columns or [])}
 
         # 按 fragment_id 排序保证顺序
-        sorted_results = sorted(
-            results, key=lambda r: r.fragment_id)
+        sorted_results = sorted(results, key=lambda r: r.fragment_id)
 
         for r in sorted_results:
-            if r.error or r.data is None:
+            if r.data is None:
                 continue
-            for col in (columns or r.data.keys()):
+            names = (columns or list(r.data.keys()))
+            for col in names:
                 if col in r.data:
                     merged.setdefault(col, []).extend(r.data[col])
 
@@ -40,37 +61,42 @@ class ResultMerger:
         合并聚合结果
         partials: [FragmentResult, ...]
         """
+        func = str(agg_func).upper()
+        if func not in SUPPORTED_AGGS:
+            raise ValueError(
+                f"ResultMerger.merge_aggregations: 不支持的聚合函数 "
+                f"{agg_func!r}，仅支持 {list(SUPPORTED_AGGS)}")
+
         if not partials:
-            return None
+            # 空输入：COUNT=0，其余 None（SQL 语义）
+            return 0 if func == 'COUNT' else None
 
-        # 提取 data
-        datas = [p.data for p in partials
-                  if p.data is not None]
+        datas = [p.data for p in partials if p.data is not None]
         if not datas:
-            return None
+            return 0 if func == 'COUNT' else None
 
-        if agg_func == 'COUNT':
+        if func == 'COUNT':
             return sum(d.get('count', 0) for d in datas)
 
-        if agg_func == 'SUM':
+        if func == 'SUM':
             return sum(d.get('sum', 0) for d in datas)
 
-        if agg_func == 'MIN':
+        if func == 'MIN':
             vals = [d.get('min') for d in datas
                      if d.get('min') is not None]
             return min(vals) if vals else None
 
-        if agg_func == 'MAX':
+        if func == 'MAX':
             vals = [d.get('max') for d in datas
                      if d.get('max') is not None]
             return max(vals) if vals else None
 
-        if agg_func == 'AVG':
+        if func == 'AVG':
             total_sum = sum(d.get('sum', 0) for d in datas)
             total_count = sum(d.get('count', 0) for d in datas)
-            return total_sum / total_count if total_count else None
+            return (total_sum / total_count) if total_count else None
 
-        return None
+        raise ValueError(f"不支持的聚合函数 {func!r}")   # pragma: no cover
 
     # ==================== 分组结果合并 ====================
 
@@ -85,8 +111,14 @@ class ResultMerger:
         if not partials:
             return []
 
+        for a in aggs:
+            if str(a.get('func', '')).upper() not in SUPPORTED_AGGS:
+                raise ValueError(
+                    f"ResultMerger.merge_group_bys: 不支持的聚合函数 "
+                    f"{a.get('func')!r}，仅支持 {list(SUPPORTED_AGGS)}")
+
         # 全局分组
-        global_groups = {}
+        global_groups: Dict[tuple, Dict] = {}
 
         for p in partials:
             if p.data is None:
@@ -101,7 +133,7 @@ class ResultMerger:
                 # 合并聚合
                 for a in aggs:
                     alias = a['alias']
-                    func = a['func']
+                    func = str(a['func']).upper()
                     old = global_groups[key].get(alias)
                     new = vals.get(alias)
 
@@ -109,8 +141,10 @@ class ResultMerger:
                         global_groups[key][alias] = (
                             (old or 0) + (new or 0))
                     elif func == 'SUM':
-                        global_groups[key][alias] = (
-                            (old or 0) + (new or 0))
+                        # None 表示该分片该组没有非 NULL 值（贡献 0）
+                        old_v = 0 if old is None else old
+                        new_v = 0 if new is None else new
+                        global_groups[key][alias] = old_v + new_v
                     elif func == 'MIN':
                         if new is None:
                             continue
@@ -122,16 +156,31 @@ class ResultMerger:
                         global_groups[key][alias] = (
                             new if old is None else max(old, new))
                     elif func == 'AVG':
-                        # 简化：使用 sum/count 聚合
-                        # 需保存 sum 和 count
-                        pass
+                        old_d = old if isinstance(old, dict) else {
+                            'sum': 0, 'count': 0}
+                        new_d = new if isinstance(new, dict) else {
+                            'sum': 0, 'count': 0}
+                        global_groups[key][alias] = {
+                            'sum': old_d.get('sum', 0) + new_d.get('sum', 0),
+                            'count': old_d.get('count', 0)
+                            + new_d.get('count', 0),
+                        }
 
         # 转换为行
         result = []
         for key, vals in global_groups.items():
             row = list(key)
             for a in aggs:
-                row.append(vals.get(a['alias']))
+                alias = a['alias']
+                func = str(a['func']).upper()
+                v = vals.get(alias)
+                if func == 'AVG':
+                    if isinstance(v, dict):
+                        cnt = v.get('count', 0)
+                        v = (v.get('sum', 0) / cnt) if cnt else None
+                    else:
+                        v = None
+                row.append(v)
             result.append(row)
 
         return result

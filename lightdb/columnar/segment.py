@@ -85,13 +85,15 @@ class Segment:
     # ==================== 读取 ====================
 
     def scan(self, columns: List[str] = None) -> Dict[str, List]:
-        """扫描指定列"""
-        target = columns or self.columns
+        """扫描指定列（未知列显式 KeyError，不静默返回空列）"""
+        target = list(columns) if columns else list(self.columns)
+        unknown = [c for c in target if c not in self.chunks]
+        if unknown:
+            raise KeyError(
+                f"Segment {self.segment_id}: 列不存在 {unknown!r}，"
+                f"可用列 {self.columns}")
         result = {}
         for col in target:
-            if col not in self.chunks:
-                result[col] = []
-                continue
             values = []
             for chunk in self.chunks[col]:
                 values.extend(chunk.values)
@@ -101,12 +103,18 @@ class Segment:
     def scan_range(self, columns: List[str],
                    start: int, end: int) -> Dict[str, List]:
         """扫描行范围"""
-        target = columns or self.columns
+        start = int(start)
+        end = int(end)
+        if start < 0 or end < start:
+            raise ValueError(f"scan_range 区间非法: [{start}, {end})")
+        target = list(columns) if columns else list(self.columns)
+        unknown = [c for c in target if c not in self.chunks]
+        if unknown:
+            raise KeyError(
+                f"Segment {self.segment_id}: 列不存在 {unknown!r}，"
+                f"可用列 {self.columns}")
         result = {}
         for col in target:
-            if col not in self.chunks:
-                result[col] = []
-                continue
             values = []
             pos = 0
             for chunk in self.chunks[col]:

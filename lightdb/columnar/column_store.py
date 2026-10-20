@@ -9,6 +9,7 @@
 """
 import os
 import pickle
+import re
 import struct
 import threading
 from collections import OrderedDict
@@ -91,12 +92,16 @@ class ColumnStore:
 
     def scan(self, columns: List[str] = None) -> Dict[str, List]:
         with self.lock:
-            target = columns or self.col_names
+            target = list(columns) if columns else list(self.col_names)
+            unknown = [c for c in target if c not in self.chunks]
+            if unknown:
+                # 显式报错：未知列若静默返回 []，调用方会把它当成
+                # 「这一列全是 0 行」从而错算聚合/过滤（历史缺陷）。
+                raise KeyError(
+                    f"ColumnStore {self.name}: 列不存在 {unknown!r}，"
+                    f"可用列 {self.col_names}")
             result = {}
             for col in target:
-                if col not in self.chunks:
-                    result[col] = []
-                    continue
                 values = []
                 for chunk in self.chunks[col]:
                     values.extend(chunk.values)
@@ -106,12 +111,19 @@ class ColumnStore:
     def scan_range(self, columns: List[str],
                    start: int, end: int) -> Dict[str, List]:
         with self.lock:
-            target = columns or self.col_names
+            start = int(start)
+            end = int(end)
+            if start < 0 or end < start:
+                raise ValueError(
+                    f"scan_range 区间非法: [{start}, {end})")
+            target = list(columns) if columns else list(self.col_names)
+            unknown = [c for c in target if c not in self.chunks]
+            if unknown:
+                raise KeyError(
+                    f"ColumnStore {self.name}: 列不存在 {unknown!r}，"
+                    f"可用列 {self.col_names}")
             result = {}
             for col in target:
-                if col not in self.chunks:
-                    result[col] = []
-                    continue
                 values = []
                 pos = 0
                 for chunk in self.chunks[col]:
@@ -148,14 +160,30 @@ class ColumnStore:
                 null_count += s.null_count
                 total_count += s.total_count
                 sum_val += s.sum_value
-            non_null = max(1, total_count - null_count)
+            non_null = total_count - null_count
+            # avg 只对数值列有意义：字符串列的 sum_value 恒为 0，
+            # 旧实现会返回 0.0（假平均值），现在显式 None。
+            numeric = False
+            try:
+                ci = self.col_names.index(col_name)
+                base = re.match(r'^([A-Z_][A-Z0-9_]*)',
+                                (self.col_types[ci] or '').upper())
+                numeric = bool(base) and base.group(1) in (
+                    'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT',
+                    'INTEGER', 'FLOAT', 'DOUBLE', 'DECIMAL', 'REAL',
+                    'NUMERIC')
+            except (ValueError, re.error):
+                numeric = False
             return {
                 'min': min_v,
                 'max': max_v,
                 'null_count': null_count,
                 'total_count': total_count,
                 'sum': sum_val,
-                'avg': sum_val / non_null,
+                # 全 NULL（或空列）列的平均值在 SQL 里是 NULL，不是 0.0；
+                # 旧实现用 max(1, ...) 兜底把它变成 0.0，属于静默错值。
+                'avg': (sum_val / non_null)
+                if (numeric and non_null > 0) else None,
                 'chunks': len(chunks),
             }
 
@@ -172,11 +200,8 @@ class ColumnStore:
                 for n, cl in self.chunks.items()
             },
         }
-        tmp = self.meta_path.with_suffix('.tmp')
-        with open(tmp, 'wb') as f:
-            pickle.dump(meta, f)
-        tmp.replace(self.meta_path)
-
+        # 先写数据文件、再写元数据文件：元数据是「哪些块存在」的权威来源，
+        # 反过来先写 meta 会出现「meta 说有 N 块、data 还是旧的」的撕裂状态。
         tmp = self.data_path.with_suffix('.tmp')
         with open(tmp, 'wb') as f:
             for n in self.col_names:
@@ -186,8 +211,18 @@ class ColumnStore:
                     f.write(encoded)
         tmp.replace(self.data_path)
 
+        tmp = self.meta_path.with_suffix('.tmp')
+        with open(tmp, 'wb') as f:
+            pickle.dump(meta, f)
+        tmp.replace(self.meta_path)
+
     def _load(self):
-        """★ 修复: 从 meta 取真实类型"""
+        """★ 修复: 从 meta 取真实类型
+
+        加载失败/数据不一致时**显式抛 ValueError**：旧实现 catch 后只打
+        warning，于是「元数据说有 1000 行、数据文件只剩 3 行」也当成加载
+        成功，扫描结果静默变短。
+        """
         try:
             with open(self.meta_path, 'rb') as f:
                 meta = pickle.load(f)
@@ -211,6 +246,10 @@ class ColumnStore:
 
             # 读数据
             if not self.data_path.exists():
+                if self.row_count:
+                    raise ValueError(
+                        f"列存储 {self.name}: 元数据有 {self.row_count} 行，"
+                        f"但数据文件不存在")
                 return
 
             with open(self.data_path, 'rb') as f:
@@ -221,22 +260,34 @@ class ColumnStore:
                     for _ in range(n_chunks):
                         len_bytes = f.read(4)
                         if len(len_bytes) < 4:
-                            break
+                            raise ValueError(
+                                f"列存储 {self.name}: 列 {n} 数据文件被截断")
                         data_len = struct.unpack(
                             '<I', len_bytes)[0]
                         raw = f.read(data_len)
+                        if len(raw) != data_len:
+                            raise ValueError(
+                                f"列存储 {self.name}: 列 {n} 数据块被截断"
+                                f"（声明 {data_len}，实际 {len(raw)}）")
                         # ★ 使用真实类型
                         chunk = ColumnChunk(n, col_type)
                         chunk.decode(raw)
                         self.chunks[n].append(chunk)
 
+            # 一致性校验：每列得到的值必须与 row_count 完全一致
+            for n in self.col_names:
+                loaded = sum(len(c.values) for c in self.chunks[n])
+                if loaded != self.row_count:
+                    raise ValueError(
+                        f"列存储 {self.name}: 列 {n} 加载 {loaded} 行，"
+                        f"元数据声明 {self.row_count} 行")
+        except ValueError:
+            raise
         except Exception as e:
-            # 加载失败：保留空列
             import traceback
-            from ..logger import logger
-            logger.warn(
+            raise ValueError(
                 f"列存储加载 {self.name} 失败: {e}\n"
-                f"{traceback.format_exc()[:500]}")
+                f"{traceback.format_exc()[:500]}") from e
 
     # ==================== 统计 ====================
 
