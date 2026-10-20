@@ -41,14 +41,16 @@
 | 工作项 | 状态 | 证据 |
 |---|---|---|
 | 阶段 0.1 打包修复 | ✅ 已完成（wheel 含引擎包/3 入口/版本单一来源；venv 实测 `lightdb-server --version`） | `pyproject.toml`、`scripts/check_packaging.py` |
-| 阶段 0.2 CI | ✅ 已落地并**本地完整实跑**（compileall + 全量 pytest + benchmark gate + packaging check）；GitHub Actions 待推送后触发（无远端，见 `docs/RELEASING.md` §0） | `.github/workflows/ci.yml`、`d7988b3`、`scripts/ci.ps1` |
+| 阶段 0.2 CI | ✅ 已落地并**本地完整实跑**（compileall + 全量 pytest + benchmark gate + packaging check）；本地 `origin` 已指向 `TomJerryGit/lightdb`（用户创建），推送后 GitHub Actions 触发（本机网络/认证就绪后） | `.github/workflows/ci.yml`、`d7988b3`、`scripts/ci.ps1` |
 | 阶段 0.3 失败测试清零 | ✅ 已完成（真实缺陷修复 + 带 reason 的 skip/xfail；24 → 0） | `tests/regression/*`、`test_batch9/10/14`、`test_v3_batch*`、`test_v4_batch*` 等 |
 | 阶段 0.4/0.5 收尾 | ✅ 发版材料（CHANGELOG/RELEASING/版本标记一致）、仓库卫生（data_* / worktree / 双 LICENSE / 调试产物 / .gitattributes）、`ci.ps1` 可执行性 | commit `d7988b3`；`scripts/check_repo_hygiene.py` PASS |
 | **阶段 1.1 授权体系** | ✅ 已完成（GRANT/REVOKE/SHOW GRANTS + 执行期鉴权 1142/1044/1227 + 协议层元数据过滤；真实 pymysql 端到端） | commit `bb2dce5`；`tests/test_privileges.py` 12 例 |
 | **阶段 1 协议项（COM_STMT）** | ✅ 已完成（PREPARE/EXECUTE/CLOSE/RESET、二进制参数/结果集、1210/1243/1235、PREPARE 鉴权） | commit `02a4e2c`；`tests/test_prepared_statements.py` 16 例 |
 | **决策 2 OLAP 4A.1** | ✅ 正确性止血完成（12 类缺陷 + 91 例对拍矩阵；取消 2 个 skip） | commit `d6170b1` |
-| **决策 2 OLAP 4A.2/4A.3** | ✅ 列存/OLAP **显式接入 SQL 路径**（默认关闭 + crosscheck + dispatch_stats；63 例端到端对拍）+ 并行分片重做（GROUP BY w2 实测 2.75x） | commit `d26b7ee` |
+| **决策 2 OLAP 4A.2/4A.3** | ✅ 列存/OLAP **显式接入 SQL 路径**（2026-10-20 起**默认开启**，`LIGHTDB_OLAP_DISPATCH=0` 可关闭；crosscheck + dispatch_stats；63 例端到端对拍）+ 并行分片重做（GROUP BY w2 实测 2.75x） | commit `d26b7ee`、`16bcd1d` |
 | **决策 2 OLAP 4A.5** | ✅ 两条门禁（并行 GROUP BY ≥1.2x、dispatch 对拍不一致=0）；3 条性能类 skip 换成实测基线阈值并恢复正式测试；quick 门禁由 5 项扩到 7 项 | 本次提交（benchmarks/cases.py + gate.py + tests/regression_v4） |
+| **决策 2 OLAP 4A.4 Cython** | ✅ **真实编译验证**（Cython 3.3.0 + Zig 0.16.0，D 盘 venv；6 个扩展编译通过；修 3 处 Cython 3 语法 + 2 个 C 层 bug；对拍测试；产物不入库/CI 走回退） | commit `92b033c`；`tests/test_cython_compiled_parity.py` |
+| **本地全量 GUI+DB 验证** | ✅ 数据库矩阵 **34/34**、GUI **45/45 场景 / 77 截图 / 25 对话框**（offscreen + windows 平台窗口）；发现并修 3 个真实缺陷（UNION 协议/ORDER BY·LIMIT、并发 tables 迭代）；登记 3 条 UI 缺陷 + 2 条引擎限制 | commit `16bcd1d`；`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md` |
 | 决策 3 Studio 删除 | ✅ 已完成（134→90 文件；39,256→23,532 行；悬空 import=0） | commit `32f479f` |
 | **决策 4 真 binlog** | ✅ **阶段 1+2 完成**（文件/CRC/位点/SHOW/主从闭环 + 轮转/严格提交/UPDATE·DELETE 镜像快路径；GTID 不做、半同步移除） | commits `903d8e4`、`3b48126`；`test_binlog_append_only.py` 16 + `test_binlog_phase2.py` 19 |
 
@@ -189,18 +191,21 @@
 | 打包 | ✅ wheel 含引擎 + 3 入口（venv 实测） | ✅ 已修 | — | — | GUI/Web 可安装 |
 | 基准门禁 | **PASS 7/7**（含 2 条 OLAP 门禁） | ✅ 已修 | ✅ 保持 | COMMIT 延迟 O(参与表) | — |
 | 安全项 | ✅ P0/P1 六项 + 授权体系 + COM_STMT 闭环 | — | 审计/`SET PASSWORD POLICY` 仍缺 | — | 凭据加密 |
-| OLAP 接线/门禁 | ✅ 4A.1–4A.3+4A.5 完成（默认关闭；并行 GROUP BY 2.75x、对拍 0 不一致；dispatch 当前无收益） | — | — | — | — |
+| OLAP 接线/门禁 | ✅ 4A.1–4A.5 完成（**2026-10-20 起 dispatch 默认开启**，可 `LIGHTDB_OLAP_DISPATCH=0` 关闭；并行 GROUP BY 2.75x、对拍 0 不一致；dispatch 当前无显著收益 0.44–1.10x） | — | — | — | — |
+| Cython 加速层 | ✅ 4A.4 本机真实编译 6 个扩展（Cython+Zig；btree 5.9–7.0x 等）；产物不入库、CI 走纯 Python 回退 | — | — | — | MSVC 发布构建 |
+| GUI/DB 端到端 | ✅ 2026-10-20 本地全量验证：DB 34/34、GUI 45/45、77 截图、25 对话框；UI 3 缺陷/引擎 2 限制已登记 | — | — | GUI 行为测试进 CI | — |
 | 死代码行占比 | Studio 不可达已清零；引擎仍有部分零引用模块 | — | — | — | 引擎 <10% |
 | 文档-实现一致 | README/CHANGELOG/roadmap/benchmarks 已同步 OLAP 接线与门禁状态 | ✅ 打包声明成真 | 协议文档 | 存储边界文档 | 功能表 100% 真实 |
 
 ### 实测基线（2026-10-20 下午，全量 pytest + benchmark）
 
-- 全量 pytest：**1016 用例 = 983 passed / 0 failed / 31 skipped / 2 xfailed**（12:21；
-  较上轮 +67 例：OLAP 接线/对拍 63 + 契约；3 条性能类 skip 换实测阈值后恢复）；
+- 全量 pytest：**1029 用例 = 988 passed / 0 failed / 39 skipped / 2 xfailed**（12:44，
+  8 核本机、纯 Python Cython 回退运行时；较上轮 +13 例：UNION 协议 2、Cython 对拍 8、
+  dispatch 默认开启契约 3；+8 skip 为无编译产物时的 Cython 对拍自动 skip）；
 - `benchmarks.run --suite quick --gate`：**PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、
-  dispatch 对拍不一致=0；quick 墙钟 ~30.6 s）；
+  dispatch 对拍不一致=0）；
 - `scripts/check_packaging.py`：PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源）；
-  `scripts/check_repo_hygiene.py`：PASS。
+  `scripts/check_repo_hygiene.py`：PASS（提交本报告后复跑通过）。
 
 
 ---

@@ -7,26 +7,31 @@
 
 - 工作流：[`.github/workflows/ci.yml`](.github/workflows/ci.yml)（Windows：install → compileall →
   pytest → benchmark gate → packaging check；触发 push / pull_request / workflow_dispatch）。
-- **GitHub Actions 尚未实跑**：当前仓库唯一远端是本地裸仓库 `D:\lightdb_backup.git`
-  （`git remote -v` 无 github 远端），没有 GitHub 仓库/runner。工作流 YAML 已用 PyYAML
-  解析校验（`name: ci`，单 job `test`，7 个 step 齐全）。
-- 本地等价门禁已实跑（见下方「本地 CI 实跑记录」）；推送到 GitHub 后 Actions 会自动执行同一套步骤：
+- **GitHub Actions 尚未实跑**：本地仓库已配置 `origin = https://github.com/TomJerryGit/lightdb.git`
+  （用户创建），但首次 `git push` 需要浏览器完成 GitHub 认证；认证完成、`main` 与标签
+  推送后 Actions 会自动执行同一套步骤。工作流 YAML 已用 PyYAML 解析校验（`name: ci`，
+  单 job `test`，7 个 step 齐全）。
+- 本地等价门禁已实跑（见下方「本地 CI 实跑记录」）；首次推送命令：
   ```powershell
-  git remote add origin https://github.com/<org>/<repo>.git
   git push -u origin main --tags
   ```
+- **Cython 编译产物不参与 CI/发布**：CI 无 Cython/编译器，运行时自动走纯 Python 回退
+  （本机 Zig 构建产物已归档不启用，见 README「Cython 已真实编译验证」告警）。
 
-### 本地 CI 实跑记录（2026-10-20 下午，`scripts/ci.ps1 -SkipInstall` 一次跑通）
+### 本地 CI 实跑记录（2026-10-20 下午收尾，全量验证后）
 
 | 步骤 | 命令/步骤 | 结果 |
 |---|---|---|
-| 全量 CI | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ci.ps1 -SkipInstall > ci.log 2>&1` | **`CI: ALL CHECKS PASSED`（exit 0）** |
-| compileall | ci.ps1 内（`PYTHONPYCACHEPREFIX` 重定向，兼容受限 sandbox） | PASS（7.1s） |
-| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1016 用例 = 983 passed / 0 failed / 31 skipped / 2 xfailed**（13:43） |
-| 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致；quick ~39 s） |
+| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1029 用例 = 988 passed / 0 failed / 39 skipped / 2 xfailed**（12:44；纯 Python Cython 回退） |
+| 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致） |
 | 打包检查 | `python scripts/check_packaging.py` | PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源） |
-| 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS |
+| 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS（提交 GUI 验证报告后复跑通过） |
+| 全量 GUI+DB 验证 | `_analysis_tmp/gui_full/db_verify.py` + `gui_driver.py` | DB **34/34**、GUI **45/45 场景 / 77 截图 / 25 对话框**（报告 `docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`） |
 
+> 说明：本轮抓到一个只在**编译版 Cython** 运行时出现的 Windows 堆损坏（`0xc0000374`，
+> 全量长跑 20% 处，未定位单一模块）；归档编译产物、改回纯 Python 回退后上表全绿。
+> 编译产物不入库，CI/发布路径本来就走回退，因此不影响发布门禁。
+>
 > 排障备注：Windows PowerShell 5.1 下用 `*>` 重定向整个 CI 输出时，长时 pytest 进程
 > 偶发被终止（`$LASTEXITCODE=-1`，无 summary）；改用 `> ci.log 2>&1` 后完整跑通。
 > 建议用户/CI 都用普通 `>` 重定向。

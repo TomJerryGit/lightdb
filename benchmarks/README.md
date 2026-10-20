@@ -17,8 +17,13 @@
 进程内点查 ≥ 600 q/s、WAL ≤ 32 MB、崩溃恢复 < 5 s、崩溃不丢已提交行、
 不泄漏未提交行；**4A.2/4A.5 起再加两条 OLAP 门禁**：向量化 GROUP BY
 分片并行 ≥ 1.2x、dispatch 开关前后对拍不一致 = 0 行。OLAP/列存层已
-**显式接入 SQL 路径但默认关闭**（`LIGHTDB_OLAP_DISPATCH=1` 才派发），
-当前 dispatch 本身没有性能收益（实测 0.44–1.10x），因此不据此宣称加速。
+**显式接入 SQL 路径并默认开启**（2026-10-20 用户要求；`LIGHTDB_OLAP_DISPATCH=0`
+可关闭），当前 dispatch 本身**没有显著性能收益**（实测 0.44–1.10x），
+因此不据此宣称加速；Cython 6 个扩展已用 Cython+Zig 在本机真实编译验证
+（产物不入库；对拍见 `tests/test_cython_compiled_parity.py`）。另在
+2026-10-20 做过一次**本地全量 GUI+DB 功能验证**（DB 34/34、GUI 45/45 场景、
+77 截图），它不是性能测量，报告见
+[`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`](../docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md)。
 **它是回归护栏，不是性能承诺。**
 
 复跑一条命令：
@@ -133,6 +138,7 @@ Stepping 10（8 逻辑核），Python 3.11.9（`D:\Program Files\Python311`）�
 | 10 | 进程内多线程点查 | 1 客户端 889–898 q/s → 4 客户端 457–827 q/s（**总吞吐下降**）<br>范围查 1 客户端 9.8–14.7 → 4 客户端 7.9–12.9 q/s | 3 s 固定窗口 | 本包 `concurrency_*`（只报告） |
 | 11 | 向量化聚合（模块级，1M 行） | 单聚合 SUM 中位 **367 ms = 2.72M rows/s**（样本 2.40–2.78M）；5 聚合 w1 中位 1.91 s（~522k rows/s） | `VectorizedAggregate`/`VectorizedAggregateSet`（列存在内存，不含行存解码） | 4A.5 测量（2026-10-20） |
 | 12 | 向量化 GROUP BY 并行（100k 行） | w1 中位 **2.75 s** → w2 **1.00 s = 2.75x**（w4 约 1.7x，4 线程反而不如 2）；单/多线程结果逐值一致 | 分片线程池（`VectorizedGroupBy(workers=2)`） | 4A.5 测量 + 本包 `olap_parallel_groupby_100k` |
+| 13 | Cython 编译版 vs 纯 Python 回退（本机 Zig 构建） | btree（insert 50k+search 100k）**5.9–7.0x**；row_codec 2.0–3.3x；predicate ~10–19x；hash ~16–21x；page ~20–33x | 编译产物不入库（平台相关）；同进程、warmup+中位，只报告不设门禁 | 4A.4 测量（2026-10-20，Cython 3.3.0 + Zig 0.16.0） |
 
 **实测分布（同代码、同档位、跨约 1 小时的 8 次 quick 档，2,000 行档）**
 
@@ -206,7 +212,7 @@ insert_rowwise_table_2000: 采用第 2 次尝试
 ### 3.2 明确**不**作为目标的东西
 
 * **白皮书的 12,000 QPS / 3.5M rows/s / 41x / 12.5x**：不在目标表里。
-  OLAP/列存已在 4A.2 **显式接入**（默认关闭），但 dispatch 当前无性能收益；
+  OLAP/列存已在 4A.2 **显式接入并默认开启**，但 dispatch 当前无显著性能收益；
   白皮书数字仍不是门禁目标（4A.5 只把"并行 GROUP BY ≥1.2x"和"对拍不一致=0"
   两条可辩护的项写进门禁，见第 3 节）。
 * **TCP 点查吞吐**：实测 ~516 q/s（协议往返 + 服务端线程调度），
@@ -226,10 +232,10 @@ insert_rowwise_table_2000: 采用第 2 次尝试
 |---|---|---|---|
 | 单线程点查 **12,000 QPS** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:68`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/V4_RELEASE_NOTES.md:42`](../docs/V4_RELEASE_NOTES.md) | **1,299–2,069 q/s**（2,000 行表，本包）/ 1,140 q/s（历史 5,000 行表） | **差 6–9 倍**；未实现，不作目标 |
 | 8 核 **92,000 QPS** | [`README.md:49`](../README.md)、[`docs/USER_GUIDE.md:106`](../docs/USER_GUIDE.md) | 进程内多线程**不扩展**：8 客户端总吞吐低于单客户端 | **未实现**；GIL + 表级锁 |
-| OLAP 扫描 **3.5M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:72`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 向量化/列存链路在 `Executor` / `plan_executor` 里**零引用**，本包查询路径实测是逐行量级（范围/聚合 ~5k–11k rows/s） | **没有落点**；未接入 |
-| 大表聚合 **85M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:768`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 4A.2 起 `lightdb/olap/**` 已**显式接入** SQL 路径（默认关闭）；模块级实测 1M 行单 SUM 2.72M rows/s（门禁 2.0M），但 dispatch 默认关闭且当前无收益 | **未达白皮书数字**；只有模块级实测 + 门禁 |
-| 列存加速比 **41x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:93`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/ARCHITECTURE_v4.md:560`](../docs/ARCHITECTURE_v4.md) | 列存已接线（默认关闭）；实测向量化 GROUP BY 并行 w2 2.75x、模块级列存扫描远快于行存（内存态，无解码口径） | **41x 无对照基线**；对外只引用实测 2.75x 并行门禁 |
-| Cython B+Tree **12.5x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:92`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/DEAD_CODE.md:11`](../docs/DEAD_CODE.md) | `lightdb/cython/` 编译产物 **0 个**，`status()['any_accelerated'] == False`（无回退实现） | **未编译、未验证**；未实现 |
+| OLAP 扫描 **3.5M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:72`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 向量化链路已显式接入 SQL 路径（默认开启，白名单语法）；本包查询路径的逐行量级仍是默认兜底。模块级扫描实测远高于 3.5M（内存列存口径，见 §2） | **无非 SQL 端到端对照**；只有模块级实测 |
+| 大表聚合 **85M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:768`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 4A.2 起 `lightdb/olap/**` 已**显式接入** SQL 路径（默认开启）；模块级实测 1M 行单 SUM 2.72M rows/s（门禁 2.0M）；dispatch 当前无显著收益（0.44–1.10x） | **未达白皮书数字**；只有模块级实测 + 门禁 |
+| 列存加速比 **41x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:93`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/ARCHITECTURE_v4.md:560`](../docs/ARCHITECTURE_v4.md) | 列存已接线（默认开启）；实测向量化 GROUP BY 并行 w2 2.75x、模块级列存扫描远快于行存（内存态，无解码口径） | **41x 无对照基线**；对外只引用实测 2.75x 并行门禁 |
+| Cython B+Tree **12.5x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:92`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/DEAD_CODE.md:11`](../docs/DEAD_CODE.md) | 已用 Cython 3.3.0 + Zig 0.16.0 **真实编译** 6 个扩展；单模块本机实测（编译版 vs 纯 Python 回退）：btree **5.9–7.0x**（insert50k+search100k 混合）、row_codec 2.0–3.3x、predicate ~10–19x、hash ~16–21x、page ~20–33x；但一次全量测试长跑出现 Windows 堆损坏（`0xc0000374`，未定位单一模块） | **12.5x 单一指标不成立**（负载相关）；产物不入库、当前**运行时不启用**（归档、默认走回退）、MinGW ABI 仅开发验证 |
 | 逐行 INSERT 的"批量更快"印象 | 历史脚本报告口径 | **顺序对照下批量并不更快**（实测 0.91–1.05x）；**同窗成对**下才是 1.44–1.72x | 用比值，不用顺序对照 |
 | 并发"1→4→8 提升" | 阶段 0 摘要 | 1,163 → 925 → **749 q/s（−36%）**（[`README.md:65`](../README.md)） | **回退而非扩展**；如实报告 |
 
@@ -245,7 +251,7 @@ insert_rowwise_table_2000: 采用第 2 次尝试
   已在 4A.2 接线，历史条目请以 `lightdb/olap/status.py` 与本文为准）。
 * [`README.md:23-70`](../README.md) —— "性能声明状态说明"（阶段 2 第 6 项
   「实验性 / 未接入 SQL 路径 / 不计入性能声明」的统一口径；4A.5 起 OLAP 已有
-  基准门禁，口径升级为"已接线、默认关闭、只引用实测门禁数字"）。
+  基准门禁，口径升级为"已接线、默认开启（可关闭）、只引用实测门禁数字"）。
 
 ---
 

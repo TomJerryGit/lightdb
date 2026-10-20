@@ -14,13 +14,16 @@
 > 本节是 2026-10 代码审计的**审计时**实测结论，**优先于下方所有功能与性能描述**。完整报告见 [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md)，死代码清单见 [docs/DEAD_CODE.md](docs/DEAD_CODE.md)。其中若干 P0 缺陷已在同一次会话中修复，见本节末尾「本次会话已修复」。
 >
 > **接线口径（4A.2/4A.5，2026-10-20）**：`lightdb/olap/**`（向量化）与
-> `lightdb/columnar/**`（列存）已**显式接入 SQL 执行路径**，但**默认关闭**
-> （`LIGHTDB_OLAP_DISPATCH=1` / `Config(olap_dispatch=True)` 才派发；默认查询
-> 与接线前逐字节一致、且不加载 OLAP 引擎模块）。当前 dispatch **没有性能收益**
-> （实测同 SQL 开关比 0.44–1.10x），因此**不计入任何对外性能声明**；只对外
-> 引用 `benchmarks/` 里已有门禁的实测数字（并行 GROUP BY ≥1.2x、dispatch 对拍
-> 不一致=0）。Cython 加速层仍是纯 Python 回退、从未编译，不计入性能声明。
-> 全部实测数字与白皮书对照表见 [benchmarks/README.md](benchmarks/README.md)。
+> `lightdb/columnar/**`（列存）已**显式接入 SQL 执行路径**，并**默认开启**
+> （2026-10-20 用户要求；`LIGHTDB_OLAP_DISPATCH=0` 可关闭，关闭时不加载
+> OLAP 引擎模块）。派发只走白名单语法，其余一律回退行存；当前 dispatch
+> **没有显著性能收益**（实测同 SQL 开关比 0.44–1.10x），因此**不据此宣称
+> "SQL 已加速"**；只对外引用 `benchmarks/` 里已有门禁的实测数字（并行
+> GROUP BY ≥1.2x、dispatch 对拍不一致=0）。Cython 加速层已用 Cython 3.3 +
+> Zig 在本机编译验证（见 `scripts/build_cython_zig.py`，产物不入库），
+> 实测 btree 5.9–7.0x / row_codec 2.0–3.3x / predicate ~10–19x / hash
+> ~16–21x / page ~20–33x；Windows 上 Zig/MinGW ABI 产物仅建议开发验证，
+> 发布用 MSVC。全部实测数字与白皮书对照表见 [benchmarks/README.md](benchmarks/README.md)。
 
 - **服务端单进程模式**（`python -m lightdb.main --mode single`）可以监听端口并发出标准 MySQL v10 握手包（server version `5.7.30-LightDB`），但**认证校验存在缺陷，没有任何客户端能登录成功**：`lightdb/net/mysql_protocol.py:293` 的长度守卫排在空密码分支之前，`:304` 的比较少做一次 SHA1 —— 空密码与非空密码实测均被拒绝。
 - **建表必然失败**：`lightdb/storage/buffer_pool.py:15` 用 `open(path, 'r+b')` 打开尚不存在的 `.dat` 文件，抛 `FileNotFoundError`。
@@ -127,10 +130,27 @@
   **134 文件/39,256 行**降到 **90 文件/23,532 行**；剩余 90/90 模块逐个 import 成功、无悬空引用。
 - **真复制已落地（决策 4 阶段 1）**：独立 append-only binlog + CRC32 + 真实字节位点 + DDL 复制 +
   从库持久位点续传 + START/STOP SLAVE/CHANGE MASTER，见上文「复制支持边界」；专项测试 16 例。
-- **OLAP 已显式接入（决策 2，4A.2/4A.3/4A.5）**：单表白名单聚合/分组查询可经
-  `LIGHTDB_OLAP_DISPATCH=1` 走向量化执行（**默认关闭**）；行存↔列存对拍逐行一致
-  （63 例 + 契约测试）；并行 GROUP BY 分片实测 w1→w2 **2.75x**，门禁 ≥1.2x；
-  正确性/并行/对拍数字见 [benchmarks/README.md](benchmarks/README.md)。
+- **OLAP 已显式接入且默认开启（决策 2，4A.2/4A.3/4A.5）**：单表白名单聚合/分组查询
+  默认走向量化执行（2026-10-20 用户要求；`LIGHTDB_OLAP_DISPATCH=0` 可关闭）；行存↔列存
+  对拍逐行一致（63 例 + 契约测试）；并行 GROUP BY 分片实测 w1→w2 **2.75x**，门禁 ≥1.2x；
+  正确性/并行/对拍数字见 [benchmarks/README.md](benchmarks/README.md)。**注意：dispatch 当前
+  无显著性能收益（0.44–1.10x），默认开启不代表"SQL 已加速"。**
+- **Cython 已真实编译验证（4A.4）**：本机用 `Cython 3.3.0 + ziglang 0.16.0`（D 盘 venv）
+  编译 6 个扩展（`scripts/build_cython_zig.py`，修复了 3 处 Cython 3 语法错误 + 2 个真实
+  C 层 bug：page 空页 next_row_ptr 未初始化导致堆溢出、hash remove 后 get 命中残留）；
+  `tests/test_cython_compiled_parity.py` 逐模块对拍编译版 vs 回退版。**产物不入库**
+  （平台相关；CI/干净 checkout 自动走回退）；Windows 上 Zig/MinGW ABI 仅建议开发验证，
+  发布请用 MSVC。**⚠️ 长跑结论：** 编译产物在单模块功能/对拍/微基准下通过，但在一次
+  **全量测试长跑**中出现 Windows 堆损坏（`0xc0000374`，未定位到单一模块），因此当前
+  **运行时不启用编译产物**（本机已归档、不进仓库、不加载），默认走纯 Python 回退；
+  该构建链路验证结论保持"本地可编译、单模块可用"，**不计入性能声明**，待 MSVC
+  构建或后续定位后复验。
+- **本地全量 GUI + DB 验证（2026-10-20）**：真实起服务 + Studio，数据库功能矩阵
+  **34/34 通过**、GUI **45/45 场景通过 / 77 张截图 / 25 个对话框**（offscreen +
+  `QT_QPA_PLATFORM=windows` 真实窗口探针通过）。验证发现并修复 3 个真实缺陷
+  （UNION 经 MySQL 文本协议返回 OK/0 行、UNION 级 ORDER BY/LIMIT 被丢弃、并发 DDL
+  时 `dictionary changed size during iteration`）；登记 3 条 Studio UI 缺陷与 2 条已知
+  引擎限制。详见 [`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`](docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md)。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip
@@ -144,21 +164,24 @@
 > 逐条给出**当前真实状态**。原始文档**不删除**，其段落内保留原文以便对照。
 >
 > **统一口径（4A.2/4A.5，2026-10-20）**：OLAP（`lightdb/olap/**` 向量化）与
-> 列存（`lightdb/columnar/**`）已**显式接入 SQL 路径但默认关闭**；默认查询
-> 仍走行存且不加载 OLAP 引擎模块，派发只在白名单语法命中时发生（有
-> `dispatch_stats()` 计数与日志，禁止静默改道）。**dispatch 当前没有性能收益**
-> （实测开关比 0.44–1.10x），因此不宣称"OLAP 加速"；可对外引用的只有
-> [benchmarks/README.md](benchmarks/README.md) 中已有门禁的实测数字
+> 列存（`lightdb/columnar/**`）已**显式接入 SQL 路径并默认开启**（2026-10-20
+> 用户要求；`LIGHTDB_OLAP_DISPATCH=0` 可关闭）。派发只在白名单语法命中时发生
+> （有 `dispatch_stats()` 计数与日志，禁止静默改道）。**dispatch 当前没有显著
+> 性能收益**（实测开关比 0.44–1.10x），因此不宣称"OLAP 加速"；可对外引用的
+> 只有 [benchmarks/README.md](benchmarks/README.md) 中已有门禁的实测数字
 > （向量化并行 GROUP BY ≥1.2x、dispatch 对拍不一致=0、1M 行单 SUM 2.72M rows/s）。
 > 契约测试见 [`tests/test_olap_wiring_contract.py`](tests/test_olap_wiring_contract.py)。
 
 - **OLAP/列存层**：4A.1 修完 12 类正确性缺陷并加 91 例行存↔列存对拍；4A.2 接入
-  SQL 路径（白名单 + 默认关闭 + crosscheck）；4A.3 并行分片重做（GROUP BY w2
-  实测 2.75x，自动档在纯 SUM 加速不足 1.2x 时保持串行）。**仍未把
-  dispatch 默认打开**：因为实测无收益，打开只会增加复杂度。
-- **Cython 加速层仍未编译**：`lightdb/cython/*.pyx` 的编译产物在仓库里 **0 个**
-  （`status()['any_accelerated']` 为 `False`），因此 `12.5x` 仍是设计目标、
-  不计入任何性能声明。
+  SQL 路径（白名单 + crosscheck）；4A.3 并行分片重做（GROUP BY w2 实测 2.75x，
+  自动档在纯 SUM 加速不足 1.2x 时保持串行）；**2026-10-20 按用户要求默认开启
+  dispatch**（实测无显著收益，故不宣称加速）。
+- **Cython 加速层（4A.4）**：已用 Cython 3.3.0 + Zig 0.16.0 在本机真实编译并运行
+  6 个扩展（`scripts/build_cython_zig.py`）；编译验证同时发现并修复了 page/hash
+  两个 C 层 bug。实测加速：btree 5.9–7.0x、row_codec 2.0–3.3x、predicate
+  ~10–19x、hash ~16–21x、page ~20–33x（本机 8 核、混合负载）；**低于白皮书
+  12.5x 的单一指标不成立**（不同负载差异大），且编译产物**不入库**、
+  Windows 上 Zig/MinGW ABI 仅建议开发验证（发布用 MSVC）。
 - **以下历史数字仍是设计目标，不是实测**：`12,000 QPS`（单线程点查）、
   `92,000 QPS`（8 核）、`3.5M rows/s`（OLAP 扫描）、`85M rows/s`（大表聚合）、
   `41x`（列存加速比）、`12.5x`（Cython B+Tree）、`3.15x`（向量化过滤）——
@@ -180,11 +203,12 @@
   | WAL 运行期增长 | **≈200 B/行**，无 checkpoint/轮转 | 长跑实例磁盘无界增长 |
   | 10 轮 × 2000 行 UPDATE 后 `.dat` | **669 KB → 16 MB**（≈800 B/更新） | `vacuum()` 只释放槽位、不紧凑 |
 
-- **仍未验证/未完成**：Cython **从未编译验证**（本机无 Cython、无 C 编译器）；
-  向量化 dispatch 默认关闭且当前无收益（实测 0.44–1.10x），是否在生产开启需
-  等更大数据量/更优格式的实测；4A.3 并行在纯 SUM 上加速不足 1.2x（自动档保持
-  串行），只有 GROUP BY 分片有明显收益（w2 2.75x）；float SUM/AVG 分片合并
-  理论上有末位差异（顺序固定 + crosscheck 兜底）。
+- **仍未验证/未完成**：Cython 编译产物**不入库**，CI/干净 checkout 自动走纯 Python
+  回退（本机验证见 4A.4 记录）；Windows 上 Zig/MinGW ABI 产物仅建议开发验证，发布
+  请用 MSVC Build Tools；dispatch 默认开启但当前无显著收益（实测 0.44–1.10x），
+  是否在生产长期开启需等更大数据量/更优列格式的实测；4A.3 并行在纯 SUM 上加速
+  不足 1.2x（自动档保持串行），只有 GROUP BY 分片有明显收益（w2 2.75x）；
+  float SUM/AVG 分片合并理论上有末位差异（顺序固定 + crosscheck 兜底）。
 - **历史文档状态**：[docs/V4_DECISION.md](docs/V4_DECISION.md) 已被**有意截断**
   （44 行，含"原文档在此处截断，后续章节缺失"）以移除不可核实的数据；
   本 README **不补写**其中缺失的历史内容，只在此处如实标注该文件不完整。
@@ -194,10 +218,10 @@
   [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
   顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
 
-- 一次完整测试运行的结果（2026-10-20，OLAP 4A.2/4A.3/4A.5 之后）：**1016 个用例中
-  983 通过 / 0 失败 / 31 跳过 / 2 xfailed**（门禁保持全绿；较上一轮 +67 例：OLAP
-  接线/对拍 63 例 + 契约测试；3 条性能类 skip 换成实测基线阈值后恢复为正式测试），
-  skip/xfail 均带明确原因，见下方「测试套件」说明与
+- 一次完整测试运行的结果（2026-10-20，dispatch 默认开启 + Cython 回退 + 全量验证修复之后）：
+  **1029 个用例中 988 通过 / 0 失败 / 39 跳过 / 2 xfailed**（12:44，纯 Python 回退运行时；
+  较上一轮 +13 例：UNION 协议回归 2 例、Cython 编译对拍 8 例（无产物环境自动 skip）、
+  dispatch 默认开启契约 3 例），skip/xfail 均带明确原因，见下方「测试套件」说明与
   [docs/analysis_2026-10-19/06_ROADMAP.md](docs/analysis_2026-10-19/06_ROADMAP.md) §1）。
 
 ### ✅ 本次会话已修复（2026-10，含实测验证）
@@ -316,7 +340,7 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**（2026-10-20 OLAP 4A.5 后的门禁基线）：**1016 用例 = 983 通过 / 0 失败 / 31 跳过 / 2 xfailed**（本轮优化开始时是 150 通过 / 118 失败；较上一轮 +67 例）。**失败数保持 0**——原 24 条失败按根因处置：
+**测试套件**（2026-10-20 dispatch 默认开启/全量验证后的门禁基线）：**1029 用例 = 988 通过 / 0 失败 / 39 跳过 / 2 xfailed**（12:44；纯 Python Cython 回退运行时；本轮优化开始时是 150 通过 / 118 失败）。**失败数保持 0**——原 24 条失败按根因处置：
 - **真实缺陷已修**：`row_format` DECIMAL 编码 TypeError、CLI `-h/--host` 与 argparse 内建 `-h` 冲突（Windows CLI 必崩）、诊断 CLI 的 emoji 在 GBK 控制台崩溃；权限体系（GRANT/REVOKE/鉴权，已接线，2 条 GRANT 用例恢复为正式测试）；半同步死代码已删除（原 xfail 移除）；
 - **OLAP 4A.5 门禁化**：原 3 条性能类 skip 换成实测基线阈值并恢复正式测试（编码压缩率 2.5x vs 实测 2.78x；OLAP 聚合 2.0M rows/s vs 实测 2.72M；并行 1.2x vs 实测 2.75x，<4 核环境按 reason skip）；新增并行 GROUP BY 门禁与 dispatch 对拍门禁；
 - **带明确 reason 的 skip/xfail**（不是无声绿）：`parser_v3b4` 死代码（×2）、`row_format` 实验格式性能目标、沙箱写权限（×2）、诊断子进程 `DuplicateHandle` 沙箱限制、IPC 延迟阈值防抖、`lineage_enhanced` 列级血缘已知缺陷、mysql-connector 未安装时的端到端 skip；
