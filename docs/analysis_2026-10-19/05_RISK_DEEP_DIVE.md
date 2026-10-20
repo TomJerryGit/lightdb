@@ -619,6 +619,27 @@ python -m benchmarks.run --suite quick --gate      # → PASS 5/5
    Linux/macOS 路径未验证。
 4. 预编译语句（COM_STMT_*）仍缺；`SET PASSWORD POLICY` 经协议 ACK 不生效（阶段 1 剩余项）。
 
+### II.2 2026-10-20 中午追加：真 binlog 阶段 2 + 预处理语句 + CI 实跑
+
+| 工作项 | 结果 | 提交 |
+|---|---|---|
+| **决策 4 阶段 2** | ①`max_bytes` 真实轮转（binlog.NNNNNN，旧文件只读，跨文件全局 lsn，从库跨轮转续传）；②**binlog 写失败即拒绝提交**（先 binlog 后可见提交，失败物理回滚 + 1180/HY000，`LIGHTDB_BINLOG_STRICT=0` 可退化）；③GTID 明确不实现（Executed_Gtid_Set 恒 NULL）、**半同步死代码物理删除**（模块/导出/配置/指标/测试全部清理）；④UPDATE/DELETE 镜像改读 WAL 增量，无触发器/where 非空时零额外 SELECT（5k 行 A/B 约快 1–2×，select 调用计数确定性对照） | `3b48126` |
+| **阶段 1 协议项** | COM_STMT_PREPARE/EXECUTE/CLOSE/RESET 全链路；连接级 statement 注册表；二进制参数/结果集（常用类型 + NULL bitmap）；参数数 1210/未知 id 1243/不支持类型 1235；PREPARE 阶段 SELECT 鉴权；CLOSE 按真实协议无响应包；文本协议回归 | `02a4e2c` |
+| **CI 实跑** | `scripts/ci.ps1` 完整本地跑通：compileall + 全量 pytest + benchmark gate + packaging check（同一套步骤与 `.github/workflows/ci.yml` 等价；GitHub Actions 因无远端未触发，已在 `docs/RELEASING.md` §0 记录） | 见 `docs/RELEASING.md` |
+
+**2026-10-20 中午门禁**：
+
+- 全量 pytest：**949 用例 = 913 passed / 0 failed / 34 skipped / 2 xfailed**（11:51）；
+- benchmark quick --gate、check_packaging、check_repo_hygiene：见本地 CI 日志（`_analysis_tmp/lead/ci_run4.log`）。
+
+**残余风险（更新）**：
+1. `binlog_strict` 仅覆盖 `Database.commit/commit_statement`；单行 autocommit 的 binlog 失败
+   仍只告警且数据已提交（阶段 3 统一为语句级内部事务）；WAL 与 binlog 非 2PC；
+   无 `binlog.index`（启动 O(n) 扫描）。
+2. 预处理语句：游标/FETCH、`SEND_LONG_DATA` 长参数、BIT/GEOMETRY 参数不支持（1235）；
+   PREPARE 不做语法校验（EXECUTE 回 1064）。
+3. 授权/OLAP/Cython/桌面端残余同 §II.1。
+
 ---
 
 ## 附：本文证据脚本与来源

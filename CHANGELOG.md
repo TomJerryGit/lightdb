@@ -30,6 +30,18 @@
   负数/列存统计丢失/GroupBy COUNT(*)=0/AVG 崩溃/Filter 缺 IS NULL/优化器丢 OR/并行
   丢 where 等 12 类缺陷；新增 `tests/test_olap_correctness.py`（91 例行存↔列存对拍）。
   **尚未接入 SQL 路径**（4A.2），性能目标未达（仍 skip）。
+- **真 binlog 阶段 2（决策 D）**：`max_bytes` 真实**日志轮转**（旧文件只读、跨文件全局
+  lsn、从库跨轮转续传）；**binlog 写失败即拒绝提交**（回滚事务 + 1180/HY000，
+  `LIGHTDB_BINLOG_STRICT=0` 可退化排障）；`SHOW MASTER STATUS` 报当前文件名+文件内位点、
+  `SHOW BINLOG EVENTS IN 'file'` 可读历史文件；UPDATE/DELETE 镜像走 WAL 增量快路径
+  （无触发器时零额外 SELECT，5k 行 A/B 约快 1-2×）；GTID 明确不实现、半同步死代码删除。
+  测试：`tests/test_binlog_phase2.py`（19 例）。
+- **预处理语句 COM_STMT_***（阶段 1 协议项）：PREPARE/EXECUTE/CLOSE/RESET 全链路，
+  二进制参数/结果集编码，覆盖常用类型；参数数不符 1210、未知 statement 1243、不支持类型
+  1235；PREPARE 阶段鉴权防元数据泄露；`tests/test_prepared_statements.py`（16 例）。
+- **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
+  `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
+  仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。
 
 ### Changed / Fixed（2026-10-19 P0/P1 修复）
 
@@ -47,11 +59,16 @@
 - **打包**：wheel 含 `lightdb` 引擎包；入口 `lightdb-server` / `lightdb-studio` /
   `lightdb-studio-web`；依赖与 `requirements.txt` 对齐。
 - **门禁**：24 条失败测试按根因处置（真实缺陷修复 + 带 reason 的 skip/xfail），
-  当前 **811 用例 = 771 passed / 0 failed / 35 skipped / 5 xfailed**。
+  当前基线见 README「测试套件」（0 failed）。
 
 ### Known limitations
 
-- 复制：无轮转、无 GTID/半同步、binlog 写失败只告警不拒提交。
+- 复制：轮转/严格提交已实现；仍**无 GTID**（按位点复制）、**半同步不实现**（死代码已删）、
+  无 `binlog.index`（启动 O(n) 扫描）；`binlog_strict` 覆盖 `Database.commit/commit_statement`，
+  单行 autocommit 的 binlog 失败仍只告警（阶段 3 统一语句级内部事务）；WAL 与 binlog 非 2PC；
+  绕过执行器的直接存储写不产生事件。
+- 协议：预处理语句游标/FETCH、`SEND_LONG_DATA` 长参数、BIT/GEOMETRY 参数不支持（显式 1235）；
+  `PREPARE` 不做语法校验（在 EXECUTE 回 1064）。
 - 授权：账号 host 维度未建模（用户名唯一）；多进程 worker 本地内置分支未本地鉴权；
   PL/触发器按调用者权限执行（比 MySQL DEFINER 严格）；`SHOW VARIABLES`/`SELECT @@var` 未限制。
 - OLAP/列存/并行/Cython：正确性已修，但**未接入 SQL 路径**；性能目标（压缩率 3x、

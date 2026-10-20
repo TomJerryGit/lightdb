@@ -36,18 +36,19 @@
 | 3 | **Studio 死代码：批量删除** | ✅ **已执行**（commit `32f479f`）：删除 44 个死模块（15,728 行）+ 6 个死测试文件；`lightdb_studio` 134 文件/39,256 行 → **90 文件/23,532 行**。阶段 3 只剩"保留功能的可用性收口" |
 | 4 | **复制：投入 1–2 周做真 append-only binlog** | 由"摘牌或 1–2 周二选一"改为**立即投入**，见 §2.6「真复制专项计划」；`semi_sync` 死代码在 M4 决策删除 |
 
-### 执行进度（截至 2026-10-20 上午）
+### 执行进度（截至 2026-10-20 中午）
 
 | 工作项 | 状态 | 证据 |
 |---|---|---|
 | 阶段 0.1 打包修复 | ✅ 已完成（wheel 含引擎包/3 入口/版本单一来源；venv 实测 `lightdb-server --version`） | `pyproject.toml`、`scripts/check_packaging.py` |
-| 阶段 0.2 CI | ✅ 已落地（本地 `scripts/ci.ps1` + GitHub Actions；本地已实跑验证） | `.github/workflows/ci.yml`、`d7988b3` |
+| 阶段 0.2 CI | ✅ 已落地并**本地完整实跑**（compileall + 全量 pytest + benchmark gate + packaging check）；GitHub Actions 待推送后触发（无远端，见 `docs/RELEASING.md` §0） | `.github/workflows/ci.yml`、`d7988b3`、`scripts/ci.ps1` |
 | 阶段 0.3 失败测试清零 | ✅ 已完成（真实缺陷修复 + 带 reason 的 skip/xfail；24 → 0） | `tests/regression/*`、`test_batch9/10/14`、`test_v3_batch*`、`test_v4_batch*` 等 |
 | 阶段 0.4/0.5 收尾 | ✅ 发版材料（CHANGELOG/RELEASING/版本标记一致）、仓库卫生（data_* / worktree / 双 LICENSE / 调试产物 / .gitattributes）、`ci.ps1` 可执行性 | commit `d7988b3`；`scripts/check_repo_hygiene.py` PASS |
 | **阶段 1.1 授权体系** | ✅ 已完成（GRANT/REVOKE/SHOW GRANTS + 执行期鉴权 1142/1044/1227 + 协议层元数据过滤；真实 pymysql 端到端） | commit `bb2dce5`；`tests/test_privileges.py` 12 例 |
+| **阶段 1 协议项（COM_STMT）** | ✅ 已完成（PREPARE/EXECUTE/CLOSE/RESET、二进制参数/结果集、1210/1243/1235、PREPARE 鉴权） | commit `02a4e2c`；`tests/test_prepared_statements.py` 16 例 |
 | **决策 2 OLAP 4A.1** | ✅ 正确性止血完成（12 类缺陷 + 91 例对拍矩阵；取消 2 个 skip） | commit `d6170b1`；4A.2 接线待做 |
 | 决策 3 Studio 删除 | ✅ 已完成（134→90 文件；39,256→23,532 行；悬空 import=0） | commit `32f479f` |
-| 决策 4 真 binlog | ✅ **阶段 1 完成**（文件/CRC/位点/SHOW/主从闭环/续传/控制语句；16 例 + 166 回归） | commit `903d8e4`；阶段 2 TODO 见 §2.6 |
+| **决策 4 真 binlog** | ✅ **阶段 1+2 完成**（文件/CRC/位点/SHOW/主从闭环 + 轮转/严格提交/UPDATE·DELETE 镜像快路径；GTID 不做、半同步移除） | commits `903d8e4`、`3b48126`；`test_binlog_append_only.py` 16 + `test_binlog_phase2.py` 19 |
 
 ---
 
@@ -168,31 +169,33 @@
 
 ## 4. 建议的"下一个 3 个动作"
 
-> 2026-10-20 更新：阶段 0 全部收尾、阶段 1.1 授权、OLAP 4A.1 已完成（`d7988b3`/`bb2dce5`/`d6170b1`）。
-> 现在的下一步：
+> 2026-10-20 中午更新：阶段 0 全部收尾、阶段 1（授权 + COM_STMT）、OLAP 4A.1、真 binlog 阶段 2
+> 均已完成（`d7988b3`/`bb2dce5`/`d6170b1`/`3b48126`/`02a4e2c`）。现在的下一步：
 
 1. **OLAP 4A.2 接线**（决策 2）：把列存/OLAP 接入 `plan_executor`/`optimizer` 的显式 dispatch
-   （默认仍走行存），做"同一 SQL 行存/列存结果一致"的端到端对拍；再按 4A.3 重做并行。
-2. **真 binlog 阶段 2**（决策 4 收尾）：日志轮转 / binlog 写失败即拒绝提交 / GTID·半同步决策 /
-   `UPDATE`/`DELETE` 镜像少一次 SELECT；完成后把 README「复制支持边界」从 beta 升级为正式可用并进 CI。
-3. **阶段 1 剩余协议项**：预处理语句（COM_STMT_*）、`SET PASSWORD POLICY` 落地、审计越权保护；
-   之后进入阶段 2 存储可靠性（WAL CRC / COMMIT O(参与表) / 隔离级别诚实化 / EXPLAIN 真实路径）。
+   （默认仍走行存），做"同一 SQL 行存/列存结果一致"的端到端对拍；再按 4A.3 重做并行、
+   4A.5 性能门禁化（当前 3 个性能类 skip 需替换为可辩护阈值）。
+2. **阶段 2 存储可靠性**：WAL 行级 CRC + 损坏检测、COMMIT 只刷参与表（当前 O(表数) fsync）、
+   隔离级别诚实化（实现 RC 或如实报 RR）、EXPLAIN 真实访问路径、生成列重算、页回收/vacuum。
+3. **阶段 1 收尾 + 交付验证**：`SET PASSWORD POLICY` 落地、审计越权保护；把仓库推到 GitHub
+   让 `.github/workflows/ci.yml` 真实触发（当前无远端，本地 CI 已实跑）；随后进入阶段 3
+   Studio/Web 可用性收口（QThread/分页/凭据加密/Web 前端连接表单）。
 
 ## 5. KPI（每次阶段收口测一次）
 
 | 指标 | 当前（2026-10-20） | 阶段 0 目标 | 阶段 1 | 阶段 2 | 阶段 3 |
 |---|---:|---:|---:|---:|---:|
-| 用例通过 / 失败 | 见下方"实测基线"（0 failed；skip/xfail 全部带 reason） | ✅ 失败=0（显式 skip 除外） | ✅ 权限/审计/**预编译未完成** | 存储故障注入通过 | GUI 行为测试进 CI |
+| 用例通过 / 失败 | 见下方"实测基线"（0 failed；skip/xfail 全部带 reason） | ✅ 失败=0（显式 skip 除外） | ✅ 权限/预编译已完成；审计部分 | 存储故障注入通过 | GUI 行为测试进 CI |
 | 打包 | ✅ wheel 含引擎 + 3 入口（venv 实测） | ✅ 已修 | — | — | GUI/Web 可安装 |
 | 基准门禁 | PASS 5/5 | ✅ 保持 | ✅ 保持 | COMMIT 延迟 O(参与表) | — |
-| 安全项 | ✅ P0/P1 六项 + 授权体系闭环 | — | 审计/预编译仍缺 | — | 凭据加密 |
+| 安全项 | ✅ P0/P1 六项 + 授权体系 + COM_STMT 闭环 | — | 审计/`SET PASSWORD POLICY` 仍缺 | — | 凭据加密 |
 | 死代码行占比 | Studio 不可达已清零；引擎仍有 ~74 模块零引用 | — | — | — | 引擎 <10% |
-| 文档-实现一致 | README/CHANGELOG/roadmap 已同步授权/OLAP/复制状态 | ✅ 打包声明成真 | 协议文档 | 存储边界文档 | 功能表 100% 真实 |
+| 文档-实现一致 | README/CHANGELOG/roadmap 已同步授权/OLAP/复制/协议状态 | ✅ 打包声明成真 | 协议文档 | 存储边界文档 | 功能表 100% 真实 |
 
-### 实测基线（2026-10-20 上午，全量 pytest + benchmark）
+### 实测基线（2026-10-20 中午，全量 pytest + benchmark）
 
-- 全量 pytest：**914 用例 = 878 passed / 0 failed / 33 skipped / 3 xfailed**（12:34；
-  较上轮 +103 例：权限 12 + OLAP 对拍 91；4 个原 skip/xfail 恢复为正式测试）；
+- 全量 pytest：**949 用例 = 913 passed / 0 failed / 34 skipped / 2 xfailed**（11:51；
+  较上轮 +35 例：binlog 阶段 2 19 + COM_STMT 16；1 个半同步 xfail 移除、+1 个 mysql-connector skip）；
 - `benchmarks.run --suite quick --gate`：**PASS 5/5**（逐行 INSERT 3,829 rows/s、批量/逐行 2.043×、
   点查 901.7 q/s、WAL 468.6 KB、崩溃恢复 0.570 s、丢/漏行 0）；
 - `scripts/check_packaging.py`：PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源）；

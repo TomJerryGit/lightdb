@@ -66,6 +66,21 @@
 > 本次修复的详细证据、复现与仍未修复项见
 > [docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md](docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md)。
 
+### 🧩 预处理语句（COM_STMT_*，2026-10-20 阶段 1 协议补齐）
+
+- **服务端 prepare 全链路**：`COM_STMT_PREPARE / EXECUTE / CLOSE / RESET` 已实现；连接级
+  statement 注册表（id 从 1，单连接上限 1461），断连自动释放；`CLOSE` 按 MySQL 协议不回响应包。
+- **参数类型**：TINY/SHORT/LONG/LONGLONG/INT24、FLOAT/DOUBLE、STRING/VAR_STRING/VARCHAR、
+  DECIMAL/NEWDECIMAL、DATE/DATETIME/TIMESTAMP/TIME、BLOB 家族、NULL、ENUM/SET/JSON；
+  跨字节 NULL bitmap 正确；执行时按值安全内联后复用文本协议同一 parser/事务/权限路径。
+- **安全与错误语义**：PREPARE 阶段做 SELECT 鉴权（防元数据泄露）；参数数不符 **1210**、
+  未知 statement **1243**、不支持类型 **1235**；`SEND_LONG_DATA` 不累积（EXECUTE 显式 1235）、
+  游标/FETCH 不支持（显式 1235）。
+- **验收**：`tests/test_prepared_statements.py`（16 例，自写最小二进制客户端逐包断言；
+  另 1 例 mysql-connector 端到端在未安装时 skip，已用 mysql-connector-python 26.7.0 实测通过）。
+- **注意**：pymysql 默认客户端参数化仍走文本协议；此实现面向 JDBC / mysql-connector 等
+  server-side prepare 客户端。
+
 ### 🛡️ 授权体系（阶段 1.1，2026-10-20：GRANT/REVOKE 真正生效）
 
 > 此前「登录即全权」：GRANT/REVOKE 语法 1064、权限检查为零。现在权限模型已接线并持久化：
@@ -167,10 +182,11 @@
   [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
   顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
 
-- 一次完整测试运行的结果（2026-10-20，阶段 1.1 授权 + OLAP 4A.1 之后）：**914 个用例中
-  878 通过 / 0 失败 / 33 跳过 / 3 xfailed**（门禁保持全绿；新增 103 例：权限 12 例 +
-  OLAP 行存↔列存对拍 91 例；4 个原 skip/xfail 恢复为正式测试），skip/xfail 均带明确原因，
-  见下方「测试套件」说明与 [docs/analysis_2026-10-19/06_ROADMAP.md](docs/analysis_2026-10-19/06_ROADMAP.md) §1）。
+- 一次完整测试运行的结果（2026-10-20，binlog 阶段 2 + 预处理语句之后）：**949 个用例中
+  913 通过 / 0 失败 / 34 跳过 / 2 xfailed**（门禁保持全绿；较上一轮 +35 例：binlog 阶段 2
+  19 例 + COM_STMT 16 例；1 个半同步 xfail 随死代码删除而移除、新增 1 个 mysql-connector
+  端到端 skip），skip/xfail 均带明确原因，见下方「测试套件」说明与
+  [docs/analysis_2026-10-19/06_ROADMAP.md](docs/analysis_2026-10-19/06_ROADMAP.md) §1）。
 
 ### ✅ 本次会话已修复（2026-10，含实测验证）
 
@@ -260,17 +276,18 @@
 
 > 触发器定义持久化在数据目录的 `_triggers.json`；`BEFORE INSERT/UPDATE` 里的 `SET NEW.列 = ...` 真的会改写即将写入的行。上述校验与运行期使用**同一套**语句切分/解释规则，避免"建的时候允许、跑的时候解析失败"。
 
-### 🔁 复制支持边界（beta：真 append-only binlog 已落地；2026-10-19 决策 D）
+### 🔁 复制支持边界（beta：真 append-only binlog + 轮转/严格提交；2026-10-20 决策 D 阶段 2）
 
 | 项 | 状态 / 结论 |
 |---|---|
 | 定位 | **beta、单向（主 → 从）**：可用于开发/测试/单主单从，不建议承载生产写入；不计入"生产可用"声明 |
-| 日志文件 | ✅ `<data_dir>/binlog/binlog.000001`：独立 **append-only binlog** 文件，文件头 magic/version + 每条记录（type/真实字节 pos/length/**CRC32**）+ JSON payload；损坏/中间截断**显式报错**，写端只修复末尾半条 |
-| 位点语义 | ✅ `SHOW MASTER STATUS.Position` = **binlog 文件真实字节偏移**，只增不回退（checkpoint / ALTER / 重启均不回退）；`SHOW BINLOG EVENTS` / `__BINLOG_FETCH__` 读同一文件 |
-| 事务与 DDL | ✅ DML 提交时成组写 `BEGIN → 行事件… → COMMIT`（autocommit 也成组）；`ROLLBACK` 如实记录被丢弃条数；**DDL 事件也写入并复制**（从库不再需要预建同构 schema） |
-| 从库 | ✅ `master.info` 持久化 read/exec 位点，**重启续传**；DDL/DML 重放失败显式报错（`Last_SQL_Errno` 语义沿用 E2）；`START SLAVE` / `STOP SLAVE` / `CHANGE MASTER TO` 已支持 |
-| 明确未完成 | ⚠️ 无日志轮转（`max_bytes` 仅告警）；无 GTID / 半同步；binlog 写失败只告警不拒绝提交（阶段 2 改为失败即拒）；绕过执行器的直接存储写不产生事件；无复制过滤/多通道 |
-| 验收 | `python -m pytest tests/test_binlog_append_only.py -q`（16 例：位点单调/不回退、CRC 损坏、截断修复、事务分组、任意 pos 重读、DDL+DML 主从闭环、从库重启续传、控制语句） |
+| 日志文件 | ✅ `<data_dir>/binlog/binlog.000001`…：独立 **append-only binlog**，文件头 magic/version + 每条记录（type/真实字节 pos/length/**CRC32**）+ JSON payload；损坏/中间截断**显式报错**；**按 `max_bytes`（默认 32MB）真实轮转**，旧文件只读保留 |
+| 位点语义 | ✅ `SHOW MASTER STATUS` = **当前文件名 + 文件内真实字节位点**；只增不回退（checkpoint / ALTER / 重启 / 轮转均不回退）；`SHOW BINLOG EVENTS IN 'file' FROM pos` 可读历史文件；`__BINLOG_FETCH__` 6 列兼容（`pos`=跨文件全局逻辑序号、`lsn`=跨文件全局字节偏移，从库跨轮转续传） |
+| 事务与 DDL | ✅ DML 提交时成组写 `BEGIN → 行事件… → COMMIT`（autocommit 也成组）；`ROLLBACK` 如实记录被丢弃条数；**DDL 事件也写入并复制** |
+| 严格提交 | ✅ **binlog 写失败即拒绝提交**：write/flush/fsync/轮转建文件失败 → 物理回滚事务 + 显式 `1180`（HY000）；`LIGHTDB_BINLOG_STRICT=0` 可退化为告警（排障用） |
+| 从库 | ✅ `master.info` 持久化 read/exec 位点，**重启跨轮转续传**；DDL/DML 重放失败显式报错（`Last_SQL_Errno` 语义沿用 E2）；`START SLAVE` / `STOP SLAVE` / `CHANGE MASTER TO` 已支持 |
+| 明确未完成 | ⚠️ **无 GTID**（按位点复制；`Executed_Gtid_Set` 恒 NULL）；**半同步不实现**（死代码已删除）；无 `binlog.index`（启动 O(n) 扫描）；`UPDATE/DELETE` 镜像已有 WAL 增量快路径（无触发器时零额外 SELECT）；绕过执行器的直接存储写不产生事件；无复制过滤/多通道 |
+| 验收 | `python -m pytest tests/test_binlog_append_only.py tests/test_binlog_phase2.py -q`（16 + 19 例：位点单调/不回退、CRC 损坏、截断修复、事务分组、主从闭环、重启续传、控制语句、轮转跨文件、写失败拒绝提交、镜像一致性） |
 
 **多进程模式实测**（`python -m lightdb.main --mode multi --workers 2` + 真实 pymysql）：
 
@@ -287,9 +304,9 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**（2026-10-20 阶段 1.1 + OLAP 4A.1 后的门禁基线）：**914 用例 = 878 通过 / 0 失败 / 33 跳过 / 3 xfailed**（本轮优化开始时是 150 通过 / 118 失败；较上一轮 +103 例）。**失败数保持 0**——原 24 条失败按根因处置：
-- **真实缺陷已修**：`row_format` DECIMAL 编码 TypeError、CLI `-h/--host` 与 argparse 内建 `-h` 冲突（Windows CLI 必崩）、诊断 CLI 的 emoji 在 GBK 控制台崩溃；权限体系（GRANT/REVOKE/鉴权，2026-10-20 已接线，2 条 GRANT 用例恢复为正式测试）；
-- **带明确 reason 的 skip/xfail**（不是无声绿）：半同步死代码、OLAP/列存/并行未接入 SQL 路径与性能目标未达（3 条性能类 skip）、`parser_v3b4` 死代码（×2）、`row_format` 实验格式性能目标、沙箱写权限（×2）、诊断子进程 `DuplicateHandle` 沙箱限制、IPC 延迟阈值防抖、`lineage_enhanced` 列级血缘已知缺陷；
+**测试套件**（2026-10-20 binlog 阶段 2 + COM_STMT 后的门禁基线）：**949 用例 = 913 通过 / 0 失败 / 34 跳过 / 2 xfailed**（本轮优化开始时是 150 通过 / 118 失败；较上一轮 +35 例）。**失败数保持 0**——原 24 条失败按根因处置：
+- **真实缺陷已修**：`row_format` DECIMAL 编码 TypeError、CLI `-h/--host` 与 argparse 内建 `-h` 冲突（Windows CLI 必崩）、诊断 CLI 的 emoji 在 GBK 控制台崩溃；权限体系（GRANT/REVOKE/鉴权，已接线，2 条 GRANT 用例恢复为正式测试）；半同步死代码已删除（原 xfail 移除）；
+- **带明确 reason 的 skip/xfail**（不是无声绿）：OLAP/列存/并行未接入 SQL 路径与性能目标未达（3 条性能类 skip）、`parser_v3b4` 死代码（×2）、`row_format` 实验格式性能目标、沙箱写权限（×2）、诊断子进程 `DuplicateHandle` 沙箱限制、IPC 延迟阈值防抖、`lineage_enhanced` 列级血缘已知缺陷、mysql-connector 未安装时的端到端 skip；
 - 并发用例去掉已删除的 `query_cache` 断言、QPS 阈值降为防抖健全性检查（吞吐门禁在 `benchmarks/`）。
 
 **仍未修复**：查询执行仍是 Master 单线程（存储层无法安全地多进程共享，见上）；行值 `(a,b) IN (SELECT x,y ...)` 与行值比较 `(a,b) = (1,2)`（现**显式报错**并给出 `EXISTS` 改写建议）、HAVING 标量子查询引用外层聚合/非分组键、外层引用藏在函数或算式里、子查询里再嵌标量子查询作比较右值、WHERE 里的算术谓词、投影标量函数、`FROM (子查询)` 之后直接 `JOIN` —— 以上均**显式报错**（不静默错答）；**Cython 从未编译**（已实现纯 Python 回退，`status()['any_accelerated']` 为 False；本机无 Cython 且无任何 C 编译器）；存储侧 `Database.vacuum()` 只释放槽位、不做页内紧凑，且旧 `.dat` 行头布局不兼容（需重建库）。Linux/macOS 下 Worker 走 `SO_REUSEPORT` 自绑定路径，本机（Windows）无法验证。
