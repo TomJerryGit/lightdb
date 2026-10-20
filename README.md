@@ -1,10 +1,11 @@
 # LightDB Studio
 
-> 图形化数据库管理工具 · Navicat 的开源替代 · 纯 Python 实现
+> 纯 Python 实现的 MySQL 兼容数据库引擎 · 图形化管理工具（LightDB Studio）· Web 版
 
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)]()
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)]()
+[![Status](https://img.shields.io/badge/status-beta-orange.svg)]()
 
 ---
 
