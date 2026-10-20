@@ -55,8 +55,9 @@ cdef class IntHashTable:
     cpdef void put(self, int64_t key, int32_t value):
         cdef uint32_t idx = self._hash(key)
         cdef uint32_t i
+        cdef uint32_t pos
         for i in range(self.capacity):
-            cdef uint32_t pos = (idx + i) & (self.capacity - 1)
+            pos = (idx + i) & (self.capacity - 1)
             if not self.used[pos]:
                 self.keys[pos] = key
                 self.values[pos] = value
@@ -70,8 +71,13 @@ cdef class IntHashTable:
     cpdef int32_t get(self, int64_t key, int32_t default=-1):
         cdef uint32_t idx = self._hash(key)
         cdef uint32_t i
+        cdef uint32_t pos
         for i in range(self.capacity):
-            cdef uint32_t pos = (idx + i) & (self.capacity - 1)
+            pos = (idx + i) & (self.capacity - 1)
+            # 墓碑（2）不是终点：继续向后探测；否则删除过 key 后 get/contains
+            # 会命中旧 key 残留（编译版实测：remove 后 contains 仍为 True）。
+            if self.used[pos] == 2:
+                continue
             if not self.used[pos]:
                 return default
             if self.keys[pos] == key:
@@ -82,15 +88,20 @@ cdef class IntHashTable:
         return self.get(key, -1) != -1
 
     cpdef bint remove(self, int64_t key):
-        # 简化：标记删除
+        # 标记删除（墓碑），并清掉旧 key/value，避免 remove 后 get 命中残留
         cdef uint32_t idx = self._hash(key)
         cdef uint32_t i
+        cdef uint32_t pos
         for i in range(self.capacity):
-            cdef uint32_t pos = (idx + i) & (self.capacity - 1)
+            pos = (idx + i) & (self.capacity - 1)
+            if self.used[pos] == 2:
+                continue
             if not self.used[pos]:
                 return False
             if self.keys[pos] == key:
                 self.used[pos] = 2  # tombstone
+                self.keys[pos] = 0
+                self.values[pos] = 0
                 self.size -= 1
                 return True
         return False

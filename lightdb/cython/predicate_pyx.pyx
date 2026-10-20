@@ -66,11 +66,23 @@ cdef class CompiledPredicate:
             return self.op == 'IS NULL'
 
         cdef str op = self.op
+        # Cython 3 不允许 cdef 出现在 if/try 块内：全部提到函数顶部
+        cdef int64_t iv
+        cdef int64_t cv
+        cdef double dv
+        cdef double fcv
+        cdef str sv
+        cdef bytes svb
+        cdef const char* a
+        cdef const char* b
+        cdef object pat
+        cdef object regex
+        cdef object res
 
         # 快速路径：整数比较
         if self.value_type == 1 and isinstance(v, int):
-            cdef int64_t iv = <int64_t>v
-            cdef int64_t cv = self.int_value
+            iv = <int64_t>v
+            cv = self.int_value
             if op == '=': return iv == cv
             if op == '!=': return iv != cv
             if op == '<': return iv < cv
@@ -81,23 +93,23 @@ cdef class CompiledPredicate:
         # 浮点
         if self.value_type == 2:
             try:
-                cdef double dv = <double>float(v)
-                cdef double cv = self.float_value
-                if op == '=': return dv == cv
-                if op == '!=': return dv != cv
-                if op == '<': return dv < cv
-                if op == '>': return dv > cv
-                if op == '<=': return dv <= cv
-                if op == '>=': return dv >= cv
+                dv = <double>float(v)
+                fcv = self.float_value
+                if op == '=': return dv == fcv
+                if op == '!=': return dv != fcv
+                if op == '<': return dv < fcv
+                if op == '>': return dv > fcv
+                if op == '<=': return dv <= fcv
+                if op == '>=': return dv >= fcv
             except (ValueError, TypeError):
                 return False
 
         # 字符串
         if self.value_type == 3:
-            cdef str sv = str(v)
-            cdef bytes svb = sv.encode('utf-8')
-            cdef const char* a = svb
-            cdef const char* b = self.str_value
+            sv = str(v)
+            svb = sv.encode('utf-8')
+            a = svb
+            b = self.str_value
             if op == '=':
                 return strcmp(a, b) == 0
             if op == '!=':

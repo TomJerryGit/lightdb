@@ -45,6 +45,15 @@ cdef class RawPage:
         cdef uint32_t magic = PAGE_MAGIC
         memcpy(self.data, &magic, 4)
         memcpy(self.data + 4, &page_id, 4)
+        # 空页必须有初始 next_row_ptr = PAGE_SIZE（从页尾向前分配）。
+        # 原实现漏掉这一步：get_next_row_ptr() 读到 0，insert_row 里
+        # `0 - blen` 发生 uint16 下溢 → memcpy 写到缓冲之外（堆溢出，
+        # 编译后实测在 insert_row 中触发 access violation）。
+        # 纯 Python 回退版在 __init__ 里初始化了该字段，所以只有编译版暴露。
+        cdef uint16_t next_ptr = PAGE_SIZE
+        memcpy(self.data + 19, &next_ptr, 2)
+        cdef uint16_t n_slots_zero = 0
+        memcpy(self.data + 17, &n_slots_zero, 2)
 
     def __dealloc__(self):
         if self.data:

@@ -85,16 +85,19 @@ cdef class RowCodec:
         if not buf:
             raise MemoryError()
 
+        # Cython 3 不允许 cdef 出现在 try/for/if 块内：全部提到函数顶部
+        cdef int offset = null_len
+        cdef int i
+        cdef object v
+        cdef int64_t iv
+        cdef double dv
+        cdef bytes b
+        cdef int slen
+        cdef const char* sdata
+        cdef int t
+
         try:
             memset(buf, 0, buf_cap)
-            cdef int offset = null_len
-            cdef int i
-            cdef object v
-            cdef int64_t iv
-            cdef double dv
-            cdef bytes b
-            cdef int slen
-            cdef const char* sdata
 
             for i in range(n):
                 v = values[i]
@@ -103,7 +106,7 @@ cdef class RowCodec:
                     buf[i // 8] |= (1 << (i % 8))
                     continue
 
-                cdef int t = self.types[i]
+                t = self.types[i]
 
                 if t == T_INT:
                     iv = <int64_t>int(v)
@@ -225,11 +228,13 @@ cdef class RowCodec:
         if not buf:
             raise MemoryError()
 
+        # Cython 3 不允许 cdef 出现在 try 块内：提到函数顶部
+        cdef int count = len(encoded)
+        cdef int offset = 4
+        cdef int blen
+
         try:
-            cdef int count = len(encoded)
             memcpy(buf, &count, 4)
-            cdef int offset = 4
-            cdef int blen
             for b in encoded:
                 blen = len(b)
                 memcpy(buf + offset, &blen, 4)
@@ -271,11 +276,11 @@ cpdef bytes encode_int64_list(list values):
     """int64 列表 → 二进制"""
     cdef int n = len(values)
     cdef unsigned char* buf = <unsigned char*>malloc(n * 8)
+    cdef int64_t v
+    cdef int i
     if not buf:
         raise MemoryError()
     try:
-        cdef int64_t v
-        cdef int i
         for i in range(n):
             v = <int64_t>values[i]
             memcpy(buf + i * 8, &v, 8)

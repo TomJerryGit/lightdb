@@ -137,6 +137,14 @@ MODULES = {
 
 AVAILABLE = {name: mod is not None for name, mod in MODULES.items()}
 
+#: 编译产物是否**在本机真实构建并全部成功导入**。
+#: 判定依据：6 个逻辑模块全部来自 ``compiled``（导入失败会归为 fallback），
+#: 且没有任何 fallback 模块。它不保证跨机器/跨编译器 ABI 兼容，只表示
+#: "当前解释器里跑的是编译版，且能正常导入"。
+_COMPILED_COUNT = sum(
+    1 for n in _MODULES if MODULE_SOURCES[n]['source'] == 'compiled')
+COMPILED_VERIFIED = (_COMPILED_COUNT == len(_MODULES))
+
 CYTHON_INSTALLED = False
 try:                                # 仅用于如实说明"为何没有编译产物"
     import Cython as _Cython        # noqa: F401
@@ -173,9 +181,16 @@ def status():
                                for n in _MODULES),
         'cython_installed': CYTHON_INSTALLED,
         'cython_version': CYTHON_VERSION,
-        'compiled_verified': False,   # 本机无条件编译，恒为 False
-        'note': ('全部模块均可调用；未编译的走纯 Python 回退（无加速）。'
-                 '编译未在本机验证。'),
+        # 编译产物是否真实存在且全部导入成功（本机构建验证结果，不是声明）
+        'compiled_verified': COMPILED_VERIFIED,
+        'compiled_count': _COMPILED_COUNT,
+        'note': (
+            '全部模块均可调用；编译产物存在时走编译版（有加速），'
+            '否则走纯 Python 回退（无加速）。'
+            if COMPILED_VERIFIED else
+            '全部模块均可调用；当前有未编译模块，走纯 Python 回退（无加速）。'
+            ' 本机构建/验证方式见 scripts/build_cython_zig.py。'
+        ),
     }
 
 
