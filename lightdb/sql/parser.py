@@ -270,6 +270,19 @@ class Parser:
 
     def _parse_ops_stmt(self, sql: str, upper: str):
         """解析运维/复制/安全语句；不认识则返回 None（交回兜底 1064）"""
+        # ---- 权限体系（P1 阶段 1.1）：GRANT / REVOKE / SHOW GRANTS ----
+        # 必须在其它分支之前识别：GRANT/REVOKE 以前完全没有语法支持，
+        # 会落到兜底 1064（"授权体系未接线"）。这里只做**语法**解析，
+        # 权限模型与执行期校验见 `security/privileges.py` /
+        # `executor._require_privilege`；作用域里的库名是否真实存在由
+        # 执行器校验（解析器拿不到 Database）。
+        if re.match(r'(GRANT|REVOKE)\b', sql, re.IGNORECASE):
+            return self._grant_revoke_stmt(sql)
+        sgm = re.match(r'SHOW\s+GRANTS(.*)$', sql,
+                       re.IGNORECASE | re.DOTALL)
+        if sgm:
+            return self._show_grants_stmt(sgm.group(1))
+
         # ---- 复制状态 ----
         if upper in ('SHOW MASTER STATUS', 'SHOW BINARY LOG STATUS'):
             return self._show_result('MASTER_STATUS')
@@ -478,7 +491,12 @@ class Parser:
         return None
 
     def _parse_account(self, text: str) -> Dict:
-        """`'user'@'host'` → {'user','host'}（省略 host 按 '%'）"""
+        """`'user'@'host'` → {'user','host'}（省略 host 按 '%'）
+
+        账号必须被**完整消费**：`'u' IDENTIFIED BY 'x'` 这类多余尾巴会显式
+        报错，而不是只解析出 user 就把剩下部分静默丢掉（那会生成一条与
+        用户输入不符的授权/建号语句）。
+        """
         t = text.strip()
         m = re.match(
             r"""^(?:'([^']*)'|"([^"]*)"|([A-Za-z_]\w*))"""
@@ -490,7 +508,128 @@ class Parser:
             m.group(2) if m.group(2) is not None else m.group(3))
         host = m.group(4) if m.group(4) is not None else (
             m.group(5) if m.group(5) is not None else m.group(6))
+        rest = t[m.end():].strip()
+        if rest:
+            raise SyntaxError(
+                f"账号写法错误: {text!r}（无法识别的内容: {rest!r}）")
         return {'user': user, 'host': host or '%'}
+
+    # ============ 权限体系（P1 阶段 1.1）：GRANT / REVOKE / SHOW GRANTS ============
+
+    def _parse_grant_privs(self, raw: str):
+        """权限列表 → 规范化权限名；不支持的权限显式 1064"""
+        from ..security.privileges import (
+            SUPPORTED_PRIVS, normalize_priv)
+        privs = []
+        for item in self._split_top_level(str(raw or '')):
+            token = item.strip()
+            if not token:
+                continue
+            p = normalize_priv(token)
+            if p not in SUPPORTED_PRIVS:
+                raise SyntaxError(
+                    f"不支持的权限 {token!r}：本引擎支持 "
+                    f"{', '.join(SUPPORTED_PRIVS)}"
+                    f"（列级权限不支持，请只授予表/库级权限）")
+            privs.append(p)
+        if not privs:
+            raise SyntaxError(
+                "GRANT/REVOKE 缺少权限名（如 GRANT SELECT ON *.* TO 'u'）")
+        return privs
+
+    @staticmethod
+    def _parse_grant_scope(raw: str):
+        """`*.*` / `db.*` → (数据库名或 '*', 展示形态)；其余显式 1064
+
+        本引擎只支持全局（`*.*`）与库级（`db.*`）两种作用域：
+        * 表级（`db.t` / `t`）：权限模型没有表粒度的存储，显式拒绝；
+        * 列级（`... (列清单)`）：同样显式 1064 —— **绝不**把列清单丢掉
+          然后按整表权限静默执行（那等于悄悄放大了授权范围）。
+        """
+        s = str(raw or '').strip()
+        if not s:
+            raise SyntaxError("GRANT/REVOKE 缺少 ON 作用域（*.* 或 db.*）")
+        if '(' in s or ')' in s:
+            raise SyntaxError(
+                f"不支持列级权限: {s} —— 本引擎权限粒度只到库/表；"
+                f"请使用 *.* 或 db.*，列级授权会被显式拒绝")
+        if s == '*.*':
+            return '*', '*.*'
+        m = re.match(
+            r'^[`"]?([A-Za-z_]\w*)[`"]?\s*\.\s*\*$', s)
+        if m:
+            return m.group(1), f'{m.group(1)}.*'
+        if re.match(r'^[`"]?[A-Za-z_]\w*[`"]?\s*\.', s):
+            raise SyntaxError(
+                f"不支持表级权限作用域: {s} —— 本引擎权限模型只有 "
+                f"*.*（全局）与 db.*（库级）；表级授权会被显式拒绝")
+        raise SyntaxError(
+            f"GRANT/REVOKE 的 ON 作用域不合法: {s!r}"
+            f"（只支持 *.* 或 db.*）")
+
+    def _grant_revoke_stmt(self, sql: str) -> Dict:
+        """`GRANT <privs> ON <scope> TO <account>` / `REVOKE ... FROM ...`"""
+        m = re.match(
+            r'(GRANT|REVOKE)\s+(.+?)\s+ON\s+(.+?)\s+'
+            r'(TO|FROM)\s+(.+?)\s*$',
+            sql, re.IGNORECASE | re.DOTALL)
+        kind = (sql.strip().split(None, 1)[0].upper()
+                if sql.strip() else 'GRANT')
+        if not m:
+            raise SyntaxError(
+                f"{kind} 语法错误：需要 {kind} <权限列表> ON <*.*|db.*> "
+                f"{'TO' if kind == 'GRANT' else 'FROM'} "
+                f"'<用户>'[@'<主机>']")
+        privs_raw = m.group(2).strip()
+        scope_raw = m.group(3).strip()
+        accounts_raw = m.group(5).strip()
+        if re.search(r'\bWITH\s+GRANT\s+OPTION\b', accounts_raw,
+                     re.IGNORECASE):
+            raise SyntaxError(
+                "不支持 WITH GRANT OPTION：本引擎的权限模型没有 "
+                "GRANT OPTION（不能把'再授权能力'传给非管理员）")
+        if re.search(r'\bGRANT\s+OPTION\b', accounts_raw, re.IGNORECASE):
+            raise SyntaxError(
+                "不支持 GRANT OPTION（REVOKE ... GRANT OPTION 同样不支持）")
+        if re.search(r'\bIDENTIFIED\b', accounts_raw, re.IGNORECASE):
+            raise SyntaxError(
+                "不支持在 GRANT/REVOKE 中创建用户或修改口令："
+                "请先 CREATE USER / 用 SET PASSWORD 管理账号")
+        privs = self._parse_grant_privs(privs_raw)
+        database, label = self._parse_grant_scope(scope_raw)
+        parts = [a for a in self._split_top_level(accounts_raw) if a.strip()]
+        if not parts:
+            raise SyntaxError(f"{kind} 缺少账号（形如 'user'@'host'）")
+        accounts = [self._parse_account(p) for p in parts]
+        return {
+            'command': kind,
+            'privs': privs,
+            'database': database,
+            'scope': label,
+            'accounts': accounts,
+        }
+
+    def _show_grants_stmt(self, rest: str) -> Dict:
+        """`SHOW GRANTS [FOR <account>|CURRENT_USER]` → 结果集 AST"""
+        rest = str(rest or '').strip()
+        if not rest:
+            return self._show_result('GRANTS')
+        m = re.match(r'FOR\s+(.+?)\s*$', rest,
+                     re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise SyntaxError(
+                "SHOW GRANTS 语法错误：SHOW GRANTS [FOR "
+                "'<用户>'[@'<主机>']")
+        target = m.group(1).strip()
+        if target.upper() in ('CURRENT_USER', 'CURRENT_USER()'):
+            return self._show_result('GRANTS')
+        parts = [a for a in self._split_top_level(target) if a.strip()]
+        if len(parts) != 1:
+            raise SyntaxError(
+                "SHOW GRANTS FOR 一次只支持一个账号")
+        acct = self._parse_account(parts[0])
+        return self._show_result(
+            'GRANTS', grant_user=acct['user'], grant_host=acct['host'])
 
     def _create_user(self, sql: str) -> Dict:
         m = re.match(r'CREATE\s+USER\s+(IF\s+NOT\s+EXISTS\s+)?(.+?)\s*$',

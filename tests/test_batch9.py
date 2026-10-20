@@ -78,11 +78,8 @@ def test_privileges():
     print(f"  → alice 权限: {grants}")
 
 
-@pytest.mark.xfail(
-    reason="授权体系（GRANT/REVOKE/PrivilegeManager）尚未接线；已列入路线图阶段 1",
-    strict=False)
 def test_grant_via_sql():
-    """测试2: SQL 层用户管理"""
+    """测试2: SQL 层用户管理（GRANT/REVOKE/SHOW GRANTS 已接线）"""
     print("\n【测试2】SQL 层用户管理")
     reset()
     srv, db = start_server(PORT)
@@ -100,24 +97,29 @@ def test_grant_via_sql():
     cur.execute("GRANT SELECT, INSERT ON *.* TO 'bob'")
     print("  ✅ GRANT")
 
-    # SHOW GRANTS
+    # SHOW GRANTS（结果集；root 可查任意账户）
     cur.execute("SHOW GRANTS FOR 'bob'")
     grants = cur.fetchall()
     print(f"  → bob 的权限: {[g[0] for g in grants]}")
+    assert any('SELECT' in g[0] for g in grants), grants
+    assert any('INSERT' in g[0] for g in grants), grants
 
-    # SHOW USERS
-    cur.execute("SHOW USERS")
-    users = cur.fetchall()
-    print(f"  → 所有用户: {[u[0] for u in users]}")
-    assert 'bob' in [u[0] for u in users]
+    # 用户表里真实存在 bob（本引擎没有 MySQL 之外的 `SHOW USERS` 语法，
+    # 原断言用它；这里改用同一份 Process 内数据库对象验证，语义等价）
+    assert 'bob' in db.users
+    assert set(db.users['bob']['privs']) >= {'SELECT', 'INSERT'}
+    print(f"  → 所有用户: {sorted(db.users)}")
 
     # REVOKE
     cur.execute("REVOKE INSERT ON *.* FROM 'bob'")
     print("  ✅ REVOKE")
+    assert 'INSERT' not in db.users['bob']['privs']
+    assert 'SELECT' in db.users['bob']['privs']
 
     # DROP USER
     cur.execute("DROP USER 'bob'")
     print("  ✅ DROP USER")
+    assert 'bob' not in db.users
 
     conn.close()
     srv.shutdown()
@@ -125,11 +127,8 @@ def test_grant_via_sql():
     time.sleep(0.3)
 
 
-@pytest.mark.xfail(
-    reason="授权体系（GRANT/REVOKE/PrivilegeManager）尚未接线；已列入路线图阶段 1",
-    strict=False)
 def test_privilege_enforcement():
-    """测试3: 权限实际生效"""
+    """测试3: 权限实际生效（登录身份来自握手，执行期鉴权在分发前）"""
     print("\n【测试3】权限实际生效")
     reset()
     srv, db = start_server(PORT)
@@ -141,13 +140,14 @@ def test_privilege_enforcement():
     rcur = root_conn.cursor()
     rcur.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(50))")
     rcur.execute("INSERT INTO t VALUES (1, 'a')")
-    rcur.execute("CREATE USER 'readonly' IDENTIFIED BY ''")
+    # 口令策略拒绝空口令（validate_password 语义），改用一个合规口令
+    rcur.execute("CREATE USER 'readonly' IDENTIFIED BY 'Readonly123'")
     rcur.execute("GRANT SELECT ON *.* TO 'readonly'")
     print("  ✅ root 建表 + 创建 readonly 用户")
 
     # readonly 只能SELECT
     ro = track(pymysql.connect(host='127.0.0.1', port=PORT, user='readonly',
-                               autocommit=True))
+                               password='Readonly123', autocommit=True))
     rc = ro.cursor()
 
     rc.execute("SELECT * FROM t")
@@ -155,13 +155,22 @@ def test_privilege_enforcement():
     print(f"  ✅ readonly SELECT: {rows}")
     assert len(rows) == 1
 
-    # INSERT 应该被拒绝
+    # INSERT 应该被拒绝（MySQL 语义 1142：INSERT command denied ... for table）
     try:
         rc.execute("INSERT INTO t VALUES (2, 'b')")
         print("  ❌ INSERT 未被拒绝！")
         assert False
-    except Exception as e:
-        print(f"  ✅ INSERT 被拒绝: {str(e)[:60]}")
+    except pymysql.err.OperationalError as e:
+        print(f"  ✅ INSERT 被拒绝: {str(e)[:80]}")
+        assert e.args[0] == 1142, e
+        assert 'INSERT command denied' in str(e)
+
+    # UPDATE 同样被拒绝
+    try:
+        rc.execute("UPDATE t SET v = 'x' WHERE id = 1")
+        assert False, "UPDATE 未被拒绝"
+    except pymysql.err.OperationalError as e:
+        assert e.args[0] == 1142, e
 
     ro.close()
     root_conn.close()

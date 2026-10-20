@@ -40,17 +40,23 @@ LOGIN_FAILURE_DELAY = 0.5
 #: 表不存在（42S02）与未知列（42S22）被说成同一类"未知错误"。
 #: 这里按 MySQL 官方错误码表补齐常用错误的 SQLSTATE；未收录的一律 HY000。
 _SQLSTATE_BY_ERRNO = {
+    1044: '42000',   # ER_DBACCESS_DENIED_ERROR：库级访问被拒
     1048: '23000',   # ER_BAD_NULL_ERROR：列不允许 NULL
     1049: '42000',   # ER_BAD_DB_ERROR：未知数据库
     1054: '42S22',   # ER_BAD_FIELD_ERROR：未知列
     1062: '23000',   # ER_DUP_ENTRY：主键/唯一键冲突
     1064: '42000',   # ER_PARSE_ERROR：语法错误
     1105: 'HY000',   # ER_UNKNOWN_ERROR：通用错误
+    1130: 'HY000',   # ER_HOST_NOT_PRIVILEGED：主机不允许连接
+    1141: '42000',   # ER_NONEXISTING_GRANT：没有该授权记录
+    1142: '42000',   # ER_TABLEACCESS_DENIED_ERROR：表级访问被拒
     1146: '42S02',   # ER_NO_SUCH_TABLE：表不存在
+    1227: '42000',   # ER_SPECIFIC_ACCESS_DENIED：需要管理员权限
     1264: '22003',   # ER_WARN_DATA_OUT_OF_RANGE：数值越界
     1292: '22007',   # ER_TRUNCATED_WRONG_VALUE：日期/时间值非法
     1366: '22007',   # ER_WRONG_VALUE：取值不合法（类型转换失败）
     1406: '22001',   # ER_DATA_TOO_LONG：数据超长
+    1410: '42000',   # ER_CANT_CREATE_USER_WITH_GRANT：GRANT 不能隐式建号
 }
 
 
@@ -234,6 +240,12 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         self.user = resp.username
         # 连接级会话的 user 与真实登录身份一致（审计 / SHOW PROCESSLIST 用）
         self.session['user'] = self.user
+        # 来源地址：权限拒绝报文（1142/1044）里的 '<user>'@'<host>' 用真实
+        # 客户端 IP，而不是编一个 '%'。
+        try:
+            self.session['host'] = str(self.client_address[0])
+        except Exception:                     # pragma: no cover - 防御
+            self.session['host'] = '%'
 
         # 用户校验
         user_info = self.db.users.get(self.user)
@@ -419,6 +431,12 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             if err is not None:
                 self._send_packet(err)
                 return
+            # 权限：切库需要该库上的任意权限（1044）
+            access_err = self._access_error_packet(
+                None, database=resolved)
+            if access_err is not None:
+                self._send_packet(access_err)
+                return
             self.database = resolved
             # 连接级会话与 handler 状态保持一致（`USE` 语句路径同样会同步）
             self.session['database'] = resolved
@@ -454,6 +472,43 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._handle_query_inner(sql)
         finally:
             self._update_session(command='Sleep', info='', stmt_started=None)
+
+    # ==================== 权限（P1 阶段 1.1） ====================
+
+    def _access_error_packet(self, priv, database=None, table=None):
+        """用执行器的权限模型做一次准入检查 → ERR 包 / None
+
+        内置分支（SHOW TABLES / SHOW COLUMNS / DESC / COM_INIT_DB /
+        COM_FIELD_LIST / KILL）不经过 `Executor.execute()`，但同样受权限
+        约束：这里复用 `Executor.check_access`（与执行期鉴权**同一份**模型），
+        避免出现"普通语句被拒、SHOW 却能看全部元数据"的旁路。
+        """
+        check = getattr(self.executor, 'check_access', None)
+        if not callable(check) or not isinstance(self.session, dict):
+            # 没有权限模型的执行器（多进程 worker 的 RemoteExecutor）
+            # 不做本地判断：真正的鉴权在 Master 侧执行器上完成。
+            return None
+        try:
+            err = check(self.session, priv, database=database, table=table)
+        except Exception as e:                # pragma: no cover - 防御
+            logger.warn(f"权限检查失败（按拒绝处理）: {e}")
+            return mp.make_err_packet(1044, '42000', 'Access denied')
+        if not err:
+            return None
+        return mp.make_err_packet(
+            int(err.get('code') or 1105),
+            err.get('sqlstate') or classify_sqlstate(err.get('code')),
+            str(err.get('message') or 'Access denied')[:200])
+
+    def _session_is_admin(self) -> bool:
+        """当前连接是否管理员（root / 全局 ALL）"""
+        fn = getattr(self.executor, 'is_admin_session', None)
+        if not callable(fn):
+            return True
+        try:
+            return bool(fn(self.session))
+        except Exception:                     # pragma: no cover - 防御
+            return False
 
     def _handle_query_inner(self, sql: str):
         sql = sql.strip().rstrip(';').strip()
@@ -510,9 +565,17 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         if upper == "SHOW DATABASES":
+            # 非管理员只列出自己有权限的库（信息泄露最小化）；
+            # `information_schema` 作为系统库对已登录账户保持可见。
+            visible = getattr(self.executor, 'visible_databases', None)
+            try:
+                names = (visible(self.session) if callable(visible)
+                         else self._database_names())
+            except Exception:                 # pragma: no cover - 防御
+                names = self._database_names()
             self._send_resultset(
                 [("Database", mp.MYSQL_TYPE_VAR_STRING, 64)],
-                [(name,) for name in self._database_names()])
+                [(name,) for name in names])
             return
 
         if upper.startswith("SHOW TABLES"):
@@ -521,6 +584,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             db_name, err = self._current_database()
             if err is not None:
                 self._send_packet(err)
+                return
+            access_err = self._access_error_packet(
+                'SELECT', database=db_name)
+            if access_err is not None:
+                self._send_packet(access_err)
                 return
             rows = [(name,) for name in self._visible_tables(db_name)]
             self._send_resultset(
@@ -1270,9 +1338,15 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 'Time', 'State', 'Info']
         rows = []
         now = time.time()
+        # MySQL 语义：没有 PROCESS 权限的账户只看得到**自己的**线程；
+        # 管理员（root / 全局 ALL）才看全部。旧实现任何账户都能看所有
+        # 连接的 SQL 文本（信息泄露）。
+        admin = self._session_is_admin()
         with _sessions_lock:
             items = list(_sessions.items())
         for sid, info in items:
+            if not admin and sid != self.server_id:
+                continue
             # `Time` 是"在当前状态里待了多久"（MySQL 语义）。会话空闲
             # （Sleep）时没有"当前语句"，如实报 NULL；正在执行语句时报
             # 该语句已运行的秒数。原来的实现用 `now - 连接建立时刻`，
@@ -1331,6 +1405,15 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 message=f"Connection {target_sid} killed"))
             return
 
+        # 杀别人需要 PROCESS/SUPER（本模型用管理员=全局 ALL 表达）；普通
+        # 账户只能 KILL 自己，旧实现里任何登录用户都能踢掉任意连接。
+        if not self._session_is_admin():
+            self._send_packet(mp.make_err_packet(
+                1227, "42000",
+                "Access denied; you need (at least one of) the "
+                "PROCESS privilege(s) for this operation"))
+            return
+
         info = _get_sessions_snapshot().get(target_sid)
         if info is None:
             self._send_packet(mp.make_err_packet(
@@ -1368,6 +1451,13 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         table_name = m.group(1)
+        # 权限先于存在性判断：否则无权限账户能靠 1146/1142 的差异探测
+        # "这个表存不存在"（MySQL 对无权限的表同样先报 1142）。
+        access_err = self._access_error_packet(
+            'SELECT', table=table_name)
+        if access_err is not None:
+            self._send_packet(access_err)
+            return
         if table_name not in self.db.tables:
             self._send_packet(mp.make_err_packet(
                 1146, "42S02",
@@ -1403,6 +1493,13 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 'utf-8', errors='replace')
         except Exception:
             table = ''
+
+        # 权限：COM_FIELD_LIST 返回列定义，属于表元数据 → 需要 SELECT
+        if table:
+            access_err = self._access_error_packet('SELECT', table=table)
+            if access_err is not None:
+                self._send_packet(access_err)
+                return
 
         # 与 `SHOW COLUMNS` 走同一份真实列定义（`describe_columns`）：
         # 旧实现直接回 `MYSQL_TYPE_VAR_STRING` + 长度 255，客户端拿到的

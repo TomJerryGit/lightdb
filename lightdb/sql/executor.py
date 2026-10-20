@@ -14,7 +14,7 @@ import threading
 import time
 import weakref
 from collections import deque
-from typing import Dict
+from typing import Dict, List, Optional
 
 from ..logger import logger
 from ..db.information_schema import InformationSchema
@@ -516,7 +516,14 @@ class Executor:
         self._active_session = session
         result = None
         try:
-            if isinstance(parsed, dict) and parsed.get('ctes'):
+            # ★ P1 阶段 1.1：执行期鉴权（在**分发之前**做，拒绝的语句不会
+            #   产生任何副作用）。网络路径的 `session['user']` 来自握手
+            #   （net/server.py），进程内/内部路径没有该键时视为可信内部
+            #   调用（不是数据库账户，详见 `_require_privilege`）。
+            denied = self._require_privilege(parsed, session)
+            if denied is not None:
+                result = denied
+            elif isinstance(parsed, dict) and parsed.get('ctes'):
                 result = self._execute_with_ctes(parsed, session)
             else:
                 result = self._dispatch(parsed, session)
@@ -716,6 +723,395 @@ class Executor:
         if handler:
             return handler(p, s)
         return self._err(1064, f"不支持的语句: {cmd}")
+
+    # ==================== 执行期鉴权（P1 阶段 1.1） ====================
+    #
+    # 事实来源是 `Database.users[user]['privs']`（与握手共用同一份用户表），
+    # 权限模型见 `security/privileges.py`。矩阵：
+    #
+    #   命令                      所需权限           拒绝码
+    #   SELECT / SHOW / DESC      SELECT             1142（表级）
+    #   INSERT/UPDATE/DELETE      对应 DML           1142
+    #   CREATE/ALTER/DROP/...     对应 DDL           1142（表级）/1044（库级）
+    #   TRUNCATE                  DROP               1142
+    #   INDEX（全文索引）           INDEX              1142
+    #   USE / SHOW TABLES         库上任意权限/ SELECT  1044
+    #   DCL / 管理语句            全局 ALL/root       1227
+    #   未知命令                   管理员             1227（fail-closed）
+    #
+    # 错误报文照 MySQL 语义：表级 1142「<CMD> command denied to user
+    # 'u'@'host' for table 't'」、库级 1044「Access denied for user ... to
+    # database 'db'」、管理语句 1227「Access denied; you need ...」。
+    # SQLSTATE 统一 42000（访问拒绝类）。
+
+    #: 需要「表级」权限的命令 → 所需权限
+    _PRIV_TABLE_COMMANDS = {
+        'SHOW COLUMNS': 'SELECT',   # SHOW COLUMNS / DESC / DESCRIBE
+        'INSERT': 'INSERT',
+        'UPDATE': 'UPDATE',
+        'DELETE': 'DELETE',
+        'CREATE TABLE': 'CREATE',
+        'DROP TABLE': 'DROP',
+        'ALTER TABLE': 'ALTER',
+        'ALTER UNSUPPORTED': 'ALTER',
+        'TRUNCATE': 'DROP',
+        'CREATE FULLTEXT INDEX': 'INDEX',
+        'CREATE INDEX': 'INDEX',
+        'DROP INDEX': 'INDEX',
+        'CREATE TRIGGER': 'CREATE',
+        'ANALYZE': 'SELECT',
+    }
+    #: 需要「库级」权限的命令 → 所需权限（None = 该库上任意权限即可）
+    _PRIV_DB_COMMANDS = {
+        'USE': None,
+        'SHOW TABLES': 'SELECT',
+        'CREATE PROCEDURE': 'CREATE',
+        'CREATE FUNCTION': 'CREATE',
+        'DROP FUNCTION': 'DROP',
+        'DROP TRIGGER': 'DROP',
+    }
+    #: 需要管理员（全局 ALL / root）的命令
+    _ADMIN_COMMANDS = frozenset({
+        'GRANT', 'REVOKE', 'CREATE USER', 'DROP USER',
+        'SET PASSWORD POLICY', 'ADD IP WHITELIST',
+        'REMOVE IP WHITELIST', 'DELETE IP WHITELIST',
+        'START SLAVE', 'STOP SLAVE', 'CHANGE MASTER', 'SHOW STATS',
+    })
+    #: 以结果集回传的 SHOW 标签 → 需要管理员的那些
+    _ADMIN_SHOW_TAGS = frozenset({
+        'security', 'audit_log', 'ip_whitelist', 'master_status',
+        'slave_status', 'binlog_events', 'vacuum', 'optimize_table',
+        'check_table', 'engine',
+    })
+    #: SHOW 标签 → 需要 SELECT（有表名按表级 1142，否则库级 1044）
+    _SELECT_SHOW_TAGS = frozenset({
+        'create_table', 'index', 'partitions', 'triggers', 'functions',
+    })
+    #: 任何已登录账户都可以执行的命令（无数据访问 / 会话控制）
+    _PUBLIC_COMMANDS = frozenset({
+        'BEGIN', 'COMMIT', 'ROLLBACK', 'SELECT VARIABLES',
+        'CALL', 'EXPLAIN', 'SHOW DATABASES',
+    })
+
+    #: 引擎内部的**服务身份**（不是数据库账户）。事件调度器等内部组件用
+    #: 它们执行语句（见 sql/event.py）；只有当同名数据库账户**不存在**时
+    #: 才按内部身份处理 —— 这样真实账户 'system' 不会被误当服务身份。
+    _INTERNAL_SERVICE_USERS = frozenset({'system'})
+
+    @staticmethod
+    def _session_user(session):
+        return (session.get('user')
+                if isinstance(session, dict) else None)
+
+    def _is_internal_session(self, session) -> bool:
+        """无 user 键 = 进程内/内部调用；或未注册的内部服务身份。
+
+        网络路径在握手成功时一定会写入 `session['user']` 且该用户必然
+        存在于 `db.users`（否则 1045），因此这里只给测试/内部组件放行，
+        **不会**给任何网络请求放行。
+        """
+        user = self._session_user(session)
+        if not user:
+            return True
+        if user in self._INTERNAL_SERVICE_USERS:
+            users = getattr(self.db, 'users', None) or {}
+            return not isinstance(users.get(user), dict)
+        return False
+
+    def _session_host(self, session, record=None) -> str:
+        host = (session.get('host')
+                if isinstance(session, dict) else None)
+        if not host and isinstance(record, dict):
+            host = record.get('host')
+        return str(host or '%')
+
+    def _target_database(self, session) -> str:
+        """当前会话库（未选库 = 引擎真实单库名）"""
+        db = (session.get('database')
+              if isinstance(session, dict) else None)
+        return str(db or self.db.name)
+
+    def _deny_table(self, cmd, table, user, host) -> Dict:
+        display = str(cmd or 'ACCESS').split()[0].upper()
+        return self._err(
+            1142,
+            f"{display} command denied to user '{user}'@'{host}' "
+            f"for table '{table}'",
+            sqlstate='42000')
+
+    def _deny_db(self, user, host, database) -> Dict:
+        return self._err(
+            1044,
+            f"Access denied for user '{user}'@'{host}' "
+            f"to database '{database}'",
+            sqlstate='42000')
+
+    def _deny_admin(self, cmd, user, host) -> Dict:
+        needed = str(cmd or 'ADMIN').split()[0].upper()
+        return self._err(
+            1227,
+            f"Access denied; you need (at least one of) the {needed} "
+            f"privilege(s) for this operation",
+            sqlstate='42000')
+
+    def _is_internal_session(self, session) -> bool:
+        """无 user 键 = 进程内/内部调用；或未注册的内部服务身份。
+
+        网络路径在握手成功时一定会写入 `session['user']` 且该用户必然
+        存在于 `db.users`（否则 1045），因此这里只给测试/内部组件放行，
+        **不会**给任何网络请求放行。
+        """
+        user = self._session_user(session)
+        if not user:
+            return True
+        if user in self._INTERNAL_SERVICE_USERS:
+            users = getattr(self.db, 'users', None) or {}
+            return not isinstance(users.get(user), dict)
+        return False
+
+    def _require_privilege(self, parsed, session) -> Optional[Dict]:
+        """执行期鉴权：返回 None = 放行，否则返回错误结果字典
+
+        在 `execute()` 分发**之前**调用，拒绝的语句不会执行、不会改数据。
+        """
+        if not isinstance(parsed, dict):
+            return None
+        if self._is_internal_session(session):
+            return None
+        from ..security.privileges import (
+            has_any_privilege_on_db, has_privilege, is_admin)
+        user = self._session_user(session)
+        users = getattr(self.db, 'users', None) or {}
+        record = users.get(user) if isinstance(user, str) else None
+        host = self._session_host(session, record)
+        cmd = str(parsed.get('command') or '')
+
+        # ---- 未知用户：按未授权处理（绝不静默放行） ----
+        if not isinstance(record, dict):
+            return self._deny_unknown(cmd, parsed, user, host)
+
+        if is_admin(users, user):
+            return None
+
+        # ---- SHOW 系列 ----
+        show_tag = str(parsed.get('show_stmt') or '').lower()
+        if show_tag:
+            return self._check_show_privilege(
+                show_tag, parsed, user, host, session)
+
+        # ---- UNION：逐段检查（每段都是独立的 SELECT） ----
+        if cmd == 'UNION':
+            for seg in parsed.get('segments') or []:
+                err = self._require_privilege(seg, session)
+                if err is not None:
+                    return err
+            return None
+
+        # ---- 单表 SELECT（含 JOIN / 子查询 / CTE / 系统表） ----
+        if cmd == 'SELECT':
+            return self._check_select_privilege(parsed, session, user, host)
+
+        # ---- 表级权限命令 ----
+        priv = self._PRIV_TABLE_COMMANDS.get(cmd)
+        if priv:
+            table = parsed.get('table')
+            if not table:
+                return self._deny_db(
+                    user, host, self._target_database(session))
+            if has_privilege(users, user, priv, self.db.name):
+                return None
+            return self._deny_table(cmd, table, user, host)
+
+        # ---- 库级权限命令 ----
+        if cmd in self._PRIV_DB_COMMANDS:
+            need = self._PRIV_DB_COMMANDS[cmd]
+            database = (parsed.get('database')
+                        if cmd == 'USE'
+                        else self._target_database(session))
+            database = database or self.db.name
+            if (str(database).lower() == 'information_schema'
+                    and self.db.is_known_database(database)):
+                # 系统库保持"最小可用"：任何已登录账户可查看元数据
+                return None
+            if need is None:
+                allowed = has_any_privilege_on_db(
+                    users, user, database)
+            else:
+                allowed = has_privilege(users, user, need, database)
+            if allowed:
+                return None
+            return self._deny_db(user, host, database)
+
+        # ---- 管理员命令 ----
+        if cmd in self._ADMIN_COMMANDS:
+            return self._deny_admin(cmd, user, host)
+
+        # ---- 公共命令（EXPLAIN 还要检查内层语句） ----
+        if cmd in self._PUBLIC_COMMANDS:
+            if cmd == 'EXPLAIN':
+                inner = parsed.get('inner')
+                if isinstance(inner, dict):
+                    return self._require_privilege(inner, session)
+            return None
+
+        # ---- 未知命令：fail-closed（只有管理员能过） ----
+        return self._deny_admin(cmd, user, host)
+
+    def _deny_unknown(self, cmd, parsed, user, host) -> Dict:
+        """未知（或已删除）用户：按命令目标返回对应的 MySQL 拒绝码"""
+        if cmd == 'SELECT' or cmd == 'UNION' or cmd in self._PRIV_TABLE_COMMANDS:
+            table = parsed.get('table') or ''
+            if not table:
+                return self._deny_db(user, host, self._target_database({}))
+            return self._deny_table(cmd or 'SELECT', table, user, host)
+        if cmd in self._PRIV_DB_COMMANDS:
+            database = parsed.get('database') or self._target_database({})
+            return self._deny_db(user, host, database)
+        if cmd in self._PUBLIC_COMMANDS:
+            return self._deny_admin(cmd, user, host)
+        return self._deny_admin(cmd, user, host)
+
+    def _check_show_privilege(self, show_tag, parsed, user, host,
+                              session) -> Optional[Dict]:
+        """SHOW 类语句的鉴权（结果集以 command='SELECT' + show_stmt 回传）"""
+        from ..security.privileges import has_privilege
+        users = getattr(self.db, 'users', None) or {}
+        if show_tag in self._ADMIN_SHOW_TAGS:
+            return self._deny_admin('SHOW ' + show_tag, user, host)
+        if show_tag == 'grants':
+            # 非管理员只能看自己的授权（FOR 别人 → 拒绝）
+            target = parsed.get('grant_user')
+            actor = self._session_user(session)
+            if target and str(target) != str(actor):
+                return self._deny_table(
+                    'SHOW GRANTS', 'user', user, host)
+            return None
+        if show_tag not in self._SELECT_SHOW_TAGS:
+            # 未登记的 SHOW：fail-closed
+            return self._deny_admin('SHOW ' + show_tag, user, host)
+        table = parsed.get('table')
+        database = self._target_database(session)
+        if table:
+            if has_privilege(users, user, 'SELECT', self.db.name):
+                return None
+            return self._deny_table('SHOW', table, user, host)
+        if has_privilege(users, user, 'SELECT', database):
+            return None
+        return self._deny_db(user, host, database)
+
+    def _check_select_privilege(self, parsed, session, user,
+                                host) -> Optional[Dict]:
+        """SELECT 的鉴权：普通表 1142；information_schema 最小可用"""
+        from ..security.privileges import has_privilege
+        users = getattr(self.db, 'users', None) or {}
+        table = parsed.get('table')
+        if not table:
+            # FROM-less（SELECT 1）不需要数据权限；FROM 子查询按内层检查
+            sub = parsed.get('subquery')
+            if isinstance(sub, dict) and sub.get('sql'):
+                try:
+                    from .parser import parser
+                    inner = parser.parse(sub['sql'])
+                except Exception:                    # pragma: no cover - 防御
+                    inner = None
+                if isinstance(inner, dict):
+                    return self._require_privilege(inner, session)
+            return None
+        tname = str(table)
+        if tname.upper() == '__BINLOG_FETCH__':
+            # 内部复制接口（binlog 拉取）只给管理员
+            return self._deny_admin('SELECT', user, host)
+        if tname.lower().startswith('information_schema.'):
+            return None
+        if (tname.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA')
+                and tname not in self.db.tables):
+            return None
+        # CTE 名：物化时内层查询会各自鉴权，这里放行
+        cte_names = {
+            str(c.get('name') or '').lower()
+            for c in (parsed.get('ctes') or [])
+            if isinstance(c, dict)
+        }
+        if tname.lower() in cte_names:
+            return None
+        if not has_privilege(users, user, 'SELECT', self.db.name):
+            return self._deny_table('SELECT', tname, user, host)
+        # JOIN 的其它表：同一库内，权限相同；内部虚拟表额外要求管理员
+        for join in (parsed.get('joins') or []):
+            jt = (join or {}).get('table') if isinstance(join, dict) else None
+            if not jt:
+                continue
+            if str(jt).upper() == '__BINLOG_FETCH__':
+                return self._deny_admin('SELECT', user, host)
+        return None
+
+    def is_admin_session(self, session) -> bool:
+        """当前会话是否管理员（net 层 SHOW/KILL 等内置分支复用）"""
+        if self._is_internal_session(session):
+            return True          # 内部调用 / 内部服务身份
+        user = self._session_user(session)
+        from ..security.privileges import is_admin
+        return is_admin(getattr(self.db, 'users', None) or {}, user)
+
+    def check_access(self, session, priv, database=None,
+                     table=None) -> Optional[Dict]:
+        """net 层复用的准入检查：None = 允许，否则返回 `_err` 结构错误
+
+        `table` 非空 → 表级 1142；否则库级 1044；`priv=None` = 该库上任意
+        权限即可。未知用户按未授权处理。
+        """
+        if self._is_internal_session(session):
+            return None          # 内部调用 / 内部服务身份
+        user = self._session_user(session)
+        users = getattr(self.db, 'users', None) or {}
+        record = users.get(user)
+        host = self._session_host(session, record)
+        if not isinstance(record, dict):
+            if table:
+                return self._deny_table(priv or 'ACCESS', table, user, host)
+            return self._deny_db(user, host,
+                                 database or self._target_database(session))
+        from ..security.privileges import (
+            has_any_privilege_on_db, has_privilege, is_admin)
+        if is_admin(users, user):
+            return None
+        if (database is not None
+                and str(database).lower() == 'information_schema'):
+            return None
+        if table:
+            if has_privilege(users, user, priv or 'SELECT', self.db.name):
+                return None
+            return self._deny_table(priv or 'ACCESS', table, user, host)
+        if priv is None:
+            allowed = has_any_privilege_on_db(users, user, database)
+        else:
+            allowed = has_privilege(users, user, priv, database)
+        if allowed:
+            return None
+        return self._deny_db(user, host,
+                             database or self._target_database(session))
+
+    def visible_databases(self, session) -> List[str]:
+        """当前会话可见的库（非管理员只看到有权限的库 + information_schema）"""
+        names = list(self.db.database_names())
+        if self._is_internal_session(session):
+            return names
+        user = self._session_user(session)
+        from ..security.privileges import (
+            has_any_privilege_on_db, is_admin)
+        users = getattr(self.db, 'users', None) or {}
+        if is_admin(users, user):
+            return names
+        if not isinstance(users.get(user), dict):
+            return []
+        visible = []
+        for name in names:
+            if str(name).lower() == 'information_schema':
+                visible.append(name)     # 系统库保持最小可用
+            elif has_any_privilege_on_db(users, user, name):
+                visible.append(name)
+        return visible
+
 
     # ==================== 结果构造 ====================
 
@@ -6519,6 +6915,29 @@ class Executor:
             entries = self.ip_whitelist.list_all()
         return self._rs(['Entry'], [(e,) for e in entries])
 
+    def _show_grants(self, p, s):
+        """`SHOW GRANTS [FOR '<user>'[@'host']]` —— 真实的授权账户记录
+
+        输出列名与 MySQL 一致：`Grants for <user>@<host>`。非管理员只能查
+        自己（FOR 别人在执行期鉴权里已被 1142 拒绝）；root/管理员可查任意
+        账户（包括自己的 ALL）。
+        """
+        from ..security.privileges import show_grants
+        users = getattr(self.db, 'users', None) or {}
+        actor = self._session_user(s)
+        target = p.get('grant_user') or actor or 'root'
+        record = users.get(target)
+        if not isinstance(record, dict):
+            return self._err(
+                1141,
+                f"There is no such grant defined for user '{target}' "
+                f"on host '%'",
+                sqlstate='42000')
+        host = str(p.get('grant_host')
+                   or record.get('host') or '%')
+        rows = [(line,) for line in show_grants(users, target)]
+        return self._rs([f"Grants for {target}@{host}"], rows)
+
     def _show_security(self, p, s):
         """SHOW SECURITY —— 真实安全配置快照 (Name, Value)"""
         pp = self.password_policy
@@ -6568,6 +6987,89 @@ class Executor:
             return True, None
         ok, err = pp.validate(password)
         return ok, err
+
+    def _cmd_grant(self, p, s):
+        """`GRANT <privs> ON <*.*|db.*> TO '<user>'[@'host']`（DCL）
+
+        只有管理员能到这里（`_require_privilege` 已按 ALL/root 拦截）。
+        权限写入 `db.users[user]['privs']` 并随 `_meta.json` 持久化 ——
+        与握手共用同一份用户表，重开 Database 后仍然生效。
+        """
+        from ..security.privileges import grant_privileges
+        database = p.get('database') or '*'
+        if database != '*':
+            if not self.db.is_known_database(database):
+                return self._err(
+                    1049, f"Unknown database '{database}'",
+                    sqlstate='42000')
+        updated = 0
+        for acct in p.get('accounts') or []:
+            user = acct.get('user')
+            host = acct.get('host') or '%'
+            record = self.db.users.get(user)
+            if not isinstance(record, dict):
+                # MySQL 8：GRANT 不会隐式建号
+                return self._err(
+                    1410,
+                    f"You are not allowed to create a user with GRANT"
+                    f"（用户 '{user}'@'{host}' 不存在，请先 CREATE USER）",
+                    sqlstate='42000')
+            try:
+                updated += grant_privileges(
+                    self.db.users, user, p.get('privs') or [], database)
+            except ValueError as e:
+                return self._err(1064, str(e))
+            if not record.get('host'):
+                record['host'] = host
+        try:
+            self.db.save_meta()
+        except Exception as e:
+            return self._err(1105, f"保存权限失败: {e}")
+        return self._ok(
+            message=f"Query OK, 0 rows affected "
+                    f"（{updated} privilege(s) granted）")
+
+    def _cmd_revoke(self, p, s):
+        """`REVOKE <privs> ON <*.*|db.*> FROM '<user>'[@'host']`（DCL）"""
+        from ..security.privileges import revoke_privileges
+        database = p.get('database') or '*'
+        if database != '*':
+            if not self.db.is_known_database(database):
+                return self._err(
+                    1049, f"Unknown database '{database}'",
+                    sqlstate='42000')
+        privs = p.get('privs') or []
+        removed = 0
+        for acct in p.get('accounts') or []:
+            user = acct.get('user')
+            host = acct.get('host') or '%'
+            record = self.db.users.get(user)
+            if not isinstance(record, dict):
+                return self._err(
+                    1141,
+                    f"There is no such grant defined for user '{user}' "
+                    f"on host '{host}'",
+                    sqlstate='42000')
+            if (str(user) == 'root' and database == '*'
+                    and 'ALL' in privs):
+                # 防止把管理员自己锁死（root 是最后的救援入口）
+                return self._err(
+                    1227,
+                    "不允许回收 root 的全局 ALL 权限"
+                    "（root 是引擎的救援账户；如需降权请直接修改用户表）",
+                    sqlstate='42000')
+            try:
+                removed += revoke_privileges(
+                    self.db.users, user, privs, database)
+            except ValueError as e:
+                return self._err(1064, str(e))
+        try:
+            self.db.save_meta()
+        except Exception as e:
+            return self._err(1105, f"保存权限失败: {e}")
+        return self._ok(
+            message=f"Query OK, 0 rows affected "
+                    f"（{removed} privilege(s) revoked）")
 
     def _cmd_create_user(self, p, s):
         """CREATE USER ... IDENTIFIED BY '...'（DCL）
@@ -8309,16 +8811,16 @@ class Executor:
         return self._rs(cols, rows)
 
     def _cmd_show_databases(self, p, s):
-        """`SHOW DATABASES` —— 引擎**真实**支持的库集合
+        """`SHOW DATABASES` —— 引擎**真实**支持、且当前账户**可见**的库
 
         依据见 `Database.database_names()`：一个真实的单库 + 真实可查询的
-        `information_schema` 虚拟库。旧实现返回写死的
-        `[('default',), ('information_schema',)]`：它与实现无关，改数据
-        目录、改库名、加/减虚拟库都不会变，属于纯装饰性元数据。
+        `information_schema` 虚拟库。非管理员只看到自己有权限的库
+        （`information_schema` 作为系统库保持最小可用，所有账户可见）；
+        未知用户看不到任何库。
         """
         return self._rs(
             ['Database'],
-            [(name,) for name in self.db.database_names()])
+            [(name,) for name in self.visible_databases(s)])
 
     def _cmd_show_columns(self, p, s):
         """`SHOW COLUMNS` / `DESC` / `DESCRIBE` —— 来自真实列定义
