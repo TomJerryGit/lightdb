@@ -48,7 +48,15 @@ def test_status_constants_match_reality():
     from lightdb.olap import status
     assert status.WIRED_TO_SQL_PATH is True, '已接线：状态必须如实为 True'
     assert status.DEFAULT_ENABLED is False, '接线默认关闭'
-    assert status.COUNTS_FOR_PERFORMANCE_CLAIMS is False, '待 4A.5 基准门禁'
+    # 4A.5：已有可辩护的基准门禁，状态必须与 benchmarks/gate.py 的事实一致
+    assert status.COUNTS_FOR_PERFORMANCE_CLAIMS is True, '4A.5 已加基准门禁'
+    from benchmarks import gate as bench_gate
+    assert 'olap_parallel_groupby_speedup' in bench_gate.TARGETS
+    assert 'olap_dispatch_crosscheck_mismatches' in bench_gate.TARGETS
+    assert bench_gate.target_of('olap_parallel_groupby_100k') == \
+        'olap_parallel_groupby_speedup'
+    assert bench_gate.target_of('olap_dispatch_crosscheck_10000') == \
+        'olap_dispatch_crosscheck_mismatches'
     assert '已接线' in status.STATUS_LABEL
     assert '默认关闭' in status.STATUS_LABEL
     assert status.PARALLEL_AUTO_WORKERS >= 1

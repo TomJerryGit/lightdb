@@ -11,11 +11,15 @@
 
 ## 0. 一句话结论
 
-本仓库**没有**白皮书宣称的 12,000 QPS / 3.5M rows/s / 41x / 12.5x
-（那些链路没有接进查询路径）。本包把**能复跑、可辩护**的数字定成
+本仓库**没有**把白皮书宣称的 12,000 QPS / 3.5M rows/s / 41x / 12.5x
+当作实测能力。本包把**能复跑、可辩护**的数字定成
 **"不回退"门禁**：逐行 INSERT ≥ 1,000 rows/s、多值批量 ≥ 1.2x 逐行、
 进程内点查 ≥ 600 q/s、WAL ≤ 32 MB、崩溃恢复 < 5 s、崩溃不丢已提交行、
-不泄漏未提交行。**它是回归护栏，不是性能承诺。**
+不泄漏未提交行；**4A.2/4A.5 起再加两条 OLAP 门禁**：向量化 GROUP BY
+分片并行 ≥ 1.2x、dispatch 开关前后对拍不一致 = 0 行。OLAP/列存层已
+**显式接入 SQL 路径但默认关闭**（`LIGHTDB_OLAP_DISPATCH=1` 才派发），
+当前 dispatch 本身没有性能收益（实测 0.44–1.10x），因此不据此宣称加速。
+**它是回归护栏，不是性能承诺。**
 
 复跑一条命令：
 
@@ -87,7 +91,7 @@ $env:LIGHTDB_WAL_CHECKPOINT_RECORDS = '0'                # 0 = 该维度不限�
 
 | 套件 | 墙上时间（本机实测） | 峰值内存 | 说明 |
 |---|---|---|---|
-| `quick` | **15–30 s**（门禁含 6 项测量） | < 400 MB | CI 用；行数取小档（2,000 / 5,000） |
+| `quick` | **~30–45 s**（门禁含 7 项测量 + 2 条 OLAP 门禁） | < 500 MB | CI 用；行数取小档（2,000 / 5,000；OLAP 100k 行） |
 | `full` | **~2–12 min**（本机干净副本 103 s；机器忙时更长） | < 800 MB | 含 TCP 点查、1/4 客户端并发、20k 行 WAL 档 |
 
 * **同一时刻只能跑一个基准进程**：本机实测两边同时跑时，崩溃恢复
@@ -127,6 +131,8 @@ Stepping 10（8 逻辑核），Python 3.11.9（`D:\Program Files\Python311`）�
 | 8 | 崩溃恢复 | **0.28–0.44 s**（2,000 行已提交）<br>**1.14–1.16 s**（8,000 行，单独跑）／2.2 s（与别的基准同时跑）<br>历史：30.5k 行 0.32 s（改前 **5.92 s**） | `Database()` 到 `SELECT` 拿到正确行数 | 本包 `crash_recovery_*` |
 | 9 | 崩溃后数据完整性 | 丢失已提交 **0** 行 / 泄漏未提交 **0** 行（每次复跑都是 0） | 同 #8 | 本包 `recovery_*_rows` |
 | 10 | 进程内多线程点查 | 1 客户端 889–898 q/s → 4 客户端 457–827 q/s（**总吞吐下降**）<br>范围查 1 客户端 9.8–14.7 → 4 客户端 7.9–12.9 q/s | 3 s 固定窗口 | 本包 `concurrency_*`（只报告） |
+| 11 | 向量化聚合（模块级，1M 行） | 单聚合 SUM 中位 **367 ms = 2.72M rows/s**（样本 2.40–2.78M）；5 聚合 w1 中位 1.91 s（~522k rows/s） | `VectorizedAggregate`/`VectorizedAggregateSet`（列存在内存，不含行存解码） | 4A.5 测量（2026-10-20） |
+| 12 | 向量化 GROUP BY 并行（100k 行） | w1 中位 **2.75 s** → w2 **1.00 s = 2.75x**（w4 约 1.7x，4 线程反而不如 2）；单/多线程结果逐值一致 | 分片线程池（`VectorizedGroupBy(workers=2)`） | 4A.5 测量 + 本包 `olap_parallel_groupby_100k` |
 
 **实测分布（同代码、同档位、跨约 1 小时的 8 次 quick 档，2,000 行档）**
 
@@ -174,6 +180,8 @@ better / basis / tolerance 四个字段，程序可读）。
 | 崩溃恢复 | **< 5 s** | 实测 0.28–0.44 s（2,000 行）/ 1.14 s（8,000 行，单独跑）；**改前 5.92 s** | 容忍 **~11×**（对 2,000 行档）；注意**并发跑别的基准时会涨到 3.1 s** |
 | 已提交行不丢 | **= 0 行** | WAL redo 的语义底线（**数据丢失**，不是性能） | 硬判据，无容忍 |
 | 未提交行不泄漏 | **= 0 行** | WAL undo 的语义底线（**隔离性**，不是性能） | 硬判据，无容忍 |
+| **OLAP 并行 GROUP BY** | **≥ 1.2 x**（w2 vs w1） | 4A.5 实测：100k 行（100 组，SUM+COUNT）w1 中位 **2.75 s** → w2 中位 **1.00 s = 2.75x**（2026-10-20，8 核）；取 1.2x 只抓"并行完全失效/负加速" | 先逐值校验单/多线程结果一致；warmup+2 轮取中位；容忍 ~56% 回退 |
+| **OLAP dispatch 对拍** | **= 0 行不一致** | 4A.2/4A.5：同一批 SQL 在 dispatch 关/开（crosscheck 模式）逐行比较；任何不一致即结果错误 | 硬判据，无容忍 |
 
 ### 3.1 门禁的"重试"语义（为什么可以有，以及它洗不白什么）
 
@@ -198,8 +206,9 @@ insert_rowwise_table_2000: 采用第 2 次尝试
 ### 3.2 明确**不**作为目标的东西
 
 * **白皮书的 12,000 QPS / 3.5M rows/s / 41x / 12.5x**：不在目标表里。
-  这些数字所在的 OLAP / 列存 / Cython 链路**没有接进 SQL 执行路径**，
-  在查询路径上没有落点（对照见第 4 节）。追逐它们不是本门禁的目标。
+  OLAP/列存已在 4A.2 **显式接入**（默认关闭），但 dispatch 当前无性能收益；
+  白皮书数字仍不是门禁目标（4A.5 只把"并行 GROUP BY ≥1.2x"和"对拍不一致=0"
+  两条可辩护的项写进门禁，见第 3 节）。
 * **TCP 点查吞吐**：实测 ~516 q/s（协议往返 + 服务端线程调度），
   抖动大且主要反映网络/线程而不是引擎，只报告不判定。
 * **进程内并发扩展比**：GIL + 表级锁下**不扩展**（8 客户端低于
@@ -218,8 +227,8 @@ insert_rowwise_table_2000: 采用第 2 次尝试
 | 单线程点查 **12,000 QPS** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:68`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/V4_RELEASE_NOTES.md:42`](../docs/V4_RELEASE_NOTES.md) | **1,299–2,069 q/s**（2,000 行表，本包）/ 1,140 q/s（历史 5,000 行表） | **差 6–9 倍**；未实现，不作目标 |
 | 8 核 **92,000 QPS** | [`README.md:49`](../README.md)、[`docs/USER_GUIDE.md:106`](../docs/USER_GUIDE.md) | 进程内多线程**不扩展**：8 客户端总吞吐低于单客户端 | **未实现**；GIL + 表级锁 |
 | OLAP 扫描 **3.5M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:72`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 向量化/列存链路在 `Executor` / `plan_executor` 里**零引用**，本包查询路径实测是逐行量级（范围/聚合 ~5k–11k rows/s） | **没有落点**；未接入 |
-| 大表聚合 **85M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:768`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 同上；`lightdb/olap/**` 在 SQL 执行路径**零引用**，本包实测聚合是逐行量级（~5k–11k rows/s） | **没有落点**；未接入 |
-| 列存加速比 **41x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:93`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/ARCHITECTURE_v4.md:560`](../docs/ARCHITECTURE_v4.md) | `lightdb/columnar/**` 未接线 | **未实现**；无对照基线 |
+| 大表聚合 **85M rows/s** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:768`](../docs/PERFORMANCE_WHITEPAPER_v4.md) | 4A.2 起 `lightdb/olap/**` 已**显式接入** SQL 路径（默认关闭）；模块级实测 1M 行单 SUM 2.72M rows/s（门禁 2.0M），但 dispatch 默认关闭且当前无收益 | **未达白皮书数字**；只有模块级实测 + 门禁 |
+| 列存加速比 **41x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:93`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/ARCHITECTURE_v4.md:560`](../docs/ARCHITECTURE_v4.md) | 列存已接线（默认关闭）；实测向量化 GROUP BY 并行 w2 2.75x、模块级列存扫描远快于行存（内存态，无解码口径） | **41x 无对照基线**；对外只引用实测 2.75x 并行门禁 |
 | Cython B+Tree **12.5x** | [`docs/PERFORMANCE_WHITEPAPER_v4.md:92`](../docs/PERFORMANCE_WHITEPAPER_v4.md)、[`docs/DEAD_CODE.md:11`](../docs/DEAD_CODE.md) | `lightdb/cython/` 编译产物 **0 个**，`status()['any_accelerated'] == False`（无回退实现） | **未编译、未验证**；未实现 |
 | 逐行 INSERT 的"批量更快"印象 | 历史脚本报告口径 | **顺序对照下批量并不更快**（实测 0.91–1.05x）；**同窗成对**下才是 1.44–1.72x | 用比值，不用顺序对照 |
 | 并发"1→4→8 提升" | 阶段 0 摘要 | 1,163 → 925 → **749 q/s（−36%）**（[`README.md:65`](../README.md)） | **回退而非扩展**；如实报告 |
@@ -232,9 +241,11 @@ insert_rowwise_table_2000: 采用第 2 次尝试
   [`docs/review/01_engine.md`](../docs/review/01_engine.md) —— 实测数字与判读。
 * [`docs/review/04_ROADMAP.md:56`](../docs/review/04_ROADMAP.md) —— "先定可辩护
   的目标并写进基准门禁"这条要求的原始出处。
-* [`docs/DEAD_CODE.md`](../docs/DEAD_CODE.md) —— 未接线链路清单。
-* [`README.md:23-70`](../README.md) —— 阶段 0 加的"性能声明状态说明"
-  （阶段 2 第 6 项补充了「实验性 / 未接入 SQL 路径 / 不计入性能声明」的统一口径）。
+* [`docs/DEAD_CODE.md`](../docs/DEAD_CODE.md) —— 未接线链路清单（OLAP/列存部分
+  已在 4A.2 接线，历史条目请以 `lightdb/olap/status.py` 与本文为准）。
+* [`README.md:23-70`](../README.md) —— "性能声明状态说明"（阶段 2 第 6 项
+  「实验性 / 未接入 SQL 路径 / 不计入性能声明」的统一口径；4A.5 起 OLAP 已有
+  基准门禁，口径升级为"已接线、默认关闭、只引用实测门禁数字"）。
 
 ---
 
@@ -323,10 +334,11 @@ python -m benchmarks.run --suite quick --gate     # 未达标 exit 1
 
 ## 6. 未做到 / 已知风险
 
-1. **没有接入真正的 CI 服务**。本仓没有 GitHub Actions / Jenkins 之类
-   配置；本包只做到"可被 CI 调用的东西"（`--gate` 退出码 +
-   可选开的 pytest 用例）。真正接 CI 需要另行决定跑在哪个 runner、
-   用哪种机器（**换机器必须重测并重新定阈值**，见下条）。
+1. **CI 已配置但尚未在 GitHub 实跑**。`.github/workflows/ci.yml`（Windows：
+   install → compileall → pytest → benchmark gate → packaging check）已提交，
+   本地等价命令 `scripts/ci.ps1` 已完整跑通；但当前仓库没有 GitHub 远端/
+   runner，Actions 触发需先推送（见 `docs/RELEASING.md` §0）。**换机器必须
+   重测并重新定阈值**，见下条。
 2. **绝对吞吐类门禁在 CI 上仍可能抖动**。本机实测同代码同一小时内
    逐行 INSERT 1,374 ↔ 6,373 rows/s、点查 588 ↔ 2,150 q/s（杀毒/索引器/
    热节流都可能是外因）。**抖动幅度的依据**就是这些频次统计：跨约

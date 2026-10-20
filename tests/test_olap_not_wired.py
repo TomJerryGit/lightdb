@@ -12,7 +12,9 @@
    结果与接线前一致；
 3. 显式打开后，白名单聚合查询**确实**走向量化（`dispatched>0`），且结果
    与行存逐行一致；白名单外语法 `dispatched==0`（无静默改道）；
-4. `COUNTS_FOR_PERFORMANCE_CLAIMS` 在 4A.5 基准门禁之前保持 False。
+4. `COUNTS_FOR_PERFORMANCE_CLAIMS` 自 4A.5 起为 True（已有可辩护的基准门禁，
+   见 `benchmarks/gate.py: olap_parallel_groupby_speedup` /
+   `olap_dispatch_crosscheck_mismatches`）。
 
 删除的是旧契约里「`lightdb/sql/**` 对 olap 零 import」这一条：现在
 `Executor._cmd_select` 会在开关打开时 import
@@ -31,7 +33,7 @@ def test_status_says_wired_but_disabled_by_default():
     from lightdb.olap import status
     assert status.WIRED_TO_SQL_PATH is True
     assert status.DEFAULT_ENABLED is False
-    assert status.COUNTS_FOR_PERFORMANCE_CLAIMS is False
+    assert status.COUNTS_FOR_PERFORMANCE_CLAIMS is True, '4A.5 已加基准门禁'
 
 
 def test_default_executor_does_not_dispatch(tmp_path):

@@ -15,13 +15,15 @@ None 走行存。因此：
 * `DEFAULT_ENABLED = False`：**默认关闭**。不设 `LIGHTDB_OLAP_DISPATCH=1`
   或 `Config(olap_dispatch=True)` 时，SQL 执行与接线前完全一致（行存），
   且不会 import 任何 OLAP/列存引擎模块（延迟 import）；
-* `COUNTS_FOR_PERFORMANCE_CLAIMS = False`：**待 4A.5 基准门禁**。目前
-  只有模块内正确性修复与对拍，尚无「可辩护的门禁阈值」，因此任何
-  QPS/rows-s 数字都不得按实测性能对外声明；
+* `COUNTS_FOR_PERFORMANCE_CLAIMS = True`（4A.5 起）：该层已有**可辩护的基准
+  门禁**（`benchmarks/gate.py: olap_parallel_groupby_speedup` 并行加速比、
+  `olap_dispatch_crosscheck_mismatches` 对拍不一致数=0），且实测数字写在
+  `benchmarks/README.md`；对外只允许引用这些实测/门禁数字，不得引用白皮书
+  设计目标。dispatch 本身当前无性能收益（默认关闭），不得据此宣称加速；
 * `PARALLEL_AUTO_WORKERS`：`config.olap_parallel_workers = 0`（自动）时
-  向量化聚合/分组实际使用的线程数。4A.3 实测加速比见
-  `tests/test_olap_wired.py` 的 A/B 输出；若 < 1.2x 则自动档保持 1
-  （即默认关闭并行），显式设 2/4 才会强制并行。
+  向量化聚合/分组实际使用的线程数。4A.3 实测 1M 行纯 SUM 加速不足 1.2x，
+  自动档保持 1（默认关闭并行）；100k 行 GROUP BY w1→w2 实测 2.75x，
+  显式设 2/4 才会强制并行（结果逐值一致）。
 
 本模块只放常量与检查点函数，不做任何计算、不 import 引擎（避免
 `import lightdb.olap` 时产生循环依赖）。
@@ -36,9 +38,11 @@ WIRED_TO_SQL_PATH = True
 #: `config.olap_dispatch` / env `LIGHTDB_OLAP_DISPATCH=1` 才会派发。
 DEFAULT_ENABLED = False
 
-#: 该层是否参与对外性能声明。**待 4A.5 基准门禁**：目前只有对拍与
-#: 模块内微基准，没有可辩护的门禁阈值，因此保持 False。
-COUNTS_FOR_PERFORMANCE_CLAIMS = False
+#: 该层是否参与对外性能声明。4A.5 起为 True：已存在可辩护的基准门禁
+#: （并行 GROUP BY 加速比 ≥1.2x、dispatch 对拍不一致数 ==0），实测数字见
+#: `benchmarks/README.md`。注意：dispatch 默认关闭且当前无性能收益，
+#: 不得据此宣称"SQL 查询已获得向量化加速"。
+COUNTS_FOR_PERFORMANCE_CLAIMS = True
 
 #: `olap_parallel_workers = 0`（自动）时向量化并行档位。
 #: 4A.3 实测 1M 行 SUM 的 1→4 线程加速比不足 1.2x（numpy 求和本身在
@@ -50,7 +54,7 @@ PARALLEL_AUTO_WORKERS = 1
 DISPATCH_MODULE = 'lightdb/olap/sql_dispatch.py'
 
 #: 该层的状态标签（文档与错误报文共用同一份口径）。
-STATUS_LABEL = '已接线、默认关闭、可在显式开启时走列存（实验性、不计入性能声明）'
+STATUS_LABEL = '已接线、默认关闭、有基准门禁（实测对照见 benchmarks/README.md）'
 
 #: 实测对照表的位置（所有性能口径都指向它）。
 BENCH_REFERENCE = 'benchmarks/README.md'

@@ -88,6 +88,22 @@ CASE_META = {
     'concurrency_range_4': {
         'metric': '进程内并发范围查总吞吐（4 客户端，3 s 窗口）',
         'unit': 'q/s', 'gate': None},
+    # ---------- OLAP 4A.5：门禁化（阈值来自 2026-10-20 实测基线） ----------
+    'olap_parallel_groupby_100k': {
+        'metric': '向量化 GROUP BY 分片并行加速比（100k 行，w1 vs w2，同进程成对）',
+        'unit': 'x', 'gate': 'olap_parallel_groupby_speedup',
+        'note': '实测 w1 中位 ~2.75 s → w2 ~1.00 s = 2.75x（2026-10-20 本机 8 核）；'
+                '门禁取 1.2x 只抓"并行完全失效/负加速"'},
+    'olap_dispatch_crosscheck_10000': {
+        'metric': 'OLAP dispatch 开关前后逐行对拍的不一致行数（必须为 0）',
+        'unit': 'rows', 'gate': 'olap_dispatch_crosscheck_mismatches',
+        'note': '走真实 Executor：同一批 SQL 在 dispatch 关/开（crosscheck 模式）'
+                '下逐行比较；任何不一致即门禁失败'},
+    'olap_dispatch_agg_10000': {
+        'metric': 'OLAP dispatch 开关同 SQL 的耗时比（on/off，仅报告）',
+        'unit': 'x', 'gate': None,
+        'note': '当前 dispatch 无性能收益（实测 0.44–1.10x），仅作事后判读；'
+                '默认保持关闭，不据此启用'},
 }
 
 
@@ -237,6 +253,168 @@ def _case_concurrency(kind='point', clients=1, seconds=3.0, nrows=2000,
             'errors': r['errors'], 'samples': []}
 
 
+# ==================== OLAP 4A.5 门禁化 case（2026-10-20） ====================
+
+def _olap_tempdir(data_dir):
+    """OLAP case 的临时目录（ColumnStore 是内存列存，仍需要一个目录标识）。"""
+    import tempfile
+    if data_dir:
+        return tempfile.mkdtemp(prefix='olap_bench_', dir=data_dir)
+    return tempfile.mkdtemp(prefix='olap_bench_')
+
+
+def _case_olap_parallel_groupby(size=100_000, rounds=3, data_dir=None):
+    """4A.3/4A.5：向量化 GROUP BY 分片线程池加速比（w1 vs w2，同进程成对）。
+
+    * 结果先做单/多线程逐值一致性校验（不一致直接抛错，不产出"加速"数字）；
+    * 计时取中位（warmup 兼一致性校验 + rounds 轮），门禁只看 metric_median。
+    """
+    import shutil
+    from lightdb.columnar.column_store import ColumnStore
+    from lightdb.olap.vectorized_engine import (
+        VectorizedScan, VectorizedGroupBy)
+
+    dd = _olap_tempdir(data_dir)
+    try:
+        store = ColumnStore('t', [
+            {'name': 'city', 'type': 'VARCHAR'},
+            {'name': 'amount', 'type': 'INT'},
+        ], dd)
+        store.append_rows([[f'c{i % 100}', i] for i in range(size)])
+        aggs = [{'func': 'SUM', 'column': 'amount', 'alias': 'total'},
+                {'func': 'COUNT', 'column': '*', 'alias': 'cnt'}]
+
+        def one(workers):
+            gb = VectorizedGroupBy(
+                VectorizedScan(store, ['city', 'amount']),
+                ['city'], aggs, workers=workers)
+            t0 = time.perf_counter()
+            rows = gb.execute()
+            return rows, time.perf_counter() - t0
+
+        rows1, dt1 = one(1)                # warmup 兼一致性校验
+        rows2, _ = one(2)
+        if rows1 != rows2:
+            raise RuntimeError('并行 GROUP BY 结果与串行不一致（门禁拒绝产出数字）')
+        serial_samples = [dt1]
+        parallel_samples = []
+        for _ in range(rounds):
+            _, dt = one(2)
+            parallel_samples.append(dt)
+        for _ in range(rounds):
+            _, dt = one(1)
+            serial_samples.append(dt)
+        serial = _median(serial_samples)
+        parallel = _median(parallel_samples)
+        ratio = serial / parallel if parallel > 0 else 0.0
+        return {'metric_median': ratio,
+                'min': min(serial_samples) / max(parallel_samples),
+                'max': max(serial_samples) / min(parallel_samples),
+                'n_samples': len(parallel_samples),
+                'median_secs': parallel,
+                'serial_median_secs': serial,
+                'parallel_workers': 2, 'rows': size,
+                'samples': {'serial': serial_samples,
+                            'parallel': parallel_samples}}
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+
+
+def _case_olap_dispatch_crosscheck(size=10_000, data_dir=None):
+    """4A.2/4A.5：dispatch 开关前后逐行对拍（真实 Executor，不一致行数必须 0）。"""
+    import shutil
+    from lightdb.db.database import Database
+    from lightdb.sql.executor import Executor
+
+    dd = _olap_tempdir(data_dir)
+    try:
+        db = Database(dd)
+        ex = Executor(db)
+        try:
+            ex.execute_sql(
+                'CREATE TABLE t (id INT PRIMARY KEY, v INT, city VARCHAR(20))',
+                {})
+            for i in range(size):
+                ex.execute_sql(
+                    f"INSERT INTO t VALUES ({i}, {i % 97}, 'c{i % 10}')", {})
+
+            queries = [
+                'SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t',
+                'SELECT COUNT(*), SUM(v) FROM t WHERE id < 500',
+                'SELECT city, COUNT(*), SUM(v) FROM t GROUP BY city',
+                'SELECT city, SUM(v) AS s FROM t GROUP BY city '
+                'ORDER BY s DESC LIMIT 5',
+                'SELECT COUNT(*), SUM(v) FROM t WHERE city = \'c3\' '
+                'AND v >= 10',
+            ]
+            mismatches = 0
+            dispatched = 0
+            from lightdb.olap.sql_dispatch import (
+                dispatch_stats, reset_dispatch_stats)
+            for sql in queries:
+                ex.olap_dispatch = False
+                ex.olap_crosscheck = False
+                ref = ex.execute_sql(sql, {})
+                ex.olap_dispatch = True
+                ex.olap_crosscheck = True
+                ex.olap_dispatch_min_rows = 0
+                reset_dispatch_stats()
+                got = ex.execute_sql(sql, {})
+                dispatched += dispatch_stats()['dispatched']
+                if (ref.get('columns'), ref.get('rows')) != (
+                        got.get('columns'), got.get('rows')):
+                    mismatches += 1
+            if dispatched == 0:
+                raise RuntimeError('对拍用例一次 dispatch 都没发生（门禁拒绝产出 0）')
+            return {'metric_median': float(mismatches), 'min': 0.0,
+                    'max': float(mismatches), 'n_samples': 1,
+                    'median_secs': None, 'rows_crosschecked': len(queries),
+                    'dispatched': dispatched, 'samples': []}
+        finally:
+            db.shutdown()
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+
+
+def _case_olap_dispatch_agg(size=10_000, data_dir=None):
+    """dispatch 开关同 SQL 耗时比（仅报告；当前无收益，不据此启用）。"""
+    import shutil
+    from lightdb.db.database import Database
+    from lightdb.sql.executor import Executor
+
+    dd = _olap_tempdir(data_dir)
+    try:
+        db = Database(dd)
+        ex = Executor(db)
+        try:
+            ex.execute_sql('CREATE TABLE t (id INT PRIMARY KEY, v INT)', {})
+            for i in range(size):
+                ex.execute_sql(f'INSERT INTO t VALUES ({i}, {i % 97})', {})
+            sql = 'SELECT COUNT(*), SUM(v), AVG(v) FROM t'
+
+            def timed(enable):
+                ex.olap_dispatch = enable
+                ex.olap_dispatch_min_rows = 0
+                ex.olap_crosscheck = False
+                samples = []
+                for _ in range(3):
+                    t0 = time.perf_counter()
+                    ex.execute_sql(sql, {})
+                    samples.append(time.perf_counter() - t0)
+                return _median(samples)
+
+            off = timed(False)
+            on = timed(True)
+            ratio = on / off if off > 0 else 0.0
+            return {'metric_median': ratio, 'min': ratio, 'max': ratio,
+                    'n_samples': 1, 'median_secs': on, 'off_secs': off,
+                    'rows': size, 'samples': []}
+        finally:
+            db.shutdown()
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+
+
 # ==================== 套件定义 ====================
 # 每项: (case_name, callable)。callable 收到 `data_dir=None` 关键字参数
 # （`benchmarks.run --data-dir` / 干净 worktree 隔离时用到）。
@@ -252,6 +430,13 @@ SUITES = {
         ('crash_recovery_2000', lambda **kw: _case_crash_recovery(2000, **kw)),
         ('insert_batch_speedup_2000',
          lambda **kw: _case_insert_batch_speedup(2000, **kw)),
+        # OLAP 4A.5 门禁项（阈值见 benchmarks/gate.py）
+        ('olap_parallel_groupby_100k',
+         lambda **kw: _case_olap_parallel_groupby(100_000, 2, **kw)),
+        ('olap_dispatch_crosscheck_2000',
+         lambda **kw: _case_olap_dispatch_crosscheck(2000, **kw)),
+        ('olap_dispatch_agg_2000',
+         lambda **kw: _case_olap_dispatch_agg(2000, **kw)),
     ],
     'full': [
         ('insert_rowwise_table_2000',

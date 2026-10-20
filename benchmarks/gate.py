@@ -83,6 +83,21 @@ TARGETS = {
         'tolerance': '硬判据，不允许任何未提交行泄漏成可见行',
         'basis': 'WAL undo 的语义底线（本项是隔离性回归，不是性能）',
     },
+    # ---------- OLAP 4A.5：门禁化（2026-10-20，阈值来自实测基线） ----------
+    'olap_parallel_groupby_speedup': {
+        'value': 1.2, 'unit': 'x', 'better': 'higher',
+        'tolerance': '单/多线程结果先逐值一致；计时 warmup+2 轮取中位；'
+                     '容忍 ~56% 回退',
+        'basis': '2026-10-20 本机实测：100k 行 GROUP BY（100 组，SUM+COUNT）'
+                 'w1 中位 2.75 s → w2 中位 1.00 s = 2.75x（8 核）；'
+                 '取 1.2x 只抓「并行完全失效/负加速」，不宣称线性扩展',
+    },
+    'olap_dispatch_crosscheck_mismatches': {
+        'value': 0.0, 'unit': 'rows', 'better': 'lower',
+        'tolerance': '硬判据，任何不一致行即失败',
+        'basis': '4A.2 显式 dispatch 的正确性底线：同 SQL 在开关前后'
+                 '（crosscheck 模式）逐行一致；不一致 = 结果错，不是性能问题',
+    },
 }
 
 #: 只报告、不判定门的量（会输出，永远算 pass）
@@ -94,6 +109,9 @@ INFORMATIONAL = {
     'concurrency_range': '进程内多线程范围查——同上',
     'insert_rowwise_sql': 'SQL 逐行 INSERT（含解析 + 审计）——实测 ~946 rows/s '
                           '（5,000 行档），比 Table API 慢 ~2x，仅作参考',
+    'olap_dispatch_agg': 'OLAP dispatch 开关同 SQL 耗时比——2026-10-20 实测 '
+                         '0.44–1.10x（当前无收益）；默认保持关闭，'
+                         '仅作事后判读，不据此启用',
 }
 
 #: 门禁类指标的前缀（用于把 case 名归到某个 target）
@@ -103,6 +121,8 @@ PREFIX_TARGETS = {
     'point_inproc': 'point_inproc',
     'wal_bounded': 'wal_bounded',
     'crash_recovery': 'crash_recovery',
+    'olap_parallel_groupby': 'olap_parallel_groupby_speedup',
+    'olap_dispatch_crosscheck': 'olap_dispatch_crosscheck_mismatches',
 }
 
 def target_of(case_name: str):
