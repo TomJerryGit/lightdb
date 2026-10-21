@@ -248,7 +248,7 @@ XLSX 导出沿用整表内存实现。**P2 剩余**：ER 图真实关系、Schem
 |---|---|---|
 | 协议握手 | `mysql_protocol.make_handshake_v10(..., ssl_enabled)` 在能力位宣告 `CLIENT_SSL` | `tests/test_wire_ssl.py`：pymysql 带 `ssl={...}` 握手成功 |
 | SSLRequest 处理 | `MySQLHandler.do_handshake()`：收到 32 字节且含 `CLIENT_SSL` 的 SSLRequest → `SSLContext.wrap_socket(server_side=True)` → 在 TLS 通道内读取并继续认证；明文客户端不受影响（TLS 可选） | TLS 查询 `SELECT 1`/DDL/DML 通过；明文客户端仍可连 |
-| 证书来源 | `Config.ssl_cert`/`ssl_key` 显式路径；未给时 `<data_dir>/ssl` 已有证书或 `SSLManager`（openssl CLI）自动生成；都不可用 → **构造 MySQLServer 时显式 RuntimeError**，绝不静默降级为明文 | `test_ssl_enabled_without_cert_fails_explicitly` |
+| 证书来源 | `Config.ssl_cert`/`ssl_key` 显式路径；未给时 `<data_dir>/ssl` 已有证书或 `SSLManager`（openssl CLI）自动生成；都不可用 → **构造 MySQLServer 时显式 RuntimeError**，绝不静默降级为明文 | `test_ssl_enabled_with_bad_cert_fails_explicitly`（显式给不存在路径，避免依赖 openssl 是否存在） |
 | 配置/环境变量 | `LIGHTDB_SSL_CERT` / `LIGHTDB_SSL_KEY`（新增） | Config 字段测试 |
 | 回归 | 恢复 `tests/test_batch14.py::test_ssl` 端到端断言（有机 openssl 环境真实跑，不再 skip） | 本地/CI 均通过 |
 

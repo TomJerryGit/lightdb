@@ -144,8 +144,13 @@ def test_plain_client_still_works_when_tls_optional(tls_server):
         conn.close()
 
 
-def test_ssl_enabled_without_cert_fails_explicitly(tmp_path):
-    """ssl_enabled 但既无 ssl_cert/ssl_key 又无法生成 → 启动失败（不静默明文）。"""
+def test_ssl_enabled_with_bad_cert_fails_explicitly(tmp_path):
+    """ssl_enabled 且证书不可用 → 构造 MySQLServer 时显式 RuntimeError（不静默明文）。
+
+    注意不能用"空 ssl_cert/ssl_key"来断言失败：`MySQLServer` 在有机 openssl
+    的环境会自动生成自签证书（CI 就是这样），空路径属于合法自动生成路径。
+    这里显式给**不存在的证书路径**，保证本地/CI 行为一致地失败。
+    """
     from lightdb.config import Config
     from lightdb.db.database import Database
     from lightdb.net.server import MySQLServer
@@ -155,14 +160,13 @@ def test_ssl_enabled_without_cert_fails_explicitly(tmp_path):
     cfg.host = '127.0.0.1'
     cfg.port = 0                            # 不会真正绑定（构造时先失败）
     cfg.ssl_enabled = True
-    cfg.ssl_cert = ''
-    cfg.ssl_key = ''
-    cfg.data_dir = str(tmp_path / 'data_no_certs')
+    cfg.ssl_cert = str(tmp_path / 'missing' / 'server.crt')
+    cfg.ssl_key = str(tmp_path / 'missing' / 'server.key')
     db = Database(str(tmp_path / 'db2'))
     ex = Executor(db)
     try:
         with pytest.raises(RuntimeError) as ei:
             MySQLServer(cfg, db, ex)
-        assert 'ssl_enabled' in str(ei.value) or '证书' in str(ei.value)
+        assert '证书' in str(ei.value) or 'ssl_enabled' in str(ei.value)
     finally:
         db.shutdown()
