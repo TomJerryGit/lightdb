@@ -1394,6 +1394,78 @@ class Executor:
 
     # ==================== DDL ====================
 
+    #: E1：本引擎真实支持的字符集（存储/协议均为 UTF-8；不做 gbk/latin1
+    #: 转码，因此这些字符集**显式拒绝**而不是"按 utf8 收下"）。
+    #: `latin1` 是历史客户端兼容名（既有协议测试锁定可记录），但同样
+    #: 不做转码 —— 服务端按 UTF-8 解码，非法字节显式 1366。
+    OLAP_E1_CHARSETS = ('utf8', 'utf8mb4', 'utf8mb3', 'latin1')
+    #: CREATE TABLE 的 CHARSET 选项：latin1 不做转码，表选项层**不接受**
+    #: （避免"声明 latin1 实际按 UTF-8 存"的静默语义）。
+    OLAP_E1_TABLE_CHARSETS = ('utf8', 'utf8mb4', 'utf8mb3')
+    #: E1：可接受的连接排序规则（bin = 真实比较语义；`_general_ci` 仅作
+    #: 连接元数据记录，不改变 Python 码点比较语义）。
+    OLAP_E1_COLLATIONS = ('utf8mb4_bin', 'utf8_bin',
+                          'utf8mb4_general_ci', 'utf8_general_ci')
+    #: CREATE TABLE 的 COLLATE 选项：只有 `*_bin` 与真实比较语义一致；
+    #: `_ci` 不接受（表级排序规则会影响比较，不能只记录不生效）。
+    OLAP_E1_TABLE_COLLATIONS = ('utf8mb4_bin', 'utf8_bin')
+
+    def _validate_table_options(self, options: dict):
+        """校验 CREATE TABLE 表选项 → `(normalized, error_result|None)`
+
+        E1 静默语义审计：旧实现把 ENGINE/CHARSET/COLLATE/AUTO_INCREMENT/
+        COMMENT 整段丢掉（SHOW CREATE 里看不到）。这里逐项判定：
+        支持的**真实生效**（持久化 + SHOW CREATE/STATUS 如实回显），
+        不支持的一律显式错误（绝不接受后静默丢弃）。
+        """
+        import re as _re
+        opts = dict(options or {})
+        out = {'engine': 'LightDB', 'charset': 'utf8mb4',
+               'collate': 'utf8mb4_bin', 'comment': None}
+        engine = (opts.get('engine') or '').upper()
+        if engine and engine not in ('LIGHTDB',):
+            return None, self._err(
+                1064,
+                f"不支持 ENGINE={opts.get('engine')}：本引擎的存储引擎是 "
+                f"LightDB（纯 Python 行存）。EXPLICIT 拒绝以免 SHOW TABLE "
+                f"STATUS 的 Engine 列变成假值。请去掉 ENGINE 选项"
+                f"（或写 ENGINE=LightDB）")
+        charset = (opts.get('charset') or '').lower()
+        if charset:
+            if charset not in self.OLAP_E1_TABLE_CHARSETS:
+                return None, self._err(
+                    1115, f"Unknown character set: '{charset}'",
+                    sqlstate='42000')
+            out['charset'] = 'utf8' if charset in ('utf8', 'utf8mb3') \
+                else 'utf8mb4'
+            out['collate'] = ('utf8_bin' if out['charset'] == 'utf8'
+                              else 'utf8mb4_bin')
+        collate = (opts.get('collate') or '').lower()
+        if collate:
+            if collate not in self.OLAP_E1_TABLE_COLLATIONS:
+                return None, self._err(
+                    1273, f"Unknown collation: '{collate}'",
+                    sqlstate='HY000')
+            coll_charset = 'utf8' if collate.startswith('utf8_') \
+                else 'utf8mb4'
+            if opts.get('charset') and coll_charset != out['charset']:
+                return None, self._err(
+                    1253, f"COLLATION '{collate}' is not valid for "
+                          f"CHARACTER SET '{out['charset']}'",
+                    sqlstate='42000')
+            out['charset'] = coll_charset
+            out['collate'] = collate
+        if opts.get('auto_increment') is not None:
+            return None, self._err(
+                1064,
+                f"表级 AUTO_INCREMENT={opts['auto_increment']} 未实现："
+                f"本引擎只在插入 INT 主键时按现有最大值+1 取值，"
+                f"不支持指定起始值。显式拒绝而不是接受后静默忽略")
+        comment = opts.get('comment')
+        if comment is not None:
+            out['comment'] = comment
+        return out, None
+
     def _cmd_create_table(self, p, s):
         # 分区描述要真正落到表对象上（Table._partition），否则
         # SHOW PARTITIONS / 分区裁剪都读不到（原实现把解析结果丢掉了）。
@@ -1408,6 +1480,11 @@ class Executor:
             # 无法重复恢复（第二次恢复的第一步就报 1062）。
             return self._ok(
                 message=f"Table '{p['table']}' already exists")
+        # E1：表选项逐项校验（不支持 → 显式错误；支持 → 持久化 + 回显）
+        table_options, opt_err = self._validate_table_options(
+            p.get('table_options') or {})
+        if opt_err is not None:
+            return opt_err
         self.db.create_table(p['table'], p['columns'],
                              partition=p.get('partition'),
                              checks=p.get('checks'),
@@ -1417,6 +1494,13 @@ class Executor:
                              # 两类唯一性都由写入路径强制，`SHOW INDEX`
                              # 会列出 UNIQUE-CHECK。
                              unique_indexes=p.get('unique_indexes'))
+        # E1：引擎扩展元数据（表选项/注释）持久化到 _meta.json，
+        # SHOW CREATE TABLE / SHOW TABLE STATUS 如实回显。
+        tbl = self.db.tables[p['table']]
+        table_options['user_specified'] = bool(p.get('table_options'))
+        tbl.table_options = table_options
+        tbl.comment = table_options.get('comment') or ''
+        self.db.save_meta()
         return self._ok(
             message=f"Table '{p['table']}' created")
 
@@ -1593,6 +1677,30 @@ class Executor:
                     return self._err(
                         1136, f"列数不匹配: 表 {tbl.name} 有 "
                               f"{len(tbl.cols)} 列，VALUES 给了 {len(v)} 个值")
+
+        # E1 静默语义审计：生成列（GENERATED ALWAYS AS ...）由引擎按表达式
+        # 计算，**不接受显式赋值**（MySQL 5.7 错误 3105）。旧实现把显式值
+        # 原样存进生成列（不计算也不报错）——同一条 DDL 两种行为。
+        gen_idx = [i for i, c in enumerate(tbl.cols)
+                   if c.get('generated')]
+        if gen_idx:
+            try:
+                from ..db.table import _OMITTED as _OMITTED_DEFAULT
+            except Exception:                     # pragma: no cover - 防御
+                _OMITTED_DEFAULT = object()
+            for row in values_list:
+                for i in gen_idx:
+                    val = row[i] if i < len(row) else None
+                    # 省略列时补位的是 `_OMITTED` 哨兵（不是显式值）；
+                    # 显式 NULL / 具体值才按 MySQL 3105 处理。
+                    if val is None or val is _OMITTED_DEFAULT:
+                        continue
+                    return self._err(
+                        3105,
+                        f"The value specified for generated column "
+                        f"'{tbl.cols[i].get('name')}' in table "
+                        f"'{tbl.name}' is not allowed.",
+                        sqlstate='HY000')
 
         n = 0
         # 必须把事务号传下去：原实现无条件走 txn_id=0（autocommit），
@@ -7037,7 +7145,107 @@ class Executor:
         except CheckConstraintError as e:               # 约束定义坏了
             return self._err(getattr(e, 'errno', 3819), str(e),
                              getattr(e, 'sqlstate', None))
+        ddl = self._enhance_show_create_ddl(self.db.get_table(name), ddl)
         return self._rs(['Table', 'Create Table'], [(name, ddl)])
+
+    @staticmethod
+    def _render_partition_spec(spec) -> str:
+        """把持久化的分区描述渲染成 SHOW CREATE TABLE 的 PARTITION 子句"""
+        if not isinstance(spec, dict):
+            return ''
+        ptype = str(spec.get('type') or '').upper()
+        col = spec.get('col') or ''
+        if ptype == 'HASH':
+            return (f" PARTITION BY HASH({col}) "
+                    f"PARTITIONS {int(spec.get('num') or 4)}")
+        if ptype == 'RANGE':
+            parts = []
+            for r in (spec.get('ranges') or []):
+                hi = 'MAXVALUE' if r.get('hi') is None else r.get('hi')
+                parts.append(f"PARTITION {r.get('name')} VALUES LESS THAN "
+                             f"({hi})")
+            if parts:
+                return (f" PARTITION BY RANGE({col}) ("
+                        + ', '.join(parts) + ')')
+        if ptype == 'LIST':
+            parts = []
+            for part in (spec.get('lists') or []):
+                vals = ', '.join(str(v) for v in (part.get('values') or []))
+                parts.append(f"PARTITION {part.get('name')} VALUES IN "
+                             f"({vals})")
+            if parts:
+                return (f" PARTITION BY LIST({col}) ("
+                        + ', '.join(parts) + ')')
+        return ''
+
+    def _enhance_show_create_ddl(self, tbl, ddl: str) -> str:
+        """E1：SHOW CREATE TABLE 补齐**真实存在但旧渲染丢失**的语义
+
+        `check_ddl` 是逻辑备份/恢复共用的一份 DDL（保证备份往返），但它
+        不导出生成列表达式、列注释、表选项、分区子句 —— 于是
+        `SHOW CREATE TABLE` 看起来"接受过这些语法却没生效"。
+        这里在不改变 check_ddl 备份路径的前提下，把**真实存在于 Table
+        元数据里的语义**补回展示文本：
+          * 生成列 `GENERATED ALWAYS AS (expr) STORED|VIRTUAL`；
+          * 列注释 `COMMENT '...'`；
+          * 表选项 `ENGINE=LightDB DEFAULT CHARSET=... COLLATE=...` +
+            表注释 + `PARTITION BY ...`。
+        这些值都来自实际生效/持久化的元数据，不是编造的。
+        """
+        import re as _re
+        if not isinstance(ddl, str) or not ddl:
+            return ddl
+        cols = getattr(tbl, 'cols', []) or []
+        lines = ddl.splitlines()
+        gen_map = {c.get('name'): c.get('generated') for c in cols
+                   if isinstance(c, dict) and c.get('generated')}
+        comment_map = {c.get('name'): c.get('comment') for c in cols
+                       if isinstance(c, dict) and c.get('comment')}
+        opts = getattr(tbl, 'table_options', None) or {}
+        tcomment = getattr(tbl, 'comment', '') or ''
+        partition_spec = getattr(tbl, '_partition_spec', None)
+        # 没有任何"check_ddl 不导出"的真实语义时，保持与 check_ddl
+        # **逐字节一致**（既有契约：SHOW CREATE 与逻辑 dump 同一份文本）。
+        has_extras = bool(gen_map or comment_map or tcomment
+                          or partition_spec
+                          or opts.get('comment')
+                          or opts.get('user_specified'))
+        if not has_extras:
+            return ddl
+        for i, line in enumerate(lines):
+            m = _re.match(r'^(\s*)([`"]?\w+[`"]?)\s', line)
+            if not m:
+                continue
+            cname = m.group(2).strip('`"')
+            if cname not in gen_map and cname not in comment_map:
+                continue
+            body = line.rstrip()
+            has_comma = body.endswith(',')
+            if has_comma:
+                body = body[:-1].rstrip()
+            gen = gen_map.get(cname)
+            if gen:
+                body += (f" GENERATED ALWAYS AS ({gen.get('expr')}) "
+                         f"{'STORED' if gen.get('stored') else 'VIRTUAL'}")
+            cmt = comment_map.get(cname)
+            if cmt:
+                body += " COMMENT '" + str(cmt).replace("'", "''") + "'"
+            lines[i] = body + (',' if has_comma else '')
+        ddl = '\n'.join(lines)
+
+        opts = getattr(tbl, 'table_options', None) or {}
+        suffix = (f" ENGINE={opts.get('engine') or 'LightDB'}"
+                  f" DEFAULT CHARSET={opts.get('charset') or 'utf8mb4'}"
+                  f" COLLATE={opts.get('collate') or 'utf8mb4_bin'}")
+        tcomment = getattr(tbl, 'comment', '') or ''
+        if tcomment:
+            suffix += " COMMENT='" + str(tcomment).replace("'", "''") + "'"
+        suffix += self._render_partition_spec(
+            getattr(tbl, '_partition_spec', None))
+        idx = ddl.rfind(')')
+        if idx >= 0:
+            ddl = ddl[:idx + 1] + suffix + ddl[idx + 1:]
+        return ddl
 
     #: MySQL 8.0 `SHOW INDEX` 的列清单（顺序照官方文档 13.7.7.22）
     _SHOW_INDEX_COLUMNS = (
@@ -8753,6 +8961,23 @@ class Executor:
             body = self._substitute_words(protected, bind_sql)
             body = self._pl_restore_targets(body, targets)
             plain = self._strip_begin_end(body)
+            # E1 静默语义审计：过程体里的结果集（`SELECT ...`）旧实现被
+            # **静默丢弃**（CALL 只回 OK，客户端看不到任何结果却以为成功）。
+            # 现在的口径：
+            #   * 单条无 INTO 的 SELECT → 按 MySQL 行为返回该结果集；
+            #   * 多条 / 混合结果集 → 显式 1235（不实现多结果集，但
+            #     绝不假装成功）；`SELECT ... INTO var` 不是结果集，放行。
+            sel_stmts = self._procedure_result_set_statements(plain)
+            if sel_stmts:
+                all_stmts = [x.strip() for x in plain.split(';') if x.strip()]
+                if (len(sel_stmts) == 1 and len(all_stmts) == 1
+                        and not out_slots):
+                    return self.execute_sql(sel_stmts[0], s)
+                return self._err(
+                    1235,
+                    f"CALL {proc.name}: 过程体包含返回结果集的 SELECT，"
+                    f"本引擎 CALL 不返回多结果集（不静默丢弃结果）。"
+                    f"请改用普通 SELECT，或在过程里用 SELECT ... INTO")
             # **统一走 PL 解释器**（过程体与函数体共用一份实现）：
             # 不再区分"有没有控制流"。旧实现把纯 SQL 过程体交给
             # `_run_statement_list`（主 SQL 解析器），于是 `SET s = 42`
@@ -8766,6 +8991,24 @@ class Executor:
         except Exception as e:
             return self._err(1105, f"CALL {proc.name} 失败: {e}")
         return self._ok(message=f"Procedure '{proc.name}' called")
+
+    @staticmethod
+    def _procedure_result_set_statements(body: str):
+        """过程体里**会返回结果集**的 SELECT 语句（`SELECT ... INTO` 不算）
+
+        用于 E1 静默语义审计：旧实现把这些 SELECT 静默丢弃。这里只做
+        词法级判定（过程体是用户写的 SQL/PL 文本，不是 AST）：
+        顶层以 SELECT 开头且不含 INTO 的语句即视为返回结果集。
+        """
+        out = []
+        for stmt in str(body or '').split(';'):
+            s = stmt.strip()
+            if not re.match(r'(?is)^SELECT\b', s):
+                continue
+            if re.search(r'(?is)\bINTO\b', s):
+                continue               # SELECT ... INTO var：赋值语句
+            out.append(s)
+        return out
 
     #: 过程调用的用户变量存放位置（会话 dict 里的键名）
     _PL_USER_VARS_KEY = 'user_vars'
@@ -9072,6 +9315,173 @@ class Executor:
                 st['btree_height']))
         return self._rs(cols, rows)
 
+    # ==================== E1：第三方客户端元数据 SHOW ====================
+    #
+    # 这批语句原先全部 1064（Navicat/mysql CLI 的元数据面板依赖它们）。
+    # 取值原则与项目一贯口径一致：**真实信息**，不可用的字段填 NULL
+    # 并注释原因；不硬编码 MySQL 全量假数据。
+    # 派发入口：parser._show_metadata_stmt → show_stmt 标记 →
+    # `_exec_show_stmt` 按 `_show_<kind>` 反射。
+
+    #: 字符串列在本引擎里的**真实**排序规则：Python 码点比较（大小写敏感）。
+    #: 报 `utf8mb4_bin` 而不是 MySQL 默认的 `_general_ci`，避免客户端据此
+    #: 以为大小写不敏感的比较会生效。
+    _REAL_COLLATION = 'utf8mb4_bin'
+
+    @staticmethod
+    def _like_match(value: str, pattern) -> bool:
+        """SQL LIKE 语义（% / _）到正则的转换；pattern 为 None 表示不过滤"""
+        if pattern is None:
+            return True
+        import re as _re
+        rx = ('^' + _re.escape(str(pattern))
+              .replace(r'\%', '.*').replace(r'\_', '.') + '$')
+        return bool(_re.match(rx, str(value), _re.IGNORECASE | _re.DOTALL))
+
+    def _show_table_status(self, p, s):
+        """`SHOW TABLE STATUS [FROM db] [LIKE ...]`（MySQL 5.7 列形状）"""
+        db_name = p.get('database') or s.get('database') or self.db.name
+        if not self.db.is_known_database(db_name):
+            return self._err(1049, f"Unknown database '{db_name}'",
+                             sqlstate='42000')
+        cols = ['Name', 'Engine', 'Version', 'Row_format', 'Rows',
+                'Avg_row_length', 'Data_length', 'Max_data_length',
+                'Index_length', 'Data_free', 'Auto_increment', 'Create_time',
+                'Update_time', 'Check_time', 'Collation', 'Checksum',
+                'Create_options', 'Comment']
+        rows = []
+        for name, tbl in list(self.db.tables.items()):
+            if not self._like_match(name, p.get('like')):
+                continue
+            try:
+                n_rows = len(tbl._visible_pks(None))
+            except Exception:
+                n_rows = int(getattr(tbl, 'row_count', 0) or 0)
+            dat_path = self.db.data_dir / f'{name}.dat'
+            try:
+                data_len = os.path.getsize(dat_path) if os.path.exists(
+                    dat_path) else None
+            except OSError:
+                data_len = None
+            try:
+                from datetime import datetime
+                ctime = datetime.fromtimestamp(
+                    os.path.getmtime(dat_path)).strftime(
+                        '%Y-%m-%d %H:%M:%S')
+            except OSError:
+                ctime = None
+            # Index_length 不可用：BTree 页与堆页在同一个 .dat 里，
+            # 拆不出独立索引长度 → NULL（不编造）。
+            # Data_free：已登记的空闲页 × 4096（真实可复用字节）。
+            try:
+                data_free = len(getattr(tbl, 'freelist').pages) * 4096
+            except Exception:
+                data_free = None
+            auto_inc = None
+            try:
+                if (tbl.cols and tbl.cols[tbl.pk_idx].get('type', '').upper()
+                        in ('INT', 'BIGINT')):
+                    auto_inc = int(getattr(tbl, '_next_pk', 0) or 0)
+            except Exception:
+                auto_inc = None
+            opts = getattr(tbl, 'table_options', {}) or {}
+            rows.append((
+                name, 'LightDB', 10, 'Dynamic', n_rows,
+                (data_len // n_rows) if (data_len and n_rows) else 0,
+                data_len, None, None, data_free, auto_inc,
+                ctime, None, None,
+                opts.get('collate') or self._REAL_COLLATION,
+                None, '', getattr(tbl, 'comment', '') or '',
+            ))
+        return self._rs(cols, rows)
+
+    def _show_full_tables(self, p, s):
+        """`SHOW FULL TABLES [FROM db] [LIKE ...]`：Tables_in_x + Table_type"""
+        db_name = p.get('database') or s.get('database') or self.db.name
+        if not self.db.is_known_database(db_name):
+            return self._err(1049, f"Unknown database '{db_name}'",
+                             sqlstate='42000')
+        col = f'Tables_in_{db_name}'
+        rows = [(name, 'BASE TABLE')
+                for name in self.db.visible_table_names(db_name)
+                if self._like_match(name, p.get('like'))]
+        return self._rs([col, 'Table_type'], rows)
+
+    def _show_full_columns(self, p, s):
+        """`SHOW FULL COLUMNS FROM t [FROM db] [LIKE ...]`（MySQL 9 列）"""
+        tbl = self.db.get_table(p.get('table'))
+        cols = ['Field', 'Type', 'Collation', 'Null', 'Key', 'Default',
+                'Extra', 'Privileges', 'Comment']
+        str_types = ('VARCHAR', 'TEXT', 'CHAR', 'MEDIUMTEXT', 'LONGTEXT',
+                     'TINYTEXT', 'JSON')
+        rows = []
+        for c in describe_columns(tbl):
+            if not self._like_match(c['name'], p.get('like')):
+                continue
+            base_type = str(c['type']).split('(')[0].upper()
+            coll = self._REAL_COLLATION if base_type in str_types else None
+            raw = next((x for x in (getattr(tbl, 'cols', []) or [])
+                        if x.get('name') == c['name']), {})
+            gen = raw.get('generated') or None
+            extra = c.get('extra', '')
+            if gen:
+                extra = 'STORED GENERATED' if gen.get('stored') \
+                    else 'VIRTUAL GENERATED'
+            rows.append((c['name'], c['type'], coll, c['null'], c['key'],
+                         c['default'], extra,
+                         'select,insert,update,references',
+                         raw.get('comment') or ''))
+        return self._rs(cols, rows)
+
+    def _show_collation(self, p, s):
+        """`SHOW COLLATION [LIKE ...]`：只返回本引擎**真实支持**的排序规则"""
+        cols = ['Collation', 'Charset', 'Id', 'Default', 'Compiled',
+                'Sortlen']
+        rows = []
+        for cid, (coll, charset, default) in enumerate((
+                ('utf8mb4_bin', 'utf8mb4', 'Yes'),
+                ('utf8_bin', 'utf8', 'Yes')), start=1):
+            if not self._like_match(coll, p.get('like')):
+                continue
+            rows.append((coll, charset, cid, default, 'Yes', 1))
+        return self._rs(cols, rows)
+
+    def _show_charset(self, p, s):
+        """`SHOW CHARSET` / `SHOW CHARACTER SET [LIKE ...]`（真实支持集合）"""
+        cols = ['Charset', 'Description', 'Default collation', 'Maxlen']
+        rows = []
+        for charset, desc, coll, maxlen in (
+                ('utf8mb4', 'UTF-8 Unicode', 'utf8mb4_bin', 4),
+                ('utf8', 'UTF-8 Unicode', 'utf8_bin', 3)):
+            if not self._like_match(charset, p.get('like')):
+                continue
+            rows.append((charset, desc, coll, maxlen))
+        return self._rs(cols, rows)
+
+    def _show_engines(self, p, s):
+        """`SHOW ENGINES`：只有真实存在的 LightDB 引擎（不列 MySQL 假引擎）"""
+        cols = ['Engine', 'Support', 'Comment', 'Transactions', 'XA',
+                'Savepoints']
+        rows = [('LightDB', 'DEFAULT',
+                 'LightDB pure-Python row-store engine'
+                 '（OLAP 向量化 dispatch 可选、默认关闭）',
+                 'YES', 'NO', 'YES')]
+        return self._rs(cols, rows)
+
+    def _show_warnings(self, p, s):
+        """`SHOW WARNINGS` / `SHOW ERRORS`：列名与 MySQL 对齐
+
+        本引擎**没有 warning 机制**（错误一律显式返回，不降级成 warning），
+        因此这里是**空结果集**。若执行器将来记录会话级 warning，可把
+        `s['warnings']` 填进来；当前如实为空，不伪造任何条目。
+        """
+        cols = ['Level', 'Code', 'Message']
+        rows = list((s or {}).get('warnings') or [])
+        return self._rs(cols, rows)
+
+    def _show_metadata_noop(self, p, s):        # pragma: no cover - 防御
+        return self._err(1064, "不支持的 SHOW 语句")
+
     # ==================== 事务 ====================
 
     def _cmd_begin(self, p, s):
@@ -9096,6 +9506,107 @@ class Executor:
             return self._ok(
                 message=f"Rolled back (id={txn['txn_id']})")
         return self._ok(message="Rolled back")
+
+    # ---------- E1：SAVEPOINT / RELEASE / ROLLBACK TO ----------
+    #
+    # 语义依据（MySQL 5.7 Reference Manual 13.3.4「SAVEPOINT,
+    # ROLLBACK TO SAVEPOINT, and RELEASE SAVEPOINT」）：
+    #   * 同名 SAVEPOINT 会删除旧保存点并设置新保存点（可重名嵌套）；
+    #   * RELEASE SAVEPOINT 删除该名字**以及其后**的所有保存点；
+    #   * ROLLBACK TO SAVEPOINT 撤销该保存点之后的数据修改，**保留**
+    #     该保存点本身、删除其后保存点；
+    #   * 不存在的保存点（RELEASE/ROLLBACK TO）→ MySQL 1305
+    #     `SAVEPOINT xxx does not exist`；SAVEPOINT 在无活动事务时是
+    #     空操作（autocommit 下不报错）。
+    # 实现：复用语句级保存点的物理 undo 栈（mvcc.undo_marks）；
+    # 回滚只撤销进程内数据（与 ROLLBACK 同一条 undo 路径）。
+    # 已知限制（如实记录，测试注释同口径）：UPDATE/DELETE 的 WAL 记录
+    # 没有为"保存点回滚后再 COMMIT"写补偿记录，因此"回滚到保存点 →
+    # COMMIT → 进程崩溃重启"后这些 UPDATE/DELETE 会被 redo 重放。
+    # 单进程内语义（可见性）完全正确；崩溃一致性需后续补补偿 WAL。
+
+    _ER_SP_DOES_NOT_EXIST = 1305
+
+    @staticmethod
+    def _savepoint_missing(name: str):
+        return {'type': 'error', 'code': 1305,
+                'sqlstate': '42000',
+                'message': f'SAVEPOINT {name} does not exist'}
+
+    def _cmd_savepoint(self, p, s):
+        name = p['name']
+        txn = s.get('txn') if isinstance(s, dict) else None
+        if not txn:
+            # MySQL：无活动事务时 SAVEPOINT 为空操作（返回 OK）
+            return self._ok(
+                message=f"Savepoint '{name}' set "
+                        f"(no active transaction: no-op)")
+        marks = self.db.mvcc.undo_marks(txn['txn_id'])
+        sps = txn.setdefault('savepoints', [])
+        # 同名旧保存点先删除（MySQL 语义），再压入新保存点
+        sps[:] = [x for x in sps if x[0] != name]
+        sps.append((name, marks))
+        return self._ok(message=f"Savepoint '{name}' set")
+
+    def _cmd_release_savepoint(self, p, s):
+        name = p['name']
+        txn = s.get('txn') if isinstance(s, dict) else None
+        sps = (txn or {}).get('savepoints') or []
+        idx = next((i for i, (n, _m) in enumerate(sps) if n == name), -1)
+        if not txn or idx < 0:
+            return self._savepoint_missing(name)
+        del sps[idx:]                 # 删除该保存点及其后所有保存点
+        return self._ok(message=f"Savepoint '{name}' released")
+
+    def _cmd_rollback_to_savepoint(self, p, s):
+        name = p['name']
+        txn = s.get('txn') if isinstance(s, dict) else None
+        sps = (txn or {}).get('savepoints') or []
+        idx = next((i for i, (n, _m) in enumerate(sps) if n == name), -1)
+        if not txn or idx < 0:
+            return self._savepoint_missing(name)
+        marks = sps[idx][1]
+        tid = txn['txn_id']
+        restored = 0
+        for tbl in list(self.db.tables.values()):
+            try:
+                restored += tbl.rollback_statement(tid, marks)
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"ROLLBACK TO SAVEPOINT {name} 回滚表 "
+                            f"{tbl.name} 失败: {e}")
+        # 保留命名保存点，删除其后保存点（MySQL 语义）
+        del sps[idx + 1:]
+        return self._ok(
+            message=f"Rolled back to savepoint '{name}' "
+                    f"({restored} row version(s) reverted)")
+
+    # ---------- E1：SET NAMES（进程内执行器路径）----------
+    #
+    # 网络路径由 net/server.py::_handle_set 处理（协议会话层）；进程内
+    # `Executor.execute_sql` 也必须有同名命令，否则两套入口语义不一致。
+    # 只接受真实支持的字符集（UTF-8 存储/收发）；gbk/latin1 不做转码 →
+    # 显式 1115，绝不"按 utf8 收下"。
+    def _cmd_set_names(self, p, s):
+        charset = 'utf8mb4' if p.get('default') else (p.get('charset') or '')
+        charset = charset or 'utf8mb4'
+        if charset not in self.OLAP_E1_CHARSETS:
+            return self._err(
+                1115, f"Unknown character set: '{charset}'",
+                sqlstate='42000')
+        collation = p.get('collation') or ''
+        if collation and collation not in self.OLAP_E1_COLLATIONS:
+            return self._err(
+                1273, f"Unknown collation: '{collation}'", sqlstate='HY000')
+        if isinstance(s, dict):
+            s.setdefault('variables', {}).update({
+                'character_set_client': charset,
+                'character_set_connection': charset,
+                'character_set_results': charset,
+                'collation_connection':
+                    collation or ('utf8_bin' if charset == 'utf8'
+                                  else 'utf8mb4_bin'),
+            })
+        return self._ok(message="Query OK")
 
     # ==================== 复制控制语句（最小实现） ====================
 

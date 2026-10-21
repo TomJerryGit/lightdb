@@ -270,6 +270,22 @@
   ⑥ 测试 `tests/test_studio_navicat_g1.py`（20 passed）+ 指定回归 170 passed；
   compileall OK；真实 GUI `p4_gui_navicat_g1.py` 5/5 PASS、8 张截图 `shots_g4_g1/`。
   路线图见 [`docs/GUI_NAVICAT_PARITY_ROADMAP.md`](docs/GUI_NAVICAT_PARITY_ROADMAP.md) §7。
+- **引擎 E1：第三方客户端兼容首批（P4-A，2026-10-21）**：
+  ① `SHOW TABLE STATUS / FULL COLUMNS / FULL TABLES / COLLATION / CHARSET / CHARACTER SET /
+  ENGINES / WARNINGS` 真实实现（列名对齐 MySQL 5.7；Engine=LightDB、Rows=真实 COUNT、
+  不可用字段 NULL，不编造）；`SHOW CREATE VIEW` 显式报错；
+  ② **静默语义消除**：`PARTITION BY`/存储过程原本已实现（batch12/13/15/v4 锁定），改为
+  `SHOW CREATE` 如实回显分区/生成列/注释/表选项、`CALL` 单 SELECT 返回结果集、多结果集
+  显式 1235；表选项 `ENGINE=InnoDB`→1064、`CHARSET=gbk`→1115、`COLLATE`→1273、
+  `AUTO_INCREMENT/ROW_FORMAT/ON UPDATE`→显式错误、生成列显式赋值→3105；
+  ③ **字符集严格化**：文本/预处理/COM_INIT_DB/FIELD_LIST 非法 UTF-8→1366（不再落
+  U+FFFD）；`SET NAMES` 校验（gbk→1115；latin1 仅记录连接元数据不转码，既有测试锁定）；
+  ④ **SAVEPOINT/RELEASE/ROLLBACK TO** 全实现（嵌套/重名/不存在 1305/无事务语义）；
+  ⑤ 新增 `tests/test_mysql_compat_p4a.py`（18 passed）；指定回归 60、扩展回归
+  147 passed/1 skipped、高风险 batch/v4 186 passed；mysql 5.0 老客户端元数据序列实跑通过；
+  ⑥ 已知限制：UPDATE/DELETE 回滚到 SAVEPOINT 后再 COMMIT 的崩溃恢复暂缺补偿 WAL
+  （进程内可见性正确）；表选项 ENGINE=InnoDB 显式拒绝（mysqldump 恢复需剥离）。
+  文档见 `docs/COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md` §6 / `GUI_NAVICAT_PARITY_ROADMAP.md` §3。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

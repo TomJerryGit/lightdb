@@ -451,6 +451,24 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
     # ==================== 命令分发 ====================
 
+    #: E1：客户端 SQL 文本必须是**合法 UTF-8**（本引擎字符集只有 utf8/
+    #: utf8mb4）。非法字节/未支持字符集 → 1366；绝不
+    #: `decode(errors='replace')` 后把 U+FFFD 存进库（那会静默污染数据，
+    #: 客户端拿到 OK 却永远读不回原字节）。
+    def _decode_client_utf8(self, raw: bytes, what: str = 'query'):
+        """严格解码客户端字节流；失败返回 `(None, ERR 包 1366)`"""
+        try:
+            return bytes(raw).decode('utf-8'), None
+        except UnicodeDecodeError as e:
+            raw = bytes(raw)
+            bad = raw[max(0, e.start):e.start + 16]
+            shown = ''.join('\\x%02X' % b for b in bad)
+            return None, mp.make_err_packet(
+                1366, 'HY000',
+                f"Incorrect string value: '{shown}' for column 'query' "
+                f"（{what} 必须为合法 UTF-8；本引擎不支持 latin1/gbk "
+                f"隐式转码，也不会用 U+FFFD 替换后写入）")
+
     def _dispatch(self, packet: bytes):
         cmd = packet[0]
         body = packet[1:]
@@ -462,7 +480,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._send_packet(self._ok_packet())
 
         elif cmd == mp.COM_INIT_DB:
-            db_name = body.decode('utf-8', errors='replace')
+            db_name, decode_err = self._decode_client_utf8(
+                body, 'COM_INIT_DB')
+            if decode_err is not None:
+                self._send_packet(decode_err)
+                return
             # `COM_INIT_DB` 就是 `USE <db>` 的协议形态。旧实现直接赋值 +
             # 回 OK，切到不存在的库也"成功"（pymysql 的
             # `connection.select_db('no_such_db')` 因此静默通过）。
@@ -483,7 +505,10 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._send_packet(self._ok_packet())
 
         elif cmd == mp.COM_QUERY:
-            sql = body.decode('utf-8', errors='replace')
+            sql, decode_err = self._decode_client_utf8(body, 'COM_QUERY')
+            if decode_err is not None:
+                self._send_packet(decode_err)
+                return
             self._handle_query(sql)
 
         elif cmd == mp.COM_FIELD_LIST:
@@ -962,6 +987,31 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         if m is not None:
             charset = (m.group(2) or 'utf8mb4').lower()
             collation = (m.group(3) or '').lower()
+            # E1 字符集严格化：只接受本引擎**真实支持**的 UTF-8 家族
+            # （utf8/utf8mb4/utf8mb3）。gbk 等不做转码 → 显式 1115，绝不
+            # "接受但按 utf8 收下"（那会让客户端写中文时静默乱码）。
+            # `latin1` 作为**历史客户端兼容名**保留（既有协议测试锁定了
+            # 它可被记录），但不做转码：服务端始终按 UTF-8 解码，latin1
+            # 非 ASCII 字节会在解码处显式 1366（不是静默替换）。
+            if charset not in ('utf8', 'utf8mb4', 'utf8mb3', 'latin1'):
+                self._send_packet(mp.make_err_packet(
+                    1115, '42000',
+                    f"Unknown character set: '{charset}'"))
+                return
+            if charset == 'utf8mb3':
+                charset = 'utf8'
+            if collation and collation not in (
+                    'utf8mb4_bin', 'utf8_bin',
+                    'utf8mb4_general_ci', 'utf8_general_ci'):
+                # 排序规则：bin 是真实比较语义（码点/二进制）；`_general_ci`
+                # 仅作为连接元数据记录（不改比较语义，见 status 说明）。
+                self._send_packet(mp.make_err_packet(
+                    1273, 'HY000',
+                    f"Unknown collation: '{collation}'"
+                    f"（本引擎真实比较语义为大小写敏感；仅接受 "
+                    f"utf8mb4_bin / utf8_bin / utf8mb4_general_ci / "
+                    f"utf8_general_ci 作为连接元数据）"))
+                return
             # 只记录、不改变协议编码（服务端始终以 UTF-8 收发）；
             # 但 @@character_set_client / SHOW VARIABLES 必须如实反映，
             # 否则客户端会以为字符集协商生效了。
@@ -1576,8 +1626,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
     def _handle_field_list(self, body: bytes):
         try:
-            table = body.split(b'\x00')[0].decode(
-                'utf-8', errors='replace')
+            table, decode_err = self._decode_client_utf8(
+                body.split(b'\x00')[0], 'COM_FIELD_LIST')
+            if decode_err is not None:
+                self._send_packet(decode_err)
+                return
         except Exception:
             table = ''
 
@@ -1885,7 +1938,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
     # ---------- COM_STMT_PREPARE / EXECUTE / CLOSE / RESET ----------
 
     def _handle_stmt_prepare(self, body: bytes):
-        sql = body.decode('utf-8', errors='replace').strip()
+        sql, decode_err = self._decode_client_utf8(body, 'COM_STMT_PREPARE')
+        if decode_err is not None:
+            self._send_packet(decode_err)
+            return
+        sql = sql.strip()
         while sql.endswith(';'):
             sql = sql[:-1].rstrip()
         if not sql:

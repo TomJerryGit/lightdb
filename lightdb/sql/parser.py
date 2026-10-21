@@ -179,6 +179,57 @@ class Parser:
                 upper.startswith('DESC ')):
             return self._show_columns(sql)
 
+        # ---------- E1：第三方客户端（Navicat/mysql CLI）元数据 SHOW ----------
+        # 这些语句原先一律 1064，导致 GUI 的元数据面板/表设计器报错。
+        # 返回 `_show_result(...)`（command=SELECT + show_stmt 标记），
+        # 由执行器 `_exec_show_stmt` 产生**真实**元数据结果集。
+        md = self._show_metadata_stmt(sql)
+        if md is not None:
+            return md
+
+        # ---------- E1：SAVEPOINT / SET NAMES（进程内执行器路径） ----------
+        # 网络路径的 SET NAMES 由 net/server.py 的会话层处理；进程内
+        # （Executor.execute_sql）必须有同名命令，否则两套入口语义不一致。
+        snm = re.match(r'(?is)^SET\s+NAMES\s+(.+)$', sql)
+        if snm:
+            body = snm.group(1).strip()
+            cm = re.match(
+                r'(?is)^(?:(DEFAULT)|([\w-]+))'
+                r'(?:\s+COLLATE\s+([\w-]+))?\s*;?\s*$', body)
+            if not cm:
+                raise SyntaxError(
+                    f"SET NAMES 语法错误: {body[:80]!r}"
+                    f"（形如 SET NAMES utf8mb4 [COLLATE utf8mb4_bin]）")
+            return {'command': 'SET NAMES',
+                    'default': bool(cm.group(1)),
+                    'charset': (cm.group(2) or '').lower(),
+                    'collation': (cm.group(3) or '').lower()}
+        csm = re.match(r'(?is)^SET\s+CHARACTER\s+SET\s+(.+)$', sql)
+        if csm:
+            body = csm.group(1).strip()
+            cm = re.match(r'(?is)^(?:(DEFAULT)|([\w-]+))\s*;?\s*$', body)
+            if not cm:
+                raise SyntaxError(f"SET CHARACTER SET 语法错误: {body[:80]!r}")
+            return {'command': 'SET NAMES',
+                    'default': bool(cm.group(1)),
+                    'charset': (cm.group(2) or '').lower(),
+                    'collation': ''}
+        spm = re.match(r'(?is)^SAVEPOINT\s+([`"]?\w+[`"]?)\s*;?\s*$', sql)
+        if spm:
+            return {'command': 'SAVEPOINT',
+                    'name': spm.group(1).strip('`"')}
+        rpm = re.match(
+            r'(?is)^RELEASE\s+SAVEPOINT\s+([`"]?\w+[`"]?)\s*;?\s*$', sql)
+        if rpm:
+            return {'command': 'RELEASE SAVEPOINT',
+                    'name': rpm.group(1).strip('`"')}
+        rtm = re.match(
+            r'(?is)^ROLLBACK\s+(?:WORK\s+)?TO\s+(?:SAVEPOINT\s+)?'
+            r'([`"]?\w+[`"]?)\s*;?\s*$', sql)
+        if rtm:
+            return {'command': 'ROLLBACK TO SAVEPOINT',
+                    'name': rtm.group(1).strip('`"')}
+
         # ---------- MySQL 兼容的运维 / 复制 / 安全语句 ----------
         stmt = self._parse_ops_stmt(sql, upper)
         if stmt is not None:
@@ -267,6 +318,94 @@ class Parser:
         }
         d.update(extra)
         return d
+
+    @staticmethod
+    def _like_literal(raw):
+        """把 `LIKE 'a%'` 的字面量去掉引号（支持 '' 转义）；None 保持 None"""
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            inner = s[1:-1]
+            return (inner.replace("''", "'") if s[0] == "'"
+                    else inner.replace('""', '"'))
+        return s
+
+    #: E1：本引擎**真实支持**的字符集（存储/协议均为 UTF-8）。
+    #: gbk/latin1 等不做转换 → 显式拒绝（见 SET NAMES / 表选项校验），
+    #: 绝不"接受但按 utf8 存"。
+    SUPPORTED_CHARSETS = ('utf8', 'utf8mb4', 'utf8mb3')
+
+    #: E1：本引擎**真实支持**的排序规则。比较语义是 Python 字符串比较
+    #: （大小写敏感、按码点），因此如实支持 `*_bin`；`*_general_ci`
+    #: 大小写不敏感语义**未实现**——接受它等于撒谎，故只在
+    #: "客户端/表声明"场景保留白名单但不改变比较语义的承诺：
+    #: 这里只把 `_bin` 视为真实支持，`_ci` 由执行器显式拒绝。
+    SUPPORTED_COLLATIONS = ('utf8mb4_bin', 'utf8_bin')
+
+    def _show_metadata_stmt(self, sql: str):
+        """E1：第三方客户端高频 `SHOW` 元数据语句 → 结果集 AST
+
+        支持：SHOW FULL COLUMNS / SHOW FULL TABLES / SHOW TABLE STATUS /
+        SHOW COLLATION / SHOW CHARSET|CHARACTER SET / SHOW ENGINES /
+        SHOW WARNINGS。`SHOW CREATE VIEW` 未实现（视图是 E2）→ 显式报错。
+        这些都是**结果集**语句，因此用 `_show_result`（command=SELECT +
+        show_stmt 标记，见该函数说明），保证网络层按结果集回包。
+        """
+        m = re.match(
+            r'(?is)^SHOW\s+FULL\s+COLUMNS\s+FROM\s+[`"]?(\w+)[`"]?'
+            r'(?:\s+FROM\s+[`"]?(\w+)[`"]?)?'
+            r'(?:\s+LIKE\s+(.+?))?\s*;?\s*$', sql)
+        if m:
+            return self._show_result(
+                'FULL_COLUMNS', table=m.group(1), database=m.group(2),
+                like=self._like_literal(m.group(3)))
+
+        m = re.match(
+            r'(?is)^SHOW\s+FULL\s+TABLES(?:\s+(?:FROM|IN)\s+'
+            r'[`"]?(\w+)[`"]?)?(?:\s+LIKE\s+(.+?))?\s*;?\s*$', sql)
+        if m:
+            return self._show_result(
+                'FULL_TABLES', database=m.group(1),
+                like=self._like_literal(m.group(2)))
+
+        m = re.match(
+            r'(?is)^SHOW\s+TABLE\s+STATUS(?:\s+(?:FROM|IN)\s+'
+            r'[`"]?(\w+)[`"]?)?(?:\s+LIKE\s+(.+?))?\s*;?\s*$', sql)
+        if m:
+            return self._show_result(
+                'TABLE_STATUS', database=m.group(1),
+                like=self._like_literal(m.group(2)))
+
+        m = re.match(
+            r'(?is)^SHOW\s+COLLATION(?:\s+LIKE\s+(.+?))?\s*;?\s*$', sql)
+        if m:
+            return self._show_result(
+                'COLLATION', like=self._like_literal(m.group(1)))
+
+        m = re.match(
+            r'(?is)^SHOW\s+(?:CHARSET|CHARACTER\s+SET)'
+            r'(?:\s+LIKE\s+(.+?))?\s*;?\s*$', sql)
+        if m:
+            return self._show_result(
+                'CHARSET', like=self._like_literal(m.group(1)))
+
+        if re.match(r'(?is)^SHOW\s+(?:STORAGE\s+)?ENGINES\s*;?\s*$', sql):
+            return self._show_result('ENGINES')
+
+        if re.match(r'(?is)^SHOW\s+(?:COUNT\s*\(\s*\*\s*\)\s+)?WARNINGS'
+                    r'(?:\s+LIMIT\s+\d+)?\s*;?\s*$', sql):
+            return self._show_result('WARNINGS')
+        if re.match(r'(?is)^SHOW\s+ERRORS(?:\s+LIMIT\s+\d+)?\s*;?\s*$', sql):
+            return self._show_result('WARNINGS')
+
+        if re.match(r'(?is)^SHOW\s+CREATE\s+VIEW\b', sql):
+            # 视图未实现（路线图 E2）：显式报错，不返回假 DDL。
+            raise SyntaxError(
+                "SHOW CREATE VIEW 不支持：本引擎尚未实现视图"
+                "（路线图 E2）。CREATE VIEW 同样会被显式拒绝，"
+                "不会静默接受。")
+        return None
 
     def _parse_ops_stmt(self, sql: str, upper: str):
         """解析运维/复制/安全语句；不认识则返回 None（交回兜底 1064）"""
@@ -2073,16 +2212,28 @@ class Parser:
             cols[0]['primary'] = True
 
         # 分区
+        table_options, tail_rest = self._parse_table_options(tail)
         partition = None
         pm = re.search(
             r'PARTITION\s+BY\s+(HASH|RANGE|LIST)\s*\((\w+)\)(.*)$',
-            tail, re.IGNORECASE | re.DOTALL)
+            tail_rest, re.IGNORECASE | re.DOTALL)
         if pm:
             ptype = pm.group(1).upper()
             pcol = pm.group(2)
             prest = pm.group(3).strip()
             partition = self._parse_partition(
                 ptype, pcol, prest)
+            tail_rest = (tail_rest[:pm.start()]
+                         + tail_rest[pm.end():])
+        leftover = tail_rest.strip().strip(';').strip()
+        if leftover:
+            # E1 静默语义审计：CREATE TABLE 尾部任何一个没被识别的选项
+            # 都显式拒绝（旧实现整段丢弃，SHOW CREATE 里看不到，等于撒谎）。
+            raise SyntaxError(
+                f"CREATE TABLE 尾部有未实现的选项 {leftover[:120]!r}："
+                f"本引擎不会接受后静默丢弃。请去掉该选项或改写为受支持形态"
+                f"（支持：ENGINE=LightDB / [DEFAULT] CHARSET / COLLATE / "
+                f"COMMENT / AUTO_INCREMENT / PARTITION BY）")
 
         return {
             'command': 'CREATE TABLE',
@@ -2090,6 +2241,10 @@ class Parser:
             'columns': cols,
             'checks': constraints,
             'partition': partition,
+            # E1：表选项（ENGINE/CHARSET/COLLATE/COMMENT/AUTO_INCREMENT）
+            # 由执行器逐项校验：支持=真实生效并在 SHOW CREATE/STATUS 如实
+            # 回显；不支持=显式错误（绝不"接受但丢弃"）。
+            'table_options': table_options,
             # 表级 `UNIQUE KEY/INDEX 名字 (列...)`：由 `Database.create_table`
             # 落成**真实强制**的唯一约束（写入路径检查 + `_meta.json`
             # 持久化 + `SHOW INDEX` 如实列出）。不再静默丢弃。
@@ -2341,6 +2496,44 @@ class Parser:
             ck['name'] = name
         return ck
 
+    #: E1：CREATE TABLE 尾部支持的**表选项**（解析后由执行器校验语义）。
+    #: 不在此清单里的词法（ROW_FORMAT / KEY_BLOCK_SIZE / ...）会被
+    #: `_create_table` 的 leftover 检查显式拒绝，不再静默丢弃。
+    def _parse_table_options(self, tail: str):
+        """解析 CREATE TABLE 尾部表选项 → `(options, 剩余文本)`
+
+        只做**词法提取**（可识别的选项）并返回剩余文本；「支不支持、
+        是否生效」由执行器 `_cmd_create_table` 逐项校验。这样解析器
+        不再"看见就吞"，执行器也不会收到丢失信息的 AST。
+        """
+        raw = tail or ''
+        options = {}
+
+        def take(pattern, key, conv=None):
+            nonlocal raw
+            m = re.search(pattern, raw, re.IGNORECASE | re.DOTALL)
+            if m is None:
+                return
+            val = m.group(1)
+            if conv is not None:
+                val = conv(val)
+            options[key] = val
+            raw = raw[:m.start()] + ' ' + raw[m.end():]
+
+        take(r'\bENGINE\s*=\s*[`"]?(\w+)[`"]?', 'engine',
+             lambda v: v.upper())
+        take(r'\b(?:DEFAULT\s+)?(?:CHARSET|CHARACTER\s+SET)\s*=\s*'
+             r'[`"]?(\w+)[`"]?', 'charset', lambda v: v.lower())
+        take(r'\bCOLLATE\s*=\s*[`"]?(\w+)[`"]?', 'collate',
+             lambda v: v.lower())
+        take(r'\bAUTO_INCREMENT\s*=\s*(\d+)', 'auto_increment', int)
+        cm = re.search(r"\bCOMMENT\s*=\s*'((?:[^']|'')*)'",
+                       raw, re.IGNORECASE | re.DOTALL)
+        if cm is not None:
+            options['comment'] = cm.group(1).replace("''", "'")
+            raw = raw[:cm.start()] + ' ' + raw[cm.end():]
+        return options, raw
+
     def _parse_partition(self, ptype, pcol, rest):
         if ptype == 'HASH':
             m = re.search(
@@ -2449,8 +2642,14 @@ class Parser:
         rest = (parts[2] if len(parts) > 2 else '')
 
         # 生成列（表达式用配对括号提取：`GENERATED ALWAYS AS (UPPER(a))`）
+        # E1 审计：MySQL 还允许 `col INT AS (expr) [VIRTUAL|STORED]` 简写。
+        # 旧实现只认带 GENERATED ALWAYS 的形态，简写会被**静默忽略**
+        # （列建出来是普通列、表达式消失）——现在两种写法都真实解析。
         generated = None
         gm = re.search(r'GENERATED\s+ALWAYS\s+AS\s*\(', rest, re.IGNORECASE)
+        if gm is None:
+            gm = re.search(r'(?<![A-Za-z0-9_])\bAS\s*\(', rest,
+                          re.IGNORECASE)
         if gm:
             gexpr, gend = self._extract_paren(rest, gm.end() - 1)
             after = rest[gend + 1:]
@@ -2459,6 +2658,24 @@ class Parser:
                 'expr': gexpr.strip(),
                 'stored': bool(sm) and sm.group(1).upper() == 'STORED',
             }
+
+        # 列级 `ON UPDATE <expr>`：本引擎**没有**实现（UPDATE 时不重算）
+        # E1 起显式拒绝：旧实现解析后丢弃，SHOW CREATE 里也看不到，
+        # 用户会以为"自动更新时间戳"生效了。
+        if re.search(r'(?<![A-Za-z0-9_])ON\s+UPDATE\b',
+                     rest, re.IGNORECASE):
+            raise SyntaxError(
+                f"列 {name} 的 `ON UPDATE` 子句未实现（本引擎 UPDATE 时"
+                f"不会重算任何列）：显式拒绝而不是接受后静默丢弃。"
+                f"请在应用层维护更新时间戳。")
+
+        # 列 COMMENT '...'：真实解析并保留（SHOW FULL COLUMNS / SHOW CREATE
+        # 如实回显），不再是"接受后丢弃"。
+        col_comment = None
+        ccm = re.search(r"\bCOMMENT\s+'((?:[^']|'')*)'",
+                        rest, re.IGNORECASE | re.DOTALL)
+        if ccm is not None:
+            col_comment = ccm.group(1).replace("''", "'")
 
         # CHECK（列级：`price INT CHECK (price > 0)`）
         #
@@ -2505,6 +2722,7 @@ class Parser:
             'has_default': has_default,
             'generated': generated,
             'check': check,
+            'comment': col_comment,
         }
 
     #: 无引号 DEFAULT 值里的函数调用（`CURRENT_TIMESTAMP` / `NOW()` /

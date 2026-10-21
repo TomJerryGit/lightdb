@@ -174,6 +174,15 @@
   提示、列复制）；连接管理（编辑/复制/删除，确认+错误显式）；导入 CSV/XLSX/JSON
   （列映射/预览/失败行）。新增 `tests/test_studio_navicat_g1.py` **20 passed**，指定回归
   **170 passed**，真实 GUI `p4_gui_navicat_g1.py` **5/5 PASS**、8 张截图（`shots_g4_g1/`）。
+- **引擎 E1（第三方客户端兼容首批）已实施（2026-10-21）**：`SHOW TABLE STATUS/FULL COLUMNS/
+  FULL TABLES/COLLATION/CHARSET/CHARACTER SET/ENGINES/WARNINGS` 真实实现（列名对齐
+  MySQL 5.7、值不编造）；SQL 层 `SAVEPOINT/RELEASE/ROLLBACK TO` 全实现；字符集严格化
+  （非法 UTF-8→1366，不再落 U+FFFD；gbk→1115）；**静默语义消除**：PARTITION BY/
+  存储过程原本已实现，改为 `SHOW CREATE` 如实回显、`CALL` 返回结果集、多结果集显式 1235；
+  表选项 `ENGINE=InnoDB`/`CHARSET=gbk`/`COLLATE`/`ON UPDATE` 等显式拒绝。新增
+  `tests/test_mysql_compat_p4a.py` **18 passed**；mysql 5.0 老客户端元数据序列实跑通过。
+  **已知限制**：UPDATE/DELETE 回滚到 SAVEPOINT 后再 COMMIT 的崩溃恢复暂缺补偿 WAL
+  （进程内可见性正确）；mysqldump 恢复需先剥离 `ENGINE=InnoDB`。
 - **GUI P0 已实施（2026-10-20）**：结果表**数值/日期感知排序**（NULL 恒末尾）、**结果过滤条**
   （1200 行 40.6ms、不查库）、**快照同名自动唯一 + 旧索引迁移**、**连接口令本地加密**
   （Windows DPAPI；`connections.json` 不再明文，旧明文自动迁移）、连接对话框**口令显示/隐藏**、

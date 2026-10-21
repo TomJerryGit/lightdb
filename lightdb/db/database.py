@@ -470,6 +470,17 @@ class Database:
                 if tinfo.get('checks'):
                     # 表级 CHECK 约束随元数据回来（重启后仍生效）
                     self.tables[tname].set_checks(tinfo['checks'])
+                # E1：表选项/表注释（ENGINE/CHARSET/COLLATE/COMMENT）随
+                # 元数据持久化，SHOW CREATE TABLE / SHOW TABLE STATUS 在
+                # 重启后仍如实回显；旧 _meta.json 没有该键 → 用默认值。
+                self.tables[tname].table_options = tinfo.get(
+                    'table_options') or {
+                        'engine': 'LightDB', 'charset': 'utf8mb4',
+                        'collate': 'utf8mb4_bin', 'comment': None}
+                self.tables[tname].comment = (
+                    tinfo.get('comment')
+                    or self.tables[tname].table_options.get('comment')
+                    or '')
             if 'users' in meta:
                 self.users = meta['users']
             self._pending_ddl = meta.get('pending_ddl')
@@ -498,7 +509,11 @@ class Database:
                     # CHECK 约束随元数据持久化（列级约束本来就在 cols 里，
                     # 表级约束在这里）。没有它，重启后表级 CHECK 就消失，
                     # 违规数据会被静默写进来。
-                    'checks': getattr(t, '_checks', None)}
+                    'checks': getattr(t, '_checks', None),
+                    # E1：表选项/注释（CREATE TABLE 的 ENGINE/CHARSET/
+                    # COLLATE/COMMENT 真实生效并回显，重启后保持）。
+                    'table_options': getattr(t, 'table_options', None),
+                    'comment': getattr(t, 'comment', '')}
                 for n, t in list(self.tables.items())
             },
             'users': self.users,

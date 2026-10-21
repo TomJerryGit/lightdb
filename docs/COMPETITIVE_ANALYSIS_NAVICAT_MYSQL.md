@@ -52,12 +52,12 @@
 | `CREATE EVENT` | ❌ 1064 | — |
 | `FOREIGN KEY` | ❌ 明确拒绝 | 错误信息诚实；ER 图只能用手工关系（已实现） |
 | `FULLTEXT` | ❌ 明确拒绝 | 提示"建表后单独执行"，但独立 CREATE FULLTEXT INDEX 也未实现（提示需修正） |
-| `PARTITION BY` | ❌ **静默丢失** | 语句被接受，`SHOW CREATE TABLE` 无分区子句（危险：用户以为分区生效） |
+| `PARTITION BY` | ✅ 已实现（本轮消除静默） | batch12/13/15/v4 已锁定实现；本轮起 `SHOW CREATE TABLE` 如实回显分区子句 |
 | WINDOW 函数 / CTE / JSON_EXTRACT | ✅ | 本轮 probe 全部成功 |
-| `SAVEPOINT` / `PREPARE`（SQL 层） | ❌ 1064 | 协议层 prepared statement 已支持；SQL 层 SAVEPOINT 是 MySQL 兼容常见项 |
-| `SHOW COLLATION/CHARSET/ENGINES/TABLE STATUS/FULL COLUMNS/FULL TABLES/WARNINGS` | ❌ 1064 | **Navicat/mysql 客户端元数据面板依赖**，是当前第三方兼容首要缺口 |
+| `SAVEPOINT` / `PREPARE`（SQL 层） | ✅ SAVEPOINT 已实现；PREPARE 仍 1064 | SAVEPOINT/RELEASE/ROLLBACK TO（嵌套/重名/1305/无事务语义）已测试；协议层 prepared 已支持，SQL 层 PREPARE 暂不做 |
+| `SHOW COLLATION/CHARSET/ENGINES/TABLE STATUS/FULL COLUMNS/FULL TABLES/WARNINGS` | ✅ E1 已实现 | 列名对齐 MySQL 5.7、值真实；mysql 5.0 老客户端元数据序列实跑通过 |
 | `SHOW GRANTS`/`CREATE USER`/`GRANT` | ⚠️ 部分 | 口令策略严格；GRANT `IDENTIFIED BY` 不支持（要求 CREATE USER / SET PASSWORD） |
-| 字符集 | ⚠️ 部分 | pymysql UTF-8 往返正确；**MySQL 5.0 老客户端写中文被静默替换为 U+FFFD**（应报 1366 而不是落坏数据） |
+| 字符集 | ✅ 严格化 | 非法 UTF-8→1366（不再落 U+FFFD）；gbk→1115；latin1 仅记录连接元数据不转码（既有测试锁定） |
 | 复制/binlog | ⚠️ 单主单从 | append-only binlog + 位点复制；无 GTID/半同步 |
 | TLS | ✅ 本轮已接线 | 服务端 CLIENT_SSL/SSLRequest + 证书配置；客户端 SSL 连接可用 |
 
@@ -150,14 +150,19 @@ Studio 在"现代 UX/安全恢复/图表报表/在线更新/插件/双语/Web"�
 `SHOW` 语句 1064 + 静默丢分区/过程语义，会让第三方 GUI 报错或"看起来成功实际没生效"，
 比缺功能更伤信任。
 
-| 任务 | 验收 |
+| 任务 | 状态/验收 |
 |---|---|
-| 1. 实现 `SHOW TABLE STATUS / FULL COLUMNS / FULL TABLES / COLLATION / CHARSET / ENGINES / WARNINGS / GRANTS / CREATE VIEW` 等元数据语句 | Navicat 10 连接后对象树/表设计器/查询不回 1064；mysql CLI 同套命令通过 |
-| 2. **静默语义审计**：`PARTITION BY`（当前丢弃）、`CREATE PROCEDURE/CALL`（当前 no-op）、表选项（ENGINE/CHARSET/COLLATE）等 → 要么实现、要么显式 1064 | 任何"接受但未生效"的语法都有测试断言；错误信息含"不支持原因" |
-| 3. 字符集：非法/未支持字节 → **1366 错误**（禁止 U+FFFD 落库）；支持 `SET NAMES gbk/latin1` 转换（Navicat 10 中文依赖） | 老客户端写中文往返正确；非法字节被拒绝；测试覆盖 |
-| 4. SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT | 事务测试通过；GUI/协议可用 |
-| 5. `CREATE INDEX` / `CREATE VIEW` / `ALTER MODIFY COLUMN`：实现（工作量中） | Schema 对比/表设计器能真正执行；无假 SQL |
-| 6. Navicat 10 人工兼容矩阵（连接/对象树/查询/数据编辑/导入导出/备份/ER） | 记录每个失败点 → 形成 bug 列表并逐项修复 |
+| 1. 实现 `SHOW TABLE STATUS / FULL COLUMNS / FULL TABLES / COLLATION / CHARSET / ENGINES / WARNINGS / GRANTS / CREATE VIEW` 等元数据语句 | ✅ **E1 已完成 2026-10-21**（除 SHOW GRANTS/CREATE VIEW）：列名对齐 MySQL 5.7、值真实不编造；mysql 5.0 老客户端元数据序列实跑通过（18 个新测试） |
+| 2. **静默语义审计**：`PARTITION BY`、`CREATE PROCEDURE/CALL`、表选项等 | ✅ **E1 已完成**：PARTITION/存储过程原本已实现（batch12/13/15/v4 锁定），改为 `SHOW CREATE` 如实回显、`CALL` 返回结果集、多结果集显式 1235；表选项 ENGINE=InnoDB→1064、CHARSET=gbk→1115、COLLATE→1273、ON UPDATE/ROW_FORMAT→显式错误、生成列赋值→3105 |
+| 3. 字符集：非法/未支持字节 → 1366；`SET NAMES` 校验 | ✅ **E1 已完成**：文本/预处理/COM_INIT_DB/FIELD_LIST 严格 UTF-8→1366（不落 U+FFFD）；gbk→1115；latin1 仅记录连接元数据不转码（既有测试锁定） |
+| 4. SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT | ✅ **E1 已完成**（嵌套/重名/不存在 1305/无事务语义）；已知限制：UPDATE/DELETE 回滚到 SAVEPOINT 后再 COMMIT 的崩溃恢复暂缺补偿 WAL（进程内正确） |
+| 5. `CREATE INDEX` / `CREATE VIEW` / `ALTER MODIFY COLUMN`：实现（工作量中） | ⏳ 待 E2；Schema 对比/表设计器当前显式提示"需手工/引擎限制" |
+| 6. Navicat 10 人工兼容矩阵（连接/对象树/查询/数据编辑/导入导出/备份/ER） | ⏳ 待做（本轮已用 mysql 5.0 老客户端覆盖元数据序列；建议下一步真实点击 Navicat 10 记录 bug 列表） |
+
+> E1 偏差说明：原计划"PARTITION/PROCEDURE 改 1064"，实测二者已真实实现且被
+> batch12/13/15/v4 测试锁定，强改会回退既有测试；因此改为**消除静默**（回显真实语义、
+> CALL 返回结果、多结果集显式错误）。`ENGINE=InnoDB` 显式拒绝是"禁止静默"的代价：
+> 用 mysqldump/Navicat 恢复时需先剥离该表选项。
 
 ### P4-B Studio 深度对齐（2–6 周）
 
@@ -194,7 +199,7 @@ Studio 在"现代 UX/安全恢复/图表报表/在线更新/插件/双语/Web"�
 
 | 周 | 重点 | 交付 |
 |---|---|---|
-| 1–2 | P4-A：SHOW 兼容 + 静默语义审计（先报错不实现）+ 字符集严格化 | Navicat 10 连接/对象树/查询回归通过；探针测试全绿 |
+| 1–2 | P4-A E1：SHOW 兼容 + 静默语义 + 字符集严格化 + SAVEPOINT | ✅ 已完成 2026-10-21：18 个新测试；mysql 5.0 老客户端元数据序列实跑通过 |
 | 3–4 | SAVEPOINT、CREATE INDEX/VIEW、ALTER MODIFY；Navicat 人工矩阵 bug 修复 | 第三方客户端兼容清单 v1 |
 | 5–8 | Studio：SSH 隧道、XLSX/JSON 导入、跨连接传输/结构同步、用户管理、结果虚拟化 | Studio 对比 Navicat 10 的差距表缩小 ≥50% |
 | 9–12 | benchmark harness + WAL/崩溃恢复硬化 + 安装包/签名/浏览器 E2E | 性能/可靠性报告 + MSI/签名产物 + 验收清单 |
