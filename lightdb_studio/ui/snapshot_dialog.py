@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QDialogButtonBox, QMessageBox, QTabWidget, QWidget,
     QLabel, QLineEdit, QFormLayout, QListWidget, QListWidgetItem,
-    QProgressDialog, QComboBox, QCheckBox, QGroupBox
+    QProgressDialog, QComboBox, QCheckBox, QGroupBox, QSpinBox
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
@@ -13,14 +13,15 @@ from ..core.snapshot import SnapshotManager
 
 
 class SnapshotDialog(QDialog):
-    def __init__(self, conn_getter, parent=None):
+    def __init__(self, conn_getter, parent=None, manager=None):
         super().__init__(parent)
-        self.mgr = SnapshotManager()
+        self.mgr = manager or SnapshotManager()
         self.conn_getter = conn_getter
         self.setWindowTitle("快照 / 克隆")
-        self.resize(960, 640)
+        self.resize(1000, 720)
         self._build_ui()
         self._refresh_list()
+        self.load_strategy_settings()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -64,12 +65,60 @@ class SnapshotDialog(QDialog):
         restore_btn.clicked.connect(self._restore)
         row.addWidget(restore_btn)
 
+        self.restore_preview_btn = QPushButton("👁 恢复预览")
+        self.restore_preview_btn.clicked.connect(self._on_preview_restore)
+        row.addWidget(self.restore_preview_btn)
+
         delete_btn = QPushButton("🗑 删除")
         delete_btn.clicked.connect(self._delete)
         row.addWidget(delete_btn)
 
         row.addStretch()
         sl.addLayout(row)
+
+        # P2-5：保留策略 / 定时快照设置（不做后台线程，由外部定时器/按钮触发）
+        strategy = QGroupBox("保留策略 / 定时快照（无后台常驻线程）")
+        sfl = QFormLayout(strategy)
+        self.keep_last_spin = QSpinBox()
+        self.keep_last_spin.setRange(0, 10000)
+        self.keep_last_spin.setValue(10)
+        self.keep_last_spin.setSpecialValueText("0（不按数量）")
+        sfl.addRow("保留最新 N 个:", self.keep_last_spin)
+        self.max_age_spin = QSpinBox()
+        self.max_age_spin.setRange(0, 3650)
+        self.max_age_spin.setSuffix(" 天")
+        self.max_age_spin.setSpecialValueText("0（不按年龄）")
+        sfl.addRow("删除超过:", self.max_age_spin)
+        self.schedule_enabled = QCheckBox("启用定时快照")
+        sfl.addRow("定时:", self.schedule_enabled)
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 1440)
+        self.interval_spin.setValue(60)
+        self.interval_spin.setSuffix(" 分钟")
+        sfl.addRow("间隔:", self.interval_spin)
+        self.prefix_edit = QLineEdit("auto")
+        sfl.addRow("名称前缀:", self.prefix_edit)
+
+        btns = QHBoxLayout()
+        self.save_schedule_btn = QPushButton("💾 保存设置")
+        self.save_schedule_btn.clicked.connect(self._on_save_strategy)
+        btns.addWidget(self.save_schedule_btn)
+        self.prune_preview_btn = QPushButton("🔍 预览清理")
+        self.prune_preview_btn.clicked.connect(self._on_prune_preview)
+        btns.addWidget(self.prune_preview_btn)
+        self.prune_apply_btn = QPushButton("🧹 执行清理")
+        self.prune_apply_btn.clicked.connect(self._on_prune_apply)
+        btns.addWidget(self.prune_apply_btn)
+        self.run_due_btn = QPushButton("⏱ 运行到期检查")
+        self.run_due_btn.clicked.connect(self._on_run_due)
+        btns.addWidget(self.run_due_btn)
+        btns.addStretch()
+        sfl.addRow("", btns)
+        self.strategy_status = QLabel("")
+        self.strategy_status.setWordWrap(True)
+        self.strategy_status.setStyleSheet("color: #9cdcfe;")
+        sfl.addRow("状态:", self.strategy_status)
+        sl.addWidget(strategy)
 
         tabs.addTab(snap_w, "快照")
 
@@ -147,6 +196,147 @@ class SnapshotDialog(QDialog):
         name = self.list_widget.item(r, 0).text()
         return self.mgr.get(name)
 
+    # ==================== P2-5 策略 / 定时 / 恢复预览 ====================
+
+    def load_strategy_settings(self) -> dict:
+        cfg = self.mgr.load_schedule()
+        self.keep_last_spin.setValue(int(cfg.get('keep_last') or 0))
+        self.max_age_spin.setValue(int(cfg.get('max_age_days') or 0))
+        self.schedule_enabled.setChecked(bool(cfg.get('enabled')))
+        self.interval_spin.setValue(int(cfg.get('interval_minutes') or 60))
+        self.prefix_edit.setText(str(cfg.get('name_prefix') or 'auto'))
+        self._refresh_strategy_status(cfg)
+        return cfg
+
+    def current_strategy_config(self) -> dict:
+        return {
+            'enabled': self.schedule_enabled.isChecked(),
+            'interval_minutes': self.interval_spin.value(),
+            'keep_last': self.keep_last_spin.value(),
+            'max_age_days': self.max_age_spin.value(),
+            'name_prefix': self.prefix_edit.text().strip() or 'auto',
+        }
+
+    def _refresh_strategy_status(self, cfg=None):
+        cfg = cfg or self.mgr.load_schedule()
+        try:
+            due = self.mgr.due()
+            last = cfg.get('last_run') or 0
+            last_text = (datetime.fromtimestamp(last).strftime('%Y-%m-%d %H:%M:%S')
+                         if last else '从未')
+            text = (f"定时: {'启用' if cfg.get('enabled') else '关闭'} | "
+                    f"到期: {'是' if due else '否'} | 上次: {last_text} | "
+                    f"间隔: {cfg.get('interval_minutes')} 分钟 | "
+                    f"保留: {cfg.get('keep_last')} / "
+                    f"{cfg.get('max_age_days')} 天")
+            if cfg.get('last_error'):
+                text += f" | ⚠ 上次错误: {cfg['last_error']}"
+        except Exception as exc:                      # noqa: BLE001
+            text = f'定时状态读取失败: {exc}'
+        self.strategy_status.setText(text)
+
+    def save_strategy_settings(self) -> dict:
+        cfg = self.mgr.save_schedule(self.current_strategy_config())
+        self._refresh_strategy_status(cfg)
+        return cfg
+
+    def _on_save_strategy(self):
+        cfg = self.save_strategy_settings()
+        QMessageBox.information(
+            self, '已保存',
+            f"保留策略/定时设置已保存到:\n{self.mgr._schedule_path()}\n\n"
+            f"定时: {'启用' if cfg['enabled'] else '关闭'}，"
+            f"每 {cfg['interval_minutes']} 分钟，"
+            f"保留 {cfg['keep_last']} 个 / {cfg['max_age_days']} 天")
+
+    def prune_dry_run(self) -> dict:
+        report = self.mgr.prune(
+            keep_last=self.keep_last_spin.value(),
+            max_age_days=self.max_age_spin.value() or None,
+            dry_run=True)
+        lines = [report.get('message', '')]
+        for c in report.get('candidates') or []:
+            lines.append(f"  - {c['name']}（{c['age_days']} 天，"
+                         f"{c['size'] / 1024:.1f} KB）")
+        if report.get('errors'):
+            lines.append('错误: ' + '; '.join(report['errors']))
+        self.strategy_status.setText('\n'.join(lines))
+        return report
+
+    def prune_apply(self) -> dict:
+        report = self.mgr.prune(
+            keep_last=self.keep_last_spin.value(),
+            max_age_days=self.max_age_spin.value() or None,
+            dry_run=False)
+        self._refresh_list()
+        self._refresh_strategy_status()
+        return report
+
+    def _on_prune_preview(self):
+        report = self.prune_dry_run()
+        QMessageBox.information(self, '清理预览', self.strategy_status.text())
+        return report
+
+    def _on_prune_apply(self):
+        ret = QMessageBox.question(
+            self, '确认清理',
+            '将按保留策略删除快照文件与索引，是否继续？')
+        if ret != QMessageBox.Yes:
+            return
+        report = self.prune_apply()
+        msg = report.get('message', '')
+        if report.get('errors'):
+            msg += '\n\n错误（未静默）:\n' + '\n'.join(report['errors'][:10])
+        if report.get('ok'):
+            QMessageBox.information(self, '清理完成', msg)
+        else:
+            QMessageBox.warning(self, '清理未完全成功', msg)
+
+    def run_due_now(self) -> dict:
+        conn = self.conn_getter() if callable(self.conn_getter) else None
+        if conn is None:
+            QMessageBox.warning(self, '提示', '请先选择连接')
+            return {'ok': False, 'created': False, 'error': '无可用连接'}
+        report = self.mgr.run_due(conn)
+        self._refresh_list()
+        self.load_strategy_settings()
+        return report
+
+    def _on_run_due(self):
+        report = self.run_due_now()
+        if report.get('created'):
+            msg = (f"已创建定时快照: {report.get('snapshot')}\n"
+                   f"文件: {report.get('file')}")
+            if report.get('prune'):
+                msg += '\n\n清理: ' + report['prune'].get('message', '')
+            QMessageBox.information(self, '定时快照完成', msg)
+        elif report.get('ok'):
+            QMessageBox.information(
+                self, '未到期', report.get('reason') or '未到执行时间')
+        else:
+            QMessageBox.critical(
+                self, '定时快照失败', report.get('error') or report.get('reason') or '')
+
+    def preview_selected_restore(self) -> dict:
+        snap = self._get_selected_snapshot()
+        if not snap:
+            QMessageBox.warning(self, '提示', '请先选择一个快照')
+            return {'ok': False, 'error': '未选择快照'}
+        preview = self.mgr.preview_restore(snap)
+        self.strategy_status.setText(preview.get('summary') or preview.get('error'))
+        return preview
+
+    def _on_preview_restore(self):
+        preview = self.preview_selected_restore()
+        if not preview.get('ok'):
+            QMessageBox.warning(self, '预览失败',
+                                preview.get('error') or '无法读取快照')
+            return
+        QMessageBox.information(
+            self, '恢复预览',
+            preview['summary'] + '\n\n真实恢复前会自动创建紧急快照 '
+            'pre_restore_<ts>；恢复失败会尝试回滚并显式报告。')
+
     def _create(self):
         conn = self.conn_getter()
         if conn is None:
@@ -212,19 +402,27 @@ class SnapshotDialog(QDialog):
             QMessageBox.warning(self, "提示", "请先选择连接")
             return
 
+        # P2-5：先预览（语句/表/风险），再确认；真实恢复自带紧急快照与回滚
+        preview = self.mgr.preview_restore(snap)
+        if not preview.get('ok'):
+            QMessageBox.critical(
+                self, "恢复预览失败", preview.get('error') or "快照不可读")
+            return
+
         ret = QMessageBox.question(
-            self, "确认",
-            f"将快照 '{snap.name}' 恢复到当前连接？\n"
-            "⚠️ 如果表已存在会失败，请确认后操作。")
+            self, "确认恢复",
+            preview['summary']
+            + "\n\n恢复前会自动为当前库创建紧急快照 pre_restore_<ts>；"
+              "恢复失败会尝试用该快照回滚（不静默半恢复）。是否继续？")
         if ret != QMessageBox.Yes:
             return
 
         progress = QProgressDialog("恢复中...", "取消", 0, 100, self)
         progress.setWindowModality(Qt.WindowModal)
 
-        def cb(i, total, preview):
+        def cb(i, total, preview_stmt):
             progress.setValue(int(i / total * 100))
-            progress.setLabelText(f"执行: {preview[:60]}")
+            progress.setLabelText(f"执行: {preview_stmt[:60]}")
 
         try:
             result = self.mgr.restore_snapshot(
@@ -235,8 +433,14 @@ class SnapshotDialog(QDialog):
             QMessageBox.critical(self, "失败", str(e))
             return
 
-        msg = (f"执行 {result['executed']} 条 SQL\n"
-               f"失败 {result['failed']} 条")
+        msg = (f"执行 {result.get('executed', 0)} 条 SQL\n"
+               f"失败 {result.get('failed', 0)} 条")
+        if result.get('emergency_snapshot'):
+            msg += f"\n\n恢复前紧急快照: {result['emergency_snapshot']}"
+        if result.get('rolled_back'):
+            msg += "\n恢复失败，已用紧急快照回滚到恢复前状态。"
+        elif result.get('rollback_error'):
+            msg += f"\n回滚失败: {result['rollback_error']}"
         if result.get('errors'):
             msg += '\n\n错误清单:\n' + '\n'.join(
                 f"  - {e}" for e in result['errors'][:20])
@@ -244,6 +448,7 @@ class SnapshotDialog(QDialog):
             QMessageBox.information(self, "完成", msg)
         else:
             QMessageBox.critical(self, "恢复未全部成功", msg)
+        self._refresh_list()
 
     def _delete(self):
         snap = self._get_selected_snapshot()

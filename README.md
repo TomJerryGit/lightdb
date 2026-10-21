@@ -186,6 +186,12 @@
   可执行 SQL 预览（CREATE TABLE/INDEX、高风险 DROP 二次确认）、引擎不支持的 ALTER/独立
   CREATE INDEX 显式标注不生成假 SQL、diff 文件落盘）。新测试 15 passed，Studio 回归
   147 passed/1 skipped，真实 GUI 3/3 PASS；详见路线图 §14。
+- **GUI P2 备份已实施（2026-10-21）**：快照**保留策略**（keep_last/max_age/dry-run 预览与执行，
+  文件删除失败显式报告，P0 同名唯一不误删）；**定时快照**（`schedule.json` + due/run_due +
+  主窗口 60s QTimer 触发，无需常驻线程）；**恢复预览**（语句/表/风险摘要）与**原子回滚**
+  （恢复前自动 `pre_restore_*` 紧急快照，失败自动回滚并显式 `rolled_back`/`rollback_error`，
+  紧急快照失败中止恢复）。新测试 17 passed，指定回归 53 passed，真实 GUI 4/4 PASS；
+  详见路线图 §15。**P2 已完成 5/9 项**。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip

@@ -19,6 +19,7 @@
 """
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -794,3 +795,419 @@ class SnapshotManager:
             seen.add(s.name)
             out.append(s)
         return out
+
+    # ==================== P2-5 保留策略（prune） ====================
+
+    @staticmethod
+    def _snapshot_info(s: Snapshot, now: float) -> dict:
+        return {'name': s.name, 'file': s.file, 'size': int(s.size or 0),
+                'created_at': s.created_at,
+                'age_days': round((now - s.created_at) / 86400, 3),
+                'tables': list(s.tables or [])}
+
+    def prune(self, keep_last: int = 0, max_age_days=None,
+              dry_run: bool = True, now: float = None) -> dict:
+        """保留策略清理。
+
+        - `keep_last=N`：按 created_at 保留最新 N 个（0 = 不按数量保护）；
+        - `max_age_days=D`：删除创建时间超过 D 天的（None/0 = 不按年龄）；
+        - `dry_run=True`：只返回将删除列表，不删文件/索引；
+        - 真实执行：删除磁盘文件 + 索引；文件删除失败不静默（保留索引项并在
+          errors 中报告）。
+        两者都未指定时不做任何删除（避免误删全部快照）。
+        """
+        now = time.time() if now is None else float(now)
+        try:
+            keep_last = max(0, int(keep_last or 0))
+        except (TypeError, ValueError):
+            keep_last = 0
+        try:
+            max_age = float(max_age_days) if max_age_days else None
+        except (TypeError, ValueError):
+            max_age = None
+        if max_age is not None and max_age <= 0:
+            max_age = None
+
+        snapshots = self.list_all()
+        total = len(snapshots)
+        report = {
+            'ok': True, 'dry_run': bool(dry_run),
+            'candidates': [], 'deleted': [], 'errors': [],
+            'kept': 0, 'total': total, 'freed_bytes': 0,
+            'policy': {'keep_last': keep_last,
+                       'max_age_days': max_age},
+            'message': '',
+        }
+        if not keep_last and max_age is None:
+            report['kept'] = total
+            report['message'] = '未指定保留策略（keep_last/max_age_days），未删除任何快照'
+            return report
+
+        candidates = []
+        for rank, snap in enumerate(snapshots):
+            protected = keep_last > 0 and rank < keep_last
+            too_old = (max_age is not None and
+                       (now - snap.created_at) > max_age * 86400)
+            if protected:
+                continue
+            if max_age is not None:
+                if too_old:
+                    candidates.append(snap)
+            elif keep_last > 0 and rank >= keep_last:
+                candidates.append(snap)
+        report['candidates'] = [self._snapshot_info(s, now)
+                                for s in candidates]
+        report['kept'] = total - len(candidates)
+        if dry_run:
+            report['message'] = (
+                f'dry-run：将删除 {len(candidates)} 个快照，保留 {report["kept"]} 个')
+            return report
+
+        delete_names = {s.name for s in candidates}
+        deleted = []
+        remaining = []
+        errors = []
+        seen_files = set()
+        freed = 0
+        # 先按名字分组（同名旧重复索引项一并处理；文件可能共享）
+        entries_by_name = {}
+        for s in self.snapshots:
+            entries_by_name.setdefault(s.name, []).append(s)
+        for snap in candidates:
+            name = snap.name
+            if name in deleted:
+                continue
+            entries = entries_by_name.get(name) or [snap]
+            removed_files = []
+            name_failed = False
+            for entry in entries:
+                f = entry.file
+                if not f:
+                    continue
+                if f in seen_files:
+                    continue
+                try:
+                    if os.path.exists(f):
+                        size = os.path.getsize(f)
+                        os.unlink(f)
+                        freed += size
+                        removed_files.append(f)
+                    seen_files.add(f)
+                except Exception as exc:              # noqa: BLE001
+                    name_failed = True
+                    errors.append(f'删除快照文件失败 {f}: {exc}')
+            if name_failed:
+                # 文件删不掉 → 保留索引项（不静默丢记录）
+                remaining.extend(entries)
+                report['ok'] = False
+                continue
+            deleted.append(name)
+            report['deleted'].append(name)
+
+        kept_names = {s.name for s in remaining}
+        if deleted:
+            deleted_set = set(deleted)
+            self.snapshots = [s for s in self.snapshots
+                              if s.name not in deleted_set]
+            try:
+                self._save_index()
+            except Exception as exc:                  # noqa: BLE001
+                errors.append(f'prune 后写索引失败: {exc}')
+                report['ok'] = False
+        report['errors'] = errors
+        report['freed_bytes'] = freed
+        report['message'] = (
+            f'已删除 {len(deleted)} 个快照，保留 {len(self.list_all())} 个'
+            + (f'，{len(errors)} 个错误' if errors else ''))
+        return report
+
+    # ==================== P2-5 定时快照（无后台线程） ====================
+
+    def _schedule_path(self):
+        return self.dir / 'schedule.json'
+
+    @staticmethod
+    def _default_schedule() -> dict:
+        return {'enabled': False, 'interval_minutes': 60,
+                'keep_last': 10, 'max_age_days': 0,
+                'name_prefix': 'auto', 'last_run': 0, 'last_error': '',
+                'updated_at': 0}
+
+    def load_schedule(self) -> dict:
+        cfg = self._default_schedule()
+        path = self._schedule_path()
+        if not path.exists():
+            return cfg
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                cfg.update({k: v for k, v in data.items() if k in cfg})
+        except Exception as exc:                      # noqa: BLE001
+            msg = f'定时配置 {path} 读取失败: {exc}'
+            self.index_warnings.append(msg)
+            print(f'[snapshot] WARN {msg}', file=sys.stderr)
+            return cfg
+        return self._normalize_schedule(cfg)
+
+    @staticmethod
+    def _normalize_schedule(cfg: dict) -> dict:
+        try:
+            cfg['enabled'] = bool(cfg.get('enabled'))
+            cfg['interval_minutes'] = max(1, int(cfg.get('interval_minutes') or 60))
+            cfg['keep_last'] = max(0, int(cfg.get('keep_last') or 0))
+            cfg['max_age_days'] = max(0.0, float(cfg.get('max_age_days') or 0))
+            cfg['name_prefix'] = str(cfg.get('name_prefix') or 'auto').strip() or 'auto'
+            cfg['last_run'] = float(cfg.get('last_run') or 0)
+            cfg['last_error'] = str(cfg.get('last_error') or '')
+            cfg['updated_at'] = float(cfg.get('updated_at') or 0)
+        except (TypeError, ValueError):
+            cfg.update({'enabled': False, 'interval_minutes': 60,
+                        'keep_last': 10, 'max_age_days': 0.0,
+                        'name_prefix': 'auto', 'last_run': 0,
+                        'last_error': '', 'updated_at': 0})
+        return cfg
+
+    def save_schedule(self, config: dict) -> dict:
+        cfg = self._default_schedule()
+        if isinstance(config, dict):
+            cfg.update({k: v for k, v in config.items() if k in cfg})
+        cfg = self._normalize_schedule(cfg)
+        cfg['updated_at'] = time.time()
+        path = self._schedule_path()
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                       encoding='utf-8')
+        tmp.replace(path)
+        return cfg
+
+    def due(self, now: float = None) -> bool:
+        """是否到期（由主窗口定时器/手动调用；本类不启动后台线程）。"""
+        cfg = self.load_schedule()
+        if not cfg['enabled']:
+            return False
+        now = time.time() if now is None else float(now)
+        last = float(cfg.get('last_run') or 0)
+        interval = max(1, int(cfg['interval_minutes'])) * 60
+        return last <= 0 or (now - last) >= interval
+
+    def schedule_status(self, now: float = None) -> dict:
+        cfg = self.load_schedule()
+        now = time.time() if now is None else float(now)
+        last = float(cfg.get('last_run') or 0)
+        interval = max(1, int(cfg['interval_minutes'])) * 60
+        next_due = (last + interval) if last > 0 else 0
+        return {'config': cfg, 'due': self.due(now),
+                'next_due': next_due,
+                'remaining_seconds': max(0.0, next_due - now) if last > 0 else 0.0}
+
+    def run_due(self, conn, now: float = None, progress_cb: Callable = None) -> dict:
+        """到点则创建快照并按保留策略清理；返回显式结果（不静默）。"""
+        now = time.time() if now is None else float(now)
+        cfg = self.load_schedule()
+        report = {'ok': True, 'created': False, 'due': False,
+                  'reason': '', 'snapshot': None, 'file': '',
+                  'prune': None, 'schedule': cfg}
+        if not cfg['enabled']:
+            report['reason'] = '定时快照未启用'
+            return report
+        if not self.due(now):
+            report['reason'] = '未到执行时间'
+            return report
+        report['due'] = True
+        name = (f"{cfg['name_prefix']}_"
+                f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(now))}")
+        try:
+            result = self.create_snapshot(conn, name=name,
+                                          progress_cb=progress_cb)
+        except Exception as exc:                      # noqa: BLE001
+            result = SnapshotResult(ok=False, error=str(exc))
+        if not getattr(result, 'ok', False):
+            report['ok'] = False
+            report['reason'] = '快照创建失败'
+            report['error'] = getattr(result, 'error', '') or '未知错误'
+            cfg['last_error'] = report['error']
+            report['schedule'] = self.save_schedule(cfg)
+            return report
+        cfg['last_run'] = now
+        cfg['last_error'] = ''
+        report['schedule'] = self.save_schedule(cfg)
+        report['created'] = True
+        report['snapshot'] = result.snapshot.name
+        report['file'] = result.snapshot.file
+        if cfg['keep_last'] or cfg['max_age_days']:
+            report['prune'] = self.prune(
+                keep_last=cfg['keep_last'],
+                max_age_days=cfg['max_age_days'] or None,
+                dry_run=False, now=now)
+        return report
+
+    # ==================== P2-5 恢复预览 / 紧急快照 / 回滚 ====================
+
+    def preview_restore(self, snapshot: Snapshot) -> dict:
+        """恢复前预览：语句分类/涉及表/风险提示（不执行任何 SQL）。"""
+        result = {'ok': False, 'snapshot': getattr(snapshot, 'name', ''),
+                  'file': getattr(snapshot, 'file', ''),
+                  'statements': 0, 'create_tables': 0, 'drop_tables': 0,
+                  'inserts': 0, 'other': 0, 'tables': [], 'risks': [],
+                  'summary': '', 'error': ''}
+        if not snapshot or not snapshot.file:
+            result['error'] = '快照对象为空或缺少文件路径'
+            result['summary'] = result['error']
+            return result
+        if not os.path.exists(snapshot.file):
+            result['error'] = f'快照文件不存在: {snapshot.file}'
+            result['summary'] = result['error']
+            return result
+        try:
+            content = Path(snapshot.file).read_text(encoding='utf-8')
+        except Exception as exc:                      # noqa: BLE001
+            result['error'] = f'快照文件读取失败: {exc}'
+            result['summary'] = result['error']
+            return result
+        statements = [s for s in self._split_statements(content)
+                      if s.strip() and not s.strip().startswith('--')]
+        tables = []
+        for stmt in statements:
+            text = stmt.strip()
+            up = text.upper()
+            m = re.match(
+                r'(?i)^(?:CREATE|DROP)\s+TABLE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?'
+                r'`?([A-Za-z_]\w*)`?', text)
+            if not m:
+                m = re.match(r'(?i)^INSERT\s+INTO\s+`?([A-Za-z_]\w*)`?', text)
+            if m:
+                tables.append(m.group(1))
+            if up.startswith('CREATE TABLE'):
+                result['create_tables'] += 1
+            elif up.startswith('DROP TABLE'):
+                result['drop_tables'] += 1
+            elif up.startswith('INSERT'):
+                result['inserts'] += 1
+            else:
+                result['other'] += 1
+        result['statements'] = len(statements)
+        result['tables'] = sorted(set(tables))
+        if result['drop_tables']:
+            result['risks'].append(
+                f"包含 {result['drop_tables']} 条 DROP TABLE：会删除目标库同名表的数据")
+        if result['create_tables']:
+            result['risks'].append(
+                f"包含 {result['create_tables']} 条 CREATE TABLE：目标库已存在同名表时可能失败")
+        if result['inserts']:
+            result['risks'].append(
+                f"包含 {result['inserts']} 条 INSERT：会写入数据")
+        result['ok'] = True
+        result['summary'] = (
+            f"快照 {result['snapshot']}：{result['statements']} 条语句"
+            f"（CREATE TABLE {result['create_tables']} / "
+            f"DROP TABLE {result['drop_tables']} / "
+            f"INSERT {result['inserts']} / 其他 {result['other']}），"
+            f"{len(result['tables'])} 张表"
+            + (f"；风险：{'; '.join(result['risks'])}" if result['risks'] else ''))
+        return result
+
+    def _execute_restore(self, conn, snapshot: Snapshot,
+                         drop_existing: bool = False,
+                         progress_cb: Callable = None) -> dict:
+        """实际执行恢复（内部；不含紧急快照/回滚逻辑）。"""
+        if not snapshot or not snapshot.file:
+            return {'ok': False, 'error': '快照对象为空或缺少文件路径',
+                    'executed': 0, 'failed': 0, 'errors': [], 'failures': []}
+        if not os.path.exists(snapshot.file):
+            return {'ok': False, 'error': f'快照文件不存在: {snapshot.file}',
+                    'executed': 0, 'failed': 0, 'errors': [], 'failures': []}
+        try:
+            with open(snapshot.file, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as exc:                      # noqa: BLE001
+            return {'ok': False, 'error': f'快照文件读取失败: {exc}',
+                    'executed': 0, 'failed': 0, 'errors': [], 'failures': []}
+        statements = self._split_statements(content)
+        total = len(statements)
+        ok = 0
+        failed = 0
+        errors = []
+        failures = []
+        for i, stmt in enumerate(statements):
+            if progress_cb:
+                progress_cb(i, total, stmt[:60])
+            stmt = stmt.strip()
+            if not stmt or stmt.startswith('--'):
+                continue
+            if not drop_existing and stmt.upper().startswith('DROP TABLE'):
+                continue
+            try:
+                _n, err = conn.execute(stmt)
+                if err:
+                    failed += 1
+                    errors.append(f"{stmt[:120]} → {err}")
+                    failures.append({'statement': stmt, 'error': str(err)})
+                else:
+                    ok += 1
+            except Exception as e:                    # noqa: BLE001
+                failed += 1
+                errors.append(f"{stmt[:120]} → {e}")
+                failures.append({'statement': stmt, 'error': str(e)})
+        result = {'ok': failed == 0, 'executed': ok, 'failed': failed,
+                  'errors': errors, 'failures': failures}
+        if failed:
+            result['error'] = f"{failed} 条语句失败（共 {ok + failed} 条执行）"
+        return result
+
+    def restore_snapshot(self, conn, snapshot: Snapshot,
+                         drop_existing: bool = False,
+                         progress_cb: Callable = None,
+                         dry_run: bool = False,
+                         create_emergency: bool = True,
+                         rollback_on_failure: bool = True,
+                         emergency_name: str = None) -> dict:
+        """恢复快照（P2-5：dry_run 预览 / 恢复前紧急快照 / 失败回滚）。
+
+        - `dry_run=True`：只做预览与语句解析，不执行 SQL、不建紧急快照；
+        - 真实恢复前先创建 `pre_restore_<ts>` 紧急快照；失败返回、绝不上报成功；
+        - 恢复失败且 `rollback_on_failure=True`：用紧急快照回滚，显式报告
+          `rolled_back` / `rollback_error`（不静默半恢复）。
+        """
+        if dry_run:
+            preview = self.preview_restore(snapshot)
+            return {'ok': bool(preview.get('ok')), 'dry_run': True,
+                    'executed': 0, 'failed': 0, 'errors': [],
+                    'failures': [], 'preview': preview,
+                    'error': preview.get('error', ''),
+                    'emergency_snapshot': None, 'rolled_back': False}
+
+        emergency = None
+        if create_emergency:
+            em_name = emergency_name or (
+                f"pre_restore_{time.strftime('%Y%m%d_%H%M%S')}")
+            try:
+                em_result = self.create_snapshot(conn, name=em_name)
+            except Exception as exc:                  # noqa: BLE001
+                return {'ok': False, 'executed': 0, 'failed': 0,
+                        'errors': [], 'failures': [],
+                        'error': f'恢复前紧急快照创建失败，已中止恢复: {exc}',
+                        'emergency_snapshot': None, 'rolled_back': False}
+            if not getattr(em_result, 'ok', False):
+                return {'ok': False, 'executed': 0, 'failed': 0,
+                        'errors': [], 'failures': [],
+                        'error': ('恢复前紧急快照创建失败，已中止恢复: '
+                                  + (getattr(em_result, 'error', '') or '未知错误')),
+                        'emergency_snapshot': None, 'rolled_back': False}
+            emergency = em_result.snapshot
+        result = self._execute_restore(conn, snapshot, drop_existing,
+                                       progress_cb)
+        result['dry_run'] = False
+        result['emergency_snapshot'] = (emergency.name if emergency else None)
+        result['emergency_file'] = (emergency.file if emergency else '')
+        result['rolled_back'] = False
+        if not result['ok'] and rollback_on_failure and emergency is not None:
+            rollback = self._execute_restore(conn, emergency,
+                                             drop_existing=True)
+            result['rollback_result'] = rollback
+            result['rolled_back'] = bool(rollback.get('ok'))
+            if not result['rolled_back']:
+                result['rollback_error'] = (
+                    rollback.get('error') or '回滚失败')
+                result['error'] = ((result.get('error') or '恢复失败')
+                                   + '；回滚失败：' + result['rollback_error'])
+        return result

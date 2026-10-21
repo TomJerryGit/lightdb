@@ -143,6 +143,21 @@
   已知限制：本引擎 parser 不支持独立 `CREATE INDEX`（预览保留语句、执行会显式报错；
   实际请在建表内联索引）。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §14。
+- **GUI P2 备份（P2-5，2026-10-21）**：
+  ① **保留策略** `SnapshotManager.prune(keep_last, max_age_days, dry_run)`：dry-run 候选清单、
+  真实删除文件+索引、删除失败显式且保留索引条目；P0 同名 `_2/_3` 不误删；
+  ② **定时快照**：快照目录 `schedule.json`（enabled/interval/keep_last/max_age/prefix/last_run/
+  last_error）+ `due/schedule_status/run_due`；主窗口 60s QTimer 调 `run_due`（未启用/无连接跳过，
+  失败写 stderr），无常驻线程；
+  ③ **恢复预览与原子回滚**：`preview_restore` 统计 CREATE/DROP/INSERT 与风险；真实恢复前自动
+  `pre_restore_<ts>` 紧急快照（失败中止恢复），恢复失败自动回滚并显式 `rolled_back`/
+  `rollback_error`（回滚自身再失败只显式报告）；
+  ④ UI：`ui/snapshot_dialog.py` 保留/定时设置面板、prune 预览+执行、恢复预览、运行到期检查、
+  结果显式含紧急快照/回滚状态。
+  新增 `tests/test_studio_p2_backup.py`（17 passed，含主窗口 QTimer 接线测试）；指定回归 +
+  新测试 53 passed；全 studio 套件 163 passed/1 skipped；真实 GUI `p2_backup_check.py`
+  4/4 PASS、4 张截图。路线图见
+  [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §15。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

@@ -68,7 +68,7 @@
 | **P1-5 DataEditor 类型编辑** | 按列类型给编辑器（日期选择器、布尔下拉、NULL 开关、JSON 文本校验）；批量修改事务提交；乐观锁（updated_at/版本列，若表有） | `ui/data_editor.py` | 日期列不能输非法值；NULL 可设；批量 100 行提交原子（失败全回滚） |
 | **P1-6 对象树懒加载与右键菜单** | 展开表才加载列/索引/触发器；右键：复制名/查看 DDL/刷新/生成 SELECT；搜索框支持模糊过滤 | `ui/object_tree.py` | 1000 张表首屏 <500ms；右键动作可用；搜索即过滤 |
 
-## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4 已完成 2026-10-21，见 §13/§14）
+## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5 已完成 2026-10-21，见 §13/§14/§15）
 
 1. **ER 图/关系图**：当前引擎没有真实外键约束（`CREATE TABLE` 接受 FOREIGN KEY 但
    是否强制需核实【待验证】），ER 图应**只用真实元数据**（主键/索引/列注释）或让用户
@@ -224,4 +224,19 @@ XLSX 导出沿用整表内存实现。**P2 剩余**：ER 图真实关系、Schem
 支持；②手工关系默认存 `~/.lightdb_studio/relations.json`（可注入路径）；③索引以 `SHOW INDEX`
 为准，查询失败回退 columns key；④`DROP TABLE` 属高风险可执行项，已二次确认。
 **P2 剩余**：快照/备份产品化（进行中）、Web/GUI 对齐、i18n/可访问性、插件 API、服务端 TLS 接线。
+
+## 15. 实施记录：P2-5 已完成（2026-10-21）
+
+| P2 项 | 实现 | 验收证据 |
+|---|---|---|
+| 保留策略 prune | `core/snapshot.py::prune(keep_last, max_age_days, dry_run, now)`：dry-run 返回候选不删文件；真实执行删除文件+索引并返回报告；文件删除失败保留索引条目、`ok=False` 且 errors 显式；P0 同名 `_2/_3` 不误删 | keep_last=2 dry-run 只列候选；真实删除最旧文件+索引；max_age 按天删；`dup/dup_2/dup_3` 只删最旧；注入删除失败 → ok=False + errors + 条目保留 |
+| 定时快照 | 快照目录 `schedule.json`（enabled/interval_minutes/keep_last/max_age_days/name_prefix/last_run/last_error）；`due(now)`、`schedule_status()`、`run_due(conn)`（到点创建 `prefix_时间戳`、更新 last_run、执行保留清理；失败写 last_error 不标记成功）；**主窗口 60s QTimer 调 `run_due`**（无需常驻线程；未启用/无连接跳过，失败写 stderr） | schedule.json round-trip；due 判断；run_due 创建 auto_* 并更新 last_run、二次调用不创建；`test_main_window_snapshot_tick_wires_run_due` 验证定时器接线 |
+| 恢复预览 | `preview_restore(snapshot)`：CREATE/DROP/INSERT 语句计数、涉及表、风险摘要；文件缺失显式失败 | CREATE=2/DROP=2/INSERT=3、表 t1/t2、风险含 DROP/CREATE/INSERT |
+| 恢复原子回滚 | `restore_snapshot(..., dry_run, create_emergency, rollback_on_failure)`：dry_run 只预览；真实恢复前自动 `pre_restore_<ts>` 紧急快照（失败中止恢复）；恢复失败自动回滚并显式 `rolled_back`/`rollback_error`（回滚再失败只显式报告，不二次回滚） | dry_run 0 SQL/不建紧急快照；成功恢复自动建紧急快照并落盘；注入 INSERT 失败 → ok=False、rolled_back=True、紧急快照存在；回滚持续失败 → rollback_error 显式；紧急快照自身失败 → 中止恢复、0 SQL |
+| UI | `ui/snapshot_dialog.py`：manager 可注入；保留/定时设置面板；prune 预览+执行；恢复预览；运行到期检查；创建/恢复结果显式含紧急快照/回滚状态 | 设置保存并重读；prune dry-run 预览文本；恢复预览摘要；run_due 到期创建/未启用不创建 |
+| 验证 | 新测试 `tests/test_studio_p2_backup.py`：**17 passed**（含主窗口定时器接线）；指定回归 + 新测试 **53 passed**；全 studio 套件 **163 passed / 1 skipped**；compileall OK；真实 GUI `p2_backup_check.py` **4/4 PASS**、4 张截图（`shots_p2b/`） | 既有证据未动 |
+
+**风险**：①无后台常驻线程（QTimer 60s + 手动“运行到期检查”）；②回滚用紧急快照按语句顺序执行，
+回滚自身再失败仅显式报告；③prune 按去重后列表计数、删除时清同名旧索引项；④dry_run 只解析不预校验
+可执行性（真实执行失败显式返回）。**P2 剩余**：Web/GUI 对齐、i18n/可访问性、插件 API、服务端 TLS 接线。
 

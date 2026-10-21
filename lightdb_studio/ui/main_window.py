@@ -158,6 +158,13 @@ class MainWindow(QMainWindow):
         self.lineage_enhanced = EnhancedLineageStore()
         self.review_workflow = ReviewWorkflow()
         self.snapshot_mgr = SnapshotManager()
+        # P2-5：定时快照不在后台常驻线程里跑；主窗口用 60s QTimer 调
+        # `snapshot_mgr.run_due(conn)`（到点才创建；未启用/无连接直接跳过）。
+        # 这样既保留"定时"能力，又避免常驻线程在 GUI 关闭时泄漏/崩溃。
+        self._snapshot_timer = QTimer(self)
+        self._snapshot_timer.setInterval(60_000)
+        self._snapshot_timer.timeout.connect(self._tick_snapshot_schedule)
+        self._snapshot_timer.start()
         self.sql_formatter = SQLFormatter()
         self.snippet_mgr = SnippetManager()
         self.masking_engine = MaskingEngine()
@@ -1744,6 +1751,36 @@ class MainWindow(QMainWindow):
         dlg = SnapshotDialog(
             conn_getter=self._get_current_conn, parent=self)
         dlg.exec()
+
+    def _tick_snapshot_schedule(self):
+        """P2-5：主窗口定时器回调——到点才创建定时快照。
+
+        - schedule 未启用 / 没有已连接连接 / manager 不支持 run_due → 直接返回；
+        - 创建成功只更新状态栏（不弹窗打断用户）；失败显式打印 stderr，
+          不静默谎报"已创建"。
+        """
+        mgr = getattr(self, 'snapshot_mgr', None)
+        run_due = getattr(mgr, 'run_due', None)
+        if not callable(run_due):
+            return
+        try:
+            status = (mgr.schedule_status() if hasattr(mgr, 'schedule_status')
+                      else {}) or {}
+            if not (status.get('config') or {}).get('enabled'):
+                return
+            conn = self._get_current_conn()
+            if conn is None or not conn.is_connected():
+                return
+            report = run_due(conn)
+            if report.get('created'):
+                snap = report.get('snapshot')
+                name = getattr(snap, 'name', None) or report.get('file') or '?'
+                self._set_status(f'定时快照已创建: {name}')
+            elif report.get('error'):
+                print(f"定时快照失败: {report['error']}", file=sys.stderr)
+        except Exception as exc:                      # noqa: BLE001
+            # 定时后台动作失败不得打断用户、也不得静默：写 stderr 供日志排查
+            print(f"定时快照检查失败: {exc}", file=sys.stderr)
 
     def _open_migration(self):
         dlg = MigrationWizard(
