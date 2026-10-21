@@ -233,7 +233,8 @@ def test_hot_switch_retranslates_ui(main_window):
     assert win.status_label.text() == 'Ready'
     assert win.conn_label.text() == 'Disconnected'
     assert win.tabs.tabText(0) == 'Query'
-    assert win.windowTitle() == f"{i18n.t('app.title')} v1.0"
+    from lightdb_studio import __version__ as studio_version
+    assert win.windowTitle() == f"{i18n.t('app.title')} v{studio_version}"
     assert 'Ctrl+Enter' in editor.placeholderText()
     assert 'Type SQL' in editor.placeholderText()
     # 工具栏动作文本英文

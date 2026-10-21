@@ -222,6 +222,17 @@
   CI 中 fail-fast 跑）+ **性能预算**（`scripts/gui_perf_budget.py`：硬上限 5s/3s/500MB、
   目标 2s/500ms/300MB 仅 WARN；本机实测 **启动 687ms / 1200 行渲染 379ms / RSS +56MB**，
   全部在目标内）。详见路线图 §20。
+- **GUI P3 收尾已实施（2026-10-21，P3 全部完成）**：**崩溃与日志**
+  （`utils/crashlog.py`：滚动日志 5×2MB、密码/Token/IDENTIFIED BY/Bearer 脱敏、
+  sys+threading 异常写 `crash_<ts>.log`、Qt 消息映射 logging）+ **首启引导**
+  （三步欢迎/本地 demo/完成，持久化 first_run_done）+ **发布工程**
+  （PyInstaller onedir/onefile 构建脚本，onedir exe **12.9MB** 且 `--smoke` 通过；
+  可选 Authenticode 签名；release manifest + 更新检查/下载强制 SHA256；Studio
+  「帮助 → 检查更新...」）+ **用户文档** `docs/USER_GUIDE.md`（快捷键卡、
+  1045/2003/1146/1062 等错误码、demo/日志/打包/插件）。新增 crash/first-run/release
+  测试 **28 passed**，组合回归 66 passed。**诚实标注**：onefile 构建成功但本沙箱禁止
+  bootloader 解压写文件，运行验证未完成（发布前需在干净 Windows 跑 `--smoke`）。
+  详见路线图 §21。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip

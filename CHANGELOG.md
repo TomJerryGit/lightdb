@@ -207,6 +207,27 @@
   warnings=[]、exit 0；
   ③ 验证：新测试 9 passed；指定回归+新 50 passed；证据 `p3_gui_smoke_check.py` 2/2 PASS。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §20。
+- **GUI P3 收尾（P3-3/P3-4/P3-5，2026-10-21）→ P3 全部完成**：
+  ① **崩溃与日志**（`utils/crashlog.py`）：RotatingFileHandler（UTF-8，5×2MB）写
+  `~/.lightdb_studio/logs/studio.log`（env 可覆盖）+ stderr；`redact()` 覆盖
+  password/passwd/pwd/`IDENTIFIED BY`/`Authorization: Bearer`/token/secret/api_key/CLI
+  `--password`；sys+threading excepthook 写脱敏 `crash_<ts>.log`；Qt message handler →
+  logging；`app.run()` 最早安装（前后分阶段）；
+  ② **首启引导**（`ui/first_run_wizard.py`）：欢迎→本地 demo（run_studio.ps1/8899/root
+  空口令仅本地/生产强口令）→完成；完成/跳过/关闭持久化 `first_run_done`；
+  `LIGHTDB_STUDIO_SUPPRESS_FIRST_RUN=1` 跳过；只在 app.run 显示；
+  ③ **发布工程**：`scripts/build_studio.py` + `packaging/lightdb_studio.spec`
+  （PyInstaller onedir/onefile，构建后真实 `--smoke` 验证）；onedir exe 12,859,533 B、
+  `--smoke` OK；`scripts/sign_windows.ps1` 可选签名（无证书显式 skip）；
+  `utils/updater.py` + `scripts/make_release_manifest.py`（版本比较/manifest 校验/
+  下载强制 SHA256+大小/不自动安装）+ Studio「帮助 → 检查更新...」；
+  `lightdb_studio.__version__` 对齐 4.0.0；manifest→检查→file:// 下载 83MB→校验全链路通过；
+  ④ **用户文档**：`docs/USER_GUIDE.md` 重写（快捷键卡、1045/2003/1146/1062 等错误码、
+  demo/首启/更新/日志/打包/插件）；RELEASING 增加 4b 打包章节与 onefile 限制；
+  ⑤ 测试：crash/first-run 16 passed、release/updater 12 passed、组合回归 66 passed；
+  证据 `p3_crash_firstrun_check.py` 3/3 PASS；onefile 构建成功但本沙箱禁止 bootloader
+  解压写文件，**运行验证未完成**（如实标注，发布前需干净 Windows 验证）。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §21。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

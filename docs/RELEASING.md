@@ -72,7 +72,9 @@ python scripts/check_packaging.py
 2. 更新 `CHANGELOG.md`（Added / Changed / Fixed / Known limitations）；
 3. 更新 `README.md` 顶部「当前实测状态」：测试基线、性能门禁、未完成项；
 4. 更新 `docs/analysis_2026-10-19/06_ROADMAP.md` 的进度表与 KPI；
-5. `docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md` 的残余风险清单与实现一致。
+5. `docs/analysis_2026-10-19/05_RISK_DEEP_DIVE.md` 的残余风险清单与实现一致；
+6. 桌面版发布时确认 `lightdb_studio/__init__.py::__version__` 与
+   `lightdb/__init__.py::__version__` 一致（Studio 窗口标题/「关于」/更新检查都读它）。
 
 ## 3. 仓库卫生
 
@@ -97,6 +99,40 @@ _analysis_tmp/release_venv/Scripts/python.exe -m pip install --no-deps --no-inde
 _analysis_tmp/release_venv/Scripts/lightdb-server.exe --version    # 期望 LightDB <version>
 _analysis_tmp/release_venv/Scripts/lightdb-studio-web.exe --help   # 期望用法输出
 ```
+
+## 4b. 桌面端打包（PyInstaller，桌面版发布物）
+
+```powershell
+# 目录版（推荐；本机已构建并验证 --smoke）→ dist/studio/LightDB-Studio/
+python scripts/build_studio.py
+
+# 单文件版 → dist/studio-onefile/LightDB-Studio.exe（构建可用；受限环境见下）
+python scripts/build_studio.py --onefile
+
+# 可选签名（未配置证书时显式 skip，不假装已签名）
+.\scripts\sign_windows.ps1 -Exe "dist\studio\LightDB-Studio\LightDB-Studio.exe"
+
+# 打包 onedir 目录为 zip 并生成更新 manifest
+Compress-Archive -Path dist\studio\LightDB-Studio\* `
+    -DestinationPath dist\release\LightDB-Studio-<version>-win64.zip
+python scripts/make_release_manifest.py --version <version> --channel stable `
+    --dist dist\release --base-url https://example.com/downloads
+```
+
+校验要求：
+- `scripts/build_studio.py` 构建后**真实执行** `LightDB-Studio.exe --smoke`
+  （offscreen + 临时 HOME + `LIGHTDB_STUDIO_SUPPRESS_FIRST_RUN=1`），失败即构建失败；
+- 本机实测（2026-10-21）：onedir 产物 exe **12,859,533 bytes**、`--smoke` exit 0；
+  zip **83,395,707 bytes**；`make_release_manifest` 产出的 manifest 经
+  `lightdb_studio.utils.updater` 解析、`file://` 下载、SHA256/大小校验全部通过；
+- **onefile 限制（如实标注）**：构建可成功（~83MB），但本仓库的沙箱环境禁止
+  bootloader 解压写文件（`PYI-...: Failed to extract VCRUNTIME140.dll ... Permission denied`），
+  因此 onefile 的**运行验证未完成**（构建成功不等于可运行）。在正常 Windows 桌面应可用；
+  若启动卡在解压（安全软件/沙箱阻止 TEMP 写入），用
+  `python scripts/build_studio.py --onefile --onefile-tmpdir <可写目录>` 重新构建；
+  发布前务必在干净 Windows 环境手工跑一次 `--smoke`。
+- 签名可选：无证书时脚本提示 SmartScreen 风险并跳过；有证书时用 `signtool`
+  SHA256 + 时间戳并 `Get-AuthenticodeSignature` 校验。
 
 ## 5. 打标签
 

@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, QSize, QTimer, QThreadPool
 from PySide6.QtGui import QAction, QKeySequence
 
 # ---------- 核心管理器 ----------
+from .. import __version__ as _STUDIO_VERSION
 from ..core.environments import EnvironmentManager
 from ..core.lineage import LineageStore
 from ..core.lineage_enhanced import EnhancedLineageStore
@@ -205,7 +206,7 @@ class MainWindow(QMainWindow):
         i18n.set_lang(self.settings.language)
         i18n.on_change(self._on_lang_changed)
 
-        self.setWindowTitle(f"{i18n.t('app.title')} v1.0")
+        self.setWindowTitle(f"{i18n.t('app.title')} v{_STUDIO_VERSION}")
         self.resize(1480, 940)
 
         # 构建 UI
@@ -704,6 +705,12 @@ class MainWindow(QMainWindow):
 
         # ---------- 帮助 ----------
         m_help = mb.addMenu("帮助(&H)")
+
+        a = QAction(i18n.t('action.check_updates'), self)
+        a.triggered.connect(self._check_updates)
+        m_help.addAction(a)
+
+        m_help.addSeparator()
 
         a = QAction("关于", self)
         a.triggered.connect(self._show_about)
@@ -2215,7 +2222,7 @@ class MainWindow(QMainWindow):
             self.object_tree.tree.setAccessibleName(i18n.t('a11y.object_tree'))
         except Exception:
             pass
-        self.setWindowTitle(f"{i18n.t('app.title')} v1.0")
+        self.setWindowTitle(f"{i18n.t('app.title')} v{_STUDIO_VERSION}")
         # 刷新 key 列表（供测试/下一次热切换使用；只存字符串 key，不存 QWidget）
         try:
             self._setup_i18n_refs()
@@ -2260,12 +2267,46 @@ class MainWindow(QMainWindow):
     def _on_lang_changed(self):
         self._retranslate_ui()
 
-    # ==================== 关于 / 关闭 ====================
+    # ==================== 关于 / 更新 / 关闭 ====================
+
+    def _check_updates(self):
+        """检查更新（P3）：默认关闭，需显式配置更新通道。
+
+        - 通道地址来自 `LIGHTDB_UPDATE_MANIFEST_URL`（http(s)/file/本地路径）；
+          未配置时明确提示"未配置"，不静默假装已是最新；
+        - 通道名来自 `LIGHTDB_UPDATE_CHANNEL`（默认 stable）；
+        - 只展示新版本/下载地址/SHA256，**不自动下载或安装**；
+        - 所有失败（网络/JSON/schema）显式弹 warning，不吞异常。
+        """
+        import os as _os
+        from ..utils.updater import check_for_update, format_update_notice, UpdateError
+        url = (_os.environ.get('LIGHTDB_UPDATE_MANIFEST_URL') or '').strip()
+        if not url:
+            QMessageBox.information(
+                self, "检查更新",
+                "未配置更新通道。\n\n"
+                "请设置环境变量 LIGHTDB_UPDATE_MANIFEST_URL 指向 "
+                "release_manifest.json（支持 http(s):// / file:// / 本地路径）。")
+            return
+        channel = (_os.environ.get('LIGHTDB_UPDATE_CHANNEL') or 'stable').strip()
+        try:
+            info = check_for_update(url, _STUDIO_VERSION, channel=channel)
+        except UpdateError as exc:
+            QMessageBox.warning(self, "检查更新失败", str(exc))
+            return
+        except Exception as exc:                      # noqa: BLE001
+            QMessageBox.warning(self, "检查更新失败", f'未知错误: {exc}')
+            return
+        text = format_update_notice(info)
+        if info.available:
+            QMessageBox.information(self, "发现新版本", text)
+        else:
+            QMessageBox.information(self, "检查更新", text)
 
     def _show_about(self):
         QMessageBox.about(
             self, "关于 LightDB Studio",
-            "<h3>LightDB Studio v1.0</h3>"
+            f"<h3>LightDB Studio v{_STUDIO_VERSION}</h3>"
             "<p>LightDB 图形化管理工具</p>"
             "<p>类似 Navicat 的数据库管理体验</p>"
             "<hr>"

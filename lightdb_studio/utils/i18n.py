@@ -22,6 +22,7 @@ _ZH = {
     'menu.help': '帮助(&H)',
     # ---------- 菜单项 / 动作 ----------
     'action.new_connection': '新建连接...',
+    'action.check_updates': '检查更新...',
     'action.new_query': '新建查询',
     'action.open_sql': '打开 SQL 文件...',
     'action.save_sql': '保存 SQL...',
@@ -170,6 +171,7 @@ _EN = {
     'menu.help': '&Help',
     # ---------- actions ----------
     'action.new_connection': 'New Connection...',
+    'action.check_updates': 'Check for Updates...',
     'action.new_query': 'New Query',
     'action.open_sql': 'Open SQL File...',
     'action.save_sql': 'Save SQL...',

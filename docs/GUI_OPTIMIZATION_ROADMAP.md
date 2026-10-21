@@ -92,7 +92,7 @@
    （当前在有机 openssl 环境显式 skip）。验收：pymysql `ssl={...}` 连接成功且
    `SHOW STATUS LIKE 'Ssl_cipher'` 非空。
 
-## 5. P3 —— 工程质量与交付（持续；1/2 已完成 2026-10-21，见 §20）
+## 5. P3 —— 工程质量与交付（✅ 全部 5 项已完成 2026-10-21，见 §20/§21；onefile 运行验证受沙箱限制，见 §21）
 
 1. **GUI 自动化测试进 CI**：把 `gui_driver.py` 裁剪出 8–10 个无网络/无服务依赖的
    offscreen 冒烟场景（启动、tab、对象树、结果表排序/过滤、错误 surface、主题、
@@ -309,4 +309,18 @@ quality 逐列查询较慢；GUI-only 能力在 parity 中标 `not_applicable` �
 **风险**：性能数字随机器/CI 冷启动波动，硬上限已放宽（5s/3s/500MB）、目标预算只 WARN，待 CI 稳定后收紧；
 冒烟含临时 MySQLServer（随机端口）；closeEvent 用例为文件末尾（pytest 默认顺序）。
 **P3 剩余**：发布工程（PyInstaller/签名/自动更新/首启引导）、崩溃日志滚动、用户文档与示例。
+
+## 21. 实施记录：P3-3/P3-4/P3-5 已完成（2026-10-21）→ **P3 全部完成**
+
+| P3 项 | 实现 | 验收证据 |
+|---|---|---|
+| P3-4 崩溃与日志 | `utils/crashlog.py`：RotatingFileHandler（UTF-8，5×2MB，`~/.lightdb_studio/logs/studio.log`，`LIGHTDB_STUDIO_LOG_DIR` 可覆盖）+ stderr；`redact()` 覆盖 password/passwd/pwd、`IDENTIFIED BY '…'`、`Authorization: Bearer`、token/secret/api_key/CLI `--password` → `***`；sys+threading excepthook → `crash_<ts>.log`（可注入 handler）；Qt message handler 映射 logging；`app.run()` 最早安装（QApplication 前后分阶段） | 16 个新测试（脱敏多模式/多行/大小写、日志落盘/幂等/轮转、sys+threading crash 文件脱敏、Qt handler、日志无明文口令）；`--smoke` 子进程 exit 0（~6s，启动早期已创建 studio.log） |
+| P3-3 发布工程 | `scripts/build_studio.py` + `packaging/lightdb_studio.spec`：PyInstaller onedir/onefile，构建后真实跑 `--smoke`（offscreen+临时 HOME+SUPPRESS_FIRST_RUN），失败即构建失败；`scripts/sign_windows.ps1` 可选 Authenticode 签名（无证书显式 skip、有证书 signtool+SHA256+时间戳+验签）；`scripts/make_release_manifest.py` + `utils/updater.py`（版本比较/manifest 校验/下载强制 SHA256/大小校验、不自动安装）；Studio「帮助 → 检查更新...」读 `LIGHTDB_UPDATE_MANIFEST_URL`；`lightdb_studio.__version__` 对齐 4.0.0（标题/关于/更新检查一致） | onedir exe **12,859,533 B** + `--smoke` OK；zip **83,395,707 B**；manifest → 更新检查（发现 4.0.1）→ `file://` 下载 83MB → SHA256/大小校验 → 同版本“已是最新”全链路通过；onefile 构建成功（~83MB）但**沙箱禁止 bootloader 解压写文件**（`PYI: Failed to extract VCRUNTIME140.dll: Permission denied`），运行验证未完成（如实标注；`--onefile-tmpdir` 供受限环境使用） |
+| P3-5 用户文档与示例 | 重写 `docs/USER_GUIDE.md`：快速开始（`run_studio.ps1` demo/安全说明）、**快捷键卡**（F5/Ctrl+E/Ctrl+Enter/Ctrl+Space/Ctrl+N/O/S/W/Shift+F/G/T/F9/H/Shift+A/,/Q）、**错误码对照 1045/2003/1146/1062/1049/1064/1054**、首启引导、更新检查、日志与脱敏、打包/签名/发布、插件示例；`docs/RELEASING.md` 增加 4b 打包章节（含 onefile 限制）与版本一致性要求 | 文档内命令与真实脚本/环境变量一致；`--help`/构建/证据均实跑 |
+| 首启引导 | `ui/first_run_wizard.py`：三步欢迎→本地 demo（run_studio.ps1/8899/root 空口令仅本地/生产强口令/可复制命令）→完成；完成/跳过/关闭都持久化 `first_run_done`；`LIGHTDB_STUDIO_SUPPRESS_FIRST_RUN=1` 跳过；只在 `app.run()` 显示（不破坏既有 GUI 测试）；旧 settings JSON 兼容 | 7 个新测试（默认/完成/跳过/关闭持久化、SUPPRESS、旧 JSON、offscreen 对话框） |
+| 验证 | crash/first-run **16 passed**；release/updater/manifest **12 passed**；组合回归 **66 passed**；`gui_perf_budget` exit 0；compileall（重定向 pycache）OK；GUI 证据 `p3_crash_firstrun_check.py` 3/3 PASS + 3 张首启截图 | 既有证据未动 |
+
+**P3 全部完成（5/5）**。**剩余诚实标注**：onefile 运行验证受本沙箱文件写限制未完成
+（构建成功 ≠ 可运行；发布前需在干净 Windows 环境跑 `--smoke`）；redact 为正则启发式，
+非常规拼接可能漏；异常钩子不再调用原 hook（避免默认 traceback 明文输出）。
 

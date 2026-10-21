@@ -12,7 +12,7 @@ LightDB Studio - 图形化数据库管理工具
     lightdb-studio-cli      # CLI 工具
 """
 
-__version__ = "1.0.0"
+__version__ = "4.0.0"  # 与 lightdb.__version__ / pyproject dynamic version 保持一致
 __author__ = "LightDB Team"
 __license__ = "MIT"
 __url__ = "https://github.com/lightdb/studio"
