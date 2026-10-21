@@ -86,6 +86,15 @@
   `tests/test_studio_credentials.py`（8）/`tests/test_studio_p0_ui.py`（12）/
   `tests/test_snapshot_unique.py`（10）；真实 GUI 端到端 4/4 PASS、10 张截图。
   路线图与验收记录见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §9。
+- **GUI 路线 P1 首批（P1-1/P1-2，2026-10-21）**：查询执行移出 UI 线程（`ui/workers.py`
+  QThreadPool + 信号回主线程；F5/菜单/Ctrl+Return/对象树双击/EXPLAIN 全部走后台，执行中
+  禁用动作+状态提示），新增“取消当前查询”（记录 `thread_id`、另一条连接 `KILL`、显式
+  提示、自动重连 + 3s 兜底）与 `settings.query_timeout` 超时接线；结果读取改为
+  `fetchmany` 分块 + `max_result_rows` 截断提示 + “加载更多”追加（不重写
+  QAbstractTableModel，留待后续）；P0 排序/过滤/错误面板全部保留。
+  新增 `tests/test_studio_async_query.py`（9 例，随机端口临时服务端）；Studio 回归 +
+  新测试 69 passed；真实 GUI `p1_ui_check.py` 5/5 PASS、4 张截图。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §10。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

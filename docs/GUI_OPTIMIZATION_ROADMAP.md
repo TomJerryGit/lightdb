@@ -57,7 +57,7 @@
 
 > P0 合计约 **5–8 人日**，全部可独立提交、可回归测试，不改引擎。
 
-## 3. P1 —— 响应性（2–4 周）
+## 3. P1 —— 响应性（首批 P1-1/P1-2 已完成 2026-10-21，见 §10）
 
 | 项 | 做法 | 涉及文件 | 验收 |
 |---|---|---|---|
@@ -150,4 +150,18 @@
 全量 pytest 见 README 测试基线。遗留风险：ResultTable 不再走 Qt 内置排序（外部直接调
 `table.sortItems()` 仍是文本序，代码内已改为 `sort_by`）；旧索引迁移同名保留最新、旧 .sql 文件
 仍留盘（UI 告警）；非 Windows 平台无 cryptography 时退化为显式 `plain:` 并告警。
+
+## 10. 实施记录：P1 首批（P1-1/P1-2）已完成（2026-10-21）
+
+| P1 项 | 实现 | 验收证据 |
+|---|---|---|
+| P1-1 后台查询 | 新增 `ui/workers.py`（QThreadPool+`QueryWorker`/`QuerySignals`，DB 调用全部在 worker 线程，信号回主线程）；`MainWindow._execute_sql_async()` 接入 F5/菜单/编辑器 Ctrl+Return/对象树双击/EXPLAIN；执行中禁用执行动作+状态栏“执行中…”，完成恢复；同步 `_execute_sql()` 保留兼容 | 慢查询 0.5s 期间 QTimer 触发 ≥8 次（UI 不冻结）；`tests/test_studio_async_query.py` 9 例 |
+| P1-1 取消 | “查询 → 取消当前查询”QAction；记录 `thread_id()`，另一条 root 连接 `KILL <id>`，显式提示“已取消”；KILL 后自动重连+3s watchdog；连接状态清理 | 取消后状态显式、重连后查询成功；engine 无 KILL QUERY 的限制写进注释/风险 |
+| P1-1 超时 | `settings.query_timeout>0` → QTimer 触发取消（同取消路径），显式“查询超时” | 1s 超时 + 1.8s 慢查询用例 |
+| P1-2 有界结果 | `db/connection.py::query_chunked()`（`fetchmany` 分块、`max_rows` 截断 + 多读一行判断 truncated）；`ResultTable.show_result(truncated=...)` 提示；`加载更多`按钮信号 → worker 取更大上限追加并重新应用过滤/排序；不重写 QAbstractTableModel（后续项） | `max_result_rows=100` → 100 行+截断提示；加载更多 200→250 后按钮隐藏；行序正确 |
+| 回归 | P0 排序/过滤/错误分类/复制保持；`test_studio_smoke/p0_ui/startup_lazy/autoconnect/db_errors/error_surface` + 新测试 **69 passed**；compileall OK | 真实 GUI `p1_ui_check.py` **5/5 PASS**、4 张截图（`_analysis_tmp/gui_full/shots_p1/`） |
+
+**未完成/后续**：取消是 KILL 连接（服务器端语句可能继续收尾）；“加载更多”重跑同一 SQL
+取更大上限（无持久游标，无 ORDER BY 时可能重复/遗漏）——完整 QAbstractTableModel 虚拟化、
+编辑器补全/错误高亮、导入导出进度、DataEditor 类型编辑、对象树懒加载仍属 P1 剩余项。
 

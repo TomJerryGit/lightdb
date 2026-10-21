@@ -145,14 +145,20 @@ def _raise_db_error(exc: BaseException, sql: str = None):
 class DBConnection:
     """单条数据库连接（会话）"""
 
-    def __init__(self, config):
+    def __init__(self, config, read_timeout=None):
         """
         config: ConnectionInfo
+        read_timeout: 可选 pymysql 读超时（秒）。None = 不限（沿用旧行为）。
+                      主窗口的后台查询另有 QTimer→KILL 的超时兜底（P1-1）。
         """
         self.config = config
         self.conn: Optional['pymysql.connections.Connection'] = None
         self.lock = threading.RLock()
         self.server_version = ""
+        try:
+            self.read_timeout = int(read_timeout) if read_timeout else None
+        except (TypeError, ValueError):
+            self.read_timeout = None
 
     def connect(self):
         if pymysql is None:
@@ -171,6 +177,7 @@ class DBConnection:
             charset=self.config.charset or 'utf8mb4',
             autocommit=True,
             connect_timeout=10,
+            read_timeout=self.read_timeout,
             ssl=ssl_param,
             cursorclass=pymysql.cursors.Cursor,
         )
@@ -287,3 +294,115 @@ class DBConnection:
                 'extra': r[5] if len(r) > 5 else '',
             })
         return result
+
+    # ============ 后台查询支持（P1-1 / P1-2） ============
+
+    def thread_id(self) -> Optional[int]:
+        """当前 pymysql 连接的服务器会话 id（取消查询时 KILL 用）。"""
+        if self.conn is None:
+            return None
+        try:
+            return int(self.conn.thread_id())
+        except Exception:
+            return None
+
+    def query_chunked(self, sql: str, params=None, max_rows=None,
+                      chunk_size: int = 1000) -> dict:
+        """分块读取查询结果（P1-2 有界结果），避免 `fetchall()` 一次性进内存。
+
+        返回 ``{'columns', 'rows', 'truncated', 'fetched', 'affected'}``：
+
+        - `max_rows` 为 None/0 → 读到结果结束（与 query() 等价，但分块读）；
+        - `max_rows > 0` → 最多返回 `max_rows` 行；若还有更多行，
+          `truncated=True`（多取 1 行判断"是否还有"，该行不返回给调用方）；
+        - 查询失败抛 `DBQueryError`（与 query() 相同的完整诊断字段）。
+        """
+        try:
+            max_rows = int(max_rows) if max_rows else None
+        except (TypeError, ValueError):
+            max_rows = None
+        if max_rows is not None and max_rows <= 0:
+            max_rows = None
+        chunk_size = max(50, int(chunk_size or 1000))
+
+        with self.lock:
+            try:
+                with self.cursor() as cur:
+                    cur.execute(sql, params)
+                    if not cur.description:
+                        return {'columns': [], 'rows': [], 'truncated': False,
+                                'fetched': 0,
+                                'affected': int(cur.rowcount or 0)}
+                    cols = [d[0] for d in cur.description]
+                    rows = []
+                    truncated = False
+                    while True:
+                        if max_rows is not None:
+                            want = min(chunk_size, max_rows - len(rows))
+                        else:
+                            want = chunk_size
+                        if want <= 0:
+                            # 已达上限：多读 1 行判断"是否还有更多"（不返回该行）
+                            truncated = bool(cur.fetchmany(1))
+                            break
+                        batch = cur.fetchmany(want)
+                        if not batch:
+                            break
+                        rows.extend(batch)
+                        if len(batch) < want:
+                            break
+                    return {'columns': cols, 'rows': rows,
+                            'truncated': truncated, 'fetched': len(rows),
+                            'affected': 0}
+            except Exception as e:
+                _raise_db_error(e, sql)
+
+    def kill_connection(self, thread_id) -> Tuple[bool, Optional[str]]:
+        """用**另一条独立连接**对 `thread_id` 执行 `KILL <id>`（取消后台查询）。
+
+        本引擎不支持 `KILL QUERY`（lightdb/net/server.py 显式拒绝），`KILL`
+        会终止**整个目标连接** → 目标连接随后不可用，调用方需重连。
+        返回 `(ok, error_text)`；取消是尽力而为路径，不抛异常。
+        """
+        if pymysql is None:
+            return False, 'pymysql 未安装，无法发送 KILL'
+        if thread_id is None:
+            return False, '缺少目标连接 thread_id'
+        try:
+            tid = int(thread_id)
+        except (TypeError, ValueError):
+            return False, f'thread_id 非法: {thread_id!r}'
+
+        ssl_param = None
+        if getattr(self.config, 'ssl', False):
+            ssl_param = {'check_hostname': False}
+        killer = None
+        try:
+            killer = pymysql.connect(
+                host=self.config.host,
+                port=self.config.port,
+                user=self.config.user,
+                password=self.config.password,
+                charset=self.config.charset or 'utf8mb4',
+                autocommit=True,
+                connect_timeout=5,
+                read_timeout=5,
+                ssl=ssl_param,
+            )
+        except Exception as e:
+            return False, f'取消连接建立失败: {e}'
+        try:
+            with killer.cursor() as cur:
+                cur.execute(f"KILL {tid}")
+                try:
+                    cur.fetchall()
+                except Exception:
+                    pass
+            return True, None
+        except Exception as e:
+            return False, f"KILL {tid} 失败: {e}"
+        finally:
+            try:
+                killer.close()
+            except Exception:
+                pass

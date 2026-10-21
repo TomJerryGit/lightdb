@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QToolBar, QStatusBar, QMessageBox, QFileDialog,
     QSplitter, QLabel, QInputDialog, QDialog, QLineEdit,
 )
-from PySide6.QtCore import Qt, QSize, QTimer
+from PySide6.QtCore import Qt, QSize, QTimer, QThreadPool
 from PySide6.QtGui import QAction, QKeySequence
 
 # ---------- 核心管理器 ----------
@@ -62,6 +62,7 @@ from .error_prompts import (show_connection_error,
 from .object_tree import ObjectTree
 from .sql_editor import SQLEditor
 from .result_table import ResultTable, parse_error_fields
+from .workers import QueryWorker
 from .data_editor import DataEditor
 from .table_designer import TableDesigner
 from .query_history import QueryHistoryPanel
@@ -121,6 +122,23 @@ class MainWindow(QMainWindow):
         self.config = config
         self.settings = config.settings
         self.history = QueryHistory()
+
+        # ---------- 后台查询状态（P1-1 响应性） ----------
+        # 真实 UI 查询走 `_execute_sql_async()`：DB 调用在 `ui.workers.QueryWorker`
+        # 的线程池线程执行，信号回主线程更新 UI；`_execute_sql()` 同步版本保留给
+        # 测试/嵌入调用方（旧 API 兼容，不改变既有行为）。
+        self._query_pool = QThreadPool(self)
+        self._query_pool.setMaxThreadCount(2)
+        self._active_worker = None
+        self._active_signals = None
+        self._active_ctx = None
+        self._query_busy = False
+        self._abort_reason = ''
+        self._cancel_action = None
+        self._load_more_ctx = {}
+        self._query_timeout_timer = QTimer(self)
+        self._query_timeout_timer.setSingleShot(True)
+        self._query_timeout_timer.timeout.connect(self._on_query_timeout)
 
         # ---------- 核心管理器 ----------
         # 说明（实测）：30+ 个管理器**全部构造只占 ~9ms**（MainWindow 构造的
@@ -482,6 +500,12 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._exec_explain)
         m_query.addAction(a)
 
+        self._cancel_action = QAction("取消当前查询", self)
+        self._cancel_action.setToolTip("取消正在执行的后台查询（KILL 连接）")
+        self._cancel_action.setEnabled(False)
+        self._cancel_action.triggered.connect(lambda: self.cancel_running_query())
+        m_query.addAction(self._cancel_action)
+
         a = QAction("性能分析", self)
         a.triggered.connect(self._open_profiler)
         m_query.addAction(a)
@@ -715,10 +739,14 @@ class MainWindow(QMainWindow):
         splitter.setSizes([220, 460])
 
         idx = self.tabs.addTab(splitter, "查询")
+        # P1-1：真实 UI 执行走后台 worker（不冻结主线程）
         editor.execute_requested.connect(
-            lambda sql, e=editor, r=result: self._execute_sql(sql, e, r))
+            lambda sql, e=editor, r=result: self._execute_sql_async(sql, e, r))
         editor.execute_selection_requested.connect(
-            lambda sql, e=editor, r=result: self._execute_sql(sql, e, r))
+            lambda sql, e=editor, r=result: self._execute_sql_async(sql, e, r))
+        # P1-2：结果被 max_result_rows 截断时，结果区「加载更多」继续取下一批
+        result.load_more_requested.connect(
+            lambda r=result: self._on_load_more(r))
 
         if auto_switch:
             self.tabs.setCurrentIndex(idx)
@@ -907,7 +935,7 @@ class MainWindow(QMainWindow):
             self._add_new_query_tab(auto_switch=False)
             editor, result = self._current_widgets()
         editor.set_sql(sql)
-        self._execute_sql(sql, editor, result)
+        self._execute_sql_async(sql, editor, result)
 
     def _insert_history_sql(self, sql):
         self._insert_sql_to_editor(sql)
@@ -933,7 +961,7 @@ class MainWindow(QMainWindow):
             return
         sql = editor.toPlainText().strip().rstrip(';')
         if sql:
-            self._execute_sql(sql, editor, result)
+            self._execute_sql_async(sql, editor, result)
 
     def _exec_explain(self):
         editor, result = self._current_widgets()
@@ -943,9 +971,9 @@ class MainWindow(QMainWindow):
         if not sql:
             return
         if sql.upper().startswith('EXPLAIN'):
-            self._execute_sql(sql, editor, result)
+            self._execute_sql_async(sql, editor, result)
         else:
-            self._execute_sql("EXPLAIN " + sql, editor, result)
+            self._execute_sql_async("EXPLAIN " + sql, editor, result)
 
     def _execute_sql(self, sql: str, editor: SQLEditor, result: ResultTable):
         conn = self._get_current_conn()
@@ -1024,6 +1052,343 @@ class MainWindow(QMainWindow):
             self.history.add(sql, conn.config.name, True, elapsed)
 
         self.history_panel.refresh()
+
+    # ==================== 后台查询（P1-1 响应性） ====================
+    # 说明：`_execute_sql()`（同步）保留给既有测试/嵌入调用方；所有真实 UI
+    # 入口（F5/菜单执行、编辑器 Ctrl+Return、对象树双击、EXPLAIN）统一走
+    # `_execute_sql_async()`，DB 调用在 QThreadPool worker 线程，UI 不冻结。
+
+    def _effective_max_rows(self) -> int:
+        """settings.max_result_rows（0/非法 → 100000 默认上限）。"""
+        try:
+            value = int(getattr(self.settings, 'max_result_rows', 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return value if value > 0 else 100000
+
+    def _query_chunk_size(self) -> int:
+        """「加载更多」每批追加的行数：取当前单次上限（50~1000）。"""
+        return max(50, min(self._effective_max_rows(), 1000))
+
+    def _query_action_widgets(self):
+        """执行类 QAction（执行/EXPLAIN）——执行期间禁用，完成后恢复。"""
+        out = []
+        for action in self.findChildren(QAction):
+            text = action.text().replace('&', '')
+            if text in ('执行', 'EXPLAIN') or text.endswith('执行'):
+                out.append(action)
+        return out
+
+    def _set_busy_ui(self, busy: bool):
+        self._query_busy = bool(busy)
+        if self._cancel_action is not None:
+            self._cancel_action.setEnabled(bool(busy))
+        for action in self._query_action_widgets():
+            action.setEnabled(not busy)
+
+    def _start_worker(self, worker, ctx):
+        """登记 worker/上下文、接信号、启动线程池任务（公共路径）。"""
+        self._active_worker = worker
+        self._active_signals = worker.signals   # 保活：排队信号投递前不能被回收
+        self._active_ctx = ctx
+        self._abort_reason = ''
+        self._set_busy_ui(True)
+        worker.signals.result.connect(self._on_async_result)
+        worker.signals.failed.connect(self._on_async_failed)
+        worker.signals.cancelled.connect(self._on_async_cancelled)
+        worker.signals.finished.connect(self._on_async_finished)
+        self._query_pool.start(worker)
+
+    def _execute_sql_async(self, sql: str, editor: SQLEditor,
+                           result: ResultTable, load_more: bool = False):
+        """真实 UI 查询入口：后台线程执行，主线程只更新 UI。"""
+        if result is None:
+            return
+        statements = self._split_statements(sql)
+        if not statements:
+            return
+        conn = self._get_current_conn()
+        if conn is None or not conn.is_connected():
+            QMessageBox.warning(self, "提示", "请先选择一个连接")
+            return
+        if self._query_busy:
+            QMessageBox.information(self, "提示",
+                                    "已有查询正在执行，请等待完成或先取消。")
+            return
+
+        max_rows = self._effective_max_rows()
+        worker = QueryWorker(conn, statements, max_rows=max_rows,
+                             chunk_size=self._query_chunk_size())
+        ctx = {
+            'editor': editor, 'result': result, 'sql': sql,
+            'statements': statements, 'max_rows': max_rows,
+            'rows_loaded': 0, 'load_more': bool(load_more),
+            'conn_name': getattr(conn.config, 'name', ''),
+            'started': time.time(),
+        }
+        if load_more:
+            result.set_loading_more(True)
+        else:
+            self._set_status('执行中…（可点 查询 → 取消当前查询 取消）')
+        try:
+            timeout = int(getattr(self.settings, 'query_timeout', 0) or 0)
+        except (TypeError, ValueError):
+            timeout = 0
+        if timeout > 0 and not load_more:
+            ctx['timeout'] = timeout
+            self._query_timeout_timer.start(timeout * 1000)
+        self._start_worker(worker, ctx)
+
+    # ---------- worker 信号回调（Qt 自动投递回主线程） ----------
+
+    def _on_async_result(self, payload):
+        ctx = self._active_ctx
+        if ctx is None:
+            return
+        result = ctx['result']
+        elapsed = float(payload.get('elapsed_ms') or 0.0)
+        if ctx.get('load_more'):
+            rows = list(payload.get('rows') or [])
+            old = int(ctx.get('rows_loaded') or 0)
+            new_rows = rows[old:] if len(rows) > old else []
+            result.append_rows(new_rows,
+                               truncated=bool(payload.get('truncated')))
+            ctx['rows_loaded'] = result.rows_loaded
+            if payload.get('truncated'):
+                self._set_status(f"已加载 {result.rows_loaded} 行"
+                                 f"（还有更多，可继续『加载更多』）")
+            else:
+                self._set_status(f"已加载全部 {result.rows_loaded} 行")
+            return
+
+        cols = list(payload.get('columns') or [])
+        rows = list(payload.get('rows') or [])
+        truncated = bool(payload.get('truncated'))
+        ctx['rows_loaded'] = len(rows)
+        if cols:
+            result.show_result(cols, rows, elapsed, truncated=truncated)
+        else:
+            result.show_message(payload.get('message') or '执行完成')
+        status = f"完成 ({elapsed:.1f} ms)"
+        message = payload.get('message') or ''
+        if message and not cols:
+            status += f" - {message}"
+        if truncated:
+            status += (f"；结果已截断：显示前 {len(rows)} 行"
+                       f"（可点『加载更多』继续）")
+        self._set_status(status)
+        try:
+            self.history.add(ctx['sql'], ctx['conn_name'], True, elapsed)
+            self.history_panel.refresh()
+        except Exception:
+            pass
+        # DDL 后刷新对象树
+        try:
+            if any(s.strip().upper().startswith(
+                    ('CREATE', 'DROP', 'ALTER', 'TRUNCATE'))
+                   for s in ctx['statements']):
+                self.object_tree.refresh_all()
+        except Exception:
+            pass
+        # 「加载更多」上下文：仅单语句 SELECT 且有截断时提供
+        try:
+            if truncated and len(ctx['statements']) == 1:
+                self._load_more_ctx[id(result)] = {
+                    'sql': ctx['statements'][0],
+                    'max_rows': ctx['max_rows'],
+                    'conn_name': ctx['conn_name'],
+                }
+            else:
+                self._load_more_ctx.pop(id(result), None)
+        except Exception:
+            pass
+
+    def _on_async_failed(self, exc):
+        ctx = self._active_ctx
+        if ctx is None:
+            return
+        text = str(exc) or repr(exc)
+        errno = error_code(exc)
+        sqlstate = error_sqlstate(exc)
+        if errno is None:
+            parsed_code, parsed_state = parse_error_fields(text)
+            errno = parsed_code
+            if not sqlstate:
+                sqlstate = parsed_state
+        if ctx.get('load_more'):
+            # 加载更多失败：保留已加载的行，只提示错误
+            try:
+                ctx['result'].set_loading_more(False)
+                ctx['result'].show_load_more(True)
+            except Exception:
+                pass
+            self._set_status(f"加载更多失败: {text}", error=True)
+            return
+        try:
+            ctx['result'].show_error(text, errno=errno, sqlstate=sqlstate)
+        except Exception:
+            pass
+        self._set_status(f"错误: {text}", error=True)
+        try:
+            elapsed = (time.time() - ctx.get('started', time.time())) * 1000
+            self.history.add(ctx['sql'], ctx['conn_name'], False, elapsed)
+            self.history_panel.refresh()
+        except Exception:
+            pass
+
+    def _on_async_cancelled(self, reason):
+        ctx = self._active_ctx
+        if ctx is None:
+            return
+        reason = str(reason or '已取消')
+        result = ctx['result']
+        try:
+            if ctx.get('load_more'):
+                result.set_loading_more(False)
+            else:
+                result.show_error(
+                    f"查询已取消：{reason}\n"
+                    f"（本引擎取消 = KILL 连接；连接会尝试自动重连，"
+                    f"服务器端语句可能仍在收尾）")
+        except Exception:
+            pass
+        self._set_status(f"已取消（{reason}）", error=True)
+
+    def _on_async_finished(self):
+        ctx = self._active_ctx
+        if not self._query_busy and ctx is None:
+            return
+        self._query_timeout_timer.stop()
+        if self._abort_reason:
+            self._reconnect_after_abort()
+        elif ctx is not None and ctx.get('load_more'):
+            try:
+                ctx['result'].set_loading_more(False)
+            except Exception:
+                pass
+        self._active_worker = None
+        self._active_signals = None
+        self._active_ctx = None
+        self._abort_reason = ''
+        self._set_busy_ui(False)
+
+    def _reconnect_after_abort(self):
+        """取消/超时后连接可能已被 KILL：自动重连并在状态栏提示。"""
+        conn = self._get_current_conn()
+        if conn is None:
+            return
+        if conn.is_connected():
+            return
+        try:
+            conn.connect()
+            suffix = '；连接已自动重连'
+        except Exception as exc:                      # noqa: BLE001
+            suffix = f'；自动重连失败: {exc}'
+        current = self.status_label.text()
+        if '连接已自动重连' in current or '自动重连失败' in current:
+            return
+        self._set_status(current + suffix,
+                         error='自动重连失败' in suffix)
+
+    def _on_query_timeout(self):
+        if not self._query_busy:
+            return
+        ctx = self._active_ctx or {}
+        timeout = ctx.get('timeout') or 0
+        reason = f"查询超时（>{timeout}s）" if timeout else '查询超时'
+        self.cancel_running_query(reason)
+
+    def cancel_running_query(self, reason: str = '用户取消') -> bool:
+        """取消当前后台查询：取消标志 + 另一条连接 KILL 目标 thread_id。"""
+        if not self._query_busy or self._active_worker is None:
+            self._set_status('当前没有正在执行的查询')
+            return False
+        self._abort_reason = str(reason or '用户取消')
+        worker = self._active_worker
+        try:
+            worker.cancel(self._abort_reason)
+        except Exception:
+            pass
+        conn = self._get_current_conn()
+        thread_id = getattr(worker, 'thread_id', None)
+        if thread_id is None and conn is not None:
+            try:
+                thread_id = conn.thread_id()
+            except Exception:
+                thread_id = None
+        ok, error = False, '没有可用连接'
+        try:
+            if conn is not None:
+                ok, error = conn.kill_connection(thread_id)
+        except Exception as exc:                      # noqa: BLE001
+            ok, error = False, f'KILL 异常: {exc}'
+        if ok:
+            self._set_status(f"正在取消（{self._abort_reason}）："
+                             f"已发送 KILL {thread_id}")
+        else:
+            self._set_status(
+                f"取消失败（{self._abort_reason}）：{error}；将忽略该查询结果",
+                error=True)
+        # 兜底：worker 3s 内不结束（引擎语句无中断点）→ 强制释放 UI
+        QTimer.singleShot(3000, self._force_abort_watchdog)
+        return ok
+
+    def _force_abort_watchdog(self):
+        """取消后 worker 迟迟不结束：强制释放 UI（避免"执行中"永久卡住）。"""
+        if not self._query_busy or not self._abort_reason:
+            return
+        ctx = self._active_ctx
+        self._abort_reason = ''
+        conn = self._get_current_conn()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if ctx is not None:
+            try:
+                if not ctx.get('load_more'):
+                    ctx['result'].show_error(
+                        '查询已取消：worker 未在 3s 内结束（服务器端语句可能'
+                        '仍在收尾），已关闭该连接，请刷新/重连后继续')
+            except Exception:
+                pass
+        self._set_status('已取消（强制）：连接已关闭，请重连', error=True)
+        self._active_worker = None
+        self._active_signals = None
+        self._active_ctx = None
+        self._set_busy_ui(False)
+
+    def _on_load_more(self, result):
+        """结果区「加载更多」：重新执行同一 SELECT（更大上限）并追加新行。"""
+        ctx = self._load_more_ctx.get(id(result))
+        if ctx is None:
+            self._set_status('没有可继续加载的结果')
+            return
+        if self._query_busy:
+            self._set_status('已有查询正在执行，请稍后再加载更多')
+            return
+        conn = self._get_current_conn()
+        if conn is None or not conn.is_connected():
+            self._set_status('连接不可用，无法加载更多', error=True)
+            return
+        old_rows = int(result.rows_loaded or 0)
+        chunk = self._query_chunk_size()
+        new_max = old_rows + chunk
+        statements = [ctx['sql']]
+        worker = QueryWorker(conn, statements, max_rows=new_max,
+                             chunk_size=chunk)
+        self._active_ctx = {
+            'editor': None, 'result': result, 'sql': ctx['sql'],
+            'statements': statements, 'max_rows': new_max,
+            'rows_loaded': old_rows, 'load_more': True,
+            'conn_name': ctx.get('conn_name', ''),
+            'started': time.time(),
+        }
+        result.set_loading_more(True)
+        self._set_status(f"正在加载更多（当前 {old_rows} 行，"
+                         f"目标 {new_max} 行）…")
+        self._start_worker(worker, self._active_ctx)
 
     def _split_statements(self, sql: str):
         stmts, buf, in_str = [], '', None
@@ -1527,6 +1892,18 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        # P1-1：关闭窗口前取消后台查询并等待 worker 退出，避免 worker
+        # 回调访问已销毁的控件（Qt 崩溃）。最多等 3s，超时不阻塞关闭。
+        if self._query_busy:
+            try:
+                self.cancel_running_query('窗口关闭')
+            except Exception:
+                pass
+        try:
+            self._query_pool.waitForDone(3000)
+        except Exception:
+            pass
+
         # 关闭所有连接
         for name, conn in list(self.object_tree.connections.items()):
             try:

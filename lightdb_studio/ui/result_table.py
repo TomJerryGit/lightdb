@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QPushButton, QApplication, QLineEdit, QComboBox,
     QCheckBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
 
 # 从 `format_db_error` 的文本里回捞字段（如 `错误码  : 1064` / `SQLSTATE: 42000`）。
@@ -136,6 +136,9 @@ def typed_sort_key(value, text=None):
 
 
 class ResultTable(QWidget):
+    # P1-2：结果被 max_result_rows 截断后点「加载更多」→ 主窗口继续取下一批
+    load_more_requested = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._raw_error_text = ""
@@ -145,6 +148,10 @@ class ResultTable(QWidget):
         self._filter_column = -1
         self._filter_case = False
         self._result_row_count = 0
+        # 有界结果状态（P1-2）
+        self._columns = []
+        self.rows_loaded = 0
+        self._truncated = False
         self.error_category_key = 'query'
         self.error_category = ERROR_CATEGORIES['query'][0]
         self._build_ui()
@@ -170,6 +177,12 @@ class ResultTable(QWidget):
         self.time_label = QLabel("")
         self.time_label.setStyleSheet("color: #969696;")
         info_layout.addWidget(self.time_label)
+        # P1-2：结果被截断时可见的「加载更多」按钮
+        self.load_more_btn = QPushButton("加载更多")
+        self.load_more_btn.setToolTip("继续取下一批结果（不重新执行完整查询）")
+        self.load_more_btn.clicked.connect(self._on_load_more_clicked)
+        self.load_more_btn.setVisible(False)
+        info_layout.addWidget(self.load_more_btn)
         layout.addWidget(info_bar)
 
         # 过滤条（P0-2）
@@ -264,13 +277,58 @@ class ResultTable(QWidget):
 
     # ==================== 结果渲染 ====================
 
-    def show_result(self, columns, rows, elapsed_ms=0.0):
+    @staticmethod
+    def _make_item(val):
+        """把原始值转成表格单元格（原始值存 Qt.UserRole 供类型化排序）。"""
+        item = QTableWidgetItem()
+        if val is None:
+            item.setText("NULL")
+            item.setForeground(QColor("#808080"))
+            f = item.font()
+            f.setItalic(True)
+            item.setFont(f)
+            item.setData(Qt.UserRole, NULL_SENTINEL)
+        elif isinstance(val, bool):
+            item.setText('1' if val else '0')
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setData(Qt.UserRole, val)
+        elif isinstance(val, (int, float)):
+            item.setText(str(val))
+            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            item.setData(Qt.UserRole, val)
+        elif isinstance(val, bytes):
+            item.setText(f"<binary {len(val)} bytes>")
+            item.setData(Qt.UserRole, val)
+        else:
+            s = str(val)
+            if len(s) > 500:
+                s = s[:500] + "..."
+            item.setText(s)
+            if '\n' in s:
+                item.setText(s.replace('\n', ' '))
+            item.setData(Qt.UserRole, val)
+        return item
+
+    def _update_info_label(self, elapsed_ms=None):
+        """结果行数/截断提示（P1-2）。"""
+        suffix = ''
+        if self._truncated:
+            suffix = (f"（已截断：显示前 {self.rows_loaded} 行，"
+                      f"可能还有更多，可点『加载更多』）")
+        self.info_label.setText(f"返回 {self.rows_loaded} 行" + suffix)
+        if elapsed_ms is not None:
+            self.time_label.setText(f"{elapsed_ms:.2f} ms")
+
+    def show_result(self, columns, rows, elapsed_ms=0.0, truncated=False):
         self._hide_error_view()
         self.table.setSortingEnabled(False)
         self.table.clear()
         self.table.setRowCount(len(rows))
         self.table.setColumnCount(len(columns))
         self.table.setHorizontalHeaderLabels(columns)
+        self._columns = list(columns)
+        self.rows_loaded = len(rows)
+        self._truncated = bool(truncated)
         self._result_row_count = len(rows)
         self._sort_column = -1
         self._sort_order = Qt.AscendingOrder
@@ -281,34 +339,7 @@ class ResultTable(QWidget):
 
         for ri, row in enumerate(rows):
             for ci, val in enumerate(row):
-                item = QTableWidgetItem()
-                if val is None:
-                    item.setText("NULL")
-                    item.setForeground(QColor("#808080"))
-                    f = item.font()
-                    f.setItalic(True)
-                    item.setFont(f)
-                    item.setData(Qt.UserRole, NULL_SENTINEL)
-                elif isinstance(val, bool):
-                    item.setText('1' if val else '0')
-                    item.setTextAlignment(Qt.AlignCenter)
-                    item.setData(Qt.UserRole, val)
-                elif isinstance(val, (int, float)):
-                    item.setText(str(val))
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    item.setData(Qt.UserRole, val)
-                elif isinstance(val, bytes):
-                    item.setText(f"<binary {len(val)} bytes>")
-                    item.setData(Qt.UserRole, val)
-                else:
-                    s = str(val)
-                    if len(s) > 500:
-                        s = s[:500] + "..."
-                    item.setText(s)
-                    if '\n' in s:
-                        item.setText(s.replace('\n', ' '))
-                    item.setData(Qt.UserRole, val)
-                self.table.setItem(ri, ci, item)
+                self.table.setItem(ri, ci, self._make_item(val))
 
         self.table.setSortingEnabled(False)   # 保持禁用：类型化排序自己管
         self.table.resizeColumnsToContents()
@@ -323,8 +354,68 @@ class ResultTable(QWidget):
 
         # 过滤条随结果重建（新的列集合 / 新数据）
         self._reset_filter(columns)
-        self.info_label.setText(f"返回 {len(rows)} 行")
-        self.time_label.setText(f"{elapsed_ms:.2f} ms")
+        self._update_info_label(elapsed_ms)
+        self.show_load_more(self._truncated)
+
+    def append_rows(self, rows, truncated=None):
+        """把「加载更多」取到的下一批行追加到表格（P1-2）。
+
+        - 保持既有过滤条件并重新应用；若当前有排序则重新按同一列排序；
+        - `truncated` 为 None 表示沿用当前状态，否则更新"是否还有更多"。
+        返回实际追加的行数。
+        """
+        rows = list(rows or [])
+        if truncated is not None:
+            self._truncated = bool(truncated)
+        if not rows:
+            self._update_info_label()
+            self.show_load_more(self._truncated)
+            return 0
+        n_cols = self.table.columnCount()
+        old_n = self.table.rowCount()
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.setRowCount(old_n + len(rows))
+            for i, row in enumerate(rows):
+                for ci in range(n_cols):
+                    val = row[ci] if ci < len(row) else None
+                    self.table.setItem(old_n + i, ci, self._make_item(val))
+        finally:
+            self.table.setUpdatesEnabled(True)
+        self.rows_loaded = old_n + len(rows)
+        self._result_row_count = self.rows_loaded
+        if self._sort_column >= 0:
+            self.sort_by(self._sort_column, self._sort_order)
+        else:
+            self._apply_filter()
+        self._update_info_label()
+        self.show_load_more(self._truncated)
+        return len(rows)
+
+    def show_load_more(self, visible: bool, loading: bool = False):
+        self.load_more_btn.setVisible(bool(visible))
+        self.load_more_btn.setEnabled(not loading)
+        self.load_more_btn.setText("加载中…" if loading else "加载更多")
+
+    def set_loading_more(self, loading: bool):
+        if loading:
+            self.load_more_btn.setVisible(True)
+        self.load_more_btn.setEnabled(not loading)
+        self.load_more_btn.setText("加载中…" if loading else "加载更多")
+
+    def _on_load_more_clicked(self):
+        if not self.load_more_btn.isEnabled():
+            return
+        self.set_loading_more(True)
+        self.load_more_requested.emit()
+
+    def _reset_load_more(self):
+        self._truncated = False
+        self._columns = []
+        self.rows_loaded = self.table.rowCount()
+        self.load_more_btn.setVisible(False)
+        self.load_more_btn.setEnabled(True)
+        self.load_more_btn.setText("加载更多")
 
     def show_message(self, message: str):
         # 修复已知缺陷：无结果集的语句（INSERT/UPDATE…）必须收起上一次错误视图，
@@ -336,6 +427,7 @@ class ResultTable(QWidget):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self._result_row_count = 0
+        self._reset_load_more()
         self.info_label.setText(message)
 
     # ==================== 类型化排序（P0-1） ====================
@@ -592,6 +684,7 @@ class ResultTable(QWidget):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self._result_row_count = 0
+        self._reset_load_more()
 
         self.error_text.setPlainText(full)
         self.error_view.setVisible(True)
@@ -631,6 +724,7 @@ class ResultTable(QWidget):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self._result_row_count = 0
+        self._reset_load_more()
         self.info_label.setText("就绪")
         self.info_label.setToolTip("")
         self.info_label.setStyleSheet("color: #969696;")

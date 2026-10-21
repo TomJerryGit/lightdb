@@ -158,6 +158,11 @@
   （Windows DPAPI；`connections.json` 不再明文，旧明文自动迁移）、连接对话框**口令显示/隐藏**、
   **错误面板分类 + 复制**（查询/权限/连接），并修复 `show_message()` 陈旧错误视图与包级
   延迟导入 RecursionError。P0 新测试 30 passed，真实 GUI 端到端 4/4 PASS；详见路线图 §9。
+- **GUI P1 首批已实施（2026-10-21）**：查询移出 UI 线程（QThreadPool + 信号，F5/菜单/
+  Ctrl+Return/对象树/EXPLAIN 全走后台，UI 不冻结），支持**取消当前查询**（KILL + 自动重连）
+  与 `query_timeout` 超时；结果读取改 **fetchmany 分块 + `max_result_rows` 截断提示 +
+  加载更多**（QAbstractTableModel 虚拟化留待后续）；P0 行为保留。新测试 9 passed，
+  Studio 回归 69 passed，真实 GUI 5/5 PASS；详见路线图 §10。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip
