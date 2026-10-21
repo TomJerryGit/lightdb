@@ -106,6 +106,16 @@
   新增 `tests/test_studio_p1_editor_tree.py`（19 例）；Studio 回归 + 新测试 88 passed；
   真实 GUI `p1_editor_tree_check.py` 3/3 PASS、6 张截图。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §11。
+- **GUI 路线 P1 第三批（P1-4/P1-5，2026-10-21）**：
+  ① 导入/导出**进度与取消**：500 行/批后台 worker + 进度条 + 取消（导入取消不回滚已提交
+  批、显式提示；失败行逐行重试定位并可导出 CSV 报告；导出 CSV/XLSX 取消/失败删除不完整文件）；
+  ② DataEditor **按列类型编辑**（DATE/DATETIME 校验规范化、BOOL 下拉、显式 NULL、INT/FLOAT
+  数值、JSON 非法报错；非法单元格标红且阻止提交）+ **单事务原子提交**（BEGIN→逐条 UPDATE→
+  COMMIT，失败 ROLLBACK + 显式提示；单条/批量同路径）。
+  新增 `tests/test_studio_p1_import_editor.py`（19 例）；Studio 回归 + 新测试 107 passed；
+  真实 GUI `p1_import_editor_check.py` 3/3 PASS、5 张截图。
+  附带修复 `DBQueryError` 在 errno=None 时 `__str__` 递归（`error_message` 优先取 message）。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §12。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

@@ -1,14 +1,249 @@
-"""数据编辑器 - 可视化增删改"""
+"""数据编辑器 - 可视化增删改（P1-5：类型编辑 + 单事务原子提交）"""
+import json
+from datetime import datetime
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QLabel, QMessageBox, QAbstractItemView, QSpinBox
+    QPushButton, QLabel, QMessageBox, QAbstractItemView, QSpinBox,
+    QComboBox, QDateEdit, QDateTimeEdit, QLineEdit,
+    QStyledItemDelegate, QStyleOptionViewItem,
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QBrush
+from PySide6.QtCore import Qt, Signal, QDate, QDateTime
+from PySide6.QtGui import QColor, QBrush, QIntValidator, QDoubleValidator
 
 from ..db.table_ops import (
     build_select, build_insert, build_update, build_delete,
 )
+
+# ==================== P1-5 类型识别 / 校验（纯函数，可单测） ====================
+
+_INT_TYPES = ('INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT', 'BIT')
+_FLOAT_TYPES = ('FLOAT', 'DOUBLE', 'DECIMAL', 'NUMERIC', 'REAL')
+_DATETIME_TYPES = ('DATETIME', 'TIMESTAMP')
+_DATE_TYPES = ('DATE',)
+
+
+def editor_kind_for_type(col_type) -> str:
+    """返回列编辑控件类别：datetime/date/bool/int/float/json/text。"""
+    t = str(col_type or '').upper()
+    if 'JSON' in t:
+        return 'json'
+    if 'BOOL' in t or t == 'TINYINT(1)':
+        return 'bool'
+    if any(k in t for k in _DATETIME_TYPES):
+        return 'datetime'
+    if any(k in t for k in _DATE_TYPES):
+        return 'date'
+    if any(k in t for k in _FLOAT_TYPES):
+        return 'float'
+    if any(k in t for k in _INT_TYPES):
+        return 'int'
+    return 'text'
+
+
+_DATE_FORMATS = ('%Y-%m-%d', '%Y/%m/%d')
+_DATETIME_FORMATS = ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S',
+                     '%Y-%m-%d %H:%M', '%Y-%m-%d')
+
+
+def validate_typed_value(col_type, text):
+    """按列类型校验单元格文本。
+
+    返回 ``(ok, value, error)``：
+      * 文本 `NULL`/空字符串 → `(True, None, '')`（显式 NULL，沿用旧行为）；
+      * 数值非法 / 日期格式错 / JSON 非法 → `(False, None, 原因)`；
+      * 日期时间统一规范化为 `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS` 字符串。
+    """
+    if text is None:
+        return True, None, ''
+    s = str(text).strip()
+    if s == '' or s.upper() == 'NULL':
+        return True, None, ''
+    kind = editor_kind_for_type(col_type)
+    try:
+        if kind == 'bool':
+            low = s.lower()
+            if low in ('1', 'true', 'yes', 'y', '是'):
+                return True, True, ''
+            if low in ('0', 'false', 'no', 'n', '否'):
+                return True, False, ''
+            return False, None, '布尔值必须是 TRUE/FALSE/1/0/NULL'
+        if kind == 'int':
+            return True, int(s), ''
+        if kind == 'float':
+            return True, float(s), ''
+        if kind == 'date':
+            for fmt in _DATE_FORMATS:
+                try:
+                    return True, datetime.strptime(s, fmt).strftime('%Y-%m-%d'), ''
+                except ValueError:
+                    continue
+            return False, None, '日期格式应为 YYYY-MM-DD'
+        if kind == 'datetime':
+            for fmt in _DATETIME_FORMATS:
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    return True, dt.strftime('%Y-%m-%d %H:%M:%S'), ''
+                except ValueError:
+                    continue
+            return False, None, '日期时间格式应为 YYYY-MM-DD HH:MM:SS'
+        if kind == 'json':
+            try:
+                json.loads(s)
+            except Exception as exc:                  # noqa: BLE001
+                return False, None, f'JSON 非法: {exc}'
+            return True, s, ''
+        return True, s, ''
+    except (ValueError, TypeError):
+        return False, None, f'{col_type} 值非法: {s!r}'
+
+
+def execute_atomic(conn, statements) -> dict:
+    """在**一个事务**内执行 statements（BEGIN → 逐条 → COMMIT）。
+
+    任一语句失败 → ROLLBACK，返回 ``ok=False, rolled_back=True``。
+    `DBConnection.execute()` 返回 `(rowcount, error_text)`，错误文本非空视为失败。
+    返回 dict: ok / executed / errors / rolled_back。
+    """
+    statements = [s for s in (statements or []) if s]
+    executed = 0
+
+    def _run(sql):
+        res = conn.execute(sql)
+        if isinstance(res, tuple):
+            n = res[0] if len(res) > 0 else 0
+            err = res[1] if len(res) > 1 else None
+        else:
+            n, err = res, None
+        return n, err
+
+    try:
+        _n, err = _run('BEGIN')
+        if err:
+            raise RuntimeError(str(err))
+        for stmt in statements:
+            _n, err = _run(stmt)
+            if err:
+                raise RuntimeError(str(err))
+            executed += 1
+        _n, err = _run('COMMIT')
+        if err:
+            raise RuntimeError(str(err))
+        return {'ok': True, 'executed': executed, 'errors': [],
+                'rolled_back': False}
+    except Exception as exc:                          # noqa: BLE001
+        try:
+            _run('ROLLBACK')
+        except Exception:
+            pass
+        return {'ok': False, 'executed': executed,
+                'errors': [str(exc)], 'rolled_back': True}
+
+
+class TypedCellDelegate(QStyledItemDelegate):
+    """按列类型提供编辑控件（DATE/DATETIME/BOOL/INT/FLOAT/JSON/文本）。"""
+
+    def __init__(self, columns_meta, parent=None):
+        super().__init__(parent)
+        self.columns_meta = columns_meta
+
+    def _kind(self, index):
+        try:
+            return editor_kind_for_type(
+                self.columns_meta[index.column()].get('type'))
+        except Exception:
+            return 'text'
+
+    def createEditor(self, parent, option, index):
+        kind = self._kind(index)
+        try:
+            if kind == 'bool':
+                editor = QComboBox(parent)
+                editor.addItems(['NULL', 'TRUE', 'FALSE'])
+                return editor
+            if kind == 'datetime':
+                editor = QDateTimeEdit(parent)
+                editor.setCalendarPopup(True)
+                editor.setDisplayFormat('yyyy-MM-dd HH:mm:ss')
+                editor.setDateTime(QDateTime.currentDateTime())
+                return editor
+            if kind == 'date':
+                editor = QDateEdit(parent)
+                editor.setCalendarPopup(True)
+                editor.setDisplayFormat('yyyy-MM-dd')
+                editor.setDate(QDate.currentDate())
+                return editor
+            if kind == 'int':
+                editor = QLineEdit(parent)
+                editor.setValidator(QIntValidator(editor))
+                editor.setPlaceholderText('整数 或 NULL')
+                return editor
+            if kind == 'float':
+                editor = QLineEdit(parent)
+                editor.setValidator(QDoubleValidator(editor))
+                editor.setPlaceholderText('数值 或 NULL')
+                return editor
+            if kind == 'json':
+                editor = QLineEdit(parent)
+                editor.setPlaceholderText('JSON（如 {"a": 1}）或 NULL')
+                return editor
+        except Exception:
+            pass
+        try:
+            return super().createEditor(parent, option, index)
+        except TypeError:
+            # 测试/嵌入方可能传 option=None：退化到纯文本编辑器
+            return QLineEdit(parent)
+
+    def setEditorData(self, editor, index):
+        text = index.data(Qt.DisplayRole)
+        text = '' if text is None else str(text)
+        kind = self._kind(index)
+        try:
+            if kind == 'bool' and isinstance(editor, QComboBox):
+                low = text.strip().lower()
+                if low in ('1', 'true', 'yes', '是'):
+                    editor.setCurrentText('TRUE')
+                elif low in ('0', 'false', 'no', '否'):
+                    editor.setCurrentText('FALSE')
+                else:
+                    editor.setCurrentText('NULL')
+                return
+            if kind == 'datetime' and isinstance(editor, QDateTimeEdit):
+                ok, value, _err = validate_typed_value('DATETIME', text)
+                if ok and value:
+                    dt = QDateTime.fromString(value, 'yyyy-MM-dd HH:mm:ss')
+                    if dt.isValid():
+                        editor.setDateTime(dt)
+                return
+            if kind == 'date' and isinstance(editor, QDateEdit):
+                ok, value, _err = validate_typed_value('DATE', text)
+                if ok and value:
+                    d = QDate.fromString(value, 'yyyy-MM-dd')
+                    if d.isValid():
+                        editor.setDate(d)
+                return
+            if isinstance(editor, QLineEdit):
+                editor.setText('' if text.upper() == 'NULL' else text)
+        except Exception:
+            pass
+
+    def setModelData(self, editor, model, index):
+        kind = self._kind(index)
+        try:
+            if kind == 'bool' and isinstance(editor, QComboBox):
+                text = editor.currentText()
+            elif kind == 'datetime' and isinstance(editor, QDateTimeEdit):
+                text = editor.dateTime().toString('yyyy-MM-dd HH:mm:ss')
+            elif kind == 'date' and isinstance(editor, QDateEdit):
+                text = editor.date().toString('yyyy-MM-dd')
+            elif isinstance(editor, QLineEdit):
+                text = editor.text()
+            else:
+                text = editor.text() if hasattr(editor, 'text') else ''
+            model.setData(index, text, Qt.EditRole)
+        except Exception:
+            pass
 
 
 class DataEditor(QWidget):
@@ -29,6 +264,7 @@ class DataEditor(QWidget):
         self.modified = {}     # {row_index: {col: new_value}}
         self.new_rows = set()
         self.deleted_rows = set()
+        self.invalid_cells = {}    # {(row, col): error_text}（P1-5 校验失败）
 
         self.page_size = 200
         self.page_offset = 0
@@ -105,6 +341,12 @@ class DataEditor(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemChanged.connect(self._on_item_changed)
+        # P1-5：按列类型提供编辑控件（日期/布尔/数值/JSON）
+        try:
+            self._delegate = TypedCellDelegate(self.columns_meta, self.table)
+            self.table.setItemDelegate(self._delegate)
+        except Exception:
+            self._delegate = None
         layout.addWidget(self.table)
 
         # 状态栏
@@ -148,6 +390,7 @@ class DataEditor(QWidget):
             self.modified.clear()
             self.new_rows.clear()
             self.deleted_rows.clear()
+            self.invalid_cells.clear()
             self._update_pending()
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
@@ -195,41 +438,69 @@ class DataEditor(QWidget):
         if ri >= len(self._row_data):
             return
         row_info = self._row_data[ri]
-        new_text = item.text()
-
         col_meta = self.columns_meta[ci]
-        val = self._parse_value(new_text, col_meta['type'])
-        if new_text == "NULL":
-            val = None
-
+        ok, val, err = validate_typed_value(col_meta.get('type'), item.text())
+        if not ok:
+            # P1-5：非法值显式报错并阻止提交（不写入 row_data / modified）
+            self.invalid_cells[(ri, ci)] = err
+            self._set_item_error(item, err)
+            self._update_pending()
+            self._mark_row(ri)
+            return
+        self.invalid_cells.pop((ri, ci), None)
+        self._clear_item_error(item)
         row_info['values'][ci] = val
 
         if row_info['is_new']:
             pass
+        elif val != row_info['orig_values'][ci]:
+            self.modified.setdefault(ri, {})[self.column_names[ci]] = val
         else:
-            if val != row_info['orig_values'][ci]:
-                self.modified.setdefault(ri, {})[self.column_names[ci]] = val
-            else:
-                if ri in self.modified:
-                    self.modified[ri].pop(self.column_names[ci], None)
-                    if not self.modified[ri]:
-                        del self.modified[ri]
+            if ri in self.modified:
+                self.modified[ri].pop(self.column_names[ci], None)
+                if not self.modified[ri]:
+                    del self.modified[ri]
 
         self._update_pending()
         self._mark_row(ri)
 
-    def _parse_value(self, text, col_type):
-        if text == "NULL" or text == "":
-            return None
-        t = col_type.upper()
+    def _set_item_error(self, item, error):
+        self.table.blockSignals(True)
         try:
-            if 'INT' in t:
-                return int(text)
-            if 'FLOAT' in t or 'DOUBLE' in t or 'DECIMAL' in t:
-                return float(text)
-            return text
-        except (ValueError, TypeError):
-            return text
+            item.setForeground(QColor("#f48771"))
+            item.setToolTip(f'非法值: {error}')
+        finally:
+            self.table.blockSignals(False)
+
+    def _clear_item_error(self, item):
+        self.table.blockSignals(True)
+        try:
+            item.setForeground(QBrush())
+            item.setToolTip('')
+        finally:
+            self.table.blockSignals(False)
+
+    def _parse_value(self, text, col_type):
+        """兼容旧调用：解析非法时回退原文（校验走 validate_typed_value）。"""
+        ok, value, _err = validate_typed_value(col_type, text)
+        return value if ok else text
+
+    def set_cell_null(self, row, col):
+        """显式把单元格设为 NULL（右键/工具栏"设为 NULL"路径）。"""
+        item = self.table.item(row, col)
+        if item is None:
+            return False
+        self.table.blockSignals(True)
+        try:
+            item.setText('NULL')
+            item.setForeground(QColor("#808080"))
+            f = item.font()
+            f.setItalic(True)
+            item.setFont(f)
+        finally:
+            self.table.blockSignals(False)
+        self._on_item_changed(item)
+        return True
 
     def _mark_row(self, ri):
         if ri >= len(self._row_data):
@@ -246,7 +517,11 @@ class DataEditor(QWidget):
         for ci in range(self.table.columnCount()):
             item = self.table.item(ri, ci)
             if item:
-                item.setBackground(QBrush(color) if color else QBrush())
+                self.table.blockSignals(True)
+                try:
+                    item.setBackground(QBrush(color) if color else QBrush())
+                finally:
+                    self.table.blockSignals(False)
 
     def _add_row(self):
         ri = self.table.rowCount()
@@ -280,15 +555,30 @@ class DataEditor(QWidget):
         n_mod = len(self.modified)
         n_new = len(self.new_rows)
         n_del = len(self.deleted_rows)
+        n_bad = len(self.invalid_cells)
+        parts = []
         if n_mod or n_new or n_del:
-            self.pending_label.setText(
-                f"待提交: 修改 {n_mod} 行, 新增 {n_new} 行, 删除 {n_del} 行")
-        else:
-            self.pending_label.setText("")
+            parts.append(f"待提交: 修改 {n_mod} 行, 新增 {n_new} 行, 删除 {n_del} 行")
+        if n_bad:
+            parts.append(f"非法值 {n_bad} 处（修复后才能提交）")
+        self.pending_label.setText('；'.join(parts))
 
     # ==================== 提交 ====================
 
     def _save(self):
+        # P1-5：存在非法值（JSON/日期/数值）→ 先显式报错、不提交
+        # （即使本次还没有其它待提交修改，也要把非法值暴露出来）
+        if self.invalid_cells:
+            lines = []
+            for (ri, ci), err in list(self.invalid_cells.items())[:10]:
+                col = self.column_names[ci] if ci < len(self.column_names) else ci
+                lines.append(f"第 {ri + 1} 行 `{col}`：{err}")
+            QMessageBox.critical(
+                self, "存在非法值，未提交",
+                f"有 {len(self.invalid_cells)} 处单元格校验失败，请先修复：\n"
+                + '\n'.join(lines))
+            return
+
         if not (self.modified or self.new_rows or self.deleted_rows):
             QMessageBox.information(self, "提示", "没有待提交的修改")
             return
@@ -299,6 +589,13 @@ class DataEditor(QWidget):
                 "该表没有主键，无法安全地修改/删除。\n请使用 SQL 编辑器手动操作。")
             return
 
+        stmts = self.build_pending_statements()
+        if not stmts:
+            return
+        self.commit_statements(stmts, ask=True)
+
+    def build_pending_statements(self) -> list:
+        """把待提交的删除/修改/新增转成 SQL 列表（不执行；供预览/测试）。"""
         stmts = []
 
         # 删除
@@ -337,39 +634,48 @@ class DataEditor(QWidget):
                 vals.append(v)
             if cols:
                 stmts.append(build_insert(self.table_name, cols, vals))
+        return stmts
 
+    def commit_statements(self, stmts, ask=True) -> dict:
+        """P1-5：在**一个事务**内提交全部语句（单条修改也走同一路径）。
+
+        BEGIN → 逐条执行 → COMMIT；任一失败 → ROLLBACK，显式提示并刷新数据。
+        """
+        stmts = [s for s in (stmts or []) if s]
         if not stmts:
-            return
+            return {'ok': True, 'executed': 0, 'errors': [],
+                    'rolled_back': False, 'cancelled': False}
 
-        preview = '\n'.join(stmts[:15])
-        if len(stmts) > 15:
-            preview += f"\n... 还有 {len(stmts) - 15} 条"
+        if ask:
+            preview = '\n'.join(stmts[:15])
+            if len(stmts) > 15:
+                preview += f"\n... 还有 {len(stmts) - 15} 条"
+            ret = QMessageBox.question(
+                self, "确认提交",
+                f"将在一个事务内执行 {len(stmts)} 条 SQL：\n\n{preview[:2000]}",
+                QMessageBox.Yes | QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return {'ok': False, 'executed': 0, 'errors': [],
+                        'rolled_back': False, 'cancelled': True}
 
-        ret = QMessageBox.question(
-            self, "确认提交",
-            f"将执行 {len(stmts)} 条 SQL：\n\n{preview[:2000]}",
-            QMessageBox.Yes | QMessageBox.No)
-        if ret != QMessageBox.Yes:
-            return
-
-        errors = []
-        for stmt in stmts:
-            _, err = self.conn.execute(stmt)
-            if err:
-                errors.append(f"{stmt[:80]}... → {err}")
-                if len(errors) > 5:
-                    break
-
-        if errors:
-            QMessageBox.critical(
-                self, "部分失败",
-                f"{len(errors)} 条失败:\n" + '\n'.join(errors[:5]))
+        result = execute_atomic(self.conn, stmts)
+        result['cancelled'] = False
+        if result['ok']:
+            QMessageBox.information(
+                self, "成功",
+                f"已在一个事务中提交 {result['executed']} 条 SQL")
+            try:
+                self.data_changed.emit()
+            except Exception:
+                pass
         else:
-            QMessageBox.information(self, "成功",
-                                    f"已提交 {len(stmts)} 条 SQL")
-            self.data_changed.emit()
-
+            err_text = '\n'.join(result['errors'][:5])
+            QMessageBox.critical(
+                self, "提交失败（已回滚）",
+                f"事务已 ROLLBACK，未留下半提交数据。\n"
+                f"已执行 {result['executed']} 条后失败：\n{err_text}")
         self.reload()
+        return result
 
     def _revert(self):
         if not (self.modified or self.new_rows or self.deleted_rows):

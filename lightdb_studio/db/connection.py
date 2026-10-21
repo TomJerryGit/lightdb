@@ -49,6 +49,13 @@ def error_message(exc: BaseException) -> str:
     """取完整错误报文（不截断、不丢后续参数）。"""
     if exc is None:
         return ''
+    # 本模块的 DBQueryError 自带 message 字段；必须**优先**取它。
+    # 否则 errno=None 时 args[0] 不是 int，会落到 `str(exc)` →
+    # DBQueryError.__str__ → format_db_error → error_message → 无限递归
+    # （2026-10-21 P1 真实服务端探测发现；此前只测了 errno 为 int 的路径）。
+    raw = getattr(exc, 'message', None)
+    if isinstance(raw, str) and raw:
+        return raw
     args = getattr(exc, 'args', None) or ()
     if args and isinstance(args[0], int):
         rest = [str(a) for a in args[1:]]

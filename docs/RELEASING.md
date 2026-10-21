@@ -12,6 +12,8 @@
     packaging check 全部通过（此前 3 轮失败的根因依次修复：cp1252 编码、SSL 限制如实
     skip、多进程 worker 元数据、DATE_FORMAT 非 ASCII 字面量、runtime 缺 setuptools/wheel）；
   - run `39526414556`（head `a900389`，GUI P1 首批）→ **success**，全部 13 个 step 成功。
+  - run `39531144802`（head `cc65c82`，GUI P1 第二批）→ **success**，全部 13 个 step 成功
+    （全量 pytest 1087 用例 + benchmark gate + packaging）。
   - 仅剩 GitHub 的 Node.js 20 deprecation warning（actions 自身，与本仓库代码无关）。
 - 推送命令：
   ```powershell
@@ -24,7 +26,7 @@
 
 | 步骤 | 命令/步骤 | 结果 |
 |---|---|---|
-| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1068 用例 = 1027 passed / 0 failed / 39 skipped / 1 xfailed / 1 xpassed**（2026-10-21 GUI P0/P1 后；GitHub CI run `39526414556` 同版本全绿） |
+| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1087 用例 = 1046 passed / 0 failed / 39 skipped / 1 xfailed / 1 xpassed**（2026-10-21 GUI P1 第二批后；GitHub CI run `39531144802` 同版本全绿） |
 | 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致） |
 | 打包检查 | `python scripts/check_packaging.py` | PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源） |
 | 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS（提交 GUI 验证报告后复跑通过） |

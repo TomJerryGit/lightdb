@@ -57,7 +57,7 @@
 
 > P0 合计约 **5–8 人日**，全部可独立提交、可回归测试，不改引擎。
 
-## 3. P1 —— 响应性（P1-1/1-2/1-3/1-6 已完成 2026-10-21，见 §10/§11）
+## 3. P1 —— 响应性（P1-1/1-2/1-3/1-4/1-5/1-6 已完成 2026-10-21，见 §10/§11/§12；仅 QAbstractTableModel 完整虚拟化留作后续增强）
 
 | 项 | 做法 | 涉及文件 | 验收 |
 |---|---|---|---|
@@ -179,5 +179,21 @@
 **风险**：①补全上下文是启发式（`表.`/最近 FROM-JOIN），无 parser 级作用域；②schema 缓存
 无 TTL（连接/DDL/手动刷新触发），大库首次候选可能延迟；③错误 token 取首个匹配，重复 token
 可能指向第一处；④右键菜单测试直接调 handler、真实菜单位路径由 GUI 证据覆盖。
-**P1 剩余**：QAbstractTableModel 虚拟化、导入导出进度、DataEditor 类型编辑。
+**P1 剩余**：QAbstractTableModel 虚拟化（其余已在本节与 §12 完成）。
+
+## 12. 实施记录：P1 第三批（P1-4/P1-5）已完成（2026-10-21）
+
+| P1 项 | 实现 | 验收证据 |
+|---|---|---|
+| P1-4 导入进度/取消 | `ui/import_export.py`：`chunk_rows`/`execute_chunked_import`（500 行/批、进度回调、取消语义、批失败逐行重试定位失败行）、`ImportWorker(QRunnable)`；`ImportCSVDialog` 后台分块 + 进度条 + 取消 + 失败行报告按钮（CSV 行号/错误/值可导出） | 1000 行 → 批次 `[500,500]`、进度 `(500,1000)→(1000,1000)`；取消后仅 1 批且显式 `cancelled=True`（已提交批不回滚）；失败行 `[3,5]`、成功 998、报告 CSV 正确 |
+| P1-4 导出进度/取消 | `write_export_chunked`（CSV/XLSX 分块、进度、取消/失败删除不完整文件）、`ExportWorker`；`ExportCSVDialog` 增加 CSV/XLSX 格式选择 + 后台导出 + 进度 + 取消 | CSV 1200 行分块（500/批）、XLSX 正常；取消 → `ExportCancelled` + 文件删除 + 信号 |
+| P1-5 DataEditor 类型编辑 | `editor_kind_for_type` + `validate_typed_value`（DATE/DATETIME 校验规范化、BOOL、显式 NULL、INT/FLOAT 数值、JSON 非法报错）；`TypedCellDelegate` 按列提供 `QDateEdit/QDateTimeEdit/QComboBox/QLineEdit`；非法单元格标红+tooltip+阻止提交（0 SQL） | `INT→int`、`DATE→QDateEdit`、`BOOL→QComboBox`、`DOUBLE→QLineEdit+validator`、`JSON→QLineEdit`；非法 JSON/日期/数值均拒绝且 0 SQL |
+| P1-5 原子提交 | `build_pending_statements()` / `execute_atomic()` / `commit_statements()`：BEGIN→逐条 UPDATE→COMMIT，失败 ROLLBACK+显式提示+刷新；单条与批量同路径 | 多单元格合并 1 条 UPDATE：`BEGIN→UPDATE→COMMIT`；注入失败：`BEGIN→UPDATE→ROLLBACK` + `rolled_back=True`；单条同路径 |
+| 附带修复 | `db/connection.py::error_message()` 优先取 `DBQueryError.message`；修复 errno=None 时 `__str__`↔`format_db_error` 相互递归（P1 真实服务端探测暴露） | `tests/test_studio_db_errors.py::test_dbqueryerror_with_no_errno_does_not_recurse` |
+| 验证 | 新测试 **19 passed**；Studio 回归 + 新测试 **107 passed**；compileall OK；真实 GUI `p1_import_editor_check.py` **3/3 PASS**、5 张截图（`shots_p1c/`） | 既有 77/10/4/6 张证据未动 |
+
+**风险**：①导入取消不回滚已提交批（UI/文档显式）；失败行号为导入顺序号；②XLSX 用普通
+Workbook 分批 append（超大结果集内存高于 write_only）；③DataEditor 事务依赖引擎
+BEGIN/COMMIT、无主键表仍拒绝编辑；④非法值只前端拦截，DB 类型错误仍由事务失败回滚提示。
+**P1 剩余**：仅 QAbstractTableModel 完整虚拟化（当前有界 fetchmany+截断+加载更多，够用）。
 

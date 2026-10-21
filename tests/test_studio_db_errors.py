@@ -189,3 +189,25 @@ def test_server_start_command_is_copy_paste_ready():
 ])
 def test_is_local_host(host, expected):
     assert is_local_host(host) is expected
+
+
+def test_dbqueryerror_with_no_errno_does_not_recurse():
+    """回归（2026-10-21）：errno=None 的 `DBQueryError.__str__` 不能无限递归。
+
+    旧实现 `error_message()` 在 args[0] 不是 int 时 fallback 到 `str(exc)`，
+    而 `DBQueryError.__str__` 又调用 `format_db_error()` → 相互递归
+    （RecursionError）。真实服务端探测才暴露；这里直接构造同形异常锁住。
+    """
+    from lightdb_studio.db.connection import DBQueryError, format_db_error
+
+    exc = DBQueryError(errno=None, sqlstate=None, message='连接被服务端重置',
+                       sql='SELECT 1')
+    text = str(exc)                       # 不得 RecursionError
+    assert '连接被服务端重置' in text
+    assert 'SQL' in text and 'SELECT 1' in text
+    assert format_db_error(exc, sql=exc.sql) == text
+
+    # errno 为 int 的旧路径仍正常（报文优先、args 兼容）
+    exc2 = DBQueryError(errno=1146, sqlstate='42S02', message='表不存在')
+    assert '1146' in str(exc2) and '42S02' in str(exc2)
+    assert '表不存在' in str(exc2)
