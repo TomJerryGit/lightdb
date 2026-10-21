@@ -195,6 +195,18 @@
   ④ 测试 `tests/test_web_gui_parity.py`（10 passed）+ 现有 web 安全 22 = 32 passed；
   真实 TestClient `p2_web_parity_check.py` 4/4 PASS（report/parity_matrix/html/csv/xlsx）。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §19。
+- **GUI P3 工程质量首批（P3-1/P3-2，2026-10-21）**：
+  ① **GUI 冒烟进 CI**：`tests/test_gui_smoke_ci.py` 9 个 offscreen 场景（临时 HOME 构造、
+  菜单/工具栏/状态栏 i18n+a11y、新建页/无连接提示、自起 in-process MySQLServer（随机端口+
+  tmp 数据目录）连接+SELECT、1200 行渲染、P0 排序/过滤、1146 错误面板、主题切换、
+  closeEvent 干净关闭）；`.github/workflows/ci.yml` 新增 **GUI smoke (offscreen, fail fast)**
+  step；服务端起不来显式 skip 不假过；
+  ② **性能预算**：`scripts/gui_perf_budget.py` 测启动/1200 行渲染/RSS 增量并输出 JSON；
+  硬上限 5s/3s/500MB（超限 exit 1），目标预算 2s/500ms/300MB 仅 WARN；CI 新增
+  **GUI perf budget** step；本机实测 **startup 687ms / render1200 379ms / RSS +56.2MB**，
+  warnings=[]、exit 0；
+  ③ 验证：新测试 9 passed；指定回归+新 50 passed；证据 `p3_gui_smoke_check.py` 2/2 PASS。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §20。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

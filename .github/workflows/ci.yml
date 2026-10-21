@@ -36,6 +36,11 @@ jobs:
       - name: Compileall
         run: python -m compileall -q lightdb lightdb_studio web
 
+      - name: GUI smoke (offscreen, fail fast)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/test_gui_smoke_ci.py -q -p no:cacheprovider
+
       - name: Full test suite
         run: python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml
 
@@ -59,6 +64,19 @@ jobs:
           Get-Content bench.log -Tail 100
           if ($code -ne 0) {
             Get-Content bench.log -Tail 40 | ForEach-Object { "::error::benchmark: $_" }
+            exit $code
+          }
+
+      - name: GUI perf budget (hard ceiling; target = WARN only)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        shell: pwsh
+        run: |
+          python scripts/gui_perf_budget.py > gui_perf.log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content gui_perf.log -Tail 80
+          if ($code -ne 0) {
+            Get-Content gui_perf.log -Tail 40 | ForEach-Object { "::error::gui-perf: $_" }
             exit $code
           }
 

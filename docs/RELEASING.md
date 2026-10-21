@@ -6,7 +6,8 @@
 ## 0. CI 状态说明（2026-10-21 更新）
 
 - 工作流：[`.github/workflows/ci.yml`](.github/workflows/ci.yml)（Windows：install → compileall →
-  pytest → benchmark gate → packaging check；触发 push / pull_request / workflow_dispatch）。
+  GUI smoke（offscreen，fail-fast）→ pytest → benchmark gate → GUI perf budget → packaging check；
+  触发 push / pull_request / workflow_dispatch）。
 - **GitHub Actions 已实跑并全绿**（`origin = https://github.com/TomJerryGit/lightdb.git`）：
   - run `39525357327`（head `e729525`）→ **success**：日志显示全量 pytest、benchmark gate、
     packaging check 全部通过（此前 3 轮失败的根因依次修复：cp1252 编码、SSL 限制如实

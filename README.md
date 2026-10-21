@@ -216,6 +216,12 @@
   （4 full/2 partial/6 not_applicable，GUI-only 能力明说不假装支持），文档
   [`docs/WEB_GUI_PARITY.md`](docs/WEB_GUI_PARITY.md)。新测试 10 passed，Web 安全+新
   32 passed，真实 TestClient 4/4 PASS；详见路线图 §19。
+- **GUI P3 工程质量首批已实施（2026-10-21）**：**GUI 冒烟进 CI**
+  （`tests/test_gui_smoke_ci.py` 9 个 offscreen 场景：构造/菜单工具栏 i18n+a11y/无连接提示/
+  自起临时 MySQLServer 查询/1200 行渲染/P0 排序过滤/错误面板/主题/closeEvent，
+  CI 中 fail-fast 跑）+ **性能预算**（`scripts/gui_perf_budget.py`：硬上限 5s/3s/500MB、
+  目标 2s/500ms/300MB 仅 WARN；本机实测 **启动 687ms / 1200 行渲染 379ms / RSS +56MB**，
+  全部在目标内）。详见路线图 §20。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip

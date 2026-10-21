@@ -92,7 +92,7 @@
    （当前在有机 openssl 环境显式 skip）。验收：pymysql `ssl={...}` 连接成功且
    `SHOW STATUS LIKE 'Ssl_cipher'` 非空。
 
-## 5. P3 —— 工程质量与交付（持续）
+## 5. P3 —— 工程质量与交付（持续；1/2 已完成 2026-10-21，见 §20）
 
 1. **GUI 自动化测试进 CI**：把 `gui_driver.py` 裁剪出 8–10 个无网络/无服务依赖的
    offscreen 冒烟场景（启动、tab、对象树、结果表排序/过滤、错误 surface、主题、
@@ -297,4 +297,16 @@ test_wire_transaction` = 19 passed。**P2 剩余**：Web/GUI 对齐、i18n/可�
 **风险**：Web 前端 `static/` 本轮未加新入口（先对齐 API）；报表/质量端点复用 `_get_conn`，真实环境需先配连接；
 quality 逐列查询较慢；GUI-only 能力在 parity 中标 `not_applicable` 并说明，不假装 Web 已支持。
 **P2（9 项）全部完成**（P2-1/2/3/4/5/8 + 服务端 TLS + i18n/可访问性 + Web/GUI 对齐）。
+
+## 20. 实施记录：P3-1/P3-2 GUI 冒烟进 CI + 性能预算已完成（2026-10-21）
+
+| P3 项 | 实现 | 验收证据 |
+|---|---|---|
+| P3-1 GUI 冒烟进 CI | `tests/test_gui_smoke_ci.py`：9 个 offscreen 场景（临时 HOME/配置构造、菜单/工具栏/状态栏 i18n+a11y、新建页/无连接显式提示、**自起 in-process MySQLServer 随机端口+tmp 数据目录**连接+SELECT、1200 行渲染、P0 排序/过滤、1146 错误面板、主题切换、closeEvent 干净关闭）；服务端起不来显式 skip；`.github/workflows/ci.yml` 新增 **GUI smoke (offscreen, fail fast)** step（Full test suite 之前） | 本地 `9 passed`（5.7s）；CI step 生效后等价运行 |
+| P3-2 性能预算 | `scripts/gui_perf_budget.py`：真实 MainWindow 启动/1200 行渲染/RSS 增量；JSON（stdout + `_analysis_tmp/gui_perf_budget.json`）；**硬上限** 5s/3s/500MB（超限 exit 1），**目标预算** 2s/500ms/300MB（仅 WARN）；CI 新增 **GUI perf budget** step | 本机实测：**startup 687ms / render1200 379ms / RSS +56.2MB**，warnings=[]、exit 0（三项均在目标预算内） |
+| 验证 | 新测试 9 passed；指定回归 + 新测试 **50 passed**；编译 clean；证据脚本 `p3_gui_smoke_check.py` **2/2 PASS**（report JSON + 性能 JSON 落盘） | 无外部 8898/固定端口依赖 |
+
+**风险**：性能数字随机器/CI 冷启动波动，硬上限已放宽（5s/3s/500MB）、目标预算只 WARN，待 CI 稳定后收紧；
+冒烟含临时 MySQLServer（随机端口）；closeEvent 用例为文件末尾（pytest 默认顺序）。
+**P3 剩余**：发布工程（PyInstaller/签名/自动更新/首启引导）、崩溃日志滚动、用户文档与示例。
 
