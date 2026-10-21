@@ -64,6 +64,10 @@ dev = [
     "black>=23.0",
     "ruff>=0.1",
     "httpx>=0.25.0",
+    # check_packaging.py 在运行环境直接调 setuptools.build_meta.build_wheel，
+    # 这两个是它的运行时依赖（CI 曾因缺 wheel 在 packaging 步骤失败）。
+    "setuptools>=61.0",
+    "wheel",
 ]
 
 [project.scripts]

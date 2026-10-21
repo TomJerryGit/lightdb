@@ -27,6 +27,10 @@ jobs:
       - name: Install (editable, all extras + dev)
         run: |
           python -m pip install --upgrade pip
+          # 运行时显式装 setuptools/wheel：check_packaging.py 在**运行环境**里
+          # 调 setuptools.build_meta.build_wheel，CI 的 ensurepip 环境可能
+          # 只有 pip（或旧 setuptools），缺 wheel 时 packaging 步骤会 exit 1。
+          python -m pip install "setuptools>=61" wheel
           python -m pip install -e ".[all,dev]"
 
       - name: Compileall
@@ -48,7 +52,23 @@ jobs:
           if-no-files-found: warn
 
       - name: Benchmark gate (quick)
-        run: python -m benchmarks.run --suite quick --gate
+        shell: pwsh
+        run: |
+          python -m benchmarks.run --suite quick --gate > bench.log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content bench.log -Tail 100
+          if ($code -ne 0) {
+            Get-Content bench.log -Tail 40 | ForEach-Object { "::error::benchmark: $_" }
+            exit $code
+          }
 
       - name: Packaging check (wheel must contain engine + entry points)
-        run: python scripts/check_packaging.py
+        shell: pwsh
+        run: |
+          python scripts/check_packaging.py > packaging.log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content packaging.log -Tail 100
+          if ($code -ne 0) {
+            Get-Content packaging.log -Tail 40 | ForEach-Object { "::error::packaging: $_" }
+            exit $code
+          }
