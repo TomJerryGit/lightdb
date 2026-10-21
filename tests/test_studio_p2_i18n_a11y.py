@@ -100,6 +100,13 @@ def main_window(tmp_path, monkeypatch):
     win = MainWindow(cfg)
     # 避免事件循环里延迟启动（插件注入会计入菜单文本，不影响本测试目标）
     win.do_startup_restore = lambda: None
+    # 关键：MainWindow 构造时 QTimer.singleShot(0, 原 do_startup_restore) 已绑定
+    # 原方法；若等到测试里第一次 processEvents 才触发，会把状态栏改成
+    # “已跳过自动连接…”（CI 上真实发生过，本地时序可能不同）。这里先主动
+    # 冲掉启动期事件，再把状态栏复位到“就绪”，消除时序依赖。
+    qapp().processEvents()
+    win._set_status(i18n.t('status.ready'))
+    win.conn_label.setText(i18n.t('status.disconnected'))
     win.history.path = tmp_path / 'history.json'
     yield win
     try:
