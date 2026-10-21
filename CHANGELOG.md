@@ -108,6 +108,23 @@
 - **门禁**：24 条失败测试按根因处置（真实缺陷修复 + 带 reason 的 skip/xfail），
   当前基线见 README「测试套件」（0 failed）。
 
+### Fixed（2026-10-21，GitHub Windows runner 兼容）
+
+- **`DATE_FORMAT` 非 ASCII 字面量**：`%Y年%m月%d日` 在 cp1252 环境（GitHub
+  windows-latest）下 `strftime` 抛 `UnicodeEncodeError`，旧实现返回 `None`。
+  新增 `datetime_funcs._format_dt()`：先尝试平台 `strftime`，失败时把非 ASCII
+  字面量替换为 ASCII 占位符、格式化后还原；`DATE_FORMAT` / `FROM_UNIXTIME`
+  改用它。新增回归测试
+  `tests/test_v3_batch4.py::test_date_format_unicode_literals_on_ascii_locale`
+  （用 wrapper 模拟 `UnicodeEncodeError`，不依赖运行机器的 locale）。
+- **GitHub CI 输出编码**：workflow 加 `PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8`；
+  `scripts/ci_annotate_pytest.py` 强制 UTF-8 输出（注解步骤此前也因中文失败）。
+- **多进程 Worker 元数据**：`RemoteDB` 补 `database_names()`/`visible_table_names()`，
+  Master 快照带 `database_names`/`visible_tables`，修复 worker 上 `SHOW TABLES`
+  1049 "No database selected"。
+- **服务端 TLS 限制如实标注**：`ssl_enabled` 目前不生效，`tests/test_batch14.py::test_ssl`
+  在有机 openssl 环境显式 skip；已列入 Known limitations 与路线图 P2。
+
 ### Known limitations
 
 - **服务端 TLS/SSL 尚未接线**：`Config.ssl_enabled` 与 `security.ssl_support.SSLManager`

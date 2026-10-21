@@ -405,6 +405,38 @@ def test_variable_executor():
         print(f"  ✅ 只读变量拒绝: {e}")
 
 
+def test_date_format_unicode_literals_on_ascii_locale():
+    """CI 回归（2026-10-21）：DATE_FORMAT 的非 ASCII 字面量不能依赖 locale 编码。
+
+    GitHub Windows runner 是 cp1252，`strftime('%Y年%m月%d日')` 会
+    UnicodeEncodeError → 旧实现返回 None。用 wrapper 模拟该异常，验证
+    `_format_dt` 的占位符兜底仍然输出正确中文。
+    """
+    from datetime import datetime
+    from lightdb.sql.functions.datetime_funcs import (
+        DATETIME_FUNCTIONS, _format_dt)
+
+    d = datetime(2025, 1, 15, 14, 30, 45)
+    assert DATETIME_FUNCTIONS['DATE_FORMAT'](
+        '2025-01-15 14:30:45', '%Y年%m月%d日') == '2025年01月15日'
+
+    class _Cp1252Like:
+        def __init__(self, real):
+            self.real = real
+            self.calls = 0
+
+        def strftime(self, fmt):
+            self.calls += 1
+            if self.calls == 1:                 # 第一次模拟平台编码失败
+                raise UnicodeEncodeError('cp1252', str(fmt), 0, 1,
+                                         'character maps to <undefined>')
+            return self.real.strftime(fmt)
+
+    fake = _Cp1252Like(d)
+    assert _format_dt(fake, '%Y年%m月%d日') == '2025年01月15日'
+    assert fake.calls == 2, '兜底应重试一次 strftime（占位符版本）'
+
+
 def main():
     print("=" * 60)
     print("  v3.0 Batch 4 测试 - 功能补齐")

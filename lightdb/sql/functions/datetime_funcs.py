@@ -6,6 +6,48 @@ import time
 from datetime import datetime, date, timedelta
 from typing import Any, Optional
 
+#: 匹配一个 strftime 转换指令：%Y / %-d / %_m / %04Y / %% 等。
+#: 注意必须**带捕获组**：下面用 `re.split` 时要把指令保留在结果里
+#: （否则字面量/指令的位置全部错位，中文兜底会丢掉 `%Y` 等指令）。
+_STRFTIME_DIRECTIVE = re.compile(
+    r'(%(?:[-_0^#]*\d*(?:\.\d+)?[A-Za-z%]))')
+
+
+def _format_dt(dt, fmt: str) -> str:
+    """`dt.strftime(fmt)`，但对**非 ASCII 字面量**做平台无关兜底。
+
+    MySQL `DATE_FORMAT(dt, '%Y年%m月%d日')` 里的中文是字面量，不是转换指令。
+    CPython 的 `strftime` 在 Windows 上会按当前 locale 的 ANSI 代码页编码整个
+    格式串：GitHub Windows runner（en-US/cp1252）遇到中文会抛
+    `UnicodeEncodeError`，本函数返回 None（2026-10-21 CI 实测
+    `test_v3_batch4::test_datetime_functions` 正是此原因失败）。
+
+    兜底策略：把非 ASCII 的字面量片段替换成 ASCII 占位符 → `strftime` →
+    还原。转换指令本身保持 Python 语义（已由 date_format 把 MySQL 指令换掉）。
+    """
+    try:
+        return dt.strftime(fmt)
+    except (UnicodeEncodeError, LookupError):
+        pass
+
+    protected = []
+
+    def _protect(text: str) -> str:
+        if not text or all(ord(ch) < 128 for ch in text):
+            return text
+        tag = f'@@LDBLIT{len(protected)}@@'
+        protected.append(text)
+        return tag
+
+    parts = _STRFTIME_DIRECTIVE.split(fmt)
+    # re.split(带捕获组) → [字面量, 指令, 字面量, 指令, ..., 字面量]
+    for i in range(0, len(parts), 2):
+        parts[i] = _protect(parts[i])
+    out = dt.strftime(''.join(parts))
+    for i, text in enumerate(protected):
+        out = out.replace(f'@@LDBLIT{i}@@', text)
+    return out
+
 
 # ==================== 当前时间 ====================
 
@@ -45,7 +87,7 @@ def unix_timestamp(dt=None) -> int:
 def from_unixtime(ts, fmt='%Y-%m-%d %H:%M:%S') -> Optional[str]:
     """FROM_UNIXTIME"""
     try:
-        return datetime.fromtimestamp(int(ts)).strftime(fmt)
+        return _format_dt(datetime.fromtimestamp(int(ts)), fmt)
     except Exception:
         return None
 
@@ -190,7 +232,7 @@ def date_format(d, fmt) -> Optional[str]:
     fmt = fmt.replace('%T', '%H:%M:%S')
 
     try:
-        return dt.strftime(fmt)
+        return _format_dt(dt, fmt)
     except Exception:
         return None
 
