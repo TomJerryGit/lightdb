@@ -199,9 +199,9 @@
 
 ### 实测基线（2026-10-20 下午，全量 pytest + benchmark）
 
-- 全量 pytest：**1131 用例 = 1089 passed / 0 failed / 40 skipped / 1 xfailed /
-  1 xpassed**（2026-10-21，GUI P2 可视化后；GitHub Windows runner CI
-  run `39535395829` 同版本全绿，含 benchmark gate + packaging）；
+- 全量 pytest：**1182 用例 = 1140 passed / 0 failed / 40 skipped / 1 xfailed /
+  1 xpassed**（2026-10-21，P2 元数据/备份/TLS/插件后；GitHub Windows runner CI
+  run `39548734259` 同版本全绿，含 benchmark gate + packaging）；
 - `benchmarks.run --suite quick --gate`：**PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、
   dispatch 对拍不一致=0）；
 - `scripts/check_packaging.py`：PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源）；

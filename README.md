@@ -203,6 +203,12 @@
   菜单/工具栏注入 `install_actions`（主窗口启动时接线）、错误可见、状态文件损坏回退；
   插件管理面板（列表/启停/重载/刷新/打开目录/安装）。新测试 16 passed，全 Studio 套件
   179 passed/1 skipped，真实 GUI 3/3 PASS；详见路线图 §17。**P2 已完成 6/9 项**。
+- **GUI P2 i18n/可访问性已实施（2026-10-21）**：zh_CN/en_US 两套文案 **134 key 完全一致**
+  （覆盖主窗口菜单/工具栏/状态栏/标签页/空态/设置对话框），**语言热切换**即时重译（不重启）
+  + 设置持久化；未知 key 回退并记录 missing（`t_strict` 严格接口）；高 DPI 明确“由系统/
+  Qt6 自动控制”（不提供假设置）；关键控件 accessibleName/tooltip + 合理 Tab 顺序。
+  新测试 8 passed，全 Studio 套件 188 passed/1 skipped，真实 GUI 3/3 PASS（中英截图）；
+  详见路线图 §18。**P2 剩余仅 Web/GUI 能力对齐**。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip
@@ -277,9 +283,9 @@
   [docs/V4_DECISION.md](docs/V4_DECISION.md)、[docs/V4_RELEASE_NOTES.md](docs/V4_RELEASE_NOTES.md)
   顶部；本次收尾补齐了其余仍把上述数字当实测陈述的文档。
 
-- 一次完整测试运行的结果（2026-10-21，GUI P2 可视化之后）：
-  **1131 个用例中 1089 通过 / 0 失败 / 40 跳过 / 1 xfailed / 1 xpassed**（GitHub
-  Windows runner CI run `39535395829` 全绿；P2 可视化新增 24 passed + 1 skipped），
+- 一次完整测试运行的结果（2026-10-21，P2 元数据/备份/TLS/插件批次之后）：
+  **1182 个用例中 1140 通过 / 0 失败 / 40 跳过 / 1 xfailed / 1 xpassed**（GitHub
+  Windows runner CI run `39548734259` 全绿；本批新增 51 例），
   skip/xfail 均带明确原因，见下方「测试套件」说明与
   [docs/analysis_2026-10-19/06_ROADMAP.md](docs/analysis_2026-10-19/06_ROADMAP.md) §1）。
 
@@ -399,7 +405,7 @@
 
 **端到端实测**（真实 pymysql 客户端）：`CREATE TABLE` / `INSERT` / `SELECT *` / `COUNT(*)` / `UPDATE` / `DELETE` / `WHERE` 过滤全部返回正确结果。
 
-**测试套件**（2026-10-21 GUI P2 可视化后的门禁基线）：**1131 用例 = 1089 通过 / 0 失败 / 40 跳过 / 1 xfailed / 1 xpassed**（GitHub Windows runner CI run `39535395829` 全绿；本轮优化开始时是 150 通过 / 118 失败）。**失败数保持 0**——原 24 条失败按根因处置：
+**测试套件**（2026-10-21 GUI P2 元数据/备份/TLS/插件后的门禁基线）：**1182 用例 = 1140 通过 / 0 失败 / 40 跳过 / 1 xfailed / 1 xpassed**（GitHub Windows runner CI run `39548734259` 全绿；本轮优化开始时是 150 通过 / 118 失败）。**失败数保持 0**——原 24 条失败按根因处置：
 - **真实缺陷已修**：`row_format` DECIMAL 编码 TypeError、CLI `-h/--host` 与 argparse 内建 `-h` 冲突（Windows CLI 必崩）、诊断 CLI 的 emoji 在 GBK 控制台崩溃；权限体系（GRANT/REVOKE/鉴权，已接线，2 条 GRANT 用例恢复为正式测试）；半同步死代码已删除（原 xfail 移除）；
 - **OLAP 4A.5 门禁化**：原 3 条性能类 skip 换成实测基线阈值并恢复正式测试（编码压缩率 2.5x vs 实测 2.78x；OLAP 聚合 2.0M rows/s vs 实测 2.72M；并行 1.2x vs 实测 2.75x，<4 核环境按 reason skip）；新增并行 GROUP BY 门禁与 dispatch 对拍门禁；
 - **带明确 reason 的 skip/xfail**（不是无声绿）：`parser_v3b4` 死代码（×2）、`row_format` 实验格式性能目标、沙箱写权限（×2）、诊断子进程 `DuplicateHandle` 沙箱限制、IPC 延迟阈值防抖、`lineage_enhanced` 列级血缘已知缺陷、mysql-connector 未安装时的端到端 skip；

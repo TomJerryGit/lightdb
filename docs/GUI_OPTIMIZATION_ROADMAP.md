@@ -68,7 +68,7 @@
 | **P1-5 DataEditor 类型编辑** | 按列类型给编辑器（日期选择器、布尔下拉、NULL 开关、JSON 文本校验）；批量修改事务提交；乐观锁（updated_at/版本列，若表有） | `ui/data_editor.py` | 日期列不能输非法值；NULL 可设；批量 100 行提交原子（失败全回滚） |
 | **P1-6 对象树懒加载与右键菜单** | 展开表才加载列/索引/触发器；右键：复制名/查看 DDL/刷新/生成 SELECT；搜索框支持模糊过滤 | `ui/object_tree.py` | 1000 张表首屏 <500ms；右键动作可用；搜索即过滤 |
 
-## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5/P2-8 + 服务端 TLS 已完成 2026-10-21，见 §13–§17；Web/GUI 对齐、i18n/可访问性待续）
+## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5/P2-8 + 服务端 TLS + i18n/可访问性已完成 2026-10-21，见 §13–§18；仅 Web/GUI 能力对齐待续）
 
 1. **ER 图/关系图**：当前引擎没有真实外键约束（`CREATE TABLE` 接受 FOREIGN KEY 但
    是否强制需核实【待验证】），ER 图应**只用真实元数据**（主键/索引/列注释）或让用户
@@ -268,5 +268,18 @@ test_wire_transaction` = 19 passed。**P2 剩余**：Web/GUI 对齐、i18n/可�
 
 **风险**：reload 会重新实例化插件（实例内存状态丢失）；禁停状态默认写用户目录（可注入）；
 主窗口只在启动安装一次，面板启停后不自动重装（避免重复 action，后续可加 listener 清理）。
-**P2 剩余**：Web/GUI 能力对齐、i18n/可访问性（`utils/i18n.py` 已有基础，需覆盖率与 a11y）。
+**P2 剩余**：Web/GUI 能力对齐（i18n/可访问性已在本轮完成，见 §18）。
+
+## 18. 实施记录：P2 i18n/可访问性已完成（2026-10-21）
+
+| 项 | 实现 | 验收证据 |
+|---|---|---|
+| i18n 字典 | `utils/i18n.py`：zh_CN/en_US 扩到 **134 key 且集合完全一致**；新增 `t_strict`/`missing()`/`missing_keys()`/`missing_report()`/`check_coverage()`/`key_set()`/`reset_missing()`；未知 key 原样返回并记录、格式化失败记录、未知语言拒绝并告警 | 两语言 key 集合一致无空值、coverage ok；`t('result.rows', n=3)` 中英格式化正确；未知 key 回退+记录；`t_strict` 缺失抛 KeyError |
+| 语言热切换 | `main_window.py`：菜单/菜单项/工具栏全部走 i18n key；状态栏 ready/connected/disconnected；查询标签页/编辑器 placeholder/结果空态；`_retranslate_ui()` 切换时即时刷新；设置关闭后重新应用/重译 | 切 en → 菜单 `&File`、工具栏 `▶ Execute`、状态 `Ready`、连接 `Disconnected`、标签 `Query`、空态英文；切回 zh 恢复；已翻译项无 CJK |
+| 设置持久化 | `settings_dialog.py`：标题/tab/标签/按钮 i18n；语言 Apply 即 `settings.save()` + `i18n.set_lang()` 立即切换；高 DPI 行明确写“自动（由系统/Qt6 High-DPI 控制）”，不提供假设置 | 设置切 en → `settings.json` 写入、`Settings.load()` round-trip、主窗口立即英文；新窗口读持久化 en；高 DPI 说明存在 |
+| 可访问性 | `_setup_accessibility()`：主窗口/对象树/编辑器/结果表/工具栏/状态栏 accessibleName+tooltip；`_setup_tab_order()`：对象树→编辑器→结果表→中央标签→右侧面板；QAction 文本/提示非空 | a11y 非空、Tab 顺序 5 控件无重复且顺序正确；执行/取消动作文本+提示非空 |
+| 验证 | 新增 `tests/test_studio_p2_i18n_a11y.py`：**8 passed**；全 studio 套件 **188 passed / 1 skipped**；compileall OK；真实 GUI `p2_i18n_check.py` **3/3 PASS**、5 张截图（`shots_p2_i18n/`：中文主窗口、设置 zh/en、英文主窗口、切回中文） | 既有证据未动 |
+
+**风险**：本轮覆盖主窗口+设置对话框；历史面板/env bar/插件/快照等其余面板文案仍中文（后续批次）；
+高 DPI 依据 Qt6 自动策略不覆盖；主题/字体品牌名保持双语。**P2 剩余**：Web/GUI 能力对齐。
 

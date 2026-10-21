@@ -7,7 +7,7 @@ import time
 from PySide6.QtWidgets import (
     QMainWindow, QDockWidget, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QToolBar, QStatusBar, QMessageBox, QFileDialog,
-    QSplitter, QLabel, QInputDialog, QDialog, QLineEdit,
+    QSplitter, QLabel, QInputDialog, QDialog, QLineEdit, QMenu,
 )
 from PySide6.QtCore import Qt, QSize, QTimer, QThreadPool
 from PySide6.QtGui import QAction, QKeySequence
@@ -38,7 +38,7 @@ from ..core.catalog import CatalogEngine
 from ..core.metrics import get_registry
 
 # ---------- i18n ----------
-from ..utils.i18n import i18n
+from ..utils.i18n import i18n, STRINGS
 from ..utils.history import QueryHistory
 
 # ---------- DB 错误字段（errno / sqlstate / message，绝不丢） ----------
@@ -216,6 +216,7 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._build_ui()
         self._build_toolbar()
+        self._setup_accessibility()
         self._apply_settings()
 
         # 启动后台服务
@@ -333,7 +334,7 @@ class MainWindow(QMainWindow):
         self.object_tree.query_requested.connect(self._on_query_requested)
         self.object_tree.new_query_requested.connect(self._open_sql_in_new_tab)
 
-        self.tree_dock = QDockWidget("对象浏览器", self)
+        self.tree_dock = QDockWidget(i18n.t('tab.object_browser'), self)
         self.tree_dock.setWidget(self.object_tree)
         self.tree_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
@@ -343,34 +344,40 @@ class MainWindow(QMainWindow):
         # 右侧：多功能 Tab
         self.right_tabs = QTabWidget()
         self.right_tabs.setTabPosition(QTabWidget.North)
+        self._right_tab_title_keys = {}
 
         # 首屏可见的右侧标签（右侧工具面板的第一个标签是"历史"）：
         # 这两个面板很小（历史 0.7ms / 片段 ~1ms）且首屏就在前台，直接建。
         self.history_panel = QueryHistoryPanel(self.history)
         self.history_panel.sql_selected.connect(self._insert_history_sql)
-        self.right_tabs.addTab(self.history_panel, "历史")
+        idx = self.right_tabs.addTab(self.history_panel, i18n.t('tab.history'))
+        self._right_tab_title_keys[idx] = 'tab.history'
 
         self.snippet_panel = SnippetPanel(self.snippet_mgr)
         self.snippet_panel.snippet_activated.connect(self._insert_sql_to_editor)
-        self.right_tabs.addTab(self.snippet_panel, "片段")
+        idx = self.right_tabs.addTab(self.snippet_panel, i18n.t('tab.snippets'))
+        self._right_tab_title_keys[idx] = 'tab.snippets'
 
         # 其余四个面板首屏看不到（右侧面板当前停在"历史"），构造它们是纯浪费：
         # 实测 AI 11ms + Agent(含 AIAgent) 19ms + 协作 7ms + 目录 27ms。
         # 这里先占位，**首次切到该标签（或首次访问 `win.ai_chat` 等属性）时**
         # 才真正构造，见 `_ensure_right_tab` / `__getattr__`。
         self._right_tab_index = {}
-        for attr, title in (('ai_chat', 'AI'), ('agent_chat', 'Agent'),
-                            ('collab_panel', '协作'),
-                            ('catalog_panel', '目录')):
+        for attr, title_key in (('ai_chat', 'tab.ai'),
+                                ('agent_chat', 'tab.agent'),
+                                ('collab_panel', 'tab.collab'),
+                                ('catalog_panel', 'tab.catalog')):
             ph = QWidget()
-            self._right_tab_index[attr] = self.right_tabs.addTab(ph, title)
+            idx = self.right_tabs.addTab(ph, i18n.t(title_key))
+            self._right_tab_index[attr] = idx
+            self._right_tab_title_keys[idx] = title_key
         self.right_tabs.currentChanged.connect(self._on_right_tab_changed)
         if _LEGACY_STARTUP:                 # 对照测量用：立即建（老行为）
             for _attr in list(self._right_tab_index):
                 self._ensure_right_tab(_attr)
             self.right_tabs.setCurrentIndex(0)
 
-        self.right_dock = QDockWidget("工具面板", self)
+        self.right_dock = QDockWidget(i18n.t('tab.tools'), self)
         self.right_dock.setWidget(self.right_tabs)
         self.right_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
@@ -447,7 +454,8 @@ class MainWindow(QMainWindow):
             if old is not None and old is not panel:
                 old.setParent(None)
                 old.deleteLater()
-            self.right_tabs.insertTab(idx, panel, self._right_tab_titles[attr])
+            self.right_tabs.insertTab(
+                idx, panel, i18n.t(self._right_tab_titles[attr]))
             if self.right_tabs.widget(idx) is not panel:
                 for i in range(self.right_tabs.count()):
                     if self.right_tabs.widget(i) is panel:
@@ -461,8 +469,9 @@ class MainWindow(QMainWindow):
         finally:
             self._right_tab_building = False
 
-    _right_tab_titles = {'ai_chat': 'AI', 'agent_chat': 'Agent',
-                         'collab_panel': '协作', 'catalog_panel': '目录'}
+    _right_tab_titles = {'ai_chat': 'tab.ai', 'agent_chat': 'tab.agent',
+                         'collab_panel': 'tab.collab',
+                         'catalog_panel': 'tab.catalog'}
 
     def _on_right_tab_changed(self, idx):
         for attr, i in self._right_tab_index.items():
@@ -701,10 +710,11 @@ class MainWindow(QMainWindow):
         m_help.addAction(a)
 
     def _build_toolbar(self):
-        tb = QToolBar("主工具栏")
+        tb = QToolBar(i18n.t('toolbar.title'))
         tb.setIconSize(QSize(18, 18))
         tb.setMovable(False)
         self.addToolBar(tb)
+        self._main_toolbar = tb
 
         items = [
             ("🔌 连接", self._new_connection),
@@ -741,13 +751,13 @@ class MainWindow(QMainWindow):
         # 用只读 QLineEdit 而不是 QLabel：完整错误文本可以在状态栏里
         # 直接选中复制（以前是 `any_error[:80]` 静默截断，后面的诊断信息
         # 用户永远看不到）。用 QLineEdit 仍然保持单行高度与横向滚动。
-        self.status_label = QLineEdit("就绪")
+        self.status_label = QLineEdit(i18n.t('status.ready'))
         self.status_label.setReadOnly(True)
         self.status_label.setFrame(False)
         self.status_label.setStyleSheet(
             "QLineEdit { background: transparent; border: none; color: #cccccc; }")
         sb.addWidget(self.status_label)
-        self.conn_label = QLabel("未连接")
+        self.conn_label = QLabel(i18n.t('status.disconnected'))
         sb.addPermanentWidget(self.conn_label)
 
     def _set_status(self, text: str, error: bool = False, tooltip: str = None):
@@ -773,7 +783,18 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([220, 460])
 
-        idx = self.tabs.addTab(splitter, "查询")
+        idx = self.tabs.addTab(splitter, i18n.t('tab.query'))
+        # P2 i18n / 可访问性：编辑器空态提示 + accessibleName
+        try:
+            editor.setPlaceholderText(i18n.t('editor.empty_hint'))
+            editor.setAccessibleName(i18n.t('a11y.sql_editor'))
+            editor.setToolTip(i18n.t('a11y.sql_editor'))
+            result.setAccessibleName(i18n.t('a11y.result_table'))
+            result.setToolTip(i18n.t('a11y.result_table'))
+            if hasattr(result, 'show_message'):
+                result.show_message(i18n.t('result.empty'))
+        except Exception:
+            pass
         # P1-1：真实 UI 执行走后台 worker（不冻结主线程）
         editor.execute_requested.connect(
             lambda sql, e=editor, r=result: self._execute_sql_async(sql, e, r))
@@ -1893,7 +1914,10 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec() == QDialog.Accepted:
+            # 语言可能已变：重新应用主题/字体并热重译主窗口
+            i18n.set_lang(self.settings.language)
             self._apply_settings()
+            self._retranslate_ui()
 
     def _open_profiler(self):
         dlg = QDialog(self)
@@ -2054,8 +2078,187 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_lang_changed(self):
+    # ==================== 设置 / i18n / 可访问性 ====================
+
+    def _setup_i18n_refs(self):
+        """收集菜单/工具栏中文本与 i18n 字典值相同的 key（只存 key，不存 QWidget，
+        避免 PySide 包装对象跨函数生命周期问题）。"""
+        self._i18n_key_of_text = {}
+        for lang in STRINGS:
+            for key, text in STRINGS[lang].items():
+                self._i18n_key_of_text.setdefault(text, key)
+        self._i18n_menus = []
+        self._i18n_actions = []
+        self._i18n_toolbar = []
+        try:
+            for menu in self.menuBar().findChildren(QMenu):
+                key = self._i18n_key_of_text.get(menu.title())
+                if key:
+                    self._i18n_menus.append(key)
+                for act in menu.actions():
+                    if act.isSeparator():
+                        continue
+                    key = self._i18n_key_of_text.get(act.text())
+                    if key:
+                        self._i18n_actions.append(key)
+        except Exception:
+            pass
+        tb = getattr(self, '_main_toolbar', None)
+        if tb is not None:
+            for act in tb.actions():
+                if act.isSeparator():
+                    continue
+                key = self._i18n_key_of_text.get(act.text())
+                if key:
+                    self._i18n_toolbar.append(key)
+        return {'menus': list(self._i18n_menus),
+                'actions': list(self._i18n_actions),
+                'toolbar': list(self._i18n_toolbar)}
+
+    def _translate_state_text(self, text, keys):
+        for key in keys:
+            old_values = {STRINGS[lang].get(key) for lang in STRINGS
+                          if key in STRINGS[lang]}
+            if text in old_values:
+                return i18n.t(key)
+        return None
+
+    def _retranslate_ui(self):
+        """语言热切换：立即重译菜单/工具栏/状态栏/标签页/空态/accessibleName。"""
+        # 先按当前（可能是旧语言）文本建立反向映射，再逐个 setText
+        key_of_text = {}
+        for lang in STRINGS:
+            for key, text in STRINGS[lang].items():
+                key_of_text.setdefault(text, key)
+        try:
+            for menu in self.menuBar().findChildren(QMenu):
+                key = key_of_text.get(menu.title())
+                if key:
+                    menu.setTitle(i18n.t(key))
+                for act in menu.actions():
+                    if act.isSeparator():
+                        continue
+                    key = key_of_text.get(act.text())
+                    if key:
+                        act.setText(i18n.t(key))
+        except Exception:
+            pass
+        tb = getattr(self, '_main_toolbar', None)
+        if tb is not None:
+            tb.setWindowTitle(i18n.t('toolbar.title'))
+            tb.setAccessibleName(i18n.t('a11y.toolbar'))
+            for act in tb.actions():
+                if act.isSeparator():
+                    continue
+                key = key_of_text.get(act.text())
+                if key:
+                    act.setText(i18n.t(key))
+                    act.setToolTip(i18n.t(key))
+        cancel = getattr(self, '_cancel_action', None)
+        if cancel is not None:
+            cancel.setToolTip(i18n.t('action.cancel_query_tip'))
+        # 状态栏（仅翻译已知的通用状态，业务错误文本保持原样不篡改）
+        translated = self._translate_state_text(
+            self.status_label.text(), ('status.ready', 'status.executing'))
+        if translated is not None:
+            self.status_label.setText(translated)
+        connected_old = {STRINGS[lang]['status.connected'] for lang in STRINGS}
+        conn_text = self.conn_label.text()
+        if conn_text in connected_old:
+            self.conn_label.setText(i18n.t('status.connected'))
+        elif self._translate_state_text(
+                conn_text, ('status.disconnected',)) is not None:
+            self.conn_label.setText(i18n.t('status.disconnected'))
+        else:
+            # "已连接: name @ host:port" 这类前缀也随语言切换
+            for lang in STRINGS:
+                prefix = STRINGS[lang].get('status.connected') or ''
+                if prefix and conn_text.startswith(prefix):
+                    self.conn_label.setText(
+                        i18n.t('status.connected') + conn_text[len(prefix):])
+                    break
+        # dock / 标签页标题
+        try:
+            self.tree_dock.setWindowTitle(i18n.t('tab.object_browser'))
+            self.right_dock.setWindowTitle(i18n.t('tab.tools'))
+        except Exception:
+            pass
+        for idx, key in getattr(self, '_right_tab_title_keys', {}).items():
+            if 0 <= idx < self.right_tabs.count():
+                self.right_tabs.setTabText(idx, i18n.t(key))
+        for i in range(self.tabs.count()):
+            widget = self.tabs.widget(i)
+            if isinstance(widget, QSplitter) and widget.widget(0) is not None:
+                self.tabs.setTabText(i, i18n.t('tab.query'))
+                try:
+                    editor = widget.widget(0)
+                    result = widget.widget(1)
+                    editor.setPlaceholderText(i18n.t('editor.empty_hint'))
+                    editor.setAccessibleName(i18n.t('a11y.sql_editor'))
+                    editor.setToolTip(i18n.t('a11y.sql_editor'))
+                    result.setAccessibleName(i18n.t('a11y.result_table'))
+                    result.setToolTip(i18n.t('a11y.result_table'))
+                    if getattr(result, 'table', None) is not None and \
+                            result.table.rowCount() == 0:
+                        result.show_message(i18n.t('result.empty'))
+                except Exception:
+                    pass
+        # 可访问性名称
+        self.setAccessibleName(i18n.t('a11y.main_window'))
+        self.tabs.setAccessibleName(i18n.t('a11y.tabs'))
+        self.status_label.setAccessibleName(i18n.t('a11y.status'))
+        self.conn_label.setAccessibleName(i18n.t('a11y.status'))
+        try:
+            self.menuBar().setAccessibleName(i18n.t('a11y.main_window'))
+            self.object_tree.setAccessibleName(i18n.t('a11y.object_tree'))
+            self.object_tree.setToolTip(i18n.t('a11y.object_tree'))
+            self.object_tree.tree.setAccessibleName(i18n.t('a11y.object_tree'))
+        except Exception:
+            pass
         self.setWindowTitle(f"{i18n.t('app.title')} v1.0")
+        # 刷新 key 列表（供测试/下一次热切换使用；只存字符串 key，不存 QWidget）
+        try:
+            self._setup_i18n_refs()
+        except Exception:
+            pass
+
+    def _setup_tab_order(self):
+        """合理 Tab 顺序：对象树 → SQL 编辑器 → 结果表 → 中央标签 → 右侧面板。"""
+        widgets = []
+        try:
+            widgets.append(self.object_tree.tree)
+            editor, result = self._current_widgets()
+            if editor is not None:
+                widgets.append(editor)
+            if result is not None:
+                widgets.append(result)
+            widgets.append(self.tabs)
+            widgets.append(self.right_tabs)
+            widgets = [w for w in widgets if isinstance(w, QWidget)]
+            for first, second in zip(widgets, widgets[1:]):
+                QWidget.setTabOrder(first, second)
+            self.tab_order_widgets = widgets
+            self._tab_order_configured = len(widgets) >= 2
+        except Exception:
+            self.tab_order_widgets = []
+            self._tab_order_configured = False
+
+    def _setup_accessibility(self):
+        """初始化可访问性：accessibleName/toolTip + Tab 顺序 + 语言热切换初译。"""
+        self._setup_i18n_refs()
+        self._retranslate_ui()
+        self._setup_tab_order()
+        try:
+            self.setAccessibleName(i18n.t('a11y.main_window'))
+            self.object_tree.setAccessibleName(i18n.t('a11y.object_tree'))
+            self.object_tree.tree.setAccessibleName(i18n.t('a11y.object_tree'))
+            self.tabs.setAccessibleName(i18n.t('a11y.tabs'))
+            self.status_label.setAccessibleName(i18n.t('a11y.status'))
+        except Exception:
+            pass
+
+    def _on_lang_changed(self):
+        self._retranslate_ui()
 
     # ==================== 关于 / 关闭 ====================
 

@@ -173,6 +173,17 @@
   新增 `tests/test_studio_p2_plugin.py`（16 passed，含主窗口安装接线）；全 studio 套件
   179 passed/1 skipped；compileall OK；真实 GUI `p2_plugin_check.py` 3/3 PASS、5 张截图。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §17。
+- **GUI P2 i18n/可访问性（2026-10-21）**：
+  ① `utils/i18n.py`：zh_CN/en_US 扩到 **134 key 且集合完全一致**（主窗口菜单/工具栏/状态栏/
+  标签页/空态/设置对话框）；新增 `t_strict`/`missing()`/`missing_report()`/`check_coverage()`
+  等；未知 key 原样返回并记录（不崩溃）、未知语言拒绝告警；
+  ② 语言**热切换**：`main_window._retranslate_ui()` 即时刷新菜单/工具栏/状态栏/标签页/空态/
+  accessibleName；设置对话框语言 Apply 即持久化 `settings.json` 并立即切换（新窗口读持久化值）；
+  ③ 可访问性：关键控件 accessibleName/tooltip、合理 Tab 顺序（对象树→编辑器→结果表→标签→
+  右侧面板）；高 DPI 明确“由系统/Qt6 自动控制”，不提供假设置；
+  ④ 测试 `tests/test_studio_p2_i18n_a11y.py`（8 passed）；全 studio 套件 188 passed/1 skipped；
+  真实 GUI `p2_i18n_check.py` 3/3 PASS、5 张中英截图。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §18。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。
