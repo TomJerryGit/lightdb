@@ -17,9 +17,12 @@ import re
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPlainTextEdit, QToolBar, QPushButton,
-    QLabel, QHBoxLayout, QMessageBox, QTextEdit, QCompleter,
+    QLabel, QHBoxLayout, QMessageBox, QTextEdit, QCompleter, QLineEdit,
+    QCheckBox, QGridLayout, QInputDialog,
 )
-from PySide6.QtCore import Qt, Signal, QRect, QSize, QTimer, QStringListModel
+from PySide6.QtCore import (
+    Qt, Signal, QRect, QSize, QTimer, QStringListModel, QRegularExpression,
+)
 from PySide6.QtGui import (
     QFont, QPainter, QColor, QTextFormat, QKeySequence, QShortcut,
     QTextCursor, QTextCharFormat,
@@ -69,6 +72,8 @@ class LineNumberArea(QWidget):
 class SQLEditor(QPlainTextEdit):
     execute_requested = Signal(str)             # 执行全文
     execute_selection_requested = Signal(str)   # 执行选中
+    # G1：执行光标所在语句（分号切分）
+    execute_statement_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -85,6 +90,12 @@ class SQLEditor(QPlainTextEdit):
         self._schema_cache = ([], {})
         self._error_span = None            # (start, length)
         self._error_info = None            # {'token','line','column','errno'}
+        # ---- G1 查找/替换状态 ----
+        self._find_matches = []             # [(start, length)]
+        self._find_index = -1
+        self._find_bar_visible = False
+        self.find_error = ''
+        self.last_action_error = ''
 
         self.line_number_area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_line_number_area_width)
@@ -103,6 +114,21 @@ class SQLEditor(QPlainTextEdit):
         # 手动补全
         QShortcut(QKeySequence("Ctrl+Space"), self,
                   lambda: self.show_completion(force=True))
+        # ---- G1 编辑器细节快捷键 ----
+        QShortcut(QKeySequence("Ctrl+F"), self,
+                  lambda: self.open_find_bar(replace=False))
+        QShortcut(QKeySequence("Ctrl+H"), self,
+                  lambda: self.open_find_bar(replace=True))
+        QShortcut(QKeySequence("Ctrl+R"), self,
+                  lambda: self.open_find_bar(replace=True))
+        QShortcut(QKeySequence("Ctrl+L"), self, self.goto_line_dialog)
+        QShortcut(QKeySequence("Ctrl+/"), self, self.toggle_comment)
+        QShortcut(QKeySequence("Ctrl+D"), self, self.duplicate_line)
+        QShortcut(QKeySequence("Alt+Up"), self, lambda: self.move_line(-1))
+        QShortcut(QKeySequence("Alt+Down"), self, lambda: self.move_line(1))
+        QShortcut(QKeySequence("Ctrl+Shift+E"), self,
+                  self.execute_current_statement)
+        self._build_find_bar()
 
     # ==================== 行号区域 ====================
 
@@ -166,6 +192,20 @@ class SQLEditor(QPlainTextEdit):
             sel.format.setProperty(QTextFormat.FullWidthSelection, True)
             sel.cursor = self.textCursor()
             sel.cursor.clearSelection()
+            extra.append(sel)
+        for idx, (start, length) in enumerate(getattr(self, '_find_matches', [])):
+            if length <= 0:
+                continue
+            sel = QTextEdit.ExtraSelection()
+            if idx == getattr(self, '_find_index', -1):
+                sel.format.setBackground(QColor('#d7ba7d'))
+                sel.format.setForeground(QColor('#1e1e1e'))
+            else:
+                sel.format.setBackground(QColor('#264f78'))
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(start)
+            cursor.setPosition(start + length, QTextCursor.KeepAnchor)
+            sel.cursor = cursor
             extra.append(sel)
         if self._error_span:
             start, length = self._error_span
@@ -452,6 +492,370 @@ class SQLEditor(QPlainTextEdit):
 
     def error_highlight_info(self) -> dict:
         return dict(self._error_info) if self._error_info else None
+
+    # ==================== G1 查找 / 替换 / 行操作 ====================
+
+    def _build_find_bar(self):
+        self.find_bar = QWidget(self)
+        self.find_bar.setObjectName('find_bar')
+        lay = QGridLayout(self.find_bar)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(4)
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText('查找...')
+        self.find_edit.setAccessibleName('查找内容')
+        self.find_edit.returnPressed.connect(self.find_next)
+        lay.addWidget(self.find_edit, 0, 0, 1, 3)
+        self.replace_edit = QLineEdit()
+        self.replace_edit.setPlaceholderText('替换为...')
+        self.replace_edit.setAccessibleName('替换内容')
+        lay.addWidget(self.replace_edit, 1, 0, 1, 3)
+        self.find_case = QCheckBox('区分大小写')
+        self.find_whole = QCheckBox('全词')
+        self.find_regex = QCheckBox('正则')
+        for i, cb in enumerate((self.find_case, self.find_whole,
+                                self.find_regex)):
+            lay.addWidget(cb, 2, i)
+        self.find_prev_btn = QPushButton('上一个')
+        self.find_next_btn = QPushButton('下一个')
+        self.replace_btn = QPushButton('替换')
+        self.replace_all_btn = QPushButton('全部替换')
+        self.find_close_btn = QPushButton('✕')
+        for i, b in enumerate((self.find_prev_btn, self.find_next_btn,
+                               self.replace_btn, self.replace_all_btn,
+                               self.find_close_btn)):
+            lay.addWidget(b, 3, i)
+        self.find_count_label = QLabel('0/0')
+        lay.addWidget(self.find_count_label, 4, 0)
+        self.find_error_label = QLabel('')
+        self.find_error_label.setStyleSheet('color: #f48771;')
+        lay.addWidget(self.find_error_label, 4, 1, 1, 2)
+        self.find_prev_btn.clicked.connect(self.find_prev)
+        self.find_next_btn.clicked.connect(self.find_next)
+        self.replace_btn.clicked.connect(self.replace_current)
+        self.replace_all_btn.clicked.connect(self.replace_all)
+        self.find_close_btn.clicked.connect(self.close_find_bar)
+        self.find_edit.textChanged.connect(self._refresh_find_matches)
+        for cb in (self.find_case, self.find_whole, self.find_regex):
+            cb.stateChanged.connect(self._refresh_find_matches)
+        self.find_bar.resize(380, 118)
+        self.find_bar.hide()
+        self._find_bar_visible = False
+
+    def _position_find_bar(self):
+        if not getattr(self, 'find_bar', None):
+            return
+        try:
+            self.find_bar.move(max(0, self.width() - self.find_bar.width() - 18),
+                               8)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(
+            QRect(cr.left(), cr.top(),
+                  self.line_number_area_width(), cr.height()))
+        self._position_find_bar()
+
+    def open_find_bar(self, replace=False):
+        """Ctrl+F / Ctrl+H：打开查找/替换条。"""
+        self.find_bar.setVisible(True)
+        self._find_bar_visible = True
+        self.replace_edit.setVisible(bool(replace))
+        self.replace_btn.setVisible(bool(replace))
+        self.replace_all_btn.setVisible(bool(replace))
+        self._position_find_bar()
+        selected = self.textCursor().selectedText()
+        if selected and '\u2029' not in selected:
+            self.find_edit.setText(selected)
+        self.find_edit.setFocus()
+        self.find_edit.selectAll()
+        self._refresh_find_matches()
+        return True
+
+    def close_find_bar(self):
+        self.find_bar.setVisible(False)
+        self._find_bar_visible = False
+        self._find_matches = []
+        self._find_index = -1
+        self._highlight_current_line()
+        return True
+
+    def _search_regex(self):
+        pattern = self.find_edit.text()
+        if not pattern:
+            return None
+        flags = 0 if self.find_case.isChecked() else re.IGNORECASE
+        try:
+            if self.find_regex.isChecked():
+                expr = pattern
+            else:
+                expr = re.escape(pattern)
+            if self.find_whole.isChecked():
+                expr = r'\b(?:' + expr + r')\b'
+            return re.compile(expr, flags)
+        except re.error as exc:
+            self.find_error = f'非法正则: {exc}'
+            self.find_error_label.setText(self.find_error)
+            return None
+
+    def _refresh_find_matches(self, *_args):
+        pattern = self.find_edit.text()
+        self.find_error = ''
+        if self.find_error_label.text():
+            self.find_error_label.setText('')
+        self._find_matches = []
+        self._find_index = -1
+        if pattern:
+            regex = self._search_regex()
+            if regex is not None:
+                text = self.toPlainText()
+                self._find_matches = [(m.start(), m.end() - m.start())
+                                      for m in regex.finditer(text)]
+                if self._find_matches:
+                    self._find_index = 0
+        self._update_find_count()
+        self._highlight_current_line()
+        return len(self._find_matches)
+
+    def _update_find_count(self):
+        total = len(self._find_matches)
+        current = self._find_index + 1 if total and self._find_index >= 0 else 0
+        self.find_count_label.setText(f'{current}/{total}')
+        return total
+
+    def find_count(self):
+        return len(self._find_matches)
+
+    def find_next(self):
+        if not self._find_matches:
+            self._refresh_find_matches()
+        if not self._find_matches:
+            self.find_count_label.setText('0/0')
+            return False
+        self._find_index = (self._find_index + 1) % len(self._find_matches)
+        self._select_current_match()
+        return True
+
+    def find_prev(self):
+        if not self._find_matches:
+            self._refresh_find_matches()
+        if not self._find_matches:
+            return False
+        self._find_index = (self._find_index - 1) % len(self._find_matches)
+        self._select_current_match()
+        return True
+
+    def _select_current_match(self):
+        if not self._find_matches:
+            return
+        start, length = self._find_matches[self._find_index]
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(start)
+        cursor.setPosition(start + length, QTextCursor.KeepAnchor)
+        self.setTextCursor(cursor)
+        self._update_find_count()
+        self._highlight_current_line()
+
+    def replace_current(self):
+        """替换当前匹配；返回是否替换。"""
+        if not self._find_matches:
+            self._refresh_find_matches()
+        if not self._find_matches:
+            return False
+        start, length = self._find_matches[self._find_index]
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(start)
+        cursor.setPosition(start + length, QTextCursor.KeepAnchor)
+        cursor.insertText(self.replace_edit.text())
+        self._refresh_find_matches()
+        return True
+
+    def replace_all(self):
+        """全部替换；返回替换次数（非法正则返回 -1 并显式记录错误）。"""
+        if self._search_regex() is None and self.find_edit.text():
+            return -1
+        if not self._find_matches:
+            self._refresh_find_matches()
+        count = len(self._find_matches)
+        if not count:
+            return 0
+        text = self.toPlainText()
+        regex = self._search_regex()
+        if regex is None:
+            return 0
+        try:
+            new_text = regex.sub(self.replace_edit.text(), text)
+        except re.error as exc:
+            self.find_error = f'替换失败: {exc}'
+            self.find_error_label.setText(self.find_error)
+            return -1
+        self.setPlainText(new_text)
+        self._refresh_find_matches()
+        return count
+
+    def goto_line(self, line: int):
+        """跳转到第 line 行（1-based）并选中该行。"""
+        block = self.document().findBlockByNumber(max(0, int(line) - 1))
+        if not block.isValid():
+            self.last_action_error = f'行号超出范围: {line}'
+            return False
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                            QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cursor)
+        self.centerCursor()
+        return True
+
+    def goto_line_dialog(self):
+        line, ok = QInputDialog.getInt(
+            self, '跳转行', '行号:', self.textCursor().blockNumber() + 1,
+            1, max(1, self.blockCount()))
+        if ok:
+            return self.goto_line(line)
+        return False
+
+    def _selected_or_current_lines(self):
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            start = self.document().findBlock(cursor.selectionStart())
+            end = self.document().findBlock(cursor.selectionEnd())
+        else:
+            start = end = cursor.block()
+        lines = []
+        block = start
+        while block.isValid():
+            lines.append(block)
+            if block == end:
+                break
+            block = block.next()
+        return lines
+
+    def toggle_comment(self):
+        """Ctrl+/：注释/取消注释当前行或选中行（`-- ` 前缀）。"""
+        lines = self._selected_or_current_lines()
+        if not lines:
+            return False
+        all_commented = all(block.text().lstrip().startswith('--')
+                            for block in lines)
+        cursor = self.textCursor()
+        cursor.beginEditBlock()
+        try:
+            for block in lines:
+                text = block.text()
+                if all_commented:
+                    idx = text.find('--')
+                    new_text = text[:idx] + text[idx + 2:]
+                    if new_text.startswith(' '):
+                        new_text = new_text[1:]
+                else:
+                    indent = len(text) - len(text.lstrip())
+                    new_text = text[:indent] + '-- ' + text[indent:]
+                bcursor = QTextCursor(block)
+                bcursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                                     QTextCursor.MoveMode.KeepAnchor)
+                bcursor.insertText(new_text)
+        finally:
+            cursor.endEditBlock()
+        return True
+
+    def duplicate_line(self):
+        """Ctrl+D：复制当前行（选中多行时复制整段选中文本）。"""
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            text = cursor.selectedText().replace('\u2029', '\n')
+            end = QTextCursor(self.document())
+            end.setPosition(cursor.selectionEnd())
+            end.insertText('\n' + text)
+            return True
+        block = cursor.block()
+        text = block.text()
+        end = QTextCursor(block)
+        end.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        end.insertText('\n' + text)
+        return True
+
+    def move_line(self, direction: int):
+        """Alt+↑/↓：与相邻行交换（direction=-1 上移，1 下移）。"""
+        if direction not in (-1, 1):
+            return False
+        block = self.textCursor().block()
+        lines = self.toPlainText().split('\n')
+        idx = block.blockNumber()
+        target = idx + direction
+        if target < 0 or target >= len(lines):
+            return False
+        lines[idx], lines[target] = lines[target], lines[idx]
+        self.setPlainText('\n'.join(lines))
+        new_block = self.document().findBlockByNumber(target)
+        cursor = QTextCursor(new_block)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        self.setTextCursor(cursor)
+        return True
+
+    def _sql_statements_with_offsets(self):
+        """按分号切分 SQL（跳过字符串/注释），返回 [(start,end,text)]。"""
+        text = self.toPlainText()
+        out = []
+        start = 0
+        i = 0
+        quote = None
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if quote:
+                if ch == '\\' and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == quote:
+                    if i + 1 < n and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                continue
+            if ch == '-' and i + 1 < n and text[i + 1] == '-':
+                j = text.find('\n', i)
+                i = n if j < 0 else j
+                continue
+            if ch == '/' and i + 1 < n and text[i + 1] == '*':
+                j = text.find('*/', i + 2)
+                i = n if j < 0 else j + 2
+                continue
+            if ch == ';':
+                stmt = text[start:i]
+                if stmt.strip():
+                    out.append((start, i + 1, stmt.strip()))
+                start = i + 1
+            i += 1
+        tail = text[start:]
+        if tail.strip():
+            out.append((start, n, tail.strip()))
+        return out
+
+    def current_statement_text(self):
+        """光标所在语句（按分号切分）；纯空白返回空串。"""
+        pos = self.textCursor().position()
+        statements = self._sql_statements_with_offsets()
+        for start, end, text in statements:
+            if start <= pos <= end:
+                return text
+        return ''
+
+    def execute_current_statement(self):
+        sql = self.current_statement_text()
+        if not sql:
+            self.last_action_error = '当前光标处没有可执行语句'
+            self.setToolTip(self.last_action_error)
+            return False
+        self.execute_statement_requested.emit(sql)
+        return True
 
     # ==================== 执行 ====================
 

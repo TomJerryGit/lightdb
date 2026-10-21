@@ -254,6 +254,22 @@
   被静默丢弃、`CREATE PROCEDURE/CALL` 为 no-op 非报错、老客户端中文写入被替换为
   U+FFFD；文档给出定位建议（轻量 MySQL 兼容 + 现代 GUI）、90 天排期（先第三方兼容+
   诚实性 → Studio 深度 → 性能/可靠性 → 交付）与"不做"清单。
+- **GUI G1：Navicat 细节对标首批（2026-10-21）**：
+  ① 结果网格（`result_table.py`）：排序箭头、表头右键升/降/取消排序、按本列过滤+值列表
+  筛选（上限显式）、隐藏列、列可见性对话框（显示全部/恢复默认）、双击值详情（完整值/
+  类型未知显式/复制）、复制子菜单（无/含表头、INSERT、CSV）、选中行导出 CSV/XLSX、
+  列统计（非空/空/唯一/min/max/sum/avg，标注基于当前结果集）；
+  ② SQL 编辑器（`sql_editor.py`）：Ctrl+F/H/R 查找替换（大小写/全词/正则非法显式/
+  上下一个/替换/全部替换/计数/高亮）、Ctrl+L 跳行、Ctrl+/ 注释、Ctrl+D 复制行、
+  Alt+↑↓ 移动行、执行光标语句；
+  ③ 对象树（`object_tree.py`）：新建/删除库（二次确认含库名）、设计表、重命名表
+  （ALTER RENAME 实测支持）、导入/导出入口、复制结构（引擎不支持→显式提示）、列复制/
+  列信息；④ 连接管理（`connection_dialog.py`）：编辑/复制（名称唯一）/删除（确认+写回）
+  +主窗口接线；⑤ 导入（`import_export.py`）：CSV/XLSX/JSON 自动识别、列映射/预览、
+  格式错误/空文件显式、取消语义不变；
+  ⑥ 测试 `tests/test_studio_navicat_g1.py`（20 passed）+ 指定回归 170 passed；
+  compileall OK；真实 GUI `p4_gui_navicat_g1.py` 5/5 PASS、8 张截图 `shots_g4_g1/`。
+  路线图见 [`docs/GUI_NAVICAT_PARITY_ROADMAP.md`](docs/GUI_NAVICAT_PARITY_ROADMAP.md) §7。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

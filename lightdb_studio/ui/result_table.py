@@ -19,10 +19,11 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QLabel, QHBoxLayout, QHeaderView, QAbstractItemView,
     QPlainTextEdit, QPushButton, QApplication, QLineEdit, QComboBox,
-    QCheckBox,
+    QCheckBox, QMenu, QDialog, QDialogButtonBox, QListWidget,
+    QListWidgetItem, QFileDialog,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QAction
 
 # 从 `format_db_error` 的文本里回捞字段（如 `错误码  : 1064` / `SQLSTATE: 42000`）。
 # 目的：错误以字符串形式到达界面时（DBConnection.execute 的返回值就是这种
@@ -238,6 +239,19 @@ class ResultTable(QWidget):
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.horizontalHeader().sectionClicked.connect(
             self._on_header_clicked)
+        # ---- G1：表头/单元格右键菜单、双击值详情 ----
+        self._all_columns = []
+        self._hidden_columns = set()
+        self._value_filters = {}
+        self.last_detail_dialog = None
+        self._header = self.table.horizontalHeader()
+        self._header.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._header.customContextMenuRequested.connect(
+            self._on_header_context_menu)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(
+            self._on_cell_context_menu)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
         layout.addWidget(self.table)
 
@@ -327,6 +341,13 @@ class ResultTable(QWidget):
         self.table.setColumnCount(len(columns))
         self.table.setHorizontalHeaderLabels(columns)
         self._columns = list(columns)
+        self._orig_rows = [list(r) for r in rows]
+        # G1 列可见性：列集合变化时重置（结果刷新/换查询）；同一列集合保留用户选择
+        if list(columns) != list(getattr(self, '_all_columns', [])):
+            self._all_columns = list(columns)
+            self._hidden_columns = set()
+            self._value_filters = {}
+        self._apply_column_visibility()
         self.rows_loaded = len(rows)
         self._truncated = bool(truncated)
         self._result_row_count = len(rows)
@@ -384,6 +405,10 @@ class ResultTable(QWidget):
             self.table.setUpdatesEnabled(True)
         self.rows_loaded = old_n + len(rows)
         self._result_row_count = self.rows_loaded
+        try:
+            self._orig_rows.extend([list(r) for r in rows])
+        except AttributeError:
+            self._orig_rows = [list(r) for r in rows]
         if self._sort_column >= 0:
             self.sort_by(self._sort_column, self._sort_order)
         else:
@@ -577,26 +602,33 @@ class ResultTable(QWidget):
             text, column, case
 
         n_rows = self.table.rowCount()
-        if not text.strip():
+        has_text = bool(text.strip())
+        if not has_text and not self._value_filters:
             for r in range(n_rows):
                 self.table.setRowHidden(r, False)
             visible = n_rows
         else:
             visible = 0
             for r in range(n_rows):
-                match = self._row_matches(r, needle, column, case)
+                match = (not has_text or
+                         self._row_matches(r, needle, column, case))
+                if match:
+                    for fcol, values in self._value_filters.items():
+                        it = self.table.item(r, fcol)
+                        if it is None or it.text() not in values:
+                            match = False
+                            break
                 self.table.setRowHidden(r, not match)
                 if match:
                     visible += 1
             if visible == 0:
                 self.empty_label.setText(f"无匹配行（共 {n_rows} 行）")
-        self.empty_label.setVisible(bool(text.strip()) and visible == 0
-                                    and n_rows > 0)
+        self.empty_label.setVisible(has_text and visible == 0 and n_rows > 0)
         no_match = not self.empty_label.isHidden()
         self.table.setVisible(not no_match)
         self.filter_bar.setVisible(n_rows > 0)
         if n_rows:
-            if text.strip():
+            if has_text or self._value_filters:
                 self.filter_count.setText(f"显示 {visible}/{n_rows} 行")
             else:
                 self.filter_count.setText(f"{n_rows} 行")
@@ -730,3 +762,525 @@ class ResultTable(QWidget):
         self.info_label.setStyleSheet("color: #969696;")
         self.time_label.setText("")
         self._raw_error_text = ""
+
+    # ==================== G1：结果网格细节 ====================
+
+    def _raw_value(self, row, col):
+        item = self.table.item(row, col)
+        if item is None:
+            return None
+        val = item.data(Qt.UserRole)
+        return None if val is NULL_SENTINEL else val
+
+    def _column_name(self, section):
+        item = self.table.horizontalHeaderItem(section)
+        return item.text() if item is not None else f'列{section + 1}'
+
+    def sort_indicator(self):
+        """返回 (列, 顺序)；未排序返回 (-1, None)（表头箭头状态）。"""
+        if self._sort_column < 0:
+            return -1, None
+        return self._sort_column, self._sort_order
+
+    def sort_ascending(self, section):
+        self.sort_by(section, Qt.AscendingOrder)
+        return True
+
+    def sort_descending(self, section):
+        self.sort_by(section, Qt.DescendingOrder)
+        return True
+
+    def clear_sort(self):
+        """取消排序：恢复原始结果顺序，并隐藏表头箭头。"""
+        self._rebuild_from_original()
+        self._sort_column = -1
+        self._sort_order = Qt.AscendingOrder
+        try:
+            self.table.horizontalHeader().setSortIndicator(-1,
+                                                           Qt.AscendingOrder)
+        except Exception:
+            pass
+        self._apply_filter()
+        return True
+
+    def _rebuild_from_original(self):
+        """按 show_result/append_rows 的原始行重建表格（保留列/过滤/可见性）。"""
+        cols = self._all_columns or self._columns
+        rows = getattr(self, '_orig_rows', [])
+        if not cols:
+            return
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.setRowCount(len(rows))
+            for ri, row in enumerate(rows):
+                for ci in range(len(cols)):
+                    val = row[ci] if ci < len(row) else None
+                    self.table.setItem(ri, ci, self._make_item(val))
+        finally:
+            self.table.setUpdatesEnabled(True)
+        self.rows_loaded = len(rows)
+        self._result_row_count = len(rows)
+        self._apply_column_visibility()
+
+    def _apply_column_visibility(self):
+        n_cols = self.table.columnCount()
+        for c in range(n_cols):
+            self.table.setColumnHidden(c, c in self._hidden_columns)
+
+    def visible_columns(self):
+        return [c for c in range(self.table.columnCount())
+                if not self.table.isColumnHidden(c)]
+
+    def hide_column(self, section):
+        if 0 <= section < self.table.columnCount():
+            self._hidden_columns.add(section)
+            self.table.setColumnHidden(section, True)
+            return True
+        return False
+
+    def show_column(self, section):
+        self._hidden_columns.discard(section)
+        if 0 <= section < self.table.columnCount():
+            self.table.setColumnHidden(section, False)
+            return True
+        return False
+
+    def show_all_columns(self):
+        self._hidden_columns.clear()
+        self._apply_column_visibility()
+        return True
+
+    def reset_column_visibility(self):
+        """恢复默认：全部列可见（并清除列值筛选）。"""
+        self.show_all_columns()
+        return True
+
+    def set_visible_columns(self, sections):
+        n = self.table.columnCount()
+        keep = {int(c) for c in sections if 0 <= int(c) < n}
+        self._hidden_columns = set(range(n)) - keep
+        self._apply_column_visibility()
+        return True
+
+    def build_column_visibility_dialog(self, parent=None):
+        dlg = QDialog(parent or self)
+        dlg.setWindowTitle('列可见性')
+        dlg.resize(320, 360)
+        layout = QVBoxLayout(dlg)
+        listw = QListWidget()
+        for c in range(self.table.columnCount()):
+            item = QListWidgetItem(self._column_name(c))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setData(Qt.UserRole, c)
+            item.setCheckState(Qt.Unchecked if c in self._hidden_columns
+                               else Qt.Checked)
+            listw.addItem(item)
+        layout.addWidget(listw)
+        row = QHBoxLayout()
+        show_all = QPushButton('显示全部')
+        default_btn = QPushButton('恢复默认')
+        box = QDialogButtonBox(QDialogButtonBox.Ok |
+                               QDialogButtonBox.Cancel)
+        row.addWidget(show_all)
+        row.addWidget(default_btn)
+        row.addStretch()
+        row.addWidget(box)
+        layout.addLayout(row)
+
+        def _all():
+            for i in range(listw.count()):
+                listw.item(i).setCheckState(Qt.Checked)
+        show_all.clicked.connect(_all)
+        default_btn.clicked.connect(_all)
+
+        def _accept():
+            cols = [listw.item(i).data(Qt.UserRole)
+                    for i in range(listw.count())
+                    if listw.item(i).checkState() == Qt.Checked]
+            self.set_visible_columns(cols)
+            dlg.accept()
+        box.accepted.connect(_accept)
+        box.rejected.connect(dlg.reject)
+        dlg.column_list = listw
+        dlg.show_all_button = show_all
+        dlg.reset_button = default_btn
+        return dlg
+
+    def column_statistics(self, section):
+        """列统计（明确基于当前结果集；数值列才有 min/max/sum/avg）。"""
+        n = self.table.rowCount()
+        if not (0 <= section < self.table.columnCount()):
+            return None
+        values, nulls = [], 0
+        for r in range(n):
+            raw = self._raw_value(r, section)
+            if raw is None:
+                nulls += 1
+                continue
+            values.append(raw)
+        numeric = []
+        for v in values:
+            if isinstance(v, bool):
+                numeric.append(int(v))
+            elif isinstance(v, (int, float)):
+                numeric.append(float(v))
+            elif isinstance(v, str) and _NUM_RE.match(v.strip()):
+                try:
+                    numeric.append(float(v.strip()))
+                except ValueError:
+                    pass
+        stats = {
+            'column': self._column_name(section),
+            'count': n,
+            'non_null': len(values),
+            'nulls': nulls,
+            'unique': len({self._raw_key(v) for v in values}),
+            'numeric_count': len(numeric),
+            'min': None, 'max': None, 'sum': None, 'avg': None,
+            'based_on': '当前已加载结果集（非全表）',
+        }
+        if numeric:
+            stats['min'] = min(numeric)
+            stats['max'] = max(numeric)
+            stats['sum'] = sum(numeric)
+            stats['avg'] = sum(numeric) / len(numeric)
+        return stats
+
+    @staticmethod
+    def _raw_key(value):
+        try:
+            hash(value)
+            return ('v', value)
+        except TypeError:
+            return ('r', repr(value))
+
+    def column_stats_text(self, section):
+        stats = self.column_statistics(section)
+        if not stats:
+            return ''
+        lines = [
+            f"列: {stats['column']}（基于{stats['based_on']}）",
+            f"总行数: {stats['count']}  非空: {stats['non_null']}  "
+            f"空值: {stats['nulls']}  唯一值: {stats['unique']}",
+        ]
+        if stats['numeric_count']:
+            lines.append(
+                f"数值({stats['numeric_count']}): min={stats['min']:g} "
+                f"max={stats['max']:g} sum={stats['sum']:g} "
+                f"avg={stats['avg']:.4f}")
+        else:
+            lines.append('数值统计: 无（该列没有可解析的数值）')
+        return '\n'.join(lines)
+
+    def distinct_values(self, section, limit=100):
+        """当前结果集该列的去重值（最多 limit 项，排序后返回）。"""
+        if not (0 <= section < self.table.columnCount()):
+            return []
+        seen, out = set(), []
+        for r in range(self.table.rowCount()):
+            raw = self._raw_value(r, section)
+            text = 'NULL' if raw is None else str(raw)
+            if text not in seen:
+                seen.add(text)
+                out.append(text)
+        out.sort(key=str.casefold)
+        return out[:max(1, int(limit))]
+
+    def apply_value_filter(self, section, values):
+        """按列值列表筛选（基于当前结果集，可与文本过滤叠加）。"""
+        if not (0 <= section < self.table.columnCount()):
+            return 0
+        vals = [str(v) for v in (values or [])]
+        if vals:
+            self._value_filters[section] = set(vals)
+        else:
+            self._value_filters.pop(section, None)
+        return self._apply_filter()
+
+    def clear_value_filters(self):
+        self._value_filters.clear()
+        return self._apply_filter()
+
+    def filter_by_column(self, section, text=''):
+        """表头菜单「按本列过滤」：只对该列应用文本过滤。"""
+        if not (0 <= section < self.table.columnCount()):
+            return 0
+        return self.apply_filter(text=str(text), column=section)
+
+    def build_value_filter_menu(self, section, limit=100, parent=None):
+        """值列表筛选菜单（基于当前结果集；超出上限显式提示）。"""
+        from PySide6.QtWidgets import QMenu as _QMenu
+        menu = _QMenu(parent or self)
+        all_values = self.distinct_values(section, limit=10 ** 9)
+        shown = all_values[:limit]
+        for value in shown:
+            act = menu.addAction(value)
+            act.triggered.connect(
+                lambda _checked=False, v=value: self.apply_value_filter(
+                    section, [v]))
+        if len(all_values) > limit:
+            act = menu.addAction(
+                f"…共 {len(all_values)} 个值，仅显示前 {limit} 个（可加文本过滤）")
+            act.setEnabled(False)
+        menu.addSeparator()
+        clear = menu.addAction('清除本列值筛选')
+        clear.triggered.connect(lambda: self.apply_value_filter(section, []))
+        return menu
+
+    def build_header_menu(self, section, parent=None):
+        """表头右键菜单：排序/取消、按本列过滤、值列表、隐藏列、列统计。"""
+        menu = QMenu(parent or self)
+        act = menu.addAction('升序排序')
+        act.triggered.connect(lambda: self.sort_ascending(section))
+        act = menu.addAction('降序排序')
+        act.triggered.connect(lambda: self.sort_descending(section))
+        act = menu.addAction('取消排序')
+        act.triggered.connect(self.clear_sort)
+        menu.addSeparator()
+        act = menu.addAction('按本列过滤…')
+        act.triggered.connect(
+            lambda: self.filter_by_column(
+                section, self.filter_edit.text()))
+        menu.addMenu(self.build_value_filter_menu(section))
+        act = menu.addAction('隐藏此列')
+        act.triggered.connect(lambda: self.hide_column(section))
+        act = menu.addAction('列可见性…')
+        act.triggered.connect(self._open_column_visibility_dialog)
+        menu.addSeparator()
+        act = menu.addAction('列统计')
+        act.triggered.connect(
+            lambda: self._show_column_stats(section))
+        return menu
+
+    def _on_header_context_menu(self, pos):
+        section = self._header.logicalIndexAt(pos)
+        if section < 0:
+            return
+        self.build_header_menu(section).exec(
+            self._header.mapToGlobal(pos))
+
+    def _open_column_visibility_dialog(self):
+        dlg = self.build_column_visibility_dialog()
+        dlg.exec()
+        return dlg
+
+    def _show_column_stats(self, section):
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.information(self, '列统计', self.column_stats_text(section))
+        return self.column_statistics(section)
+
+    def cell_detail_text(self, row, col):
+        """单元格「值详情」文本（完整值；列类型未知时显式说明）。"""
+        if not (0 <= row < self.table.rowCount()
+                and 0 <= col < self.table.columnCount()):
+            return ''
+        raw = self._raw_value(row, col)
+        if raw is None:
+            value = 'NULL'
+        elif isinstance(raw, bytes):
+            value = '0x' + raw.hex()
+        else:
+            value = str(raw)
+        return '\n'.join([
+            f'列名: {self._column_name(col)}',
+            f'行号: {row + 1} / {self.table.rowCount()}',
+            '类型: 未知（查询结果未携带列类型信息）',
+            f'长度: {len(value)} 字符',
+            '',
+            '完整值:',
+            value,
+        ])
+
+    def build_cell_detail_dialog(self, row, col, parent=None):
+        dlg = QDialog(parent or self)
+        dlg.setWindowTitle(f'值详情 - {self._column_name(col)}')
+        dlg.resize(560, 320)
+        layout = QVBoxLayout(dlg)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(self.cell_detail_text(row, col))
+        text.setFont(QFont('Consolas', 10))
+        layout.addWidget(text)
+        rowbar = QHBoxLayout()
+        copy_btn = QPushButton('复制值')
+        value = self._raw_value(row, col)
+        value_text = 'NULL' if value is None else str(value)
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(value_text))
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(dlg.accept)
+        rowbar.addWidget(copy_btn)
+        rowbar.addStretch()
+        rowbar.addWidget(close_btn)
+        layout.addLayout(rowbar)
+        dlg.value_text = text
+        dlg.copy_button = copy_btn
+        self.last_detail_dialog = dlg
+        return dlg
+
+    def show_cell_detail(self, row, col):
+        dlg = self.build_cell_detail_dialog(row, col)
+        dlg.exec()
+        return dlg
+
+    def _on_cell_double_clicked(self, row, col):
+        self.show_cell_detail(row, col)
+
+    # ---------- 复制 / 导出选中 ----------
+
+    def _selected_matrix(self):
+        """返回 (rows, cols) 选中的矩形单元格原始值；无选择返回 ([], [])。"""
+        ranges = self.table.selectedRanges()
+        if not ranges:
+            return [], [], []
+        rng = ranges[0]
+        rows = list(range(rng.topRow(), rng.bottomRow() + 1))
+        cols = list(range(rng.leftColumn(), rng.rightColumn() + 1))
+        matrix = [[self._raw_value(r, c) for c in cols] for r in rows]
+        return rows, cols, matrix
+
+    def selected_block_text(self, include_headers=False):
+        rows, cols, matrix = self._selected_matrix()
+        if not rows:
+            return ''
+        lines = []
+        if include_headers:
+            lines.append('\t'.join(self._column_name(c) for c in cols))
+        for row in matrix:
+            lines.append('\t'.join(
+                'NULL' if v is None else str(v) for v in row))
+        return '\n'.join(lines)
+
+    def copy_selection(self, include_headers=False):
+        text = self.selected_block_text(include_headers=include_headers)
+        if text:
+            QApplication.clipboard().setText(text)
+        return text
+
+    def copy_with_headers(self):
+        return self.copy_selection(include_headers=True)
+
+    def copy_without_headers(self):
+        return self.copy_selection(include_headers=False)
+
+    @staticmethod
+    def _sql_literal(value):
+        if value is None:
+            return 'NULL'
+        if isinstance(value, bool):
+            return '1' if value else '0'
+        if isinstance(value, (int, float)):
+            return repr(value)
+        if isinstance(value, bytes):
+            return "0x" + value.hex()
+        s = str(value).replace('\\', '\\\\').replace("'", "\\'")
+        return f"'{s}'"
+
+    def copy_as_insert(self, table_name='result'):
+        rows, cols, matrix = self._selected_matrix()
+        if not rows:
+            return ''
+        names = ', '.join('`%s`' % self._column_name(c).replace('`', '``')
+                          for c in cols)
+        values = []
+        for row in matrix:
+            literals = ', '.join(self._sql_literal(v) for v in row)
+            values.append(f'({literals})')
+        sql = (f'INSERT INTO `{table_name}` ({names}) VALUES\n'
+               + ',\n'.join(values) + ';')
+        QApplication.clipboard().setText(sql)
+        return sql
+
+    def copy_as_csv(self):
+        import csv as _csv
+        import io
+        rows, cols, matrix = self._selected_matrix()
+        if not rows:
+            return ''
+        buf = io.StringIO()
+        writer = _csv.writer(buf)
+        writer.writerow([self._column_name(c) for c in cols])
+        for row in matrix:
+            writer.writerow(['' if v is None else v for v in row])
+        text = buf.getvalue()
+        QApplication.clipboard().setText(text)
+        return text
+
+    def build_copy_menu(self, parent=None):
+        menu = QMenu(parent or self)
+        act = menu.addAction('复制单元格/选中块（无表头）')
+        act.triggered.connect(self.copy_without_headers)
+        act = menu.addAction('复制选中块（含表头）')
+        act.triggered.connect(self.copy_with_headers)
+        menu.addSeparator()
+        act = menu.addAction('复制为 INSERT 语句')
+        act.triggered.connect(self.copy_as_insert)
+        act = menu.addAction('复制为 CSV')
+        act.triggered.connect(self.copy_as_csv)
+        return menu
+
+    def build_context_menu(self, parent=None):
+        menu = QMenu(parent or self)
+        menu.addMenu(self.build_copy_menu(menu))
+        menu.addSeparator()
+        act = menu.addAction('值详情…')
+        act.triggered.connect(self._show_current_cell_detail)
+        act = menu.addAction('导出选中行 CSV…')
+        act.triggered.connect(lambda: self._export_selected_ui('csv'))
+        act = menu.addAction('导出选中行 XLSX…')
+        act.triggered.connect(lambda: self._export_selected_ui('xlsx'))
+        menu.addSeparator()
+        act = menu.addAction('列可见性…')
+        act.triggered.connect(self._open_column_visibility_dialog)
+        return menu
+
+    def _on_cell_context_menu(self, pos):
+        self.build_context_menu().exec(self.table.viewport().mapToGlobal(pos))
+
+    def _show_current_cell_detail(self):
+        cell = self.table.currentItem()
+        if cell is None:
+            return
+        self.show_cell_detail(cell.row(), cell.column())
+
+    def selected_rows_data(self):
+        rows, cols, matrix = self._selected_matrix()
+        if not rows:
+            return [], []
+        return [self._column_name(c) for c in cols], matrix
+
+    def export_selected(self, filepath, fmt=None):
+        """仅导出选中行 CSV/XLSX（复用 chunked 导出，真实写文件）。"""
+        columns, rows = self.selected_rows_data()
+        if not rows:
+            return {'ok': False, 'error': '未选择行', 'rows': 0,
+                    'path': str(filepath) if filepath else ''}
+        fmt = fmt or (str(filepath).rsplit('.', 1)[-1].lower()
+                      if filepath and '.' in str(filepath) else 'csv')
+        if fmt not in ('csv', 'xlsx'):
+            return {'ok': False, 'error': f'不支持的导出格式: {fmt}',
+                    'rows': 0}
+        try:
+            from .import_export import write_export_chunked
+            write_export_chunked(str(filepath), columns, rows, fmt=fmt)
+            return {'ok': True, 'path': str(filepath), 'rows': len(rows),
+                    'columns': len(columns), 'format': fmt, 'error': ''}
+        except Exception as exc:                      # noqa: BLE001
+            return {'ok': False, 'error': f'导出失败: {exc}',
+                    'rows': 0, 'path': str(filepath)}
+
+    def _export_selected_ui(self, fmt):
+        from PySide6.QtWidgets import QMessageBox, QFileDialog
+        columns, rows = self.selected_rows_data()
+        if not rows:
+            QMessageBox.information(self, '导出选中行', '未选择行')
+            return {'ok': False, 'error': '未选择行'}
+        path, _ = QFileDialog.getSaveFileName(
+            self, '导出选中行', f'selection.{fmt}',
+            f'{fmt.upper()} (*.{fmt})')
+        if not path:
+            return {'ok': False, 'error': '用户取消'}
+        result = self.export_selected(path, fmt=fmt)
+        if not result.get('ok'):
+            QMessageBox.warning(self, '导出失败', result.get('error', ''))
+        return result

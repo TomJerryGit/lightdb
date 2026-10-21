@@ -343,3 +343,83 @@ class ConnectionDialog(QDialog):
 
     def get_connection(self) -> ConnectionInfo:
         return self.info
+
+
+# ==================== G1：连接编辑 / 复制 / 删除（供主窗口接线） ====================
+
+def validate_connection_name(config, name, exclude=None):
+    """名称非空/唯一校验。返回 (ok, error)。"""
+    name = str(name or '').strip()
+    if not name:
+        return False, '连接名称不能为空'
+    for conn in getattr(config, 'connections', []):
+        if conn.name == name and conn.name != exclude:
+            return False, f'连接名称已存在: {name}'
+    return True, ''
+
+
+def duplicate_connection(config, source_name, new_name=None):
+    """复制连接（名称唯一校验；保存写回 config）。"""
+    source = config.find(source_name) if hasattr(config, 'find') else None
+    if source is None:
+        return {'ok': False, 'error': f'连接不存在: {source_name}'}
+    new_name = str(new_name or (source_name + ' - 副本')).strip()
+    ok, error = validate_connection_name(config, new_name)
+    if not ok:
+        return {'ok': False, 'error': error}
+    info = ConnectionInfo(
+        name=new_name, host=source.host, port=source.port,
+        user=source.user, password=source.password,
+        database=source.database, charset=source.charset, ssl=source.ssl)
+    try:
+        config.add_connection(info)
+    except Exception as exc:                          # noqa: BLE001
+        return {'ok': False, 'error': f'保存连接失败: {exc}'}
+    return {'ok': True, 'connection': info, 'name': new_name, 'error': ''}
+
+
+def delete_connection(config, name, ask=True, confirmer=None):
+    """删除连接（二次确认含名称；保存后不丢其它连接）。"""
+    target = None
+    for conn in getattr(config, 'connections', []):
+        if conn.name == name:
+            target = conn
+            break
+    if target is None:
+        return {'ok': False, 'error': f'连接不存在: {name}'}
+    if ask:
+        question = confirmer or (lambda title, text:
+                                 QMessageBox.question(None, title, text))
+        ret = question('删除连接',
+                       f'确定删除连接 {name}？仅删除本地配置，不删除数据库。')
+        if ret != QMessageBox.Yes:
+            return {'ok': False, 'error': '用户取消', 'cancelled': True}
+    try:
+        config.remove_connection(name)
+    except Exception as exc:                          # noqa: BLE001
+        return {'ok': False, 'error': f'删除连接失败: {exc}'}
+    return {'ok': True, 'name': name, 'error': ''}
+
+
+def edit_connection(parent, config, name, dialog_class=None):
+    """编辑选中连接：打开预填对话框；保存后写回 config。"""
+    info = None
+    for conn in getattr(config, 'connections', []):
+        if conn.name == name:
+            info = conn
+            break
+    if info is None:
+        return {'ok': False, 'error': f'连接不存在: {name}'}
+    cls = dialog_class or ConnectionDialog
+    dlg = cls(parent, info=ConnectionInfo(**info.__dict__))
+    if not dlg.exec():
+        return {'ok': False, 'error': '用户取消', 'cancelled': True}
+    edited = dlg.get_connection()
+    ok, error = validate_connection_name(config, edited.name, exclude=name)
+    if not ok:
+        return {'ok': False, 'error': error}
+    try:
+        config.add_connection(edited)
+    except Exception as exc:                          # noqa: BLE001
+        return {'ok': False, 'error': f'保存连接失败: {exc}'}
+    return {'ok': True, 'connection': edited, 'name': edited.name, 'error': ''}

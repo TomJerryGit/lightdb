@@ -27,10 +27,98 @@ DEFAULT_BATCH_SIZE = 500
 
 __all__ = [
     'DEFAULT_BATCH_SIZE', 'ImportCSVDialog', 'ExportCSVDialog',
-    'ImportWorker', 'ExportWorker', 'TransferSignals',
+    'ImportWorker', 'ExportWorker', 'TransferSignals', 'load_import_file',
     'chunk_rows', 'normalize_import_params', 'execute_chunked_import',
     'write_failure_report', 'write_export_chunked', 'ExportCancelled',
 ]
+
+
+def load_import_file(path, skip_header=True):
+    """读取 CSV / XLSX / JSON 为 {'headers','rows','kind'}。
+
+    格式错误、空文件、空表都抛 ValueError（调用方显式提示，不静默假成功）。
+    XLSX 用 openpyxl 只读；JSON 支持数组对象与数组数组。
+    """
+    from pathlib import Path
+    p = Path(path)
+    if not p.exists():
+        raise ValueError(f'文件不存在: {path}')
+    ext = p.suffix.lower()
+    if ext == '.csv':
+        try:
+            try:
+                with open(p, 'r', encoding='utf-8', newline='') as f:
+                    all_rows = list(csv.reader(f))
+            except UnicodeDecodeError:
+                with open(p, 'r', encoding='gbk', newline='') as f:
+                    all_rows = list(csv.reader(f))
+        except Exception as exc:                      # noqa: BLE001
+            raise ValueError(f'CSV 读取失败: {exc}') from exc
+        if not all_rows:
+            raise ValueError('CSV 为空（没有数据行）')
+        if skip_header:
+            headers, rows = all_rows[0], all_rows[1:]
+        else:
+            headers = [f'col{i+1}' for i in range(len(all_rows[0]))]
+            rows = all_rows
+        kind = 'csv'
+    elif ext == '.xlsx':
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+            try:
+                ws = wb.active
+                values = [list(r) for r in ws.iter_rows(values_only=True)]
+            finally:
+                wb.close()
+        except Exception as exc:                      # noqa: BLE001
+            raise ValueError(f'XLSX 读取失败: {exc}') from exc
+        values = [[('' if v is None else v) for v in row] for row in values]
+        while values and not any(str(v).strip() for v in values[-1]):
+            values.pop()
+        if not values:
+            raise ValueError('XLSX 为空（没有数据行）')
+        if skip_header:
+            headers = [str(v) for v in values[0]]
+            rows = [list(r) for r in values[1:]]
+        else:
+            headers = [f'col{i+1}' for i in range(len(values[0]))]
+            rows = values
+        kind = 'xlsx'
+    elif ext == '.json':
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:                      # noqa: BLE001
+            raise ValueError(f'JSON 解析失败: {exc}') from exc
+        if isinstance(data, dict) and isinstance(data.get('data'), list):
+            data = data['data']
+        if not isinstance(data, list):
+            raise ValueError('JSON 必须是数组（对象数组或数组的数组）')
+        if not data:
+            raise ValueError('JSON 为空（没有数据行）')
+        if all(isinstance(item, dict) for item in data):
+            headers = []
+            for item in data:
+                for key in item:
+                    if key not in headers:
+                        headers.append(key)
+            rows = [[item.get(h, '') for h in headers] for item in data]
+        elif all(isinstance(item, list) for item in data):
+            if skip_header:
+                headers = [str(v) for v in data[0]]
+                rows = [list(r) for r in data[1:]]
+            else:
+                headers = [f'col{i+1}' for i in range(len(data[0]))]
+                rows = [list(r) for r in data]
+        else:
+            raise ValueError('JSON 数组元素必须全部是对象或全部是数组')
+        kind = 'json'
+    else:
+        raise ValueError(f'不支持的文件格式: {ext or "(无扩展名)"}（支持 .csv/.xlsx/.json）')
+    if not rows:
+        raise ValueError(f'{kind.upper()} 只有表头，没有数据行')
+    return {'headers': headers, 'rows': rows, 'kind': kind}
 
 
 # ==================== 纯逻辑（可在 worker/单测直接调用） ====================
@@ -327,6 +415,8 @@ class ImportCSVDialog(QDialog):
         self.csv_path = ""
         self.headers = []
         self.rows = []
+        self.file_kind = ''
+        self.last_error = ''
         self.last_import_result = None
         self._worker = None
         self._signals = None
@@ -343,7 +433,7 @@ class ImportCSVDialog(QDialog):
 
         # 文件行
         file_row = QHBoxLayout()
-        file_row.addWidget(QLabel("CSV 文件:"))
+        file_row.addWidget(QLabel("数据文件:"))
         self.file_edit = QLineEdit()
         self.file_edit.setReadOnly(True)
         file_row.addWidget(self.file_edit)
@@ -394,14 +484,31 @@ class ImportCSVDialog(QDialog):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 CSV 文件", "",
-            "CSV 文件 (*.csv);;所有文件 (*.*)")
+            self, "选择数据文件", "",
+            "数据文件 (*.csv *.xlsx *.json);;CSV (*.csv);;"
+            "XLSX (*.xlsx);;JSON (*.json);;所有文件 (*.*)")
         if not path:
             return
-        self.csv_path = path
-        self.file_edit.setText(path)
-        self._load_csv()
+        self.load_file(path)
         self._reload_preview()
+
+    def load_file(self, path):
+        """载入 CSV/XLSX/JSON；格式错误/空数据显式返回 False 并记录错误。"""
+        try:
+            data = load_import_file(path, skip_header=self.skip_header.isChecked())
+        except Exception as exc:                      # noqa: BLE001
+            self.last_error = str(exc)
+            self.headers, self.rows = [], []
+            QMessageBox.critical(self, "读取失败", str(exc))
+            return False
+        self.last_error = ''
+        self.file_kind = data['kind']
+        self.csv_path = path
+        self.headers = data['headers']
+        self.rows = data['rows']
+        self.file_edit.setText(path)
+        self.setWindowTitle(f"导入 {data['kind'].upper()} → {self.table_name}")
+        return True
 
     def _load_csv(self):
         self.headers = []

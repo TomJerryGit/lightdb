@@ -58,7 +58,9 @@ from .environment_bar import EnvironmentBar
 from .lineage_view import LineageGraphView, LineageDialog
 from .review_panel import ReviewPanel, ReviewSubmitDialog
 from .snapshot_dialog import SnapshotDialog
-from .connection_dialog import ConnectionDialog
+from .connection_dialog import (
+    ConnectionDialog, delete_connection, duplicate_connection,
+    edit_connection)
 from .error_prompts import (show_connection_error,
                             show_connection_error_nonblocking)
 from .object_tree import ObjectTree
@@ -334,6 +336,13 @@ class MainWindow(QMainWindow):
         self.object_tree = ObjectTree()
         self.object_tree.query_requested.connect(self._on_query_requested)
         self.object_tree.new_query_requested.connect(self._open_sql_in_new_tab)
+        # G1：对象树里的设计表/导入/导出动作接线到现有实现
+        self.object_tree.design_table_requested.connect(
+            self._on_tree_design_table)
+        self.object_tree.import_data_requested.connect(
+            self._on_tree_import_data)
+        self.object_tree.export_data_requested.connect(
+            self._on_tree_export_data)
 
         self.tree_dock = QDockWidget(i18n.t('tab.object_browser'), self)
         self.tree_dock.setWidget(self.object_tree)
@@ -492,6 +501,17 @@ class MainWindow(QMainWindow):
 
         a = QAction("新建连接...", self)
         a.triggered.connect(self._new_connection)
+        m_file.addAction(a)
+
+        # G1：编辑 / 复制 / 删除连接（作用于对象树当前选中的连接）
+        a = QAction("编辑当前连接...", self)
+        a.triggered.connect(self._edit_current_connection)
+        m_file.addAction(a)
+        a = QAction("复制当前连接...", self)
+        a.triggered.connect(self._duplicate_current_connection)
+        m_file.addAction(a)
+        a = QAction("删除当前连接...", self)
+        a.triggered.connect(self._delete_current_connection)
         m_file.addAction(a)
 
         a = QAction("新建查询", self)
@@ -807,6 +827,9 @@ class MainWindow(QMainWindow):
             lambda sql, e=editor, r=result: self._execute_sql_async(sql, e, r))
         editor.execute_selection_requested.connect(
             lambda sql, e=editor, r=result: self._execute_sql_async(sql, e, r))
+        # G1：执行光标所在语句（分号切分）
+        editor.execute_statement_requested.connect(
+            lambda sql, e=editor, r=result: self._execute_sql_async(sql, e, r))
         # P1-2：结果被 max_result_rows 截断时，结果区「加载更多」继续取下一批
         result.load_more_requested.connect(
             lambda r=result: self._on_load_more(r))
@@ -963,6 +986,105 @@ class MainWindow(QMainWindow):
         self._on_tab_changed(self.tabs.currentIndex())
         # P1-3：连接建立后后台刷新 schema 缓存（首次补全前就有候选）
         self._refresh_schema_cache_async(conn)
+
+    # ==================== G1：连接编辑/复制/删除 ====================
+
+    def _current_connection_name(self):
+        conn = self.object_tree.get_current_connection()
+        return getattr(getattr(conn, 'config', None), 'name', '') if conn else ''
+
+    def _edit_current_connection(self):
+        name = self._current_connection_name()
+        if not name:
+            QMessageBox.information(self, '提示', '请先在左侧选择一个连接')
+            return None
+        result = edit_connection(self, self.config, name)
+        if not result.get('ok'):
+            if not result.get('cancelled'):
+                QMessageBox.warning(self, '编辑连接失败', result.get('error', ''))
+            return result
+        info = result['connection']
+        # 连接参数变化：断开旧连接并按新配置重连（失败显式，不假装成功）
+        try:
+            old = self.object_tree.connections.get(name)
+            if old is not None:
+                old.close()
+            self.object_tree.remove_connection(name)
+            conn = DBConnection(info)
+            conn.connect()
+            self.object_tree.add_connection(info, conn)
+            self.object_tree.select_connection(info.name)
+            self.status_label.setText(f"已连接: {info.name}")
+            self._refresh_schema_cache_async(conn)
+        except Exception as exc:                      # noqa: BLE001
+            self._report_connection_failure(info, exc)
+            return {'ok': False, 'error': str(exc), 'connection': info}
+        return result
+
+    def _duplicate_current_connection(self):
+        name = self._current_connection_name()
+        if not name:
+            QMessageBox.information(self, '提示', '请先在左侧选择一个连接')
+            return None
+        new_name, ok = QInputDialog.getText(
+            self, '复制连接', '新连接名称:', text=name + ' - 副本')
+        if not ok:
+            return None
+        result = duplicate_connection(self.config, name, new_name.strip())
+        if not result.get('ok'):
+            QMessageBox.warning(self, '复制连接失败', result.get('error', ''))
+            return result
+        self.status_label.setText(
+            f"已复制连接配置: {result['name']}（未自动连接）")
+        return result
+
+    def _delete_current_connection(self):
+        name = self._current_connection_name()
+        if not name:
+            QMessageBox.information(self, '提示', '请先在左侧选择一个连接')
+            return None
+        result = delete_connection(self.config, name, ask=True,
+                                   confirmer=lambda t, m: QMessageBox.question(
+                                       self, t, m))
+        if result.get('cancelled'):
+            return result
+        if not result.get('ok'):
+            QMessageBox.warning(self, '删除连接失败', result.get('error', ''))
+            return result
+        self.object_tree.remove_connection(name)
+        self.status_label.setText(f"已删除连接: {name}")
+        return result
+
+    # ==================== G1：对象树设计/导入/导出接线 ====================
+
+    def _on_tree_design_table(self, conn_name, db, table):
+        conn = self.object_tree.connections.get(conn_name) or \
+            self._get_current_conn()
+        if conn is None:
+            QMessageBox.warning(self, '提示', '请先选择一个连接')
+            return None
+        dlg = TableDesigner(conn, self)
+        if dlg.exec() == TableDesigner.Accepted:
+            self.object_tree.refresh_all()
+        return dlg
+
+    def _on_tree_import_data(self, conn_name, db, table):
+        conn = self.object_tree.connections.get(conn_name) or \
+            self._get_current_conn()
+        if conn is None:
+            QMessageBox.warning(self, '提示', '请先选择一个连接')
+            return None
+        self._import_csv(table)
+        return True
+
+    def _on_tree_export_data(self, conn_name, db, table):
+        conn = self.object_tree.connections.get(conn_name) or \
+            self._get_current_conn()
+        if conn is None:
+            QMessageBox.warning(self, '提示', '请先选择一个连接')
+            return None
+        self._export_table(table)
+        return True
 
     def _report_connection_failure(self, info, exc, title='连接失败'):
         """连接失败 → 弹「可行动」的框（原始报文一字不删）+ 状态栏一行结论。

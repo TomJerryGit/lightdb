@@ -1,4 +1,6 @@
 """左侧对象浏览器：连接 / 数据库 / 表（P1-6：懒加载 + 右键菜单）"""
+import re
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
     QMenu, QMessageBox, QInputDialog, QToolBar, QLineEdit,
@@ -39,6 +41,10 @@ class ObjectTree(QWidget):
     query_requested = Signal(str)            # sql（当前编辑器执行）
     new_query_requested = Signal(str)        # sql（新查询页，不自动执行）
     connection_selected = Signal(object)     # DBConnection
+    # G1：把对象管理动作接到 MainWindow（设计表/导入/导出）
+    design_table_requested = Signal(str, str, str)   # conn, db, table
+    import_data_requested = Signal(str, str, str)
+    export_data_requested = Signal(str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -471,6 +477,8 @@ class ObjectTree(QWidget):
             add("刷新", lambda: self._reload_connection(item, name))
         elif node_type == NODE_DB:
             add("切换到此库", lambda: self._switch_database(name))
+            add("新建库…", lambda: self._ui_create_database(item))
+            add("删除库…", lambda: self._ui_drop_database(item, name))
             add("复制库名", lambda: copy_text(name))
             add("刷新", lambda: self._reload_db(item))
         elif node_type == NODE_TABLE_FOLDER:
@@ -478,6 +486,11 @@ class ObjectTree(QWidget):
             add("复制库名", lambda: copy_text(db_name))
         elif node_type == NODE_TABLE:
             add("复制表名", lambda: copy_text(name))
+            add("设计表", lambda: self._ui_design_table(item))
+            add("重命名表…", lambda: self._ui_rename_table(item))
+            add("导入数据…", lambda: self._ui_import_data(item))
+            add("导出数据…", lambda: self._ui_export_data(item))
+            menu.addSeparator()
             add("生成 SELECT LIMIT 200（新查询页）",
                 lambda: self.new_query_requested.emit(
                     f"SELECT * FROM `{name}` LIMIT 200"))
@@ -492,8 +505,12 @@ class ObjectTree(QWidget):
                 lambda: self.query_requested.emit(
                     f"SELECT COUNT(*) FROM `{name}`"))
             menu.addSeparator()
+            add("复制结构…", lambda: self._ui_copy_structure(item))
             add("删除表", lambda: self._drop_table(item, name))
             add("清空表", lambda: self._truncate_table(name))
+        elif node_type == NODE_COLUMN:
+            add("复制列名", lambda: copy_text(name))
+            add("查看列信息", lambda: self._show_column_info(item))
         elif node_type == NODE_PROC:
             add("查看定义",
                 lambda: self.query_requested.emit(
@@ -625,3 +642,233 @@ class ObjectTree(QWidget):
                 child.setHidden(not visible)
             else:
                 self._filter_node(child)
+
+    # ==================== G1：库/表/列对象管理 ====================
+
+    @staticmethod
+    def _valid_ident(name) -> bool:
+        return bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]{0,63}',
+                                 str(name or '')))
+
+    def _conn_for_meta(self, meta):
+        conn = self.connections.get((meta or {}).get('conn'))
+        return conn or self.get_current_connection()
+
+    def _conn_root_for(self, conn_name):
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            data = item.data(0, Qt.UserRole)
+            if data and data[0] == NODE_CONN and data[1] == conn_name:
+                return item
+        return None
+
+    def _refresh_conn_root(self, conn_name):
+        root = self._conn_root_for(conn_name)
+        if root is not None:
+            self._reload_connection(root, conn_name)
+
+    def create_database(self, name, conn_name=None):
+        """新建库；名称非法/执行失败显式返回错误，不假成功。"""
+        conn = self.connections.get(conn_name) if conn_name \
+            else self.get_current_connection()
+        if conn is None:
+            return {'ok': False, 'error': '未选择连接'}
+        if not self._valid_ident(name):
+            return {'ok': False,
+                    'error': f'非法库名: {name!r}（仅字母/数字/下划线/$，字母开头）'}
+        try:
+            _n, err = conn.execute(f"CREATE DATABASE `{name}`")
+        except Exception as exc:                      # noqa: BLE001
+            return {'ok': False, 'error': f'新建库失败: {exc}'}
+        if err:
+            return {'ok': False, 'error': f'新建库失败: {err}'}
+        self._refresh_conn_root(conn_name or getattr(
+            conn.config, 'name', ''))
+        return {'ok': True, 'database': name, 'error': ''}
+
+    def drop_database(self, name, item=None, ask=True, confirmer=None):
+        """删除库（二次确认含库名；失败显式）。"""
+        meta = item.data(0, Qt.UserRole + 1) or {} if item else {}
+        conn = self._conn_for_meta(meta)
+        if conn is None:
+            return {'ok': False, 'error': '未选择连接'}
+        if not self._valid_ident(name):
+            return {'ok': False, 'error': f'非法库名: {name!r}'}
+        if ask:
+            question = confirmer or (lambda title, text:
+                                     QMessageBox.question(self, title, text))
+            ret = question('确认删除数据库',
+                           f'确定删除数据库 {name}？其中所有表将丢失！')
+            if ret != QMessageBox.Yes:
+                return {'ok': False, 'error': '用户取消', 'cancelled': True}
+        try:
+            _n, err = conn.execute(f"DROP DATABASE `{name}`")
+        except Exception as exc:                      # noqa: BLE001
+            return {'ok': False, 'error': f'删除库失败: {exc}'}
+        if err:
+            return {'ok': False, 'error': f'删除库失败: {err}'}
+        conn_name = meta.get('conn') or getattr(conn.config, 'name', '')
+        self._refresh_conn_root(conn_name)
+        return {'ok': True, 'database': name, 'error': ''}
+
+    def rename_table(self, item, new_name, ask=True, confirmer=None):
+        """重命名表：ALTER TABLE ... RENAME TO ...（失败显式）。"""
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        meta = item.data(0, Qt.UserRole + 1) or {} if item is not None else {}
+        if not data or data[0] != NODE_TABLE:
+            return {'ok': False, 'error': '不是表节点'}
+        old_name = data[1]
+        if not self._valid_ident(new_name):
+            return {'ok': False,
+                    'error': f'非法表名: {new_name!r}（仅字母/数字/下划线/$）'}
+        if str(new_name) == str(old_name):
+            return {'ok': False, 'error': '新表名与原名相同'}
+        if ask:
+            question = confirmer or (lambda title, text:
+                                     QMessageBox.question(self, title, text))
+            ret = question('重命名表',
+                           f'将表 {old_name} 重命名为 {new_name}？')
+            if ret != QMessageBox.Yes:
+                return {'ok': False, 'error': '用户取消', 'cancelled': True}
+        conn = self._conn_for_meta(meta)
+        if conn is None:
+            return {'ok': False, 'error': '未选择连接'}
+        try:
+            _n, err = conn.execute(
+                f"ALTER TABLE `{old_name}` RENAME TO `{new_name}`")
+        except Exception as exc:                      # noqa: BLE001
+            return {'ok': False, 'error': f'重命名失败: {exc}'}
+        if err:
+            return {'ok': False, 'error': f'重命名失败: {err}'}
+        parent = item.parent()
+        try:
+            if parent is not None and parent.parent() is not None:
+                self._load_db_children(parent.parent())
+            elif parent is not None:
+                self._reload_table_folder(parent)
+        except Exception:
+            pass
+        return {'ok': True, 'old': old_name, 'new': new_name, 'error': ''}
+
+    def copy_table_structure(self, item, new_name, ask=False, confirmer=None):
+        """复制表结构（CREATE TABLE ... LIKE）；引擎不支持时显式提示。"""
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        meta = item.data(0, Qt.UserRole + 1) or {} if item is not None else {}
+        if not data or data[0] != NODE_TABLE:
+            return {'ok': False, 'error': '不是表节点'}
+        source = data[1]
+        if not self._valid_ident(new_name):
+            return {'ok': False, 'error': f'非法表名: {new_name!r}'}
+        if str(new_name) == str(source):
+            return {'ok': False, 'error': '新表名与原名相同'}
+        if ask:
+            question = confirmer or (lambda title, text:
+                                     QMessageBox.question(self, title, text))
+            ret = question('复制表结构',
+                           f'按 {source} 的结构新建表 {new_name}？')
+            if ret != QMessageBox.Yes:
+                return {'ok': False, 'error': '用户取消', 'cancelled': True}
+        conn = self._conn_for_meta(meta)
+        if conn is None:
+            return {'ok': False, 'error': '未选择连接'}
+        try:
+            _n, err = conn.execute(
+                f"CREATE TABLE `{new_name}` LIKE `{source}`")
+        except Exception as exc:                      # noqa: BLE001
+            return {'ok': False, 'engine_unsupported': True,
+                    'error': f'引擎不支持复制表结构（CREATE TABLE ... LIKE）: {exc}'}
+        if err:
+            low = str(err).lower()
+            unsupported = any(k in low for k in (
+                'syntax', 'not support', 'unsupported', 'unknown',
+                'near', 'denied', '1146', '1064'))
+            prefix = ('引擎不支持复制表结构（CREATE TABLE ... LIKE）'
+                      if unsupported else '复制表结构失败')
+            return {'ok': False, 'engine_unsupported': unsupported,
+                    'error': f'{prefix}: {err}'}
+        parent = item.parent()
+        try:
+            if parent is not None and parent.parent() is not None:
+                self._load_db_children(parent.parent())
+        except Exception:
+            pass
+        return {'ok': True, 'source': source, 'new': new_name, 'error': ''}
+
+    def design_table(self, item):
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        meta = item.data(0, Qt.UserRole + 1) or {} if item is not None else {}
+        if not data or data[0] != NODE_TABLE:
+            return {'ok': False, 'error': '不是表节点'}
+        conn = meta.get('conn', '')
+        self.design_table_requested.emit(
+            conn, meta.get('db', ''), data[1])
+        return {'ok': True, 'conn': conn, 'db': meta.get('db', ''),
+                'table': data[1], 'error': ''}
+
+    def import_data(self, item):
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        meta = item.data(0, Qt.UserRole + 1) or {} if item is not None else {}
+        if not data or data[0] != NODE_TABLE:
+            return {'ok': False, 'error': '不是表节点'}
+        self.import_data_requested.emit(
+            meta.get('conn', ''), meta.get('db', ''), data[1])
+        return {'ok': True, 'table': data[1], 'error': ''}
+
+    def export_data(self, item):
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        meta = item.data(0, Qt.UserRole + 1) or {} if item is not None else {}
+        if not data or data[0] != NODE_TABLE:
+            return {'ok': False, 'error': '不是表节点'}
+        self.export_data_requested.emit(
+            meta.get('conn', ''), meta.get('db', ''), data[1])
+        return {'ok': True, 'table': data[1], 'error': ''}
+
+    def _show_column_info(self, item):
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        meta = item.data(0, Qt.UserRole + 1) or {} if item is not None else {}
+        if not data or data[0] != NODE_COLUMN:
+            return None
+        text = '\n'.join([
+            f'列名: {data[1]}',
+            f"表: {meta.get('db', '')}.{meta.get('table', '')}",
+            f"类型: {meta.get('type', '')}",
+            f"可空: {meta.get('null', '')}",
+            f"键: {meta.get('key', '')}",
+            f"默认值: {meta.get('default')}",
+            f"额外: {meta.get('extra', '')}",
+        ])
+        QMessageBox.information(self, '列信息', text)
+        return {'name': data[1], **meta, 'text': text}
+
+    # ---------- UI 包装（对话框/确认） ----------
+
+    def _ui_create_database(self, item):
+        meta = item.data(0, Qt.UserRole + 1) or {}
+        name, ok = QInputDialog.getText(self, '新建数据库', '库名:')
+        if not ok:
+            return None
+        return self.create_database(name.strip(), meta.get('conn'))
+
+    def _ui_drop_database(self, item, name):
+        return self.drop_database(name, item=item, ask=True)
+
+    def _ui_design_table(self, item):
+        return self.design_table(item)
+
+    def _ui_rename_table(self, item):
+        new_name, ok = QInputDialog.getText(self, '重命名表', '新表名:')
+        if not ok:
+            return None
+        return self.rename_table(item, new_name.strip(), ask=False)
+
+    def _ui_import_data(self, item):
+        return self.import_data(item)
+
+    def _ui_export_data(self, item):
+        return self.export_data(item)
+
+    def _ui_copy_structure(self, item):
+        new_name, ok = QInputDialog.getText(self, '复制表结构', '新表名:')
+        if not ok:
+            return None
+        return self.copy_table_structure(item, new_name.strip(), ask=False)
