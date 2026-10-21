@@ -1,19 +1,168 @@
 """
-报表系统
+报表系统（P2-3：参数化查询 / 预览 / 模板产品化 / 导出校验）
 - 保存查询为报表模板
 - 定时执行
 - 导出 Excel / HTML / CSV
+
+向后兼容：旧模板 JSON 缺少 `params` / `preview_limit` / `chart` 时自动补默认值；
+既有 `ReportEngine.add/update/remove/get/export_*` API 语义不变。
 """
+import csv as _csv
 import json
 import os
+import re
 import time
 import html
 from pathlib import Path
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from typing import List, Dict, Optional
 
 REPORT_DIR = Path.home() / '.lightdb_studio' / 'reports'
 OUTPUT_DIR = REPORT_DIR / 'outputs'
+
+
+# ==================== 参数化查询（P2-3） ====================
+
+class ReportError(Exception):
+    """报表系统异常基类。"""
+
+
+class ReportValidationError(ReportError):
+    """模板/SQL 校验失败。"""
+
+
+class ReportParameterError(ReportValidationError):
+    """参数缺失/多余/占位符混用等。"""
+
+
+_NAMED_PARAM_RE = re.compile(r'(?<!:):([A-Za-z_]\w*)')
+
+
+def _mask_sql_literals(sql: str) -> str:
+    """把字符串字面量/注释/反引号内容替换成空格（等长），用于安全扫描占位符。"""
+    s = '' if sql is None else str(sql)
+    out = []
+    i, n = 0, len(s)
+    quote = None
+    while i < n:
+        ch = s[i]
+        if quote:
+            if ch == quote:
+                if quote == "'" and i + 1 < n and s[i + 1] == "'":
+                    out.extend('  ')
+                    i += 2
+                    continue
+                quote = None
+                out.append(' ')
+            else:
+                out.append(' ')
+            i += 1
+            continue
+        if ch in ("'", '"', '`'):
+            quote = ch
+            out.append(' ')
+            i += 1
+            continue
+        if ch == '-' and i + 1 < n and s[i + 1] == '-':
+            j = s.find('\n', i)
+            j = n if j < 0 else j
+            out.extend(' ' * (j - i))
+            i = j
+            continue
+        if ch == '/' and i + 1 < n and s[i + 1] == '*':
+            j = s.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            out.extend(' ' * (j - i))
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def extract_sql_params(sql: str) -> Dict:
+    """解析 SQL 占位符，返回 {'style','names','qmark_count','mixed'}。
+
+    - `:name` 命名占位符（跳过 `::` 与字符串/注释内的内容）；
+    - `?` 位置占位符（按出现顺序）；
+    - 两者混用 → mixed=True（调用方应显式报错）。
+    """
+    masked = _mask_sql_literals(sql)
+    names = _NAMED_PARAM_RE.findall(masked)
+    qmark_count = masked.count('?')
+    if names and qmark_count:
+        style = 'mixed'
+    elif names:
+        style = 'named'
+    elif qmark_count:
+        style = 'qmark'
+    else:
+        style = 'none'
+    return {'style': style, 'names': list(dict.fromkeys(names)),
+            'qmark_count': qmark_count, 'mixed': style == 'mixed'}
+
+
+def convert_named_params(sql: str) -> str:
+    """把 `:name` 占位符转成 pymysql 的 `%(name)s`（只改占位符，不动值）。"""
+    masked = _mask_sql_literals(sql)
+    matches = list(_NAMED_PARAM_RE.finditer(masked))
+    out = ''
+    last = 0
+    for m in matches:
+        out += sql[last:m.start()] + f"%({m.group(1)})s"
+        last = m.end()
+    out += sql[last:]
+    return out
+
+
+def bind_params(sql: str, values=None):
+    """把用户参数绑定到 SQL。
+
+    返回 ``(execute_sql, params, meta)``：
+      - 命名参数 → execute_sql 已转 `%(name)s`，params 为 dict；
+      - `?` → params 为 list；
+      - 无占位符 → params=None；
+      - 缺参/多参/混用 → 抛 `ReportParameterError`（显式、可断言）。
+    """
+    req = extract_sql_params(sql)
+    style = req['style']
+    if style == 'mixed':
+        raise ReportParameterError(
+            'SQL 不能混用 :name 与 ? 两种占位符')
+    if style == 'none':
+        if values:
+            raise ReportParameterError('SQL 没有占位符，但传入了多余参数')
+        return sql, None, req
+    if style == 'named':
+        if values is None:
+            raise ReportParameterError(
+                '缺少参数: ' + ', '.join(req['names']))
+        if not isinstance(values, dict):
+            raise ReportParameterError(':name 占位符需要 dict 形式的参数')
+        known = set(req['names'])
+        missing = [n for n in req['names'] if n not in values]
+        extra = [k for k in values if k not in known]
+        if missing:
+            raise ReportParameterError('缺少参数: ' + ', '.join(missing))
+        if extra:
+            raise ReportParameterError(
+                '多余参数: ' + ', '.join(str(k) for k in extra))
+        return (convert_named_params(sql),
+                {n: values[n] for n in req['names']}, req)
+    # qmark
+    count = req['qmark_count']
+    if values is None:
+        raise ReportParameterError(f'缺少 {count} 个 ? 参数')
+    if isinstance(values, dict):
+        values = list(values.values())
+    seq = list(values)
+    if len(seq) < count:
+        raise ReportParameterError(
+            f'缺少 {count - len(seq)} 个 ? 参数（需要 {count} 个）')
+    if len(seq) > count:
+        raise ReportParameterError(
+            f'多余 {len(seq) - count} 个参数（需要 {count} 个）')
+    return sql, seq, req
 
 
 def _html_cell(value) -> str:
@@ -34,8 +183,12 @@ class ReportTemplate:
     sql: str = ""
     connection: str = ""          # 连接名
     database: str = ""
-    # 图表配置（可选）
+    # 图表配置（可选；旧模板没有该字段也能加载）
     chart: Dict = field(default_factory=dict)
+    # P2-3 参数默认值 {name: value}（? 占位符时可为空/不使用）
+    params: Dict = field(default_factory=dict)
+    # 预览行数（50/100/500，默认 100）
+    preview_limit: int = 100
     # 定时
     schedule: str = ""            # 空 = 不定时；否则 cron 简化: "daily 09:00"
     last_run: float = 0
@@ -49,12 +202,39 @@ class ReportTemplate:
             self.created_at = now
         if not self.updated_at:
             self.updated_at = now
+        if not isinstance(self.chart, dict):
+            self.chart = {}
+        if not isinstance(self.params, dict):
+            # 旧数据/外部传入 list 时容错为空 dict，避免加载失败
+            self.params = {}
+        try:
+            self.preview_limit = int(self.preview_limit or 100)
+        except (TypeError, ValueError):
+            self.preview_limit = 100
+        if self.preview_limit <= 0:
+            self.preview_limit = 100
+
+    def validate(self):
+        """保存前校验（名称/SQL 非空、占位符合法），失败抛 ReportValidationError。"""
+        if not str(self.name or '').strip():
+            raise ReportValidationError('报表名称不能为空')
+        if not str(self.sql or '').strip():
+            raise ReportValidationError('SQL 不能为空')
+        extract_sql_params(self.sql)       # mixed 时抛参数错误
+        req = extract_sql_params(self.sql)
+        if req['mixed']:
+            raise ReportValidationError('SQL 不能混用 :name 与 ? 占位符')
+        return True
 
 
 class ReportEngine:
-    def __init__(self):
-        self.dir = REPORT_DIR
-        self.out_dir = OUTPUT_DIR
+    def __init__(self, base_dir=None):
+        if base_dir is not None:
+            self.dir = Path(base_dir)
+            self.out_dir = self.dir / 'outputs'
+        else:
+            self.dir = REPORT_DIR
+            self.out_dir = OUTPUT_DIR
         self.dir.mkdir(parents=True, exist_ok=True)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.templates: List[ReportTemplate] = []
@@ -63,13 +243,32 @@ class ReportEngine:
     def _path(self):
         return self.dir / 'templates.json'
 
+    @staticmethod
+    def _template_from_dict(d) -> Optional[ReportTemplate]:
+        if not isinstance(d, dict):
+            return None
+        known = {f.name for f in fields(ReportTemplate)}
+        data = {k: v for k, v in d.items() if k in known}
+        try:
+            return ReportTemplate(**data)
+        except Exception:
+            try:
+                return ReportTemplate(name=str(d.get('name', '')),
+                                     sql=str(d.get('sql', '')))
+            except Exception:
+                return None
+
     def _load(self):
         if not self._path().exists():
             return
+        self.templates = []
         try:
             with open(self._path(), 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            self.templates = [ReportTemplate(**t) for t in data]
+            for item in data:
+                tmpl = self._template_from_dict(item)
+                if tmpl is not None:
+                    self.templates.append(tmpl)
         except Exception:
             self.templates = []
 
@@ -81,14 +280,18 @@ class ReportEngine:
         tmp.replace(self._path())
 
     def add(self, tmpl: ReportTemplate):
+        tmpl.validate()
         self.templates.append(tmpl)
         self.save()
+        return tmpl
 
     def update(self, idx: int, tmpl: ReportTemplate):
+        tmpl.validate()
         if 0 <= idx < len(self.templates):
             tmpl.updated_at = time.time()
             self.templates[idx] = tmpl
             self.save()
+        return tmpl
 
     def remove(self, idx: int):
         if 0 <= idx < len(self.templates):
@@ -101,12 +304,120 @@ class ReportEngine:
                 return t
         return None
 
+    def names(self) -> List[str]:
+        return [t.name for t in self.templates]
+
+    # ---------- P2-3 模板产品化 ----------
+
+    def upsert(self, tmpl: ReportTemplate) -> ReportTemplate:
+        """按 name 存在则更新、否则新增；保存前校验。"""
+        tmpl.validate()
+        existing = self.get(tmpl.name)
+        if existing is not None:
+            idx = self.templates.index(existing)
+            tmpl.updated_at = time.time()
+            self.templates[idx] = tmpl
+            self.save()
+        else:
+            self.add(tmpl)
+        return tmpl
+
+    def rename(self, idx: int, new_name: str):
+        new_name = str(new_name or '').strip()
+        if not new_name:
+            raise ReportValidationError('报表名称不能为空')
+        if not (0 <= idx < len(self.templates)):
+            raise ReportValidationError('模板不存在')
+        if any(t.name == new_name for i, t in enumerate(self.templates)
+               if i != idx):
+            raise ReportValidationError(f'报表名称已存在: {new_name}')
+        self.templates[idx].name = new_name
+        self.templates[idx].updated_at = time.time()
+        self.save()
+        return self.templates[idx]
+
+    def duplicate(self, idx: int, new_name: str = '') -> ReportTemplate:
+        import copy
+        if not (0 <= idx < len(self.templates)):
+            raise ReportValidationError('模板不存在')
+        src = self.templates[idx]
+        base = str(new_name or '').strip() or f'{src.name} 副本'
+        name = base
+        n = 2
+        while self.get(name) is not None:
+            name = f'{base} ({n})'
+            n += 1
+        tmpl = copy.deepcopy(src)
+        tmpl.name = name
+        tmpl.created_at = time.time()
+        tmpl.updated_at = time.time()
+        tmpl.last_run = 0
+        tmpl.last_status = ''
+        tmpl.validate()
+        self.templates.append(tmpl)
+        self.save()
+        return tmpl
+
+    def remove_by_name(self, name: str) -> bool:
+        tmpl = self.get(name)
+        if tmpl is None:
+            return False
+        self.remove(self.templates.index(tmpl))
+        return True
+
+    def validate_template(self, tmpl: ReportTemplate):
+        return tmpl.validate()
+
+    # ---------- 参数化查询 ----------
+
+    def resolve_query(self, sql: str, values=None):
+        """返回 (execute_sql, params, meta)；缺参/多参显式抛 ReportParameterError。"""
+        return bind_params(sql, values)
+
+    def run_query(self, conn, sql: str, values=None):
+        """安全执行参数化查询：占位符转 pymysql 风格，值走 params。"""
+        exec_sql, params, _meta = bind_params(sql, values)
+        if params is None:
+            return conn.query(exec_sql)
+        return conn.query(exec_sql, params)
+
+    def preview_query(self, conn, sql: str, values=None, limit=None) -> Dict:
+        """执行查询并截断到前 limit 行（预览）；返回结果元信息。"""
+        exec_sql, params, meta = bind_params(sql, values)
+        cols, rows = (conn.query(exec_sql) if params is None
+                      else conn.query(exec_sql, params))
+        cols = list(cols or [])
+        rows = list(rows or [])
+        total = len(rows)
+        if limit is None:
+            limit = 0
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit > 0:
+            rows = rows[:limit]
+        return {'columns': cols, 'rows': rows, 'total': total,
+                'returned': len(rows), 'limit': limit,
+                'sql': exec_sql, 'params': params,
+                'style': meta['style'], 'param_names': meta['names']}
+
     # ==================== 导出 ====================
 
+    def export_data(self, columns, rows, filepath, fmt='csv', title='',
+                    chart_svg=''):
+        """按格式导出（csv/xlsx/html），返回文件路径。"""
+        fmt = str(fmt or 'csv').lower()
+        if fmt in ('xlsx', 'excel'):
+            return self.export_excel(columns, rows, filepath, title=title)
+        if fmt == 'html':
+            return self.export_html(columns, rows, filepath, title=title,
+                                    chart_svg=chart_svg)
+        return self.export_csv(columns, rows, filepath)
+
     def export_csv(self, columns, rows, filepath):
-        import csv
         with open(filepath, 'w', encoding='utf-8-sig', newline='') as f:
-            w = csv.writer(f)
+            w = _csv.writer(f)
             w.writerow(columns)
             for r in rows:
                 w.writerow(['' if v is None else v for v in r])

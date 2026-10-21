@@ -68,7 +68,7 @@
 | **P1-5 DataEditor 类型编辑** | 按列类型给编辑器（日期选择器、布尔下拉、NULL 开关、JSON 文本校验）；批量修改事务提交；乐观锁（updated_at/版本列，若表有） | `ui/data_editor.py` | 日期列不能输非法值；NULL 可设；批量 100 行提交原子（失败全回滚） |
 | **P1-6 对象树懒加载与右键菜单** | 展开表才加载列/索引/触发器；右键：复制名/查看 DDL/刷新/生成 SELECT；搜索框支持模糊过滤 | `ui/object_tree.py` | 1000 张表首屏 <500ms；右键动作可用；搜索即过滤 |
 
-## 4. P2 —— 功能深度（4–8 周）
+## 4. P2 —— 功能深度（4–8 周；P2-2/P2-3 已完成 2026-10-21，见 §13）
 
 1. **ER 图/关系图**：当前引擎没有真实外键约束（`CREATE TABLE` 接受 FOREIGN KEY 但
    是否强制需核实【待验证】），ER 图应**只用真实元数据**（主键/索引/列注释）或让用户
@@ -196,4 +196,18 @@
 Workbook 分批 append（超大结果集内存高于 write_only）；③DataEditor 事务依赖引擎
 BEGIN/COMMIT、无主键表仍拒绝编辑；④非法值只前端拦截，DB 类型错误仍由事务失败回滚提示。
 **P1 剩余**：仅 QAbstractTableModel 完整虚拟化（当前有界 fetchmany+截断+加载更多，够用）。
+
+## 13. 实施记录：P2-2/P2-3 已完成（2026-10-21）
+
+| P2 项 | 实现 | 验收证据 |
+|---|---|---|
+| P2-2 图表可配置化 | `ui/chart_view.py`：`ChartConfig` / `parse_chart_config`（兼容旧单 y/中文类型聚合名）；多 Y 系列 + SUM/AVG/COUNT/MIN/MAX 聚合（重复 X 聚合、NULL 忽略、唯一 X 原值）；X/Y/类型/标题实时重绘 + 图例；无有效数值列显式提示；PNG/SVG 导出（QImage/XML 真实校验）；配置 JSON save/load | 5 种聚合在重复 X/NULL/非数值列上正确；PNG 14.5KB 可读、SVG 4.7KB XML 可解析；旧配置 `{'y':'sales','type':'折线图','agg':'平均'}` 可规范化；配置往返 |
+| P2-3 报表参数化/模板 | `core/reports.py`：`extract_sql_params`（`:name`/`?`，跳过字符串/注释/反引号）、`bind_params`（`:name`→pymysql `%()s`，缺参/多参/混用显式 `ReportParameterError`）、模板 `params`/`preview_limit` + `validate/upsert/rename/duplicate/remove_by_name/names`、`preview_query/run_query/export_data`、`ReportEngine(base_dir=...)`；旧模板缺字段自动默认 | 参数转换/缺参显式不查库；模板保存校验/CRUD；重开 engine 后 params+chart+preview_limit round-trip；旧 JSON 兼容 |
+| P2-3 设计器 | `ui/report_builder.py`：`ParamInputDialog`（无参数不弹、空值缺参显式）；安全 `conn.query(sql, params)`；内嵌预览 50/100/500 行；模板新建/保存校验/重命名/复制/删除；HTML/CSV/XLSX 导出（真实文件校验）；从预览构建图表并写入模板 `chart` | HTML 转义 `<script>`/`&`/NULL；CSV 行数 + utf-8-sig；XLSX openpyxl 可读；模板图表配置持久化 |
+| 验证 | 新增 `tests/test_studio_p2_visuals.py`：**24 passed + 1 skipped**（8898 不可用时真实 e2e 显式 skip）；全部 Studio 回归 + 新测试 **132 passed / 1 skipped**；compileall OK；真实 GUI `p2_visual_check.py` **3/3 PASS**、4 张截图（`shots_p2/`） | 既有 77/10/4/6/5 张证据未动 |
+
+**风险**：图表 limit 为原始行截断后再分组；HTML 导出暂未嵌入图表 SVG（`chart_svg` 形参已预留）；
+参数解析为启发式扫描（非完整 parser，空白参数视为缺参、qmark 默认值不持久化）；
+XLSX 导出沿用整表内存实现。**P2 剩余**：ER 图真实关系、Schema 对比/迁移产品化、快照/备份
+产品化、Web/GUI 对齐、i18n/可访问性、插件 API、服务端 TLS 接线。
 

@@ -116,6 +116,19 @@
   真实 GUI `p1_import_editor_check.py` 3/3 PASS、5 张截图。
   附带修复 `DBQueryError` 在 errno=None 时 `__str__` 递归（`error_message` 优先取 message）。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §12。
+- **GUI P2 可视化（P2-2/P2-3，2026-10-21）**：
+  ① **图表可配置化**（`ui/chart_view.py`）：`ChartConfig` + 多 Y 系列；X 轴列、Y 数值列、
+  SUM/AVG/COUNT/MIN/MAX 聚合（重复 X 聚合、NULL 忽略、唯一 X 原值）、bar/line/pie/scatter
+  + 标题实时重绘 + 图例；无有效数值列显式提示；**PNG/SVG 导出**（文件真实可解析）；
+  配置 JSON save/load 并兼容旧单 y 配置，可写入报表模板 `chart` 字段。
+  ② **报表设计器产品化**（`core/reports.py` + `ui/report_builder.py`）：`:name`/`?`
+  参数化查询（字符串/注释内占位符不误伤；缺参/多参/混用显式 `ReportParameterError`）、
+  参数输入对话框；模板 `params`/`preview_limit` + validate/upsert/rename/duplicate/remove；
+  内嵌预览 50/100/500 行；HTML（转义）/CSV（utf-8-sig）/XLSX（openpyxl 可读）导出；
+  旧模板缺字段自动默认。
+  新增 `tests/test_studio_p2_visuals.py`（24 passed + 1 skipped，真实服务不可用时显式 skip）；
+  Studio 回归 + 新测试 132 passed / 1 skipped；真实 GUI `p2_visual_check.py` 3/3 PASS、4 张截图。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §13。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。
