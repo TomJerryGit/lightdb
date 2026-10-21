@@ -342,3 +342,24 @@ openpyxl 可读）。**限制**：本机无浏览器/Node，未做真实 DOM/JS 
 接口契约覆盖替代，已注明）。CI Actions 同时升级到 `checkout@v7`/`setup-python@v7`/
 `upload-artifact@v7`，消除 Node.js 20 deprecation 警告。
 
+## 23. 竞争分析与下一步路线（2026-10-21）
+
+本机安装的 **Navicat for MySQL 10.0.11 + MySQL 5.0.51b** 提供了现实对照。完整矩阵、
+实测探针、定位建议与 90 天排期见
+[`docs/COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md`](COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md)。
+关键结论：
+
+- **兼容实证**：MySQL 5.0 老客户端（与 Navicat 10 同代 libmysql）可连 LightDB 8898，
+  `SELECT/SHOW DATABASES/TABLES/INDEX/DESC/SHOW CREATE TABLE/EXPLAIN/DDL/DML/事务` 通过；
+- **首要缺口（P4-A，2 周）**：一批 `SHOW ...` 元数据语句 1064（Navicat 面板依赖）；
+  `PARTITION BY` 被接受但静默丢弃、`CREATE PROCEDURE/CALL` 为 no-op 非报错；
+  老客户端中文写入被静默替换 U+FFFD（应 1366）；`CREATE INDEX/VIEW`、SAVEPOINT、
+  `ALTER MODIFY COLUMN` 未实现；
+- **Studio 深度（P4-B）**：SSH/SSL 客户端、XLSX/JSON/SQL 导入、跨连接传输/结构同步、
+  用户权限管理、结果表完整虚拟化、多窗口；
+- **性能（P5）**：先建同机同负载 benchmark harness（当前 LightDB 绝对基线：
+  INSERT 1,501 rows/s、点查 1,138 q/s TCP、GUI 启动 687ms/1200 行 379ms）；补
+  WAL checkpoint/压实与崩溃恢复压测；Cython 在堆损坏根因定位前不重启；
+- **定位建议**："轻量 MySQL 兼容数据库 + 现代轻量数据库工作台"（教学/演示/CI/边缘），
+  不与 Navicat+MySQL 正面拼全功能；明确"不做"清单见文档 §8。
+

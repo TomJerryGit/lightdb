@@ -242,6 +242,18 @@
   已知限制：本机无浏览器/Node，未做真实 DOM 运行验证（静态扫描 + API 契约覆盖替代）。
 - **CI Actions 升级（2026-10-21）**：`actions/checkout@v7`、`actions/setup-python@v7`、
   `actions/upload-artifact@v7`，消除 Node.js 20 deprecation 警告。
+- **现场 GUI 缺陷修复（2026-10-21）**：真实运行 Studio 点「示例插件 → 插入 SELECT 1」
+  抛 `QTextCursor has no attribute 'End'`（PySide6 6.x 枚举作用域化）；
+  `SQLEditor.append_sql()` 改用 `QTextCursor.MoveOperation.End`，新增回归测试
+  `test_sql_editor_append_sql_uses_scoped_enum`。
+- **竞争分析与下一步路线（2026-10-21）**：新增
+  `docs/COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md`——本机 Navicat for MySQL 10.0.11 +
+  MySQL 5.0.51b 实测环境；MySQL 5.0 老客户端可连 LightDB 8898（SELECT/SHOW/DDL/DML/
+  事务），但 `SHOW COLLATION/CHARSET/ENGINES/TABLE STATUS/FULL COLUMNS/FULL TABLES/
+  WARNINGS`、`CREATE INDEX/VIEW/EVENT/SAVEPOINT/PREPARE` 仍 1064；`PARTITION BY`
+  被静默丢弃、`CREATE PROCEDURE/CALL` 为 no-op 非报错、老客户端中文写入被替换为
+  U+FFFD；文档给出定位建议（轻量 MySQL 兼容 + 现代 GUI）、90 天排期（先第三方兼容+
+  诚实性 → Studio 深度 → 性能/可靠性 → 交付）与"不做"清单。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

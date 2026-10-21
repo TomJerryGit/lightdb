@@ -153,6 +153,12 @@
   引擎限制。详见 [`docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md`](docs/analysis_2026-10-19/07_GUI_FULL_VERIFICATION.md)；
   GUI 后续优化路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md)
   （P0 正确性/安全 → P1 响应性 → P2 功能深度 → P3 工程质量）。
+- **与 Navicat + MySQL 的竞争分析与下一步路线（2026-10-21）**见
+  [`docs/COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md`](docs/COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md)：
+  基于本机 **Navicat for MySQL 10.0.11 + MySQL 5.0.51b** 实测环境，含功能宽度/深度/
+  UI/性能矩阵、第三方客户端兼容探针（MySQL 5.0 老客户端可连 LightDB；一批
+  `SHOW ...` 语句仍 1064、`PARTITION BY`/`CREATE PROCEDURE` 存在静默语义丢失）、
+  定位建议与 90 天排期（先做第三方兼容+诚实性，再做 Studio 深度与性能可靠性）。
 - **GUI P0 已实施（2026-10-20）**：结果表**数值/日期感知排序**（NULL 恒末尾）、**结果过滤条**
   （1200 行 40.6ms、不查库）、**快照同名自动唯一 + 旧索引迁移**、**连接口令本地加密**
   （Windows DPAPI；`connections.json` 不再明文，旧明文自动迁移）、连接对话框**口令显示/隐藏**、
@@ -243,6 +249,12 @@
   无浏览器/Node，未做真实 DOM 运行验证（静态+接口契约覆盖，已注明）。
 - **CI Actions 升级（2026-10-21）**：`checkout@v7` / `setup-python@v7` /
   `upload-artifact@v7`，移除 Node.js 20 deprecation 警告。
+- **现场 GUI 缺陷修复（2026-10-21）**：真实运行 Studio 时点「示例插件 → 插入 SELECT 1」
+  抛 `QTextCursor has no attribute 'End'`（PySide6 6.x 枚举作用域化）；已修
+  `SQLEditor.append_sql()` 为 `QTextCursor.MoveOperation.End` 并加回归测试。
+- **竞争分析文档（2026-10-21）**：新增
+  [`docs/COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md`](docs/COMPETITIVE_ANALYSIS_NAVICAT_MYSQL.md)
+  （Navicat 10 + MySQL 5.0 实测对比、第三方客户端兼容探针、定位与 90 天路线）。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip

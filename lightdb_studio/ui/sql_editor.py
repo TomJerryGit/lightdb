@@ -478,7 +478,9 @@ class SQLEditor(QPlainTextEdit):
 
     def append_sql(self, sql: str):
         cur = self.textCursor()
-        cur.movePosition(cur.End)
+        # PySide6 6.x 的枚举是作用域限定的：旧的 `cur.End` 会抛
+        # AttributeError（现场 GUI 点“示例插件”暴露）；用 MoveOperation.End。
+        cur.movePosition(QTextCursor.MoveOperation.End)
         if self.toPlainText().strip():
             self.insertPlainText("\n\n" + sql)
         else:

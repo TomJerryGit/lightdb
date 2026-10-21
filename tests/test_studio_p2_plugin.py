@@ -460,6 +460,26 @@ def test_main_window_installs_plugin_actions_on_startup():
     MainWindow._install_plugin_actions(_Win(_NoInstall()))
 
 
+# ==================== 现场 bug 回归：示例插件「插入 SELECT 1」 ====================
+
+def test_sql_editor_append_sql_uses_scoped_enum():
+    """GUI 现场点「示例插件」暴露：`cur.End` 在 PySide6 6.x 不存在。
+
+    回归：`SQLEditor.append_sql()` 必须能把 SQL 追加到编辑器（空/非空两条路径），
+    不能抛 `AttributeError: QTextCursor has no attribute End`。
+    """
+    qapp()
+    from lightdb_studio.ui.sql_editor import SQLEditor
+    ed = SQLEditor()
+    ed.append_sql('SELECT 1')
+    assert ed.toPlainText() == 'SELECT 1'
+    ed.append_sql('SELECT 2')
+    text = ed.toPlainText()
+    assert 'SELECT 1' in text and 'SELECT 2' in text
+    assert text.index('SELECT 1') < text.index('SELECT 2')
+    ed.close()
+
+
 if __name__ == '__main__':
     print('本文件需 pytest（fixture）；直接运行仅做导入检查')
     sys.exit(0)
