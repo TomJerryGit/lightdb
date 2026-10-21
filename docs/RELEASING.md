@@ -16,6 +16,8 @@
     （全量 pytest 1087 用例 + benchmark gate + packaging）。
   - run `39534182111`（head `7087f0b`，GUI P1 第三批）→ **success**，全部 13 个 step 成功
     （全量 pytest 1106 用例 + benchmark gate + packaging）。
+  - run `39535395829`（head `8882232`，GUI P2 可视化）→ **success**，全部 13 个 step 成功
+    （全量 pytest 1131 用例 + benchmark gate + packaging）。
   - 仅剩 GitHub 的 Node.js 20 deprecation warning（actions 自身，与本仓库代码无关）。
 - 推送命令：
   ```powershell
@@ -28,7 +30,7 @@
 
 | 步骤 | 命令/步骤 | 结果 |
 |---|---|---|
-| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1106 用例 = 1065 passed / 0 failed / 39 skipped / 1 xfailed / 1 xpassed**（2026-10-21 GUI P1 第三批后；GitHub CI run `39534182111` 同版本全绿） |
+| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1131 用例 = 1089 passed / 0 failed / 40 skipped / 1 xfailed / 1 xpassed**（2026-10-21 GUI P2 可视化后；GitHub CI run `39535395829` 同版本全绿） |
 | 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致） |
 | 打包检查 | `python scripts/check_packaging.py` | PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源） |
 | 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS（提交 GUI 验证报告后复跑通过） |
