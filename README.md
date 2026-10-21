@@ -192,6 +192,11 @@
   （恢复前自动 `pre_restore_*` 紧急快照，失败自动回滚并显式 `rolled_back`/`rollback_error`，
   紧急快照失败中止恢复）。新测试 17 passed，指定回归 53 passed，真实 GUI 4/4 PASS；
   详见路线图 §15。**P2 已完成 5/9 项**。
+- **服务端 TLS 已接线（P2 安全，2026-10-21）**：握手宣告 `CLIENT_SSL` → 识别 SSLRequest →
+  wrap socket → TLS 内继续认证；证书来自 `ssl_cert`/`ssl_key` 或 `<data_dir>/ssl`
+  （SSLManager/openssl 自动生成），不可用时启动显式报错；TLS 可选（明文客户端仍可连）。
+  新增 `tests/test_wire_ssl.py`（cryptography 自签证书）3 passed，
+  `tests/test_batch14.py::test_ssl` 恢复端到端断言；详见路线图 §16。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip
@@ -250,10 +255,13 @@
   是否在生产长期开启需等更大数据量/更优列格式的实测；4A.3 并行在纯 SUM 上加速
   不足 1.2x（自动档保持串行），只有 GROUP BY 分片有明显收益（w2 2.75x）；
   float SUM/AVG 分片合并理论上有末位差异（顺序固定 + crosscheck 兜底）。
-- **仍有限制（2026-10-21 CI 首跑暴露并已如实标注）**：**服务端 TLS/SSL 尚未接线**
-  （`ssl_enabled` 与 `SSLManager` 证书工具存在，但 `MySQLServer` 未 wrap socket /
-  未宣告 `CLIENT_SSL`；`tests/test_batch14.py::test_ssl` 在有机 openssl 环境显式 skip，
-  待实现后恢复端到端断言，见路线图 P2 安全项）；
+- **服务端 TLS/SSL 已接线（2026-10-21）**：`MySQLServer` 在握手阶段宣告 `CLIENT_SSL`，
+  识别 32 字节 SSLRequest 后 wrap socket 并在 TLS 通道内继续认证；证书来源
+  `ssl_cert`/`ssl_key` 显式路径，或 `<data_dir>/ssl` 已有证书/`SSLManager`（openssl CLI）
+  自动生成；两者都不可用时**启动显式报错**，绝不静默降级为明文。TLS 为可选语义
+  （不发 SSLRequest 的客户端仍可明文连接）。端到端测试
+  `tests/test_wire_ssl.py`（cryptography 自签证书，不依赖 openssl CLI）+ 恢复
+  `tests/test_batch14.py::test_ssl` 断言。
 - **历史文档状态**：[docs/V4_DECISION.md](docs/V4_DECISION.md) 已被**有意截断**
   （44 行，含"原文档在此处截断，后续章节缺失"）以移除不可核实的数据；
   本 README **不补写**其中缺失的历史内容，只在此处如实标注该文件不完整。

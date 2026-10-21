@@ -44,6 +44,8 @@ _ENV_MAP = {
     'LIGHTDB_SLOW_QUERY_THRESHOLD': ('slow_query_threshold', float),
     'LIGHTDB_MAX_ALLOWED_PACKET': ('max_allowed_packet', int),
     'LIGHTDB_SSL_ENABLED': ('ssl_enabled', bool),
+    'LIGHTDB_SSL_CERT': ('ssl_cert', str),
+    'LIGHTDB_SSL_KEY': ('ssl_key', str),
     'LIGHTDB_AUDIT_LEVEL': ('audit_level', str),
     'LIGHTDB_MAX_CONN_PER_IP': ('max_conn_per_ip', int),
     'LIGHTDB_IP_WHITELIST_ENABLED': ('ip_whitelist_enabled', bool),
@@ -128,7 +130,13 @@ class Config:
     log_dir: str = ""                    # 空 = 只输出到 stdout
 
     # ---------- 安全 ----------
+    #: 是否启用服务端 TLS（MySQL SSLRequest 协商；见 net/server.py）。
     ssl_enabled: bool = False
+    #: 服务端证书/私钥路径。为空且 ssl_enabled=True 时：
+    #: 先用 `<data_dir>/ssl/` 下已有证书，否则尝试用 openssl CLI 生成自签证书
+    #: （SSLManager）；两者都不可用 → 启动时显式报错（绝不静默降级为明文）。
+    ssl_cert: str = ""
+    ssl_key: str = ""
     audit_level: str = "DDL"
     # 决策 D 阶段 2：半同步复制**不实现**（死代码已移除，不再有该配置项）。
 

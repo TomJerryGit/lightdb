@@ -13,6 +13,7 @@ import os
 import re
 import socket
 import socketserver
+import ssl
 import struct
 import threading
 import time
@@ -187,6 +188,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         self.server_id = _alloc_server_id()
         self.auth_seed = os.urandom(20)
         self.closed = False
+        self.tls_active = False
         self.db = self.server.db
         self.executor = self.server.executor
         self.connected_at = time.time()
@@ -235,13 +237,36 @@ class MySQLHandler(socketserver.BaseRequestHandler):
     # ==================== 握手 ====================
 
     def do_handshake(self) -> bool:
+        ssl_enabled = bool(getattr(self.server, 'ssl_enabled', False))
         handshake = mp.make_handshake_v10(
-            self.server_id, self.auth_seed)
+            self.server_id, self.auth_seed, ssl_enabled=ssl_enabled)
         self._send_packet(handshake)
 
         response_data = self._read_packet()
         if not response_data:
             return False
+
+        # ---------- TLS（MySQL SSLRequest 协商） ----------
+        # 启用 TLS 时客户端若带 CLIENT_SSL 能力，会先发一个 32 字节
+        # SSLRequest（capabilities+max_packet+charset+reserved），然后才在
+        # TLS 通道里发送真正的 HandshakeResponse。这里先做 TLS 握手，再读
+        # 认证包；不启用 TLS 的连接（客户端未带 CLIENT_SSL）继续明文，保持
+        # 向后兼容（MySQL 的 TLS 是"可选"语义）。
+        if (ssl_enabled and getattr(self.server, 'ssl_context', None)
+                is not None and len(response_data) == 32):
+            caps = struct.unpack('<I', response_data[:4])[0]
+            if caps & mp.CLIENT_SSL:
+                try:
+                    self.sock = self.server.ssl_context.wrap_socket(
+                        self.sock, server_side=True)
+                    self.request = self.sock
+                    self.tls_active = True
+                    response_data = self._read_packet()
+                except Exception as e:            # noqa: BLE001
+                    logger.warn(f"TLS 握手失败: {e}")
+                    return False
+                if not response_data:
+                    return False
 
         try:
             resp = mp.HandshakeResponse(response_data)
@@ -2170,9 +2195,51 @@ class MySQLServer(socketserver.ThreadingTCPServer):
             logger.warn(f"初始化 IP 白名单失败（按未启用处理）: {e}")
             self.ip_whitelist = None
 
+        # ---------- TLS/SSL（可选；ssl_enabled=True 时失败即显式抛错） ----------
+        self.ssl_enabled = False
+        self.ssl_context = None
+        self._init_ssl_context()
+
         super().__init__(
             (config.host, config.port),
             MySQLHandler)
+
+    def _init_ssl_context(self):
+        """按配置初始化服务端 TLS 上下文。
+
+        - `ssl_cert`/`ssl_key` 显式指定 → 直接用；
+        - 否则尝试 `<data_dir>/ssl/` 已有证书，或调用 SSLManager（openssl CLI）
+          生成自签证书；
+        - 都不行 → **抛 RuntimeError**（启动失败），绝不静默降级成明文。
+        """
+        if not bool(getattr(self.config, 'ssl_enabled', False)):
+            return
+        cert = str(getattr(self.config, 'ssl_cert', '') or '').strip()
+        key = str(getattr(self.config, 'ssl_key', '') or '').strip()
+        if not cert or not key:
+            cert_dir = os.path.join(
+                str(getattr(self.config, 'data_dir', '') or 'data'), 'ssl')
+            try:
+                from ..security.ssl_support import SSLManager
+                mgr = SSLManager(cert_dir)
+                if not mgr.ensure_certificates():
+                    raise RuntimeError('证书生成失败')
+                cert, key = str(mgr.cert_file), str(mgr.key_file)
+            except Exception as e:            # noqa: BLE001
+                raise RuntimeError(
+                    'ssl_enabled=True 但未提供 ssl_cert/ssl_key，且无法自动生成'
+                    f'证书（需要 openssl CLI 或显式证书路径）: {e}') from e
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(cert, key)
+        except Exception as e:                # noqa: BLE001
+            raise RuntimeError(
+                f'ssl_enabled=True 但证书加载失败 (cert={cert!r}, '
+                f'key={key!r}): {e}') from e
+        self.ssl_enabled = True
+        self.ssl_context = ctx
+        logger.info(f"TLS 已启用（证书: {cert}）")
 
     def _int_cfg(self, name: str, default: int) -> int:
         """读取整型配置，非法值回退默认值（0/负数视为非法）"""

@@ -9,5 +9,8 @@ black>=23.0
 ruff>=0.1
 httpx>=0.25.0
 
+# tests/test_wire_ssl.py 用 cryptography 生成自签证书（不依赖 openssl CLI）
+cryptography>=41.0
+
 # Cython 加速模块的本地编译（可选，见 scripts/build_cython.sh）
 # cython>=3.0.0

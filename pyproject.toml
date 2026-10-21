@@ -68,6 +68,8 @@ dev = [
     # 这两个是它的运行时依赖（CI 曾因缺 wheel 在 packaging 步骤失败）。
     "setuptools>=61.0",
     "wheel",
+    # tests/test_wire_ssl.py 用 cryptography 生成自签证书（不依赖 openssl CLI）。
+    "cryptography>=41.0",
 ]
 
 [project.scripts]

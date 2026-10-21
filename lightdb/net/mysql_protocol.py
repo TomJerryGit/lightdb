@@ -167,22 +167,25 @@ def build_packet(payload: bytes, seq_id: int = 0) -> bytes:
 
 # ========== 服务端 -> 客户端 包 ==========
 
-def make_handshake_v10(connection_id: int, auth_seed: bytes) -> bytes:
+def make_handshake_v10(connection_id: int, auth_seed: bytes,
+                       ssl_enabled: bool = False) -> bytes:
     """
     HandshakeV10 包
     auth_seed 必须是 20 字节
+    ssl_enabled=True 时宣告 CLIENT_SSL，客户端才会发 SSLRequest 并开始 TLS。
     """
     assert len(auth_seed) == 20
+    capabilities = SERVER_CAPABILITIES | (CLIENT_SSL if ssl_enabled else 0)
     payload = b''
     payload += b'\x0a'                          # protocol version = 10
     payload += b'5.7.30-LightDB\x00'            # server version
     payload += struct.pack('<I', connection_id) # connection id
     payload += auth_seed[:8]                    # auth-plugin-data-part-1
     payload += b'\x00'                          # filler
-    payload += struct.pack('<H', SERVER_CAPABILITIES & 0xffff)  # capability_flags_1
+    payload += struct.pack('<H', capabilities & 0xffff)  # capability_flags_1
     payload += bytes([CHARSET_UTF8MB4])         # character_set
     payload += struct.pack('<H', SERVER_STATUS_AUTOCOMMIT)      # status_flags
-    payload += struct.pack('<H', (SERVER_CAPABILITIES >> 16) & 0xffff)  # capability_flags_2
+    payload += struct.pack('<H', (capabilities >> 16) & 0xffff)  # capability_flags_2
     payload += bytes([21])                      # auth_plugin_data_len
     payload += b'\x00' * 10                     # reserved
     payload += auth_seed[8:]                    # auth-plugin-data-part-2 (12 bytes)

@@ -194,15 +194,14 @@
 - **多进程 Worker 元数据**：`RemoteDB` 补 `database_names()`/`visible_table_names()`，
   Master 快照带 `database_names`/`visible_tables`，修复 worker 上 `SHOW TABLES`
   1049 "No database selected"。
-- **服务端 TLS 限制如实标注**：`ssl_enabled` 目前不生效，`tests/test_batch14.py::test_ssl`
-  在有机 openssl 环境显式 skip；已列入 Known limitations 与路线图 P2。
+- **服务端 TLS 已实现**（P2 安全项）：`MySQLServer` 握手宣告 `CLIENT_SSL`、识别
+  32 字节 SSLRequest 后 wrap socket 并在 TLS 通道继续认证；证书来源
+  `ssl_cert`/`ssl_key` 或 `<data_dir>/ssl`（`SSLManager`/openssl）；不可用时启动
+  显式报错不静默降级；TLS 可选（明文客户端仍可连）。测试 `tests/test_wire_ssl.py`
+  用 `cryptography` 自签证书；`tests/test_batch14.py::test_ssl` 恢复端到端断言。
 
 ### Known limitations
 
-- **服务端 TLS/SSL 尚未接线**：`Config.ssl_enabled` 与 `security.ssl_support.SSLManager`
-  （自签证书生成/ctx）存在，但 `MySQLServer` 从未 wrap socket、握手不宣告
-  `CLIENT_SSL`；`tests/test_batch14.py::test_ssl` 在有机 openssl 的环境显式 skip
-  （2026-10-21 CI 首跑暴露，原因写在测试内），待实现后恢复端到端断言。
 - 复制：轮转/严格提交已实现；仍**无 GTID**（按位点复制）、**半同步不实现**（死代码已删）、
   无 `binlog.index`（启动 O(n) 扫描）；`binlog_strict` 覆盖 `Database.commit/commit_statement`，
   单行 autocommit 的 binlog 失败仍只告警（阶段 3 统一语句级内部事务）；WAL 与 binlog 非 2PC；

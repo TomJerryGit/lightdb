@@ -34,6 +34,14 @@ def start_server(port, ssl=False, audit_level='DDL'):
     cfg.port = port
     cfg.ssl_enabled = ssl
     cfg.audit_level = audit_level
+    if ssl:
+        # 服务端 TLS 已接线（2026-10-21 P2 安全项）：显式给出证书路径，
+        # 避免依赖 <data_dir>/ssl 或环境里的 openssl CLI 路径。
+        from lightdb.security.ssl_support import SSLManager
+        mgr = SSLManager(os.path.join(DATA_DIR, 'ssl'))
+        assert mgr.ensure_certificates(), 'SSL 证书生成失败'
+        cfg.ssl_cert = str(mgr.cert_file)
+        cfg.ssl_key = str(mgr.key_file)
     db = track(Database(DATA_DIR))
     ex = track(Executor(db))
     srv = track(MySQLServer(cfg, db, ex))
@@ -119,14 +127,31 @@ def test_ssl():
     print(f"  → cert: {mgr.cert_file}")
     print(f"  → key: {mgr.key_file}")
 
-    # 服务端 SSL 启用测试
-    # 已知限制（2026-10-21 CI 暴露）：服务端 TLS/SSL 尚未接线 —— Config 有
-    # ssl_enabled 字段和 SSLManager 证书工具，但 MySQLServer 从未 wrap socket/
-    # 宣告 CLIENT_SSL，因此这里不能假装 SSL 可用。明确 skip 并留下原因，
-    # 等 TLS 真正实现后再把本用例恢复为端到端断言（路线图 P2 安全项）。
-    import pytest
-    pytest.skip('服务端 TLS/SSL 尚未接线（ssl_enabled 配置项目前不生效）；'
-                '本用例仅验证证书工具，TLS 端到端待实现后恢复')
+    # 服务端 SSL 启用 + PyMySQL SSL 端到端
+    # 2026-10-21：服务端 TLS 已接线（CLIENT_SSL/SSLRequest → wrap socket →
+    # 继续认证）；这里恢复端到端断言。本机没有 openssl CLI 时上面已提前返回，
+    # 有 openssl 的环境（含 CI）必须真实通过，不得再用 skip 掩盖。
+    srv, db, ex = start_server(PORT, ssl=True)
+    print(f"  → 服务端 SSL: {srv.ssl_enabled}")
+    assert srv.ssl_enabled
+    assert srv.ssl_context is not None
+
+    import pymysql
+    conn = track(pymysql.connect(
+        host='127.0.0.1', port=PORT, user='root', autocommit=True,
+        ssl={'check_hostname': False}
+    ))
+    cur = conn.cursor()
+    cur.execute("SELECT 1")
+    r = cur.fetchone()
+    print(f"  → SSL 查询: {r}")
+    assert r == (1,)
+    conn.close()
+    print("  ✅ SSL 连接成功")
+
+    srv.shutdown()
+    db.shutdown()
+    time.sleep(0.3)
 
 
 def test_parallel_count():

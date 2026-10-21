@@ -68,7 +68,7 @@
 | **P1-5 DataEditor 类型编辑** | 按列类型给编辑器（日期选择器、布尔下拉、NULL 开关、JSON 文本校验）；批量修改事务提交；乐观锁（updated_at/版本列，若表有） | `ui/data_editor.py` | 日期列不能输非法值；NULL 可设；批量 100 行提交原子（失败全回滚） |
 | **P1-6 对象树懒加载与右键菜单** | 展开表才加载列/索引/触发器；右键：复制名/查看 DDL/刷新/生成 SELECT；搜索框支持模糊过滤 | `ui/object_tree.py` | 1000 张表首屏 <500ms；右键动作可用；搜索即过滤 |
 
-## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5 已完成 2026-10-21，见 §13/§14/§15）
+## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5 + 服务端 TLS 已完成 2026-10-21，见 §13/§14/§15/§16）
 
 1. **ER 图/关系图**：当前引擎没有真实外键约束（`CREATE TABLE` 接受 FOREIGN KEY 但
    是否强制需核实【待验证】），ER 图应**只用真实元数据**（主键/索引/列注释）或让用户
@@ -239,4 +239,20 @@ XLSX 导出沿用整表内存实现。**P2 剩余**：ER 图真实关系、Schem
 **风险**：①无后台常驻线程（QTimer 60s + 手动“运行到期检查”）；②回滚用紧急快照按语句顺序执行，
 回滚自身再失败仅显式报告；③prune 按去重后列表计数、删除时清同名旧索引项；④dry_run 只解析不预校验
 可执行性（真实执行失败显式返回）。**P2 剩余**：Web/GUI 对齐、i18n/可访问性、插件 API、服务端 TLS 接线。
+
+## 16. 实施记录：服务端 TLS/SSL 已接线（安全项，2026-10-21）
+
+此前 CI 首跑把「服务端 TLS 未接线」暴露为已知限制；本批已真正实现：
+
+| 项 | 实现 | 验收 |
+|---|---|---|
+| 协议握手 | `mysql_protocol.make_handshake_v10(..., ssl_enabled)` 在能力位宣告 `CLIENT_SSL` | `tests/test_wire_ssl.py`：pymysql 带 `ssl={...}` 握手成功 |
+| SSLRequest 处理 | `MySQLHandler.do_handshake()`：收到 32 字节且含 `CLIENT_SSL` 的 SSLRequest → `SSLContext.wrap_socket(server_side=True)` → 在 TLS 通道内读取并继续认证；明文客户端不受影响（TLS 可选） | TLS 查询 `SELECT 1`/DDL/DML 通过；明文客户端仍可连 |
+| 证书来源 | `Config.ssl_cert`/`ssl_key` 显式路径；未给时 `<data_dir>/ssl` 已有证书或 `SSLManager`（openssl CLI）自动生成；都不可用 → **构造 MySQLServer 时显式 RuntimeError**，绝不静默降级为明文 | `test_ssl_enabled_without_cert_fails_explicitly` |
+| 配置/环境变量 | `LIGHTDB_SSL_CERT` / `LIGHTDB_SSL_KEY`（新增） | Config 字段测试 |
+| 回归 | 恢复 `tests/test_batch14.py::test_ssl` 端到端断言（有机 openssl 环境真实跑，不再 skip） | 本地/CI 均通过 |
+
+测试：新增 `tests/test_wire_ssl.py`（3 passed，`cryptography` 生成自签证书，不依赖 openssl CLI）；
+`test_batch14` SSL 用例恢复断言；`test_wire_ssl + test_batch14 + test_mysql_connect +
+test_wire_transaction` = 19 passed。**P2 剩余**：Web/GUI 对齐、i18n/可访问性、插件 API。
 
