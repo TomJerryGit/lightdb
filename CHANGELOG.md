@@ -129,6 +129,20 @@
   新增 `tests/test_studio_p2_visuals.py`（24 passed + 1 skipped，真实服务不可用时显式 skip）；
   Studio 回归 + 新测试 132 passed / 1 skipped；真实 GUI `p2_visual_check.py` 3/3 PASS、4 张截图。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §13。
+- **GUI P2 元数据（P2-1/P2-4，2026-10-21）**：
+  ① **ER 图真实关系**（`ui/er_diagram.py`）：真实 `SHOW CREATE TABLE` FOREIGN KEY 解析；
+  用户手工关系 `RelationStore`（`relations.json` 持久化、可增删 round-trip）；三态优先级
+  真实 FK > 手工 > 无关系，**禁止按 `_id`/命名猜测**；表盒 PK/FK/UQ/IDX + 关系连线/箭头，
+  无关系显式提示；PNG 导出（可读校验）。
+  ② **Schema 对比产品化**（`ui/db_compare.py`）：真实列/类型/NOT NULL/默认值/PK/唯一/索引
+  差异矩阵；SQL 预览安全子集（CREATE TABLE、缺失索引 CREATE INDEX、高风险 DROP TABLE），
+  表内变更显式“需手工处理（本引擎 ALTER 限制）”不生成假 ALTER；diff SQL 落盘；高风险
+  DDL 二次确认；执行走目标连接并展示结果/错误。
+  新增 `tests/test_studio_p2_schema.py`（15 passed）；Studio 回归 + 新测试
+  **147 passed / 1 skipped**；真实 GUI `p2_schema_check.py` 3/3 PASS、5 张截图。
+  已知限制：本引擎 parser 不支持独立 `CREATE INDEX`（预览保留语句、执行会显式报错；
+  实际请在建表内联索引）。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §14。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

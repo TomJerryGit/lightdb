@@ -68,7 +68,7 @@
 | **P1-5 DataEditor 类型编辑** | 按列类型给编辑器（日期选择器、布尔下拉、NULL 开关、JSON 文本校验）；批量修改事务提交；乐观锁（updated_at/版本列，若表有） | `ui/data_editor.py` | 日期列不能输非法值；NULL 可设；批量 100 行提交原子（失败全回滚） |
 | **P1-6 对象树懒加载与右键菜单** | 展开表才加载列/索引/触发器；右键：复制名/查看 DDL/刷新/生成 SELECT；搜索框支持模糊过滤 | `ui/object_tree.py` | 1000 张表首屏 <500ms；右键动作可用；搜索即过滤 |
 
-## 4. P2 —— 功能深度（4–8 周；P2-2/P2-3 已完成 2026-10-21，见 §13）
+## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4 已完成 2026-10-21，见 §13/§14）
 
 1. **ER 图/关系图**：当前引擎没有真实外键约束（`CREATE TABLE` 接受 FOREIGN KEY 但
    是否强制需核实【待验证】），ER 图应**只用真实元数据**（主键/索引/列注释）或让用户
@@ -210,4 +210,18 @@ BEGIN/COMMIT、无主键表仍拒绝编辑；④非法值只前端拦截，DB �
 参数解析为启发式扫描（非完整 parser，空白参数视为缺参、qmark 默认值不持久化）；
 XLSX 导出沿用整表内存实现。**P2 剩余**：ER 图真实关系、Schema 对比/迁移产品化、快照/备份
 产品化、Web/GUI 对齐、i18n/可访问性、插件 API、服务端 TLS 接线。
+
+## 14. 实施记录：P2-1/P2-4 已完成（2026-10-21）
+
+| P2 项 | 实现 | 验收证据 |
+|---|---|---|
+| P2-1 ER 真实关系 | `ui/er_diagram.py`：从 `SHOW CREATE TABLE` 解析真实 FOREIGN KEY；手工关系 `RelationStore` 持久化 `relations.json`（增删 round-trip）；三态优先级=真实 FK > 手工 > 无关系，**禁止按 `_id`/命名猜测**；表盒显示 PK/FK/UQ/IDX + 连线/箭头；无关系显式提示；PNG 导出 QImage 校验 | 15 个新测试：三态/持久化/无命名猜测/PNG 可读；真实 GUI 截图（真实 FK ER 图、无关系提示、手工关系） |
+| P2-4 Schema 对比 | `ui/db_compare.py`：真实快照（`get_columns`+`SHOW INDEX`）差异矩阵（列/类型/NOT NULL/默认值/PK/唯一/索引）；SQL 预览安全子集（`CREATE TABLE`、缺失索引 `CREATE INDEX`、高风险 `DROP TABLE`）；表内变更显式“需手工处理（本引擎 ALTER 限制）”不生成假 ALTER；diff SQL 落盘；高风险二次确认；执行走目标连接并展示结果/错误 | 差异矩阵正确；预览含 CREATE TABLE/INDEX + 手工说明、无 `ALTER TABLE`；diff 800B 落盘；不确认不执行；执行 3 条含二次确认 |
+| 验证 | 新增 `tests/test_studio_p2_schema.py`：**15 passed**；全部 Studio 回归 + 新测试 **147 passed / 1 skipped**；compileall OK；真实 GUI `p2_schema_check.py` **3/3 PASS**、5 张截图（`shots_p2_schema/`） | 既有证据未动 |
+
+**风险/限制**：①本引擎 parser 实测不支持独立 `CREATE INDEX`（`parse→None`），SQL 预览仍按需求
+生成 `CREATE INDEX` 供参考，但**执行会显式报错**；真正建索引需在 `CREATE TABLE` 内声明或等引擎
+支持；②手工关系默认存 `~/.lightdb_studio/relations.json`（可注入路径）；③索引以 `SHOW INDEX`
+为准，查询失败回退 columns key；④`DROP TABLE` 属高风险可执行项，已二次确认。
+**P2 剩余**：快照/备份产品化（进行中）、Web/GUI 对齐、i18n/可访问性、插件 API、服务端 TLS 接线。
 

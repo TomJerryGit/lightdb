@@ -180,6 +180,12 @@
   校验/重命名/复制/删除、内嵌预览 50/100/500 行、HTML/CSV/XLSX 导出、旧模板兼容）。
   新测试 **24 passed + 1 skipped**，Studio 回归 132 passed/1 skipped，真实 GUI 3/3 PASS；
   详见路线图 §13。
+- **GUI P2 元数据已实施（2026-10-21）**：ER 图关系三态（真实 `SHOW CREATE TABLE` FOREIGN KEY
+  > 用户手工登记关系（持久化/增删）> 显式“无关系”，**禁止按命名猜**）+ PK/FK/UQ/IDX 标记与
+  连线 + PNG 导出；Schema 对比产品化（真实列/类型/NOT NULL/默认值/PK/唯一/索引差异矩阵、
+  可执行 SQL 预览（CREATE TABLE/INDEX、高风险 DROP 二次确认）、引擎不支持的 ALTER/独立
+  CREATE INDEX 显式标注不生成假 SQL、diff 文件落盘）。新测试 15 passed，Studio 回归
+  147 passed/1 skipped，真实 GUI 3/3 PASS；详见路线图 §14。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip
