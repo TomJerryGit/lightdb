@@ -159,6 +159,13 @@
   UI/性能矩阵、第三方客户端兼容探针（MySQL 5.0 老客户端可连 LightDB；一批
   `SHOW ...` 语句仍 1064、`PARTITION BY`/`CREATE PROCEDURE` 存在静默语义丢失）、
   定位建议与 90 天排期（先做第三方兼容+诚实性，再做 Studio 深度与性能可靠性）。
+- **深度对标 Navicat 的 GUI 细节优化路线（2026-10-21）**见
+  [`docs/GUI_NAVICAT_PARITY_ROADMAP.md`](docs/GUI_NAVICAT_PARITY_ROADMAP.md)：
+  逐项拆到"Navicat 操作路径 → Studio 现状 → 差距 → 实现点"，按 **G1（结果网格/
+  编辑器/对象树/连接/导入 XLSX·JSON）→ G2（连接导入导出/SSL/多窗口/结构同步/用户管理/
+  EXPLAIN）→ G3（大结果集虚拟化/数据生成/快捷键自定义）** 分批交付，并与引擎
+  **E1（SHOW 元数据/静默语义/字符集/SAVEPOINT）→ E2（CREATE INDEX/VIEW/ALTER MODIFY）**
+  并行；每批带 offscreen 测试 + 真实 GUI 证据 + 破坏性操作二次确认。
 - **GUI P0 已实施（2026-10-20）**：结果表**数值/日期感知排序**（NULL 恒末尾）、**结果过滤条**
   （1200 行 40.6ms、不查库）、**快照同名自动唯一 + 旧索引迁移**、**连接口令本地加密**
   （Windows DPAPI；`connections.json` 不再明文，旧明文自动迁移）、连接对话框**口令显示/隐藏**、

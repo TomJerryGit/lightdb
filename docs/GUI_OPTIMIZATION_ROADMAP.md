@@ -363,3 +363,7 @@ openpyxl 可读）。**限制**：本机无浏览器/Node，未做真实 DOM/JS 
 - **定位建议**："轻量 MySQL 兼容数据库 + 现代轻量数据库工作台"（教学/演示/CI/边缘），
   不与 Navicat+MySQL 正面拼全功能；明确"不做"清单见文档 §8。
 
+**GUI 细节执行看板**：逐项对标矩阵（结果网格/编辑器/对象树/连接/导入导出/数据编辑/
+运维等）与 **G1/G2/G3 + E1/E2 分批验收**见
+[`docs/GUI_NAVICAT_PARITY_ROADMAP.md`](GUI_NAVICAT_PARITY_ROADMAP.md)。
+
