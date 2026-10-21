@@ -13,6 +13,14 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+# GitHub Windows runner 控制台是 cp1252；注解消息/汇总里可能含中文，
+# 直接 print 会 UnicodeEncodeError（本步骤曾因此失败）。强制 UTF-8 输出。
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:                                 # noqa: BLE001
+    pass
+
 
 def _first_line(node, limit=400) -> str:
     parts = []

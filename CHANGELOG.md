@@ -110,6 +110,10 @@
 
 ### Known limitations
 
+- **服务端 TLS/SSL 尚未接线**：`Config.ssl_enabled` 与 `security.ssl_support.SSLManager`
+  （自签证书生成/ctx）存在，但 `MySQLServer` 从未 wrap socket、握手不宣告
+  `CLIENT_SSL`；`tests/test_batch14.py::test_ssl` 在有机 openssl 的环境显式 skip
+  （2026-10-21 CI 首跑暴露，原因写在测试内），待实现后恢复端到端断言。
 - 复制：轮转/严格提交已实现；仍**无 GTID**（按位点复制）、**半同步不实现**（死代码已删）、
   无 `binlog.index`（启动 O(n) 扫描）；`binlog_strict` 覆盖 `Database.commit/commit_statement`，
   单行 autocommit 的 binlog 失败仍只告警（阶段 3 统一语句级内部事务）；WAL 与 binlog 非 2PC；

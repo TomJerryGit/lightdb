@@ -216,6 +216,10 @@
   是否在生产长期开启需等更大数据量/更优列格式的实测；4A.3 并行在纯 SUM 上加速
   不足 1.2x（自动档保持串行），只有 GROUP BY 分片有明显收益（w2 2.75x）；
   float SUM/AVG 分片合并理论上有末位差异（顺序固定 + crosscheck 兜底）。
+- **仍有限制（2026-10-21 CI 首跑暴露并已如实标注）**：**服务端 TLS/SSL 尚未接线**
+  （`ssl_enabled` 与 `SSLManager` 证书工具存在，但 `MySQLServer` 未 wrap socket /
+  未宣告 `CLIENT_SSL`；`tests/test_batch14.py::test_ssl` 在有机 openssl 环境显式 skip，
+  待实现后恢复端到端断言，见路线图 P2 安全项）；
 - **历史文档状态**：[docs/V4_DECISION.md](docs/V4_DECISION.md) 已被**有意截断**
   （44 行，含"原文档在此处截断，后续章节缺失"）以移除不可核实的数据；
   本 README **不补写**其中缺失的历史内容，只在此处如实标注该文件不完整。

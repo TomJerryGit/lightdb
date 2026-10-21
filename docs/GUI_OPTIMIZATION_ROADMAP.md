@@ -85,6 +85,12 @@
    `zh_CN`/`en_US` 文案抽取（现有 `language` 设置只存值，需真正加载翻译）。
 8. **插件 API**：定义稳定接口（菜单/面板扩展点），当前 `plugin_manager` 只加载 0 个
    插件，先做"安装/启用/禁用/示例插件"闭环。
+9. **服务端 TLS/SSL 接线（安全，2026-10-21 CI 暴露的已知限制）**：`MySQLServer`
+   在握手阶段识别 `CLIENT_SSL`/SSLRequest，用 `SSLManager.make_server_context()`
+   wrap socket 并按 MySQL 协议继续认证；握手宣告 `CLIENT_SSL`；`Config` 增加
+   `ssl_cert`/`ssl_key`；恢复 `tests/test_batch14.py::test_ssl` 的端到端断言
+   （当前在有机 openssl 环境显式 skip）。验收：pymysql `ssl={...}` 连接成功且
+   `SHOW STATUS LIKE 'Ssl_cipher'` 非空。
 
 ## 5. P3 —— 工程质量与交付（持续）
 

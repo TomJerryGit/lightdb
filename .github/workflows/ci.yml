@@ -11,6 +11,12 @@ jobs:
     # 因此 CI 用 windows-latest；Linux 兼容性另有 roadmap 项。
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      # GitHub Windows runner 控制台不是 UTF-8（cp1252），测试/注解输出里含中文
+      # 会 UnicodeEncodeError（2026-10-21 首跑实测）。强制 Python 以 UTF-8 输出。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 

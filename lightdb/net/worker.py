@@ -134,9 +134,11 @@ class RemoteTable:
 
 
 class RemoteDB:
-    """把只读元数据（用户表 / 表结构）从 Master 同步过来的代理
+    """把只读元数据（用户表 / 表结构 / 库名）从 Master 同步过来的代理
 
-    handler 会用到的接口：users / tables / autocommit
+    handler 会用到的接口：users / tables / autocommit，以及
+    `database_names()` / `visible_table_names(db)`（P0-B：此前缺失，
+    导致 Worker 上 `SHOW TABLES` 报 1049 "No database selected"）。
     """
 
     def __init__(self, rpc: _RPCClient, data_dir: str = ''):
@@ -145,6 +147,8 @@ class RemoteDB:
         self.users = {}
         self.tables = {}
         self.autocommit = True
+        self._db_names = []
+        self._visible_tables = {}
 
     def refresh(self, timeout: float = 15.0) -> bool:
         ok, snap = self.rpc.call('snapshot', None, timeout=timeout)
@@ -156,7 +160,27 @@ class RemoteDB:
             for name, meta in (snap.get('tables') or {}).items()
         }
         self.autocommit = bool(snap.get('autocommit', True))
+        self._db_names = [str(n) for n in (snap.get('database_names') or [])]
+        raw_visible = snap.get('visible_tables') or {}
+        self._visible_tables = {
+            str(db): [str(t) for t in names]
+            for db, names in raw_visible.items()
+        }
         return True
+
+    # ---- handler 元数据接口（与 Database 同名同语义） ----
+
+    def database_names(self):
+        """真实库名列表（Master 快照；未同步到之前按空列表，不编造）"""
+        return list(self._db_names)
+
+    def visible_table_names(self, db_name):
+        """某库下可见表名（真实表 + information_schema 虚拟表，来自快照）"""
+        names = self._visible_tables.get(str(db_name))
+        if names is None:
+            # 快照未覆盖该库时回退到真实表名（不把别的库的表混进来）
+            return list(self.tables)
+        return list(names)
 
 
 # ==================== Worker 入口 ====================

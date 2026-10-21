@@ -209,7 +209,13 @@ class MasterServer:
         raise ValueError(f'未知的请求类型: {kind}')
 
     def _snapshot(self) -> Dict:
-        """给 Worker 的元数据快照（鉴权用户表 + 表结构）"""
+        """给 Worker 的元数据快照（鉴权用户表 + 表结构 + 库/可见表名）
+
+        `database_names` / `visible_tables` 是 P0-B 修复（2026-10-21 CI
+        多进程端到端失败）：Worker 侧 `RemoteDB` 原先没有这两个方法，
+        `SHOW TABLES`/`_current_database()` 在 Worker 上会拿到 1049
+        "No database selected"（连接没有选库时的兜底依赖库名列表）。
+        """
         tables = {}
         for name, tbl in self.db.tables.items():
             try:
@@ -222,10 +228,26 @@ class MasterServer:
         for uname, info in getattr(self.db, 'users', {}).items():
             users[uname] = dict(info) if isinstance(info, dict) else info
 
+        db_names = []
+        visible_tables = {}
+        try:
+            db_names = [str(n) for n in self.db.database_names()]
+            for db_name in db_names:
+                try:
+                    visible_tables[db_name] = [
+                        str(t) for t in self.db.visible_table_names(db_name)]
+                except Exception:
+                    visible_tables[db_name] = list(tables)
+        except Exception:                         # pragma: no cover - 防御
+            db_names = ['default']
+            visible_tables = {'default': list(tables)}
+
         return {
             'users': users,
             'tables': tables,
             'autocommit': bool(getattr(self.db, 'autocommit', True)),
+            'database_names': db_names,
+            'visible_tables': visible_tables,
         }
 
     # ==================== 启动 ====================
