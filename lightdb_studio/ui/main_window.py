@@ -226,6 +226,7 @@ class MainWindow(QMainWindow):
                 self.plugin_mgr.load_all()
             except Exception as e:            # noqa: BLE001
                 print('插件加载失败: %s' % e, file=sys.stderr)
+            self._install_plugin_actions()
             self._auto_restore()
         else:
             # 启动期恢复（插件扫描 / 自动连接 / 恢复上次打开的查询页）
@@ -293,7 +294,26 @@ class MainWindow(QMainWindow):
             self.plugin_mgr.load_all()
         except Exception as e:                        # noqa: BLE001
             print('插件加载失败: %s' % e, file=sys.stderr)
+        self._install_plugin_actions()
         self._auto_restore()
+
+    def _install_plugin_actions(self):
+        """P2-8：把已加载插件的菜单/工具栏 action 安装进主窗口。
+
+        插件加载是延迟启动动作；安装只在这里做一次（面板启停后不会自动
+        重装，避免菜单/工具栏重复堆积）。失败显式写 stderr，不静默。
+        """
+        installer = getattr(self.plugin_mgr, 'install_actions', None)
+        if not callable(installer):
+            return
+        try:
+            result = installer(self) or {}
+            errors = result.get('errors') or []
+            if errors:
+                print('插件 action 安装失败: %s' % '; '.join(
+                    str(e) for e in errors), file=sys.stderr)
+        except Exception as e:                        # noqa: BLE001
+            print('插件 action 安装异常: %s' % e, file=sys.stderr)
 
 
     # ==================== 上下文 ====================

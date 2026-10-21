@@ -197,6 +197,12 @@
   （SSLManager/openssl 自动生成），不可用时启动显式报错；TLS 可选（明文客户端仍可连）。
   新增 `tests/test_wire_ssl.py`（cryptography 自签证书）3 passed，
   `tests/test_batch14.py::test_ssl` 恢复端到端断言；详见路线图 §16。
+- **GUI P2 插件 API 已实施（2026-10-21）**：示例插件 `plugins/example_plugin.py`（菜单“插入
+  SELECT 1”/工具栏/安全 process_sql）；PluginManager 支持 **loaded/disabled/failed 状态**、
+  每插件独立失败隔离、**启用/禁用（on_unload + 状态持久化）**、**重载（清 sys.modules）**、
+  菜单/工具栏注入 `install_actions`（主窗口启动时接线）、错误可见、状态文件损坏回退；
+  插件管理面板（列表/启停/重载/刷新/打开目录/安装）。新测试 16 passed，全 Studio 套件
+  179 passed/1 skipped，真实 GUI 3/3 PASS；详见路线图 §17。**P2 已完成 6/9 项**。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip

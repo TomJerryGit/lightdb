@@ -68,7 +68,7 @@
 | **P1-5 DataEditor 类型编辑** | 按列类型给编辑器（日期选择器、布尔下拉、NULL 开关、JSON 文本校验）；批量修改事务提交；乐观锁（updated_at/版本列，若表有） | `ui/data_editor.py` | 日期列不能输非法值；NULL 可设；批量 100 行提交原子（失败全回滚） |
 | **P1-6 对象树懒加载与右键菜单** | 展开表才加载列/索引/触发器；右键：复制名/查看 DDL/刷新/生成 SELECT；搜索框支持模糊过滤 | `ui/object_tree.py` | 1000 张表首屏 <500ms；右键动作可用；搜索即过滤 |
 
-## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5 + 服务端 TLS 已完成 2026-10-21，见 §13/§14/§15/§16）
+## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5/P2-8 + 服务端 TLS 已完成 2026-10-21，见 §13–§17；Web/GUI 对齐、i18n/可访问性待续）
 
 1. **ER 图/关系图**：当前引擎没有真实外键约束（`CREATE TABLE` 接受 FOREIGN KEY 但
    是否强制需核实【待验证】），ER 图应**只用真实元数据**（主键/索引/列注释）或让用户
@@ -255,4 +255,18 @@ XLSX 导出沿用整表内存实现。**P2 剩余**：ER 图真实关系、Schem
 测试：新增 `tests/test_wire_ssl.py`（3 passed，`cryptography` 生成自签证书，不依赖 openssl CLI）；
 `test_batch14` SSL 用例恢复断言；`test_wire_ssl + test_batch14 + test_mysql_connect +
 test_wire_transaction` = 19 passed。**P2 剩余**：Web/GUI 对齐、i18n/可访问性、插件 API。
+
+## 17. 实施记录：P2-8 插件 API 已完成（2026-10-21）
+
+| P2 项 | 实现 | 验收证据 |
+|---|---|---|
+| 示例插件 | 新增 `plugins/example_plugin.py`：`PluginBase` 子类，菜单「示例：插入 SELECT 1」+ 工具栏「✨ 示例插件」+ 安全 `process_sql`（仅 rstrip）+ on_load/on_unload 日志 | 加载成功、name/version 正确、菜单/工具栏文本正确、回调安全触发 |
+| PluginManager 产品化 | `PluginInfo.status=loaded/disabled/failed`；`load_all` 每插件独立失败、error 可见且不影响其他；`enable/disable`（disable 调 on_unload、移出 active/菜单/工具栏、状态持久化到可注入 `state_path`，默认 `~/.lightdb_studio/plugins_state.json`）；`reload_one/reload_all`（unload→清 sys.modules→重新 import→on_load，禁用保持禁用）；`build_menu_actions/build_toolbar_actions/install_actions(main_window)`；`add_listener`；process_sql 异常隔离 | 4 类坏插件（语法/无基类/导入异常/继承错）隔离且 error；启停持久化 round-trip；reload 旧实例 unload + sys.modules 清理；菜单/工具栏 action 真安装 QMainWindow；状态文件损坏回退 |
+| UI | `ui/plugin_panel.py`：name/version/status/path/error 列表 + 启用/禁用/重载/刷新/打开目录/安装；操作结果显式 | 面板 5 列、启停/重载/刷新/安装结果显式、坏插件 failed+error 可见 |
+| 主窗口接线（Lead 补） | `MainWindow._install_plugin_actions()` 在启动恢复（legacy 与延迟两路径）调用 `plugin_mgr.install_actions(self)`；失败写 stderr，不静默；只在启动安装一次避免菜单/工具栏重复 | `test_main_window_installs_plugin_actions_on_startup` |
+| 验证 | 新测试 `tests/test_studio_p2_plugin.py`：**16 passed**（含主窗口安装接线）；全 studio 套件 **179 passed / 1 skipped**；compileall OK；真实 GUI `p2_plugin_check.py` **3/3 PASS**、5 张截图（`shots_p2_plugin/`） | 既有证据未动 |
+
+**风险**：reload 会重新实例化插件（实例内存状态丢失）；禁停状态默认写用户目录（可注入）；
+主窗口只在启动安装一次，面板启停后不自动重装（避免重复 action，后续可加 listener 清理）。
+**P2 剩余**：Web/GUI 能力对齐、i18n/可访问性（`utils/i18n.py` 已有基础，需覆盖率与 a11y）。
 

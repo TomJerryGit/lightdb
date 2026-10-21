@@ -158,6 +158,21 @@
   新测试 53 passed；全 studio 套件 163 passed/1 skipped；真实 GUI `p2_backup_check.py`
   4/4 PASS、4 张截图。路线图见
   [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §15。
+- **GUI P2 插件 API（P2-8，2026-10-21）**：
+  ① 示例插件 `plugins/example_plugin.py`（菜单“示例：插入 SELECT 1”+ 工具栏 + 安全
+  `process_sql` + on_load/on_unload 日志）；
+  ② `PluginManager` 产品化：`PluginInfo.status=loaded/disabled/failed`；`load_all` 每插件
+  独立失败、error 可见不影响其他；`enable/disable`（disable 调 on_unload、移出 active/菜单/
+  工具栏、状态持久化到可注入 `state_path`）；`reload_one/reload_all`（unload→清 sys.modules
+  →重新 import→on_load，禁用保持禁用）；`build_menu_actions/build_toolbar_actions/
+  install_actions(main_window)` + `add_listener`；process_sql 异常隔离；
+  ③ 插件管理面板：name/version/status/path/error 列表 + 启用/禁用/重载/刷新/打开目录/安装，
+  操作结果显式；
+  ④ 主窗口 `MainWindow._install_plugin_actions()` 在启动恢复时安装插件 action（失败写
+  stderr，只装一次避免重复）。
+  新增 `tests/test_studio_p2_plugin.py`（16 passed，含主窗口安装接线）；全 studio 套件
+  179 passed/1 skipped；compileall OK；真实 GUI `p2_plugin_check.py` 3/3 PASS、5 张截图。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §17。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。
