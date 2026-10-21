@@ -54,6 +54,8 @@ class Settings:
     page_size: int = 200
     auto_connect: bool = True
     restore_tabs: bool = False
+    # P3 首启引导：完成或跳过都置 True（旧 settings.json 无此字段 → 默认 False）
+    first_run_done: bool = False
 
     editor_font_family: str = 'Consolas'
     editor_font_size: int = 11

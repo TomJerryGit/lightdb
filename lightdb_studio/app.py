@@ -56,15 +56,40 @@ from .config import AppConfig                       # noqa: E402
 _mark('业务模块导入完成（config + main_window）')
 
 
-def run() -> int:
+def run(argv=None) -> int:
+    """启动 Studio。
+
+    - 默认：正常 GUI 启动（会展示首启引导，除非已完成/被环境变量抑制）；
+    - ``--smoke``：构造窗口后 800ms 自动退出、退出码 0（PyInstaller 打包冒烟）；
+    """
+    argv = list(sys.argv if argv is None else argv)
+    smoke = '--smoke' in argv
+    argv = [a for a in argv if a != '--smoke']
+
+    # 尽早安装崩溃日志 / 异常钩子（QApplication 创建之前；失败不影响启动）
+    try:
+        from .utils.crashlog import (
+            setup_logging, install_excepthooks, install_qt_message_handler)
+        _LOG_FILE = setup_logging()
+        install_excepthooks()
+        _mark('崩溃日志/异常钩子安装完成（%s）' % (_LOG_FILE or '日志不可用'))
+    except Exception as exc:                          # noqa: BLE001
+        print(f'[app] 崩溃日志初始化失败（继续启动）: {exc}', file=sys.stderr)
+
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     _mark('HighDpi 策略设置完成')
 
-    app = QApplication(sys.argv)
+    app = QApplication(argv)
     app.setApplicationName("LightDB Studio")
     app.setOrganizationName("LightDB")
     _mark('QApplication 创建完成')
+
+    try:
+        install_qt_message_handler()
+        _mark('Qt 消息处理器安装完成')
+    except Exception as exc:                          # noqa: BLE001
+        print(f'[app] Qt 消息处理器安装失败（继续启动）: {exc}', file=sys.stderr)
 
     font = QFont("Microsoft YaHei", 9)
     app.setFont(font)
@@ -83,6 +108,23 @@ def run() -> int:
 
     window.show()
     _mark('window.show() 返回')
+
+    if smoke:
+        # 打包产物验证：不弹首启引导、不主动拨号，窗口构造成功即 800ms 后退出
+        try:
+            config.settings.auto_connect = False
+        except Exception:
+            pass
+        QTimer.singleShot(800, app.quit)
+        _mark('smoke 模式：800ms 后自动退出')
+    else:
+        # 首启引导只在这里展示（不在 MainWindow 构造里，避免破坏既有测试）
+        try:
+            from .ui.first_run_wizard import maybe_show_first_run
+            maybe_show_first_run(window, config)
+        except Exception as exc:                      # noqa: BLE001
+            print(f'[app] 首启引导失败（跳过，不影响启动）: {exc}',
+                  file=sys.stderr)
 
     if _TIMING:
         # 事件循环真正跑起来后的第一个事件：此时窗口应已显示，
