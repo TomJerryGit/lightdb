@@ -58,10 +58,25 @@ Web 与 GUI 共用 `lightdb_studio/core` 业务层；下列端点均复用 core 
 - 真实 TestClient 证据：`_analysis_tmp/gui_full/p2_web_parity_check.py` 4/4 PASS，
   产物 `p2_web_parity/`（report JSON、`parity_matrix.json`、html/csv/xlsx）。
 
+### 2.4 Web 前端入口（2026-10-21 接入）
+
+`web/static/` 已把下列能力接成可操作 UI（不再只有 API）：
+
+| 能力 | 入口 | 说明 |
+|---|---|---|
+| SQL 格式化 | 查询工具栏「🎨 格式化」 | 调 `/sql/format`，成功替换编辑器内容；loading/空 SQL/失败显式提示 |
+| 报表模板 | 右侧「报表」Tab | 列表/保存当前 SQL/参数化预览/删除二次确认/HTML·CSV·XLSX 导出（正确文件名） |
+| 数据质量 | 右侧「质量」Tab | 表名检查 → summary + issues 表格（级别/分类/表/列/消息） |
+
+前端统一：非 2xx 提取嵌套 `detail`、401 提示登录过期、`setBusy` 防重复提交；
+**移除 innerHTML**，后端文本一律 `textContent`/DOM 渲染（防 XSS）。
+测试：`tests/test_web_static_features.py`（11 passed，含 TestClient 契约与 OpenAPI
+路由对齐）；证据 `_analysis_tmp/gui_full/p3_web_frontend_check.py` 3/3 PASS。
+
 ## 4. 已知限制
 
-- Web 前端 `static/` 本轮未加新能力入口（先做 API 对齐）；
 - 报表/质量端点复用现有 `_get_conn`，真实环境需先配置连接；
 - quality 复用逐列查询实现，大表较慢；
+- Web 前端未做真实浏览器 DOM 运行验证（本机无浏览器/Node；静态扫描 + API 契约覆盖）；
 - parity 中 GUI-only 能力（图表/ER/Schema 对比/快照备份/插件/i18n 等）标 `not_applicable`
   并说明原因，不假装 Web 已支持。

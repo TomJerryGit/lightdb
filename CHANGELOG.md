@@ -228,6 +228,20 @@
   证据 `p3_crash_firstrun_check.py` 3/3 PASS；onefile 构建成功但本沙箱禁止 bootloader
   解压写文件，**运行验证未完成**（如实标注，发布前需干净 Windows 验证）。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §21。
+- **Web 前端接入 P2 新 API（2026-10-21）**：
+  ① 查询工具栏「格式化」→ `POST /api/v1/sql/format`（loading、空 SQL/失败显式提示）；
+  ② 右侧「报表模板」Tab：GET 列表、POST 保存当前 SQL、参数化 preview（JSON / 多行
+  `key=value` / 纯值行；缺参显示后端 detail）、DELETE 二次确认、HTML/CSV/XLSX 导出
+  （fetch blob + `a.download`，解析 `Content-Disposition` 文件名）；
+  ③ 「数据质量」Tab：表名检查 → `/api/v1/quality/check`，summary + issues 表格；
+  ④ 统一 `api()/apiBlob()` 非 2xx 错误与 401 登录过期提示、`setBusy` disabled 防重复；
+  **完全移除 innerHTML**、所有后端文本用 `textContent`/DOM 渲染（顺带修复对象树 XSS）；
+  ⑤ 测试 `tests/test_web_static_features.py`（11 passed，静态控件/API 路径/XSS/blob/
+  TestClient 契约/OpenAPI 路由对齐）；Web 回归 43 passed；证据
+  `p3_web_frontend_check.py` 3/3 PASS（html 8677B/csv 2196B/xlsx 7832B 校验）。
+  已知限制：本机无浏览器/Node，未做真实 DOM 运行验证（静态扫描 + API 契约覆盖替代）。
+- **CI Actions 升级（2026-10-21）**：`actions/checkout@v7`、`actions/setup-python@v7`、
+  `actions/upload-artifact@v7`，消除 Node.js 20 deprecation 警告。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

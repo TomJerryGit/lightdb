@@ -233,6 +233,16 @@
   测试 **28 passed**，组合回归 66 passed。**诚实标注**：onefile 构建成功但本沙箱禁止
   bootloader 解压写文件，运行验证未完成（发布前需在干净 Windows 跑 `--smoke`）。
   详见路线图 §21。
+- **Web 前端接入 P2 新能力（2026-10-21）**：`web/static/` 增加查询工具栏「格式化」按钮
+  （调 `/api/v1/sql/format`，loading/空 SQL 提示）、右侧「报表模板」Tab（列表/保存当前
+  SQL/参数化预览/删除二次确认/HTML·CSV·XLSX 下载，正确文件名）与「数据质量」Tab
+  （表名检查 + issues 表格/汇总）；统一 `api()` 非 2xx 错误/401 提示、`setBusy` 防重复，
+  **移除全部 innerHTML**、后端文本一律 `textContent`（顺带修复对象树 XSS）。新增
+  `tests/test_web_static_features.py` **11 passed**，Web 相关回归 **43 passed**，
+  证据 `p3_web_frontend_check.py` 3/3 PASS（导出 html/csv/xlsx 真实文件校验）。本机
+  无浏览器/Node，未做真实 DOM 运行验证（静态+接口契约覆盖，已注明）。
+- **CI Actions 升级（2026-10-21）**：`checkout@v7` / `setup-python@v7` /
+  `upload-artifact@v7`，移除 Node.js 20 deprecation 警告。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip

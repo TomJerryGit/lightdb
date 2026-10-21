@@ -8,6 +8,8 @@
 - 工作流：[`.github/workflows/ci.yml`](.github/workflows/ci.yml)（Windows：install → compileall →
   GUI smoke（offscreen，fail-fast）→ pytest → benchmark gate → GUI perf budget → packaging check；
   触发 push / pull_request / workflow_dispatch）。
+- Actions 版本：`actions/checkout@v7`、`actions/setup-python@v7`、
+  `actions/upload-artifact@v7`（2026-10-21 升级，消除 Node.js 20 deprecation 警告）。
 - **GitHub Actions 已实跑并全绿**（`origin = https://github.com/TomJerryGit/lightdb.git`）：
   - run `39525357327`（head `e729525`）→ **success**：日志显示全量 pytest、benchmark gate、
     packaging check 全部通过（此前 3 轮失败的根因依次修复：cp1252 编码、SSL 限制如实

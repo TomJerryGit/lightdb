@@ -324,3 +324,21 @@ quality 逐列查询较慢；GUI-only 能力在 parity 中标 `not_applicable` �
 （构建成功 ≠ 可运行；发布前需在干净 Windows 环境跑 `--smoke`）；redact 为正则启发式，
 非常规拼接可能漏；异常钩子不再调用原 hook（避免默认 traceback 明文输出）。
 
+## 22. 收尾产品化：Web 前端接入（2026-10-21）
+
+P2-Web 此前只交付 API、`static/` 无入口（parity 文档已标注）。本轮补齐：
+
+| 能力 | 入口 | 实现 |
+|---|---|---|
+| SQL 格式化 | 查询工具栏「🎨 格式化」 | `POST /api/v1/sql/format`；loading/空 SQL/失败显式提示 |
+| 报表模板 | 右侧「报表」Tab | 列表/保存当前 SQL/参数化预览（JSON/多行 key=value/纯值行）/删除二次确认/HTML·CSV·XLSX 导出（blob 下载、`Content-Disposition` 文件名） |
+| 数据质量 | 右侧「质量」Tab | 表名检查 → summary + issues 表格（级别/分类/表/列/消息） |
+| 安全/健壮性 | 全局 | 非 2xx 提取嵌套 `detail`、401 登录过期提示、`setBusy` 防重复；**完全移除 innerHTML**，后端文本 `textContent`/DOM 渲染（修复对象树 XSS） |
+
+验证：新增 `tests/test_web_static_features.py` **11 passed**（静态控件/API 路径/XSS/
+blob/TestClient 契约/OpenAPI 路由对齐）；Web 回归 **43 passed**；证据
+`p3_web_frontend_check.py` **3/3 PASS**（导出 html 8677B/csv 2196B/xlsx 7832B，xlsx
+openpyxl 可读）。**限制**：本机无浏览器/Node，未做真实 DOM/JS 运行验证（静态扫描 +
+接口契约覆盖替代，已注明）。CI Actions 同时升级到 `checkout@v7`/`setup-python@v7`/
+`upload-artifact@v7`，消除 Node.js 20 deprecation 警告。
+

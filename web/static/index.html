@@ -62,9 +62,9 @@
       <main class="main-area">
         <div class="editor-area">
           <div class="toolbar">
-            <button id="run-btn" class="btn-primary">▶ 执行 (Ctrl+Enter)</button>
-            <button id="format-btn" class="btn-small">🎨 格式化</button>
-            <button id="clear-btn" class="btn-small">清空</button>
+            <button id="run-btn" class="btn-primary" data-action="run-query">▶ 执行 (Ctrl+Enter)</button>
+            <button id="format-btn" class="btn-small" data-action="format-sql">🎨 格式化</button>
+            <button id="clear-btn" class="btn-small" data-action="clear-editor">清空</button>
             <span id="exec-status" class="status"></span>
           </div>
           <textarea id="sql-editor" placeholder="-- 输入 SQL
@@ -76,10 +76,49 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
         </div>
       </main>
 
-      <!-- 右侧历史 -->
+      <!-- 右侧：历史 / 报表模板 / 数据质量 -->
       <aside class="right-panel">
-        <h3>查询历史</h3>
-        <div id="history-list" class="history-list"></div>
+        <div class="right-tabs" role="tablist">
+          <button id="tool-history-btn" class="tab-btn active" data-tool="history">历史</button>
+          <button id="tool-reports-btn" class="tab-btn" data-tool="reports">报表模板</button>
+          <button id="tool-quality-btn" class="tab-btn" data-tool="quality">数据质量</button>
+        </div>
+
+        <div id="history-section" class="tool-section">
+          <h3>查询历史</h3>
+          <div id="history-list" class="history-list"></div>
+        </div>
+
+        <div id="reports-section" class="tool-section hidden">
+          <h3>报表模板</h3>
+          <div class="form-row">
+            <input id="report-name-input" type="text" placeholder="模板名称">
+            <button id="report-save-btn" class="btn-small" data-action="save-template">保存当前 SQL</button>
+          </div>
+          <textarea id="report-params-input" class="params-input"
+            placeholder='参数（可留空使用模板默认值）：JSON 如 {"d":"2026-01-01"}，或每行 key=value'></textarea>
+          <div class="btn-row">
+            <button id="report-refresh-btn" class="btn-small" data-action="refresh-templates">刷新列表</button>
+            <button id="report-preview-btn" class="btn-small" data-action="preview-template">预览</button>
+            <button id="report-export-html" class="btn-small" data-format="html">导出 HTML</button>
+            <button id="report-export-csv" class="btn-small" data-format="csv">导出 CSV</button>
+            <button id="report-export-xlsx" class="btn-small" data-format="xlsx">导出 XLSX</button>
+          </div>
+          <div id="report-status" class="status"></div>
+          <div id="report-list" class="report-list"></div>
+          <div id="report-preview-output" class="result-table preview-output"></div>
+        </div>
+
+        <div id="quality-section" class="tool-section hidden">
+          <h3>数据质量检查</h3>
+          <div class="form-row">
+            <input id="quality-table-input" type="text" placeholder="表名（如 users）">
+            <button id="quality-check-btn" class="btn-small" data-action="quality-check">检查</button>
+          </div>
+          <div id="quality-status" class="status"></div>
+          <div id="quality-summary" class="result-info"></div>
+          <div id="quality-issues" class="result-table"></div>
+        </div>
       </aside>
     </div>
   </div>
