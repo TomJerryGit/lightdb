@@ -95,6 +95,17 @@
   新增 `tests/test_studio_async_query.py`（9 例，随机端口临时服务端）；Studio 回归 +
   新测试 69 passed；真实 GUI `p1_ui_check.py` 5/5 PASS、4 张截图。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §10。
+- **GUI 路线 P1 第二批（P1-3/P1-6，2026-10-21）**：
+  ① SQL 编辑器**自动补全**（QCompleter；关键字+表/列，`表.` 与最近 FROM/JOIN 上下文；
+  尊重 `settings.editor_auto_complete=False`，Ctrl+Space 手动触发；不阻塞 UI 的 schema 后台缓存）；
+  ② **SQL 错误位置高亮**（解析 `near '<token>'`/`at line N`/`Unknown column '<c>'`，
+  选中并红底红下划线标记；定位不到不伪造；成功/新 SQL 清除）；
+  ③ 对象树**懒加载**（展开表才查列/索引/触发器并缓存，重复展开不重查；100 张表展开
+  0 列查询、~百 ms）+ **右键菜单**（复制表名/库名、生成 `SELECT * FROM t LIMIT 200`
+  到新查询页、查看建表语句/列、刷新此表、统计/删除/清空）。
+  新增 `tests/test_studio_p1_editor_tree.py`（19 例）；Studio 回归 + 新测试 88 passed；
+  真实 GUI `p1_editor_tree_check.py` 3/3 PASS、6 张截图。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §11。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

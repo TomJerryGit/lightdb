@@ -199,9 +199,9 @@
 
 ### 实测基线（2026-10-20 下午，全量 pytest + benchmark）
 
-- 全量 pytest：**1059 用例 = 1018 passed / 0 failed / 39 skipped / 1 xfailed /
-  1 xpassed**（17:30，8 核本机、纯 Python Cython 回退运行时；GUI P0 新增 30 例，
-  1 条旧 xfail 修复转正）；
+- 全量 pytest：**1068 用例 = 1027 passed / 0 failed / 39 skipped / 1 xfailed /
+  1 xpassed**（2026-10-21，GUI P0/P1 首批后；GitHub Windows runner CI
+  run `39526414556` 同版本全绿，含 benchmark gate + packaging）；
 - `benchmarks.run --suite quick --gate`：**PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、
   dispatch 对拍不一致=0）；
 - `scripts/check_packaging.py`：PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源）；

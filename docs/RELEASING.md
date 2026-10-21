@@ -3,26 +3,28 @@
 > 适用：LightDB 引擎 + Studio 桌面端 + Web 版（单仓多产物）。
 > 版本唯一来源：`lightdb/__init__.py::__version__`（`pyproject.toml` 用 `dynamic.version` 读取）。
 
-## 0. CI 状态说明（2026-10-20）
+## 0. CI 状态说明（2026-10-21 更新）
 
 - 工作流：[`.github/workflows/ci.yml`](.github/workflows/ci.yml)（Windows：install → compileall →
   pytest → benchmark gate → packaging check；触发 push / pull_request / workflow_dispatch）。
-- **GitHub Actions 尚未实跑**：本地仓库已配置 `origin = https://github.com/TomJerryGit/lightdb.git`
-  （用户创建），但首次 `git push` 需要浏览器完成 GitHub 认证；认证完成、`main` 与标签
-  推送后 Actions 会自动执行同一套步骤。工作流 YAML 已用 PyYAML 解析校验（`name: ci`，
-  单 job `test`，7 个 step 齐全）。
-- 本地等价门禁已实跑（见下方「本地 CI 实跑记录」）；首次推送命令：
+- **GitHub Actions 已实跑并全绿**（`origin = https://github.com/TomJerryGit/lightdb.git`）：
+  - run `39525357327`（head `e729525`）→ **success**：日志显示全量 pytest、benchmark gate、
+    packaging check 全部通过（此前 3 轮失败的根因依次修复：cp1252 编码、SSL 限制如实
+    skip、多进程 worker 元数据、DATE_FORMAT 非 ASCII 字面量、runtime 缺 setuptools/wheel）；
+  - run `39526414556`（head `a900389`，GUI P1 首批）→ **success**，全部 13 个 step 成功。
+  - 仅剩 GitHub 的 Node.js 20 deprecation warning（actions 自身，与本仓库代码无关）。
+- 推送命令：
   ```powershell
   git push -u origin main --tags
   ```
 - **Cython 编译产物不参与 CI/发布**：CI 无 Cython/编译器，运行时自动走纯 Python 回退
   （本机 Zig 构建产物已归档不启用，见 README「Cython 已真实编译验证」告警）。
 
-### 本地 CI 实跑记录（2026-10-20 下午收尾，全量验证后）
+### 本地 CI 实跑记录（2026-10-21 更新）
 
 | 步骤 | 命令/步骤 | 结果 |
 |---|---|---|
-| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1059 用例 = 1018 passed / 0 failed / 39 skipped / 1 xfailed / 1 xpassed**（17:30；纯 Python Cython 回退；GUI P0 后） |
+| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1068 用例 = 1027 passed / 0 failed / 39 skipped / 1 xfailed / 1 xpassed**（2026-10-21 GUI P0/P1 后；GitHub CI run `39526414556` 同版本全绿） |
 | 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致） |
 | 打包检查 | `python scripts/check_packaging.py` | PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源） |
 | 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS（提交 GUI 验证报告后复跑通过） |

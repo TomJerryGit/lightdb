@@ -57,7 +57,7 @@
 
 > P0 合计约 **5–8 人日**，全部可独立提交、可回归测试，不改引擎。
 
-## 3. P1 —— 响应性（首批 P1-1/P1-2 已完成 2026-10-21，见 §10）
+## 3. P1 —— 响应性（P1-1/1-2/1-3/1-6 已完成 2026-10-21，见 §10/§11）
 
 | 项 | 做法 | 涉及文件 | 验收 |
 |---|---|---|---|
@@ -164,4 +164,20 @@
 **未完成/后续**：取消是 KILL 连接（服务器端语句可能继续收尾）；“加载更多”重跑同一 SQL
 取更大上限（无持久游标，无 ORDER BY 时可能重复/遗漏）——完整 QAbstractTableModel 虚拟化、
 编辑器补全/错误高亮、导入导出进度、DataEditor 类型编辑、对象树懒加载仍属 P1 剩余项。
+
+## 11. 实施记录：P1 第二批（P1-3/P1-6）已完成（2026-10-21）
+
+| P1 项 | 实现 | 验收证据 |
+|---|---|---|
+| P1-3 自动补全 | `ui/sql_editor.py`：QCompleter + QStringListModel，候选=SQL 关键字+表名+列名；上下文感知（`表.` 前缀、最近 FROM/JOIN 表只给该表列）；`settings.editor_auto_complete=False` 时不弹且不读 schema；Ctrl+Space 手动触发；Ctrl+Return/F5 保留 | 假 schema 候选正确；`表.` 上下文只给该表列；关闭时 provider 调用数 0；Ctrl+Return 仍触发执行信号 |
+| P1-3 错误位置高亮 | 解析 `near '<token>'` / `at line N` / `Unknown column '<c>'`，在 SQL 中定位后选中 + 红底红下划线 ExtraSelection；定位不到只清空、不伪造；成功/新 SQL 清除 | `near 'SELCT 1'` → 选中 token、line=2、ExtraSelection≥2；`Unknown column`/`at line` 均定位；token 不在 SQL 返回 None 且不高亮 |
+| P1-6 对象树懒加载 | `ui/object_tree.py`：表节点展开才 `get_columns` + `SHOW INDEX`/`SHOW TRIGGERS`，结果进 `_table_cache`；重复展开命中缓存、右键“刷新此表”强制重查；列节点带类型/主键标记 + 索引/触发器文件夹 | 未展开 get_columns=0；展开一次=1；折叠再展开仍=1；强制刷新=2；100 张表展开 0 列查询（~百 ms） |
+| P1-6 右键菜单 | 表：复制表名 / 生成 `SELECT * FROM t LIMIT 200` 到新查询页 / 查看建表语句 / 查看列 / 刷新此表 / 统计行数 / 删除 / 清空；表文件夹：刷新 / 复制库名；库：切换 / 复制 / 刷新；`build_context_menu()` 可测试 | 菜单文本齐全；复制→剪贴板；生成 SELECT→新 tab 内容正确；DDL→`SHOW CREATE TABLE` |
+| 接线 | `ui/main_window.py`：schema 缓存后台线程刷新（连接建立/DDL/手动，≤200 表）+ 编辑器 schema provider；`new_query_requested` → 新查询页填 SQL；错误→高亮、成功→清除；设置开关传播 | 新测试 **19 passed**；Studio 回归 + 新测试 **88 passed**；compileall OK |
+| GUI 证据 | `_analysis_tmp/gui_full/p1_editor_tree_check.py` | **3/3 PASS**、6 张截图（`shots_p1b/`）；既有 77/10/4 张证据未动 |
+
+**风险**：①补全上下文是启发式（`表.`/最近 FROM-JOIN），无 parser 级作用域；②schema 缓存
+无 TTL（连接/DDL/手动刷新触发），大库首次候选可能延迟；③错误 token 取首个匹配，重复 token
+可能指向第一处；④右键菜单测试直接调 handler、真实菜单位路径由 GUI 证据覆盖。
+**P1 剩余**：QAbstractTableModel 虚拟化、导入导出进度、DataEditor 类型编辑。
 

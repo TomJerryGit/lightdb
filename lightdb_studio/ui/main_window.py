@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import threading
 import time
 from PySide6.QtWidgets import (
     QMainWindow, QDockWidget, QTabWidget, QWidget, QVBoxLayout,
@@ -139,6 +140,12 @@ class MainWindow(QMainWindow):
         self._query_timeout_timer = QTimer(self)
         self._query_timeout_timer.setSingleShot(True)
         self._query_timeout_timer.timeout.connect(self._on_query_timeout)
+
+        # ---------- P1-3 schema 缓存（自动补全用） ----------
+        # 后台线程刷新（DB 查询不占 UI 线程）；编辑器补全只读这份内存缓存。
+        self._schema_cache = {'tables': [], 'columns': {}, 'ts': 0.0}
+        self._schema_lock = threading.Lock()
+        self._schema_thread = None
 
         # ---------- 核心管理器 ----------
         # 说明（实测）：30+ 个管理器**全部构造只占 ~9ms**（MainWindow 构造的
@@ -297,6 +304,7 @@ class MainWindow(QMainWindow):
         # 左侧：对象浏览器
         self.object_tree = ObjectTree()
         self.object_tree.query_requested.connect(self._on_query_requested)
+        self.object_tree.new_query_requested.connect(self._open_sql_in_new_tab)
 
         self.tree_dock = QDockWidget("对象浏览器", self)
         self.tree_dock.setWidget(self.object_tree)
@@ -747,6 +755,13 @@ class MainWindow(QMainWindow):
         # P1-2：结果被 max_result_rows 截断时，结果区「加载更多」继续取下一批
         result.load_more_requested.connect(
             lambda r=result: self._on_load_more(r))
+        # P1-3：schema 自动补全（只读 MainWindow 的后台刷新缓存，不查库）
+        try:
+            editor.set_schema_provider(self._schema_snapshot)
+            editor.set_auto_complete(
+                bool(getattr(self.settings, 'editor_auto_complete', True)))
+        except Exception:
+            pass
 
         if auto_switch:
             self.tabs.setCurrentIndex(idx)
@@ -803,6 +818,56 @@ class MainWindow(QMainWindow):
     def _get_current_conn(self):
         return self.object_tree.get_current_connection()
 
+    # ---------- P1-3：schema 缓存（自动补全） ----------
+
+    def _schema_snapshot(self):
+        """给编辑器补全用的只读快照（内存读，绝不查库、不阻塞 UI）。"""
+        with self._schema_lock:
+            tables = list(self._schema_cache.get('tables') or [])
+            columns = {k: list(v) for k, v in
+                       (self._schema_cache.get('columns') or {}).items()}
+        return tables, columns
+
+    def _refresh_schema_cache_async(self, conn=None, max_tables: int = 200):
+        """后台线程刷新库/表/列缓存（供自动补全）；失败静默保留旧缓存。"""
+        conn = conn or self._get_current_conn()
+        if conn is None or not conn.is_connected():
+            return False
+        if self._schema_thread is not None and self._schema_thread.is_alive():
+            return False
+
+        def _worker():
+            tables, columns = [], {}
+            try:
+                tables = list(conn.get_tables() or [])[:max_tables]
+                for table in tables:
+                    try:
+                        cols = conn.get_columns(table) or []
+                        columns[table] = [str(c.get('name', '')) for c in cols]
+                    except Exception:
+                        columns[table] = []
+            except Exception:
+                return
+            with self._schema_lock:
+                self._schema_cache = {'tables': tables, 'columns': columns,
+                                      'ts': time.time()}
+
+        self._schema_thread = threading.Thread(
+            target=_worker, name='studio-schema-cache', daemon=True)
+        self._schema_thread.start()
+        return True
+
+    def _open_sql_in_new_tab(self, sql: str):
+        """对象树「生成 SELECT ...」：新建查询页并填入 SQL（不自动执行）。"""
+        if not sql:
+            return
+        self._add_new_query_tab(auto_switch=True)
+        editor, _ = self._current_widgets()
+        if editor is not None:
+            editor.set_sql(sql)
+            editor.setFocus()
+            self._set_status(f'已在新建查询页填入 SQL（{len(sql)} 字符）')
+
     def _schema_provider(self):
         """供 AI Chat 使用"""
         conn = self._get_current_conn()
@@ -841,6 +906,8 @@ class MainWindow(QMainWindow):
         self.object_tree.select_connection(info.name)
         self.status_label.setText(f"已连接: {info.name}")
         self._on_tab_changed(self.tabs.currentIndex())
+        # P1-3：连接建立后后台刷新 schema 缓存（首次补全前就有候选）
+        self._refresh_schema_cache_async(conn)
 
     def _report_connection_failure(self, info, exc, title='连接失败'):
         """连接失败 → 弹「可行动」的框（原始报文一字不删）+ 状态栏一行结论。
@@ -923,6 +990,9 @@ class MainWindow(QMainWindow):
             self._set_status(first_failure, error=True)
         elif not ok_count:
             self._set_status('自动连接: 没有连上的连接')
+        # P1-3：只要有连接成功，后台刷新一次 schema 缓存（自动补全用）
+        if ok_count:
+            self._refresh_schema_cache_async()
 
     def _refresh_tree(self):
         self.object_tree.refresh_all()
@@ -1041,6 +1111,13 @@ class MainWindow(QMainWindow):
                 if not err_state:
                     err_state = _s
             result.show_error(any_error, errno=err_code, sqlstate=err_state)
+            # P1-3：编辑器错误位置高亮（定位不到就不高亮，不伪造位置）
+            try:
+                if editor is not None and hasattr(editor,
+                                                  'highlight_error_token'):
+                    editor.highlight_error_token(err_code, any_error, sql=sql)
+            except Exception:
+                pass
             self._set_status(f"错误: {any_error}", error=True)
             self.history.add(sql, conn.config.name, False, elapsed)
         else:
@@ -1050,6 +1127,22 @@ class MainWindow(QMainWindow):
                 result.show_message(last_msg)
             self._set_status(f"完成 ({elapsed:.1f} ms)")
             self.history.add(sql, conn.config.name, True, elapsed)
+            # P1-3：成功执行清除上一次的错误高亮
+            try:
+                if editor is not None and hasattr(editor,
+                                                  'clear_error_highlight'):
+                    editor.clear_error_highlight()
+            except Exception:
+                pass
+            # DDL 后刷新对象树 + schema 缓存（自动补全候选随之更新）
+            try:
+                if any(s.strip().upper().startswith(
+                        ('CREATE', 'DROP', 'ALTER', 'TRUNCATE'))
+                       for s in statements):
+                    self.object_tree.refresh_all()
+                    self._refresh_schema_cache_async()
+            except Exception:
+                pass
 
         self.history_panel.refresh()
 
@@ -1169,6 +1262,14 @@ class MainWindow(QMainWindow):
             result.show_result(cols, rows, elapsed, truncated=truncated)
         else:
             result.show_message(payload.get('message') or '执行完成')
+        # P1-3：成功执行清除编辑器错误高亮
+        try:
+            editor = ctx.get('editor')
+            if editor is not None and hasattr(editor,
+                                              'clear_error_highlight'):
+                editor.clear_error_highlight()
+        except Exception:
+            pass
         status = f"完成 ({elapsed:.1f} ms)"
         message = payload.get('message') or ''
         if message and not cols:
@@ -1182,12 +1283,13 @@ class MainWindow(QMainWindow):
             self.history_panel.refresh()
         except Exception:
             pass
-        # DDL 后刷新对象树
+        # DDL 后刷新对象树 + schema 缓存（自动补全候选随之更新）
         try:
             if any(s.strip().upper().startswith(
                     ('CREATE', 'DROP', 'ALTER', 'TRUNCATE'))
                    for s in ctx['statements']):
                 self.object_tree.refresh_all()
+                self._refresh_schema_cache_async()
         except Exception:
             pass
         # 「加载更多」上下文：仅单语句 SELECT 且有截断时提供
@@ -1228,6 +1330,16 @@ class MainWindow(QMainWindow):
             ctx['result'].show_error(text, errno=errno, sqlstate=sqlstate)
         except Exception:
             pass
+        # P1-3：错误位置高亮（token/行号定位不到就不高亮）
+        try:
+            editor = ctx.get('editor')
+            if editor is not None and hasattr(editor,
+                                              'highlight_error_token'):
+                editor.highlight_error_token(
+                    errno, text,
+                    sql=';\n'.join(ctx.get('statements') or []))
+        except Exception:
+            pass
         self._set_status(f"错误: {text}", error=True)
         try:
             elapsed = (time.time() - ctx.get('started', time.time())) * 1000
@@ -1250,6 +1362,13 @@ class MainWindow(QMainWindow):
                     f"查询已取消：{reason}\n"
                     f"（本引擎取消 = KILL 连接；连接会尝试自动重连，"
                     f"服务器端语句可能仍在收尾）")
+        except Exception:
+            pass
+        # 取消：清除错误高亮（本次执行没有可定位的 SQL 错误位置）
+        try:
+            editor = ctx.get('editor')
+            if editor is not None and hasattr(editor, 'clear_error_highlight'):
+                editor.clear_error_highlight()
         except Exception:
             pass
         self._set_status(f"已取消（{reason}）", error=True)
@@ -1866,6 +1985,17 @@ class MainWindow(QMainWindow):
                 editor.setFont(font)
             except Exception:
                 pass
+        # P1-3：自动补全开关跟随设置（对所有已打开查询页生效）
+        try:
+            enabled = bool(getattr(self.settings, 'editor_auto_complete', True))
+            for i in range(self.tabs.count()):
+                widget = self.tabs.widget(i)
+                if isinstance(widget, QSplitter):
+                    ed = widget.widget(0)
+                    if hasattr(ed, 'set_auto_complete'):
+                        ed.set_auto_complete(enabled)
+        except Exception:
+            pass
 
     def _on_lang_changed(self):
         self.setWindowTitle(f"{i18n.t('app.title')} v1.0")
