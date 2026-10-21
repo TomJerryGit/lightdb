@@ -68,7 +68,7 @@
 | **P1-5 DataEditor 类型编辑** | 按列类型给编辑器（日期选择器、布尔下拉、NULL 开关、JSON 文本校验）；批量修改事务提交；乐观锁（updated_at/版本列，若表有） | `ui/data_editor.py` | 日期列不能输非法值；NULL 可设；批量 100 行提交原子（失败全回滚） |
 | **P1-6 对象树懒加载与右键菜单** | 展开表才加载列/索引/触发器；右键：复制名/查看 DDL/刷新/生成 SELECT；搜索框支持模糊过滤 | `ui/object_tree.py` | 1000 张表首屏 <500ms；右键动作可用；搜索即过滤 |
 
-## 4. P2 —— 功能深度（4–8 周；P2-1/P2-2/P2-3/P2-4/P2-5/P2-8 + 服务端 TLS + i18n/可访问性已完成 2026-10-21，见 §13–§18；仅 Web/GUI 能力对齐待续）
+## 4. P2 —— 功能深度（✅ 全部 9 项已完成 2026-10-21，见 §13–§19）
 
 1. **ER 图/关系图**：当前引擎没有真实外键约束（`CREATE TABLE` 接受 FOREIGN KEY 但
    是否强制需核实【待验证】），ER 图应**只用真实元数据**（主键/索引/列注释）或让用户
@@ -282,4 +282,19 @@ test_wire_transaction` = 19 passed。**P2 剩余**：Web/GUI 对齐、i18n/可�
 
 **风险**：本轮覆盖主窗口+设置对话框；历史面板/env bar/插件/快照等其余面板文案仍中文（后续批次）；
 高 DPI 依据 Qt6 自动策略不覆盖；主题/字体品牌名保持双语。**P2 剩余**：Web/GUI 能力对齐。
+
+## 19. 实施记录：P2 Web/GUI 能力对齐已完成（2026-10-21）→ **P2 全部完成**
+
+| 项 | 实现 | 验收证据 |
+|---|---|---|
+| 共享 core：SQL 格式化 | `POST /api/v1/sql/format` 复用 `core.sql_formatter`；空 SQL/异常显式 400 | 正常格式化/minify；空 SQL 400 `empty_sql` |
+| 共享 core：报表 | `web/api.py` 新增模板 CRUD（GET/POST/DELETE `/reports/templates`）、参数化 `preview`、`export?format=html|csv|xlsx`；内部用 `core.reports.ReportEngine`（validate/参数绑定/preview/export_data）；模板目录可注入（`create_app(reports_dir=...)` / `LIGHTDB_WEB_REPORTS_DIR`）；`FileResponse` 正确 Content-Type/文件名+后台清理 | 模板 save/list/upsert/delete round-trip（tmp 落盘）；named 参数绑定为 `%(name)s`；缺参/多参 400；模板 `preview_limit` 生效；三格式导出真实文件（openpyxl 可读 xlsx） |
+| 共享 core：数据质量 | `POST /api/v1/quality/check` 复用 `core.data_quality.DataQualityChecker`；返回 issues+summary；缺表/非法表名/查询失败显式 400 | 200+summary 合计=total；缺表 400 `table_required`；注入式表名 400 |
+| Parity 矩阵 | `web/api.py::WEB_GUI_PARITY` 12 项（4 full / 2 partial / 6 not_applicable，含 shared_core 与原因）；文档 `docs/WEB_GUI_PARITY.md` 由矩阵生成 | 测试断言 key 齐全/状态合法/full/partial 带端点；共享 core ≥3 |
+| 认证/错误 | 新端点沿用 `verify_token` / `require_permission('write')`；统一结构 JSON 错误、不静默 500 | 未认证 401、viewer 保存 403、非法参数 400 |
+| 验证 | 新增 `tests/test_web_gui_parity.py`：**10 passed**；现有 web 安全 22 + 新 = **32 passed**；compileall web+studio OK；真实 TestClient `p2_web_parity_check.py` **4/4 PASS**（报告+parity_matrix.json+html/csv/xlsx 产物） | 既有证据未动 |
+
+**风险**：Web 前端 `static/` 本轮未加新入口（先对齐 API）；报表/质量端点复用 `_get_conn`，真实环境需先配连接；
+quality 逐列查询较慢；GUI-only 能力在 parity 中标 `not_applicable` 并说明，不假装 Web 已支持。
+**P2（9 项）全部完成**（P2-1/2/3/4/5/8 + 服务端 TLS + i18n/可访问性 + Web/GUI 对齐）。
 

@@ -235,7 +235,8 @@ def save_connections_file(path, connections) -> bool:
 
 def create_app(db=None, executor=None, connections: List = None,
                admin_password: Optional[str] = None,
-               connections_file: Optional[str] = None) -> FastAPI:
+               connections_file: Optional[str] = None,
+               reports_dir: Optional[str] = None) -> FastAPI:
     """创建 FastAPI 应用。
 
     前三个参数保持历史签名 ``create_app(db=None, executor=None,
@@ -254,6 +255,7 @@ def create_app(db=None, executor=None, connections: List = None,
     app_state['connections_file'] = str(connections_file) if connections_file \
         else (os.environ.get(ENV_CONNECTIONS_FILE) or None)
     app_state['users'] = resolve_users(admin_password)
+    app_state['reports_dir'] = str(reports_dir) if reports_dir else None
     _session_conns.clear()
 
     app = FastAPI(

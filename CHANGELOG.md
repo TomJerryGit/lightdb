@@ -184,6 +184,17 @@
   ④ 测试 `tests/test_studio_p2_i18n_a11y.py`（8 passed）；全 studio 套件 188 passed/1 skipped；
   真实 GUI `p2_i18n_check.py` 3/3 PASS、5 张中英截图。
   路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §18。
+- **GUI P2 Web/GUI 能力对齐（2026-10-21）→ P2 全部完成**：
+  ① Web 新增 3 类共享 `lightdb_studio/core` 的能力：`POST /api/v1/sql/format`
+  （core.sql_formatter）、报表模板 CRUD + 参数化 preview + html/csv/xlsx 导出
+  （core.reports，模板目录可注入）、`POST /api/v1/quality/check`（core.data_quality）；
+  ② 新端点沿用现有 token/权限，统一结构 JSON 错误（400/401/403），参数经 `%(name)s`
+  安全绑定，不手拼 SQL；
+  ③ `WEB_GUI_PARITY` 12 项矩阵（4 full / 2 partial / 6 not_applicable，GUI-only 能力
+  明确标注原因），文档 `docs/WEB_GUI_PARITY.md` 由矩阵生成；
+  ④ 测试 `tests/test_web_gui_parity.py`（10 passed）+ 现有 web 安全 22 = 32 passed；
+  真实 TestClient `p2_web_parity_check.py` 4/4 PASS（report/parity_matrix/html/csv/xlsx）。
+  路线图见 [`docs/GUI_OPTIMIZATION_ROADMAP.md`](docs/GUI_OPTIMIZATION_ROADMAP.md) §19。
 - **发布工程**：`CHANGELOG.md`、`docs/RELEASING.md`（发布前门禁/本地 CI 实跑记录/打标签）、
   `scripts/check_repo_hygiene.py`、`.gitattributes`；版本徽章/包元数据统一 4.0.0；
   仓库卫生清理（data_* 残留、遗留 worktree、双 LICENSE、旧调试产物）。

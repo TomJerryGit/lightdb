@@ -209,6 +209,13 @@
   Qt6 自动控制”（不提供假设置）；关键控件 accessibleName/tooltip + 合理 Tab 顺序。
   新测试 8 passed，全 Studio 套件 188 passed/1 skipped，真实 GUI 3/3 PASS（中英截图）；
   详见路线图 §18。**P2 剩余仅 Web/GUI 能力对齐**。
+- **GUI P2 Web/GUI 能力对齐已实施（2026-10-21）→ P2 全部完成**：Web 新增共享
+  `lightdb_studio/core` 的 3 类能力：SQL 格式化（`/api/v1/sql/format`）、报表模板
+  CRUD+参数化预览+html/csv/xlsx 导出（复用 `core.reports`）、数据质量检查
+  （`/api/v1/quality/check` 复用 `core.data_quality`）；`WEB_GUI_PARITY` 12 项矩阵
+  （4 full/2 partial/6 not_applicable，GUI-only 能力明说不假装支持），文档
+  [`docs/WEB_GUI_PARITY.md`](docs/WEB_GUI_PARITY.md)。新测试 10 passed，Web 安全+新
+  32 passed，真实 TestClient 4/4 PASS；详见路线图 §19。
 - **测试门禁清零**：原 24 条失败按根因处置 —— 真实缺陷修复（DECIMAL 编码 / CLI argparse / 诊断 emoji）、
   其余改为**带明确 reason 的 skip/xfail**（死模块、沙箱权限、flaky 阈值、需 ≥4 核的并行断言）。
   授权体系（GRANT ×2）已于 2026-10-20 实现并恢复为正式测试；3 条 OLAP 性能类 skip

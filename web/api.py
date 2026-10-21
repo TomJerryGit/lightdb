@@ -12,14 +12,19 @@ LightDB Studio REST API
 """
 import asyncio
 import hmac
+import json
 import logging
 import os
 import re
+import tempfile
 import time
-from typing import List, Optional
+from dataclasses import asdict
+from typing import Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .auth import require_permission, verify_token
 from lightdb_studio.db.connection import DBConnection
@@ -654,3 +659,364 @@ async def run_report(name: str,
         }
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ============================================================================
+# P2 Web/GUI 能力对齐：共享 lightdb_studio.core 的 format / 报表 / 质量能力
+# ============================================================================
+
+#: GUI 能力 → Web 能力矩阵。测试断言 key/状态合法；后续能力变化必须同步这里。
+WEB_GUI_PARITY: Dict[str, dict] = {
+    'query_execution': {
+        'gui': 'SQL 编辑器执行查询', 'web': 'POST /api/v1/query',
+        'status': 'full', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '参数/标识符校验与权限沿用现有 Web 查询链路',
+    },
+    'connection_management': {
+        'gui': '连接管理 / 对象树', 'web': 'GET/POST /api/v1/connections, '
+        'GET /databases*, GET /tables*, POST /connections/test',
+        'status': 'partial', 'shared_core': 'lightdb_studio.config.ConnectionInfo',
+        'notes': 'Web 可增改/测试连接与浏览对象；编辑连接对话框是 GUI 专属交互',
+    },
+    'object_browser': {
+        'gui': '对象浏览器（库/表/列）', 'web': 'GET /databases, /tables, /columns',
+        'status': 'full', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '表行数统计为 Web 补充能力',
+    },
+    'sql_format': {
+        'gui': '编辑器「格式化 SQL」', 'web': 'POST /api/v1/sql/format',
+        'status': 'full', 'shared_core': 'lightdb_studio.core.sql_formatter',
+        'notes': '与 GUI 同一 SQLFormatter；空 SQL 显式 400',
+    },
+    'chart': {
+        'gui': '数据图表（可配置/PNG/SVG）', 'web': None,
+        'status': 'not_applicable',
+        'notes': '图表依赖 Qt 渲染，Web 端以 API 数据为主；无对应端点',
+    },
+    'reports': {
+        'gui': '报表设计器（模板/参数/预览/导出）',
+        'web': 'GET/POST/DELETE /reports/templates, '
+        'POST /reports/templates/{name}/preview, '
+        'POST /reports/templates/{name}/export',
+        'status': 'full', 'shared_core': 'lightdb_studio.core.reports',
+        'notes': '参数化 preview/export 复用 ReportEngine；html/csv/xlsx 真实生成',
+    },
+    'schema_compare': {
+        'gui': 'Schema 对比 / ER 图', 'web': None,
+        'status': 'not_applicable',
+        'notes': '依赖 GUI 交互与 Qt 绘图；Web 后续可做 API 版',
+    },
+    'snapshot_backup': {
+        'gui': '快照/备份/恢复', 'web': None,
+        'status': 'not_applicable',
+        'notes': '本地文件系统备份属于桌面端能力',
+    },
+    'data_quality': {
+        'gui': '数据质量检查', 'web': 'POST /api/v1/quality/check',
+        'status': 'partial',
+        'shared_core': 'lightdb_studio.core.data_quality',
+        'notes': '复用 DataQualityChecker；Web 当前按单表触发并返回 issues 摘要',
+    },
+    'import_export': {
+        'gui': 'CSV 导入/导出（进度/取消）', 'web': None,
+        'status': 'not_applicable',
+        'notes': '大文件流式导入导出与进度 UI 为桌面端能力',
+    },
+    'plugins': {
+        'gui': '插件启用/禁用/菜单注入', 'web': None,
+        'status': 'not_applicable',
+        'notes': '插件作用于本地 GUI 进程，Web 进程不加载插件',
+    },
+    'i18n': {
+        'gui': '中英文热切换', 'web': None,
+        'status': 'not_applicable',
+        'notes': 'Web 是 API，错误/数据为程序消费；Web UI 文案暂未 i18n',
+    },
+}
+
+
+def _err(status_code: int, message: str, code: str) -> HTTPException:
+    """新端点统一的 JSON 错误：``{"detail": {"detail": ..., "code": ...}}``。"""
+    return HTTPException(status_code, detail={'detail': str(message),
+                                              'code': str(code)})
+
+
+def _report_engine():
+    """报表引擎：目录可注入（create_app(reports_dir=...) / env），默认为用户目录。"""
+    from lightdb_studio.core.reports import ReportEngine
+    from .server import app_state
+    base = app_state.get('reports_dir') or os.environ.get(
+        'LIGHTDB_WEB_REPORTS_DIR')
+    return ReportEngine(base_dir=str(base)) if base else ReportEngine()
+
+
+def _template_to_dict(t) -> dict:
+    return {
+        'name': t.name, 'description': t.description, 'sql': t.sql,
+        'connection': t.connection, 'database': t.database,
+        'chart': dict(t.chart or {}), 'params': dict(t.params or {}),
+        'preview_limit': int(t.preview_limit or 100),
+        'schedule': t.schedule, 'last_run': t.last_run,
+        'last_status': t.last_status,
+    }
+
+
+class SqlFormatRequest(BaseModel):
+    sql: str
+    minify: bool = False
+
+
+class ReportTemplateModel(BaseModel):
+    name: str
+    description: str = ''
+    sql: str
+    connection: str = ''
+    database: str = ''
+    params: Dict = Field(default_factory=dict)
+    chart: Dict = Field(default_factory=dict)
+    preview_limit: int = Field(100, ge=1, le=10000)
+    schedule: str = ''
+
+
+class ReportPreviewRequest(BaseModel):
+    params: Optional[Union[Dict, List]] = None
+    limit: Optional[int] = Field(None, ge=1, le=10000)
+    connection: Optional[str] = None
+
+
+class QualityRequest(BaseModel):
+    table: Optional[str] = None
+    connection: Optional[str] = None
+
+
+@router.post("/sql/format")
+async def format_sql(req: SqlFormatRequest,
+                     payload: dict = Depends(verify_token)):
+    """SQL 格式化（与 GUI 共用 core.sql_formatter）；空 SQL 显式 400。"""
+    sql = (req.sql or '').strip()
+    if not sql:
+        raise _err(400, 'SQL 不能为空', 'empty_sql')
+    try:
+        from lightdb_studio.core.sql_formatter import SQLFormatter
+        fmt = SQLFormatter()
+        formatted = fmt.minify(sql) if req.minify else fmt.format(sql)
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'SQL 格式化失败: {exc}', 'format_failed')
+    return {'ok': True, 'sql': formatted,
+            'length_in': len(sql), 'length_out': len(formatted)}
+
+
+# ---------------- 报表模板 CRUD ----------------
+
+@router.get('/reports/templates')
+async def list_report_templates(payload: dict = Depends(verify_token)):
+    try:
+        eng = _report_engine()
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(500, f'报表引擎初始化失败: {exc}', 'reports_unavailable')
+    return {'ok': True,
+            'templates': [_template_to_dict(t) for t in eng.templates]}
+
+
+@router.post('/reports/templates')
+async def save_report_template(
+        req: ReportTemplateModel,
+        payload: dict = Depends(require_permission('write'))):
+    from lightdb_studio.core.reports import (
+        ReportTemplate, ReportValidationError)
+    try:
+        tmpl = ReportTemplate(
+            name=req.name, description=req.description, sql=req.sql,
+            connection=req.connection, database=req.database,
+            params=dict(req.params or {}), chart=dict(req.chart or {}),
+            preview_limit=req.preview_limit, schedule=req.schedule)
+        tmpl.validate()
+    except ReportValidationError as exc:
+        raise _err(400, str(exc), 'invalid_template')
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'模板字段非法: {exc}', 'invalid_template')
+    try:
+        eng = _report_engine()
+        saved = eng.upsert(tmpl)
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(500, f'模板保存失败: {exc}', 'reports_unavailable')
+    return {'ok': True, 'template': _template_to_dict(saved)}
+
+
+@router.delete('/reports/templates/{name}')
+async def delete_report_template(
+        name: str,
+        payload: dict = Depends(require_permission('write'))):
+    try:
+        eng = _report_engine()
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(500, f'报表引擎初始化失败: {exc}', 'reports_unavailable')
+    if not eng.remove_by_name(name):
+        raise _err(404, f"报表模板不存在: {name}", 'template_not_found')
+    return {'ok': True, 'deleted': name}
+
+
+def _load_template_or_404(eng, name):
+    tmpl = eng.get(name)
+    if tmpl is None:
+        raise _err(404, f"报表模板不存在: {name}", 'template_not_found')
+    return tmpl
+
+
+def _bound_params(tmpl, req_params):
+    """请求未给 params 时用模板保存的默认参数（可能是空 dict）。"""
+    return dict(req_params) if isinstance(req_params, dict) else (
+        list(req_params) if isinstance(req_params, list) else dict(tmpl.params or {}))
+
+
+def _run_report_with_params(eng, tmpl, req, token=None):
+    from lightdb_studio.core.reports import ReportParameterError
+    params = _bound_params(tmpl, getattr(req, 'params', None))
+    conn_name = (getattr(req, 'connection', None) or tmpl.connection) or None
+    try:
+        conn = _get_conn(token, conn_name)
+    except HTTPException:
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'连接不可用: {exc}', 'connection_failed')
+    try:
+        if tmpl.database:
+            conn.switch_database(tmpl.database)
+    except Exception:
+        pass
+    try:
+        limit = getattr(req, 'limit', None)
+        if not limit:
+            limit = int(getattr(tmpl, 'preview_limit', 0) or 0) or None
+        result = eng.preview_query(conn, tmpl.sql, params, limit)
+    except ReportParameterError as exc:
+        raise _err(400, str(exc), 'invalid_params')
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'报表执行失败: {exc}', 'query_failed')
+    return result
+
+
+@router.post('/reports/templates/{name}/preview')
+async def preview_report_template(
+        name: str,
+        req: Optional[ReportPreviewRequest] = None,
+        payload: dict = Depends(verify_token)):
+    req = req or ReportPreviewRequest()
+    try:
+        eng = _report_engine()
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(500, f'报表引擎初始化失败: {exc}', 'reports_unavailable')
+    tmpl = _load_template_or_404(eng, name)
+    result = _run_report_with_params(eng, tmpl, req, token=payload['sub'])
+    return {
+        'ok': True,
+        'name': tmpl.name,
+        'columns': result['columns'],
+        'rows': [_serialize_row(r) for r in result['rows']],
+        'total': result['total'], 'returned': result['returned'],
+        'limit': result['limit'], 'params': result['params'],
+        'style': result['style'], 'param_names': result['param_names'],
+    }
+
+
+_EXPORT_TYPES = {
+    'csv': ('text/csv; charset=utf-8', 'csv'),
+    'html': ('text/html; charset=utf-8', 'html'),
+    'xlsx': ('application/vnd.openxmlformats-officedocument.'
+             'spreadsheetml.sheet', 'xlsx'),
+}
+
+
+@router.post('/reports/templates/{name}/export')
+async def export_report_template(
+        name: str,
+        format: str = Query('csv'),
+        req: Optional[ReportPreviewRequest] = None,
+        payload: dict = Depends(verify_token)):
+    fmt = (format or '').strip().lower()
+    if fmt not in _EXPORT_TYPES:
+        raise _err(400, f'不支持的格式: {format!r}（可选 html/csv/xlsx）',
+                   'invalid_format')
+    req = req or ReportPreviewRequest()
+    try:
+        eng = _report_engine()
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(500, f'报表引擎初始化失败: {exc}', 'reports_unavailable')
+    tmpl = _load_template_or_404(eng, name)
+    # 导出全量（不受 preview limit 截断）
+    from lightdb_studio.core.reports import ReportParameterError
+    params = _bound_params(tmpl, req.params)
+    conn_name = (req.connection or tmpl.connection) or None
+    try:
+        conn = _get_conn(payload['sub'], conn_name)
+        if tmpl.database:
+            conn.switch_database(tmpl.database)
+        cols, rows = eng.run_query(conn, tmpl.sql, params)
+    except ReportParameterError as exc:
+        raise _err(400, str(exc), 'invalid_params')
+    except HTTPException:
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'报表导出失败: {exc}', 'query_failed')
+
+    tmpdir = tempfile.mkdtemp(prefix='lightdb_web_report_')
+    ext = _EXPORT_TYPES[fmt][1]
+    filepath = os.path.join(tmpdir, f'{tmpl.name}.{ext}')
+    try:
+        eng.export_data(cols, rows, filepath, fmt=fmt, title=tmpl.name)
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'导出文件生成失败: {exc}', 'export_failed')
+    if not os.path.exists(filepath) or os.path.getsize(filepath) <= 0:
+        raise _err(400, '导出文件为空', 'export_failed')
+    media_type = _EXPORT_TYPES[fmt][0]
+
+    def _cleanup():
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+    return FileResponse(filepath, media_type=media_type,
+                        filename=f'{tmpl.name}.{ext}',
+                        background=BackgroundTask(_cleanup))
+
+
+# ---------------- 数据质量 ----------------
+
+@router.post('/quality/check')
+async def quality_check(req: QualityRequest = None,
+                        payload: dict = Depends(verify_token)):
+    req = req or QualityRequest()
+    table = (req.table or '').strip()
+    if not table:
+        raise _err(400, 'table 不能为空（请指定要检查的表）', 'table_required')
+    table = _ident(table, '表名')
+    try:
+        from lightdb_studio.core.data_quality import DataQualityChecker
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(503, f'数据质量模块不可用: {exc}', 'quality_unavailable')
+    try:
+        conn = _get_conn(payload['sub'], req.connection or None)
+    except HTTPException:
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'连接不可用: {exc}', 'connection_failed')
+    try:
+        issues = DataQualityChecker(conn).check_table(table)
+    except Exception as exc:                          # noqa: BLE001
+        raise _err(400, f'数据质量检查失败: {exc}', 'quality_failed')
+    issue_dicts = [asdict(i) if hasattr(i, '__dataclass_fields__') else dict(i)
+                   for i in issues]
+    summary = {'total': len(issue_dicts), 'error': 0, 'warning': 0, 'info': 0}
+    for item in issue_dicts:
+        level = str(item.get('level') or 'info').lower()
+        if level not in summary:
+            level = 'info'
+        summary[level] += 1
+    return {'ok': True, 'table': table, 'issues': issue_dicts,
+            'summary': summary}
+
