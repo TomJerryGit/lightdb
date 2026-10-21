@@ -193,15 +193,16 @@
 | 安全项 | ✅ P0/P1 六项 + 授权体系 + COM_STMT 闭环 | — | 审计/`SET PASSWORD POLICY` 仍缺 | — | 凭据加密 |
 | OLAP 接线/门禁 | ✅ 4A.1–4A.5 完成（**2026-10-20 起 dispatch 默认开启**，可 `LIGHTDB_OLAP_DISPATCH=0` 关闭；并行 GROUP BY 2.75x、对拍 0 不一致；dispatch 当前无显著收益 0.44–1.10x） | — | — | — | — |
 | Cython 加速层 | ✅ 4A.4 本机真实编译 6 个扩展（Cython+Zig；btree 5.9–7.0x 等）；产物不入库、CI 走纯 Python 回退 | — | — | — | MSVC 发布构建 |
-| GUI/DB 端到端 | ✅ 2026-10-20 本地全量验证：DB 34/34、GUI 45/45、77 截图、25 对话框；UI 3 缺陷/引擎 2 限制已登记 | — | — | GUI 行为测试进 CI | — |
+| GUI/DB 端到端 | ✅ 2026-10-20 本地全量验证：DB 34/34、GUI 45/45、77 截图、25 对话框；UI 3 缺陷/引擎 2 限制已登记；2026-10-21 GUI 冒烟已进 CI（9 场景）+ 性能预算门禁 | — | — | ✅ GUI 行为测试进 CI | — |
 | 死代码行占比 | Studio 不可达已清零；引擎仍有部分零引用模块 | — | — | — | 引擎 <10% |
 | 文档-实现一致 | README/CHANGELOG/roadmap/benchmarks 已同步 OLAP 接线与门禁状态 | ✅ 打包声明成真 | 协议文档 | 存储边界文档 | 功能表 100% 真实 |
 
 ### 实测基线（2026-10-20 下午，全量 pytest + benchmark）
 
-- 全量 pytest：**1182 用例 = 1140 passed / 0 failed / 40 skipped / 1 xfailed /
-  1 xpassed**（2026-10-21，P2 元数据/备份/TLS/插件后；GitHub Windows runner CI
-  run `39548734259` 同版本全绿，含 benchmark gate + packaging）；
+- 全量 pytest：**1250 用例 = 1209 passed / 0 failed / 40 skipped / 1 xfailed**
+  （2026-10-21 最终版，P0–P3 + Web 收尾后；本地全量 1198 passed + Web 前端 11 passed；
+  GitHub Windows runner CI run `39560091897` 同版本全绿，含 GUI smoke + benchmark gate +
+  GUI perf + packaging）；
 - `benchmarks.run --suite quick --gate`：**PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、
   dispatch 对拍不一致=0）；
 - `scripts/check_packaging.py`：PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源）；

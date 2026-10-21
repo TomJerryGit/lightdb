@@ -23,7 +23,14 @@
     （全量 pytest 1131 用例 + benchmark gate + packaging）。
   - run `39548734259`（head `b3435b1`，P2 元数据/备份/TLS/插件合并）→ **success**，
     全量 pytest 1182 用例 + benchmark gate + packaging 全过。
-  - 仅剩 GitHub 的 Node.js 20 deprecation warning（actions 自身，与本仓库代码无关）。
+  - run `39555807470`（head `01835d2`，P3 全部完成）→ **failure**：仅
+    `test_studio_p2_i18n_a11y::test_hot_switch_retranslates_ui` 启动期事件时序假失败；
+    测试修复 `0f9181e` 后恢复全绿（产品行为正确，修复仅测试 fixture）。
+  - run `39558295169`（head `0f9181e`，时序修复）→ **success**，全部 step 成功。
+  - run `39560091897`（head `bc91bf3`，Web 前端 + CI Actions v7）→ **success**，
+    全部 step 成功（全量 pytest ~1250 用例 + GUI smoke + benchmark gate + GUI perf +
+    packaging）。
+  - Actions 已升级 v7，**Node.js 20 deprecation warning 已消除**。
 - 推送命令：
   ```powershell
   git push -u origin main --tags
@@ -35,7 +42,7 @@
 
 | 步骤 | 命令/步骤 | 结果 |
 |---|---|---|
-| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1182 用例 = 1140 passed / 0 failed / 40 skipped / 1 xfailed / 1 xpassed**（2026-10-21 P2 元数据/备份/TLS/插件后；GitHub CI run `39548734259` 同版本全绿） |
+| 全量 pytest | `python -m pytest tests -q -p no:cacheprovider` | **1250 用例 = 1209 passed / 0 failed / 40 skipped / 1 xfailed**（2026-10-21 最终版：本地全量 1198 passed + Web 前端 11 passed；GitHub CI run `39560091897` 同版本全绿） |
 | 基准门禁 | `python -m benchmarks.run --suite quick --gate` | **PASS 7/7**（原 5 条 + OLAP 并行 GROUP BY ≥1.2x、dispatch 对拍 0 不一致） |
 | 打包检查 | `python scripts/check_packaging.py` | PASS（wheel 含引擎包 + 3 入口，版本 4.0.0 单一来源） |
 | 仓库卫生 | `python scripts/check_repo_hygiene.py` | PASS（提交 GUI 验证报告后复跑通过） |
