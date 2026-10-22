@@ -253,7 +253,8 @@ def test_show_collation_charset_engines_warnings(served):
     ("CREATE TABLE e_cs (id INT PRIMARY KEY) DEFAULT CHARSET=gbk", 1115),
     ("CREATE TABLE e_co (id INT PRIMARY KEY) COLLATE=utf8mb4_general_ci",
      1273),
-    ("CREATE TABLE e_ai (id INT PRIMARY KEY) AUTO_INCREMENT=100", 1064),
+    # P6 起表级 AUTO_INCREMENT=n 已真实实现（自增列起始号）→ 不再属于
+    # "不支持的表选项"，见 tests/test_auto_increment_p6.py。
     ("CREATE TABLE e_rf (id INT PRIMARY KEY) ROW_FORMAT=COMPRESSED", 1064),
     ("CREATE TABLE e_ou (id INT PRIMARY KEY, "
      "ts INT ON UPDATE CURRENT_TIMESTAMP)", 1064),

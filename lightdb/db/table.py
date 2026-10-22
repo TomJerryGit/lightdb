@@ -323,7 +323,9 @@ class Table:
                  mvcc: MVCCManager = None,
                  unique_indexes: List[Dict] = None,
                  secondary_indexes: List[Dict] = None,
-                 requested_engine: str = 'LightDB'):
+                 requested_engine: str = 'LightDB',
+                 auto_increment_next: Dict[str, int] = None,
+                 auto_increment_start: int = None):
         self.name = name
         self.cols = cols
         self.data_dir = Path(data_dir)
@@ -378,6 +380,19 @@ class Table:
         self._rebuild_index()
         self._lock = threading.RLock()
         self._next_pk = self._calc_next_pk()
+        # P6：AUTO_INCREMENT 状态。
+        # `_auto_next` = 每列"下一个待分配号"（列名 → int），随表元数据
+        # 持久化（`Database.save_meta`）。INSERT 省略/NULL 时在表锁内分配，
+        # 显式值推进计数器；回滚**不回收**已分配号（MySQL 语义）。
+        self._auto_next = {}
+        for _k, _v in (auto_increment_next or {}).items():
+            try:
+                self._auto_next[str(_k)] = int(_v)
+            except (TypeError, ValueError):
+                continue
+        self._auto_start_pending = (
+            int(auto_increment_start) if auto_increment_start else None)
+        self._init_auto_increment_state()
         # 启动时校验持久化的空闲页登记表: 越界（文件曾经被截断过）、
         # 已经不是堆页（页号被 B+Tree 复用）、其实没空间的项一律丢弃。
         # 丢弃只损失复用机会，绝不改变"能放下就放下"的语义。
@@ -1215,6 +1230,117 @@ class Table:
                 max_pk = k
         return max_pk + 1
 
+    # ==================== P6：AUTO_INCREMENT ====================
+    #
+    # 语义（MySQL 对齐）：
+    #   * 省略或显式 NULL → 分配 `下一个号`（每次分配后计数前进，不回退）；
+    #   * 显式整数 → 若 >= 当前计数则把计数推进到 value+1（小值不缩减计数）；
+    #   * 回滚 / 失败语句**不回收**已分配号（只留空洞，绝不重用）；
+    #   * 计数随表元数据持久化（`Database.save_meta` 的
+    #     `auto_increment_next`），重启后接着分配；
+    #   * 分配在 `Table._lock` 内完成，因此多线程/多连接并发 INSERT
+    #     不会拿到重复号。
+
+    _AUTO_INT_TYPES = frozenset((
+        'INT', 'BIGINT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'INTEGER'))
+
+    @classmethod
+    def is_auto_increment_integer_type(cls, col_type) -> bool:
+        m = re.match(r'^([A-Z_][A-Z0-9_]*)',
+                     str(col_type or '').strip().upper())
+        return bool(m) and m.group(1) in cls._AUTO_INT_TYPES
+
+    def _max_existing_auto_value(self, idx):
+        """该列现存可见行的最大整数（旧元数据缺计数时据此恢复，不重用）"""
+        mx = None
+        try:
+            for _pk, values in self._live_rows():
+                v = values[idx] if idx < len(values) else None
+                if isinstance(v, bool) or not isinstance(v, int):
+                    continue
+                mx = v if mx is None else max(mx, v)
+        except Exception:                         # pragma: no cover - 防御
+            return None
+        return mx
+
+    def _init_auto_increment_state(self):
+        """初始化自增列/计数（构造期；持久化计数优先，其次扫描现存最大值）"""
+        self._auto_cols = [i for i, c in enumerate(self.cols)
+                           if c.get('auto_increment')]
+        for i in self._auto_cols:
+            name = self.cols[i]['name']
+            nxt = int(self._auto_next.get(name, 1) or 1)
+            mx = self._max_existing_auto_value(i)
+            if mx is not None:
+                nxt = max(nxt, mx + 1)
+            if i == self.pk_idx and self._next_pk > nxt:
+                nxt = self._next_pk
+            self._auto_next[name] = max(1, nxt)
+        if self._auto_start_pending is not None and self._auto_cols:
+            name = self.cols[self._auto_cols[0]]['name']
+            self._auto_next[name] = max(
+                self._auto_next.get(name, 1), self._auto_start_pending)
+        self._auto_start_pending = None
+
+    def _sync_auto_columns(self):
+        """列定义变化后同步自增列下标（ADD/DROP COLUMN、MODIFY 后调用）"""
+        self._auto_cols = [i for i, c in enumerate(self.cols)
+                           if c.get('auto_increment')]
+        for i in self._auto_cols:
+            self._auto_next.setdefault(self.cols[i]['name'], 1)
+
+    def auto_increment_columns(self) -> List[str]:
+        return [self.cols[i]['name'] for i in self._auto_cols]
+
+    def auto_increment_next_values(self) -> Dict[str, int]:
+        """持久化用的"每列下一个待分配号"快照"""
+        return {k: int(v) for k, v in self._auto_next.items()}
+
+    def next_auto_increment_value(self):
+        """下一个将分配的自增号（没有自增列时 None；SHOW TABLE STATUS 用）"""
+        if not self._auto_cols:
+            return None
+        name = self.cols[self._auto_cols[0]]['name']
+        return int(self._auto_next.get(name, 1) or 1)
+
+    def _allocate_auto_value(self, idx: int) -> int:
+        """在表锁内分配下一个号（只前进，不回退；回滚也不回收）"""
+        name = self.cols[idx]['name']
+        nxt = int(self._auto_next.get(name, 1) or 1)
+        self._auto_next[name] = nxt + 1
+        if idx == self.pk_idx:
+            self._next_pk = max(self._next_pk, nxt + 1)
+        return nxt
+
+    def _advance_auto_value(self, idx: int, value: int):
+        """显式插入值推进计数器（大于当前才推进，绝不因小值回退）"""
+        name = self.cols[idx]['name']
+        value = int(value)
+        self._auto_next[name] = max(
+            int(self._auto_next.get(name, 1) or 1), value + 1)
+        if idx == self.pk_idx:
+            self._next_pk = max(self._next_pk, value + 1)
+
+    def set_auto_increment(self, value: int) -> int:
+        """`ALTER TABLE ... AUTO_INCREMENT = n`：设置下一个待分配号
+
+        不允许把计数设到"现存最大值 + 1"之下（MySQL 的取值下限语义）：
+        返回**实际生效**的下一号（真实值，不装作已经设成更小的数）。
+        """
+        with self._lock:
+            if not self._auto_cols:
+                raise DdlError(
+                    f"Table '{self.name}' has no AUTO_INCREMENT column",
+                    errno=1075, sqlstate='42000')
+            idx = self._auto_cols[0]
+            mx = self._max_existing_auto_value(idx)
+            floor = (mx + 1) if mx is not None else 1
+            new = max(1, int(value), floor)
+            name = self.cols[idx]['name']
+            self._auto_next[name] = new
+            self._next_pk = max(self._next_pk, new)
+            return new
+
     # ==================== 结构变更（ALTER TABLE：ADD / DROP COLUMN） ====================
     #
     # 行载荷是**按列位置编码的 JSON 数组**（见 `_encode_row`）。因此
@@ -1473,6 +1599,9 @@ class Table:
                 if self.bt.delete(pk):
                     dropped += 1
             self._next_pk = 1
+            # TRUNCATE 是 DDL：MySQL 同时把 AUTO_INCREMENT 重置回起点。
+            for i in self._auto_cols:
+                self._auto_next[self.cols[i]['name']] = 1
             self._last_heap_pid = None
             # 全文索引是**派生**数据（不持久化），清空表就必须一起清空，
             # 否则 MATCH ... AGAINST 还能搜到已经删掉的行。这里保留索引
@@ -1569,6 +1698,9 @@ class Table:
         # 新加的 `UNIQUE` 列必须立刻参与写入校验，不能等下一次重启。
         if hasattr(self, '_unique_indexes'):
             self._sync_column_unique_indexes()
+        # P6：列定义变化后同步自增列下标/计数键（ADD/DROP COLUMN 等）
+        if hasattr(self, '_auto_next'):
+            self._sync_auto_columns()
 
     def _col_idx(self, name: str) -> int:
         for i, c in enumerate(self.cols):
@@ -1732,6 +1864,21 @@ class Table:
         # 用户给的值被覆盖（MySQL 里给生成列赋值本来就是错误，这里不静默
         # 保留用户值，而是以表达式结果为准）。
         values = self._apply_generated(values)
+
+        # P6：AUTO_INCREMENT —— 省略/NULL 分配下一号；显式值推进计数器。
+        # 必须在类型转换/NOT NULL 检查之前赋值（自增列通常声明 NOT NULL），
+        # 且在拿行锁/写 WAL 之前完成（失败语句只会留下号空洞，不重号）。
+        for i in self._auto_cols:
+            v = values[i]
+            if v is None:
+                values[i] = self._allocate_auto_value(i)
+            else:
+                try:
+                    iv = int(coerce(v, self.cols[i]['type']))
+                except Exception:                 # 类型错误交给下面统一报
+                    iv = None
+                if iv is not None:
+                    self._advance_auto_value(i, iv)
 
         # 类型转换 + 声明式类型约束 + NOT NULL 检查（修复 C）
         #

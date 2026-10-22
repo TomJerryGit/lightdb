@@ -2284,7 +2284,10 @@ class Parser:
         self._validate_primary_key_types(table, cols)
 
         if not any(c.get('primary') for c in cols):
+            # 隐式内部行键（不是用户声明的 PRIMARY KEY）：单独打标，
+            # 供 AUTO_INCREMENT 的"必须是键"校验区分显式声明与内部实现。
             cols[0]['primary'] = True
+            cols[0]['implicit_pk'] = True
 
         # 分区
         table_options, tail_rest = self._parse_table_options(tail)
@@ -2788,20 +2791,12 @@ class Parser:
             check = self._parse_check(
                 rest[cpos:], strict_tail=False)
 
-        # `AUTO_INCREMENT` / `ON UPDATE`：本引擎**没有**对应实现
-        # （`Table._insert_locked` 只在主键为 NULL 时取 `_next_pk`，
-        #  UPDATE 时也不会重算任何列）。
-        #
-        # 决策（本会话）：与 `ENGINE=InnoDB` 保持**同一种态度** ——
-        # **接受但绝不声称生效**。理由：MySQL 兼容（mysqldump 一类 DDL
-        # 必须能建表），而只要元数据不伪造，使用者就不会误以为它生效。
-        # 因此这里既不报错、也不写任何"生效"痕迹：
-        #   * `SHOW COLUMNS` 的 `Extra` 恒为 `''`（不再由主键伪造
-        #     `auto_increment`，见 `db/database.py::describe_columns`）；
-        #   * 插入时不自增：不提供主键值就是主键为 NULL 的普通插入
-        #     （NOT NULL 主键会显式报错，属可见失败而非静默错值）。
-        # 曾被短暂改为定义期 SyntaxError，但那与 ENGINE 的处理不一致，
-        # 且会让合法 MySQL DDL 无法解析（`test_sql_compat::test_ddl`）。
+        # `AUTO_INCREMENT`：P6 起**真实实现**（本字段保留 → 执行器/存储层
+        # 负责"整数列 + 必须是键"校验、分配下一个值、持久化计数）。
+        # 不支持的形态（非整数 / 非键 / 多列自增）由
+        # `Database.create_table` 显式报 1075/1063，绝不静默丢弃。
+        auto_increment = bool(re.search(
+            r'(?<![A-Za-z0-9_])AUTO_INCREMENT\b', rest, re.IGNORECASE))
 
         # `DEFAULT`：真实解析并保留。旧实现根本没有 DEFAULT 分支，
         # 该子句被静默丢掉，于是 `SHOW COLUMNS` 只能恒报 Default=NULL。
@@ -2822,6 +2817,7 @@ class Parser:
             'generated': generated,
             'check': check,
             'comment': col_comment,
+            'auto_increment': auto_increment,
         }
 
     #: 无引号 DEFAULT 值里的函数调用（`CURRENT_TIMESTAMP` / `NOW()` /
@@ -3214,6 +3210,13 @@ class Parser:
         if em:
             return {'command': 'ALTER TABLE', 'table': table,
                     'action': 'ENGINE', 'engine': em.group(1)}
+
+        # ---- P6：ALTER TABLE AUTO_INCREMENT = n（设置下一个自增号）----
+        aim = re.fullmatch(r'AUTO_INCREMENT\s*=\s*(\d+)', action,
+                           re.IGNORECASE)
+        if aim:
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'AUTO_INCREMENT', 'value': int(aim.group(1))}
 
         # ---- 明确不支持的变体（先判前缀，避免被 ADD/DROP 抢先匹配）----
         for prefix, label in sorted(self._ALTER_UNSUPPORTED_ACTIONS,

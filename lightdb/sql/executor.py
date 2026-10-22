@@ -1505,11 +1505,13 @@ class Executor:
             out['charset'] = coll_charset
             out['collate'] = collate
         if opts.get('auto_increment') is not None:
-            return None, self._err(
-                1064,
-                f"表级 AUTO_INCREMENT={opts['auto_increment']} 未实现："
-                f"本引擎只在插入 INT 主键时按现有最大值+1 取值，"
-                f"不支持指定起始值。显式拒绝而不是接受后静默忽略")
+            # P6：表级 `AUTO_INCREMENT=n` = 自增列起始号（真实实现）
+            try:
+                start = int(opts['auto_increment'])
+            except (TypeError, ValueError):
+                return None, self._err(
+                    1064, f"AUTO_INCREMENT 起始值非法: {opts['auto_increment']!r}")
+            out['auto_increment_start'] = max(1, start)
         comment = opts.get('comment')
         if comment is not None:
             out['comment'] = comment
@@ -1547,7 +1549,11 @@ class Executor:
                              # 共用同一份持久化声明）
                              secondary_indexes=p.get('secondary_indexes'),
                              # E2：ENGINE= 兼容别名（持久化请求名）
-                             requested_engine=table_options['engine'])
+                             requested_engine=table_options['engine'],
+                             # P6：`CREATE TABLE ... AUTO_INCREMENT=n`
+                             # 作为自增列起始号（真实生效，SHOW 回显下一号）
+                             auto_increment_start=table_options.get(
+                                 'auto_increment_start'))
         # E1：引擎扩展元数据（表选项/注释）持久化到 _meta.json，
         # SHOW CREATE TABLE / SHOW TABLE STATUS 如实回显。
         tbl = self.db.tables[p['table']]
@@ -1644,6 +1650,13 @@ class Executor:
                 message=(f"Table '{table}' altered: ENGINE set to "
                          f"{display}（兼容别名；实际存储为 LightDB 原生"
                          f"行存，不实现 {display} 语义）"))
+        if action == 'AUTO_INCREMENT':
+            # P6：`ALTER TABLE t AUTO_INCREMENT = n`。
+            # 返回**实际生效**的下一号（低于现存最大号+1 时按 MySQL 语义抬高）。
+            nxt = self.db.set_auto_increment(table, int(p.get('value') or 0))
+            return self._ok(
+                message=(f"Table '{table}' altered: AUTO_INCREMENT set to "
+                         f"{nxt}（实际下一号；SHOW CREATE/STATUS 如实回显）"))
         if action == 'ADD COLUMN':
             col = dict(p['column'])
             stats = self.db.alter_add_column(table, col)
@@ -7772,17 +7785,26 @@ class Executor:
                    if isinstance(c, dict) and c.get('generated')}
         comment_map = {c.get('name'): c.get('comment') for c in cols
                        if isinstance(c, dict) and c.get('comment')}
+        auto_cols = {c.get('name') for c in cols
+                     if isinstance(c, dict) and c.get('auto_increment')}
         opts = getattr(tbl, 'table_options', None) or {}
         tcomment = getattr(tbl, 'comment', '') or ''
         partition_spec = getattr(tbl, '_partition_spec', None)
         engine = (getattr(tbl, 'requested_engine', None)
                   or opts.get('engine') or 'LightDB')
         secondary = (getattr(tbl, 'secondary_indexes', lambda: [])() or [])
+        next_auto = None
+        try:
+            next_auto = tbl.next_auto_increment_value()
+        except Exception:                         # pragma: no cover - 防御
+            next_auto = None
         # 没有任何"check_ddl 不导出"的真实语义时，保持与 check_ddl
         # **逐字节一致**（既有契约：SHOW CREATE 与逻辑 dump 同一份文本）。
         has_extras = bool(gen_map or comment_map or tcomment
                           or partition_spec
                           or secondary
+                          or auto_cols
+                          or (next_auto is not None and next_auto > 1)
                           or engine != 'LightDB'
                           or opts.get('comment')
                           or opts.get('user_specified'))
@@ -7793,7 +7815,8 @@ class Executor:
             if not m:
                 continue
             cname = m.group(2).strip('`"')
-            if cname not in gen_map and cname not in comment_map:
+            if cname not in gen_map and cname not in comment_map \
+                    and cname not in auto_cols:
                 continue
             body = line.rstrip()
             has_comma = body.endswith(',')
@@ -7803,6 +7826,13 @@ class Executor:
             if gen:
                 body += (f" GENERATED ALWAYS AS ({gen.get('expr')}) "
                          f"{'STORED' if gen.get('stored') else 'VIRTUAL'}")
+            if cname in auto_cols:
+                # MySQL 的列属性顺序：... AUTO_INCREMENT [PRIMARY KEY]
+                if ' PRIMARY KEY' in body:
+                    body = body.replace(' PRIMARY KEY',
+                                        ' AUTO_INCREMENT PRIMARY KEY', 1)
+                else:
+                    body += ' AUTO_INCREMENT'
             cmt = comment_map.get(cname)
             if cmt:
                 body += " COMMENT '" + str(cmt).replace("'", "''") + "'"
@@ -7831,6 +7861,9 @@ class Executor:
         tcomment = getattr(tbl, 'comment', '') or ''
         if tcomment:
             suffix += " COMMENT='" + str(tcomment).replace("'", "''") + "'"
+        # P6：下一自增号（MySQL 在 >1 时显示 AUTO_INCREMENT=n）
+        if next_auto is not None and next_auto > 1:
+            suffix += f" AUTO_INCREMENT={int(next_auto)}"
         suffix += self._render_partition_spec(
             getattr(tbl, '_partition_spec', None))
         idx = ddl.rfind(')')
@@ -9999,8 +10032,12 @@ class Executor:
                 data_free = None
             auto_inc = None
             try:
-                if (tbl.cols and tbl.cols[tbl.pk_idx].get('type', '').upper()
-                        in ('INT', 'BIGINT')):
+                # P6：真实 AUTO_INCREMENT 下一号（有自增列时优先）；
+                # 没有自增列时保留旧行为：INT 主键报内部下一个主键号。
+                auto_inc = tbl.next_auto_increment_value()
+                if auto_inc is None and (
+                        tbl.cols and tbl.cols[tbl.pk_idx].get(
+                            'type', '').upper() in ('INT', 'BIGINT')):
                     auto_inc = int(getattr(tbl, '_next_pk', 0) or 0)
             except Exception:
                 auto_inc = None

@@ -199,14 +199,14 @@ def column_default(col: dict):
 
 
 def column_extra(col: dict) -> str:
-    """Extra 列：本引擎**没有** `auto_increment` / `on update` 概念，
-    因此恒为空字符串。
+    """Extra 列：`auto_increment` 是 P6 起**真实实现**的自增列。
 
-    旧实现把 `Extra` 写成 `'auto_increment' if col['primary'] else ''`
-    —— 那是一条凭空捏造的元数据：本引擎既没有自增序列（`parser._column_def`
-    现在对 `AUTO_INCREMENT` 显式报错），主键也不等于自增。宁可留空，
-    也不给客户端一个它据此会做错的结论。
+    只有列上真的声明了 `AUTO_INCREMENT`（且建表期通过了"整数 + 键"校验）
+    才报 `auto_increment`；主键本身**不会**被推断成自增（那才是伪造元数据：
+    普通 INT 主键的"省略主键取值"用的是内部行键兜底，不是自增语义）。
     """
+    if col.get('auto_increment'):
+        return 'auto_increment'
     return ''
 
 
@@ -522,6 +522,9 @@ class Database:
                     secondary_indexes=tinfo.get('indexes'),
                     requested_engine=(tinfo.get('requested_engine')
                                       or 'LightDB'),
+                    # P6：AUTO_INCREMENT 下一号随元数据持久化；重启后
+                    # 接着分配（不因删行/回滚而重用旧号）。
+                    auto_increment_next=tinfo.get('auto_increment_next'),
                 )
                 if tinfo.get('partition'):
                     # 分区描述随表元数据一起持久化（SHOW PARTITIONS /
@@ -594,7 +597,12 @@ class Database:
                     # E1：表选项/注释（CREATE TABLE 的 ENGINE/CHARSET/
                     # COLLATE/COMMENT 真实生效并回显，重启后保持）。
                     'table_options': getattr(t, 'table_options', None),
-                    'comment': getattr(t, 'comment', '')}
+                    'comment': getattr(t, 'comment', ''),
+                    # P6：AUTO_INCREMENT 每列"下一个待分配号"（真实计数，
+                    # 重启后保持；回滚/删除不回收）
+                    'auto_increment_next': (
+                        t.auto_increment_next_values()
+                        if hasattr(t, 'auto_increment_next_values') else {})}
                 for n, t in list(self.tables.items())
             },
             'users': self.users,
@@ -665,7 +673,8 @@ class Database:
                      checks: List[dict] = None,
                      unique_indexes: List[dict] = None,
                      secondary_indexes: List[dict] = None,
-                     requested_engine: str = None) -> Table:
+                     requested_engine: str = None,
+                     auto_increment_start: int = None) -> Table:
         """建表
 
         `checks` 是 `CREATE TABLE` 里表级 CHECK 约束（`sql/parser.py` 的
@@ -704,6 +713,44 @@ class Database:
                                          'columns': [cname],
                                          'origin': 'column'})
         unique_specs = resolve_unique_indexes(name, cols, merged_specs)
+        # P6：AUTO_INCREMENT 定义期校验（绝不静默降级）
+        #   * 只允许一列自增（MySQL 1075）；
+        #   * 必须是整数类型（1063）；
+        #   * 必须是**显式声明的键**（主键 / 列级 UNIQUE / 表级唯一约束覆盖），
+        #     parser 给"第一列"打的隐式内部行键标记不算声明（1075）。
+        auto_cols = [c for c in cols if c.get('auto_increment')]
+        if len(auto_cols) > 1:
+            raise DdlError(
+                "Incorrect table definition; there can be only one auto "
+                "column and it must be defined as a key", errno=1075,
+                sqlstate='42000')
+        if auto_cols:
+            ac = auto_cols[0]
+            ac_name = str(ac.get('name') or '')
+            if not Table.is_auto_increment_integer_type(ac.get('type')):
+                raise DdlError(
+                    f"Incorrect column specifier for column '{ac_name}'"
+                    f"（AUTO_INCREMENT 只支持整数类型 INT/BIGINT 等，"
+                    f"声明为 {ac.get('type')!r} 不会生效，因此显式拒绝）",
+                    errno=1063, sqlstate='42000')
+            unique_covered = set()
+            for spec in unique_specs:
+                unique_covered.update(spec.get('columns') or [])
+            explicit_key = (
+                (bool(ac.get('primary')) and not ac.get('implicit_pk'))
+                or bool(ac.get('unique')) or ac_name in unique_covered)
+            if not explicit_key:
+                raise DdlError(
+                    "Incorrect table definition; there can be only one auto "
+                    "column and it must be defined as a key",
+                    errno=1075, sqlstate='42000')
+            if ac.get('generated'):
+                raise DdlError(
+                    f"AUTO_INCREMENT 不能与生成列同时声明（列 '{ac_name}'）",
+                    errno=1063, sqlstate='42000')
+            # MySQL：AUTO_INCREMENT 列隐式 NOT NULL（插入时由引擎填号，
+            # 不存在"自增但允许 NULL"的语义）。
+            ac['notnull'] = True
         # E2：非唯一 KEY/INDEX 声明（CREATE TABLE 内联）与独立 CREATE INDEX
         # 共用同一份持久化结构；名字不得与 PRIMARY/UNIQUE 冲突。
         reserved = [s['name'] for s in unique_specs]
@@ -714,7 +761,8 @@ class Database:
             self.lock_manager, self.mvcc,
             unique_indexes=unique_specs,
             secondary_indexes=secondary_specs,
-            requested_engine=requested_engine or 'LightDB')
+            requested_engine=requested_engine or 'LightDB',
+            auto_increment_start=auto_increment_start)
         if partition:
             tbl.set_partition(partition)
         tbl.set_checks(checks)
@@ -896,6 +944,12 @@ class Database:
             raise DdlError("ADD COLUMN 缺少列名", errno=1064)
         if any(c.get('name') == cname for c in tbl.cols):
             raise DdlError(f"Duplicate column name '{cname}'", errno=1060)
+        if col.get('auto_increment'):
+            # 不给已有行编造自增值：显式拒绝，绝不"加一列但已有行没有号"。
+            raise DdlError(
+                "ALTER TABLE ADD COLUMN ... AUTO_INCREMENT 暂不支持"
+                "（已有行的回填语义：MySQL 会按顺序补号，本引擎不做半套）",
+                errno=1235, sqlstate='42000')
         if col.get('primary'):
             # MySQL 1068：一张表只能有一个主键。`ADD COLUMN c INT PRIMARY KEY`
             # 在 MySQL 里就是这条错误（不是静默忽略 PRIMARY KEY 子句）。
@@ -1216,6 +1270,22 @@ class Database:
         for key in ('generated', 'check', 'comment'):
             if col.get(key) is not None:
                 new[key] = col.get(key)
+        # P6：MODIFY 的列定义里若没写 AUTO_INCREMENT，保留旧声明（避免
+        # "改个长度就把自增静默丢掉"）；写了则要求整数且全表仍只有一列自增。
+        new['auto_increment'] = bool(old.get('auto_increment')
+                                     or col.get('auto_increment'))
+        if new['auto_increment']:
+            if not Table.is_auto_increment_integer_type(new_type):
+                raise DdlError(
+                    f"AUTO_INCREMENT 列 '{cname}' 必须是整数类型，"
+                    f"不能改成 {new_type}", errno=1063, sqlstate='42000')
+            others = [c for j, c in enumerate(tbl.cols)
+                      if j != idx and c.get('auto_increment')]
+            if others:
+                raise DdlError(
+                    "Incorrect table definition; there can be only one auto "
+                    "column and it must be defined as a key", errno=1075,
+                    sqlstate='42000')
         if new.get('primary') and base not in self._PK_COMPATIBLE_TYPES:
             raise DdlError(
                 f"主键列 '{cname}' 只能改成整数类型（主键 B+Tree 的键按 "
@@ -1361,6 +1431,18 @@ class Database:
             f"Can't DROP '{name}'; check that column/key exists",
             errno=1091, sqlstate='42000')
 
+    def set_auto_increment(self, name: str, value: int) -> int:
+        """`ALTER TABLE t AUTO_INCREMENT = n`：设置下一号并持久化
+
+        返回**实际生效**的下一号（低于"现存最大号+1"时按 MySQL 语义抬到
+        该下限；不会假装设成了更小的数）。
+        """
+        tbl = self._get_table_for_ddl(name)
+        with tbl._lock:
+            actual = tbl.set_auto_increment(int(value))
+            self.save_meta()
+        return actual
+
     def truncate_table(self, name: str) -> dict:
         """`TRUNCATE TABLE t` —— 清空所有行，**保留表定义**
 
@@ -1411,6 +1493,10 @@ class Database:
                  'indexes': tbl.secondary_indexes(),
                  'requested_engine': getattr(tbl, 'requested_engine',
                                              'LightDB'),
+                 # P6：自增计数跟着改名走（否则 RENAME 后计数回退/重用）
+                 'auto_increment_next': (
+                     tbl.auto_increment_next_values()
+                     if hasattr(tbl, 'auto_increment_next_values') else {}),
                  'checks': [dict(c) for c in getattr(tbl, '_checks', [])]}
         self._ddl_begin(entry)
         self._finish_rename(entry)
@@ -1454,7 +1540,12 @@ class Database:
                            'indexes', tbl.secondary_indexes()),
                        requested_engine=entry.get(
                            'requested_engine',
-                           getattr(tbl, 'requested_engine', 'LightDB')))
+                           getattr(tbl, 'requested_engine', 'LightDB')),
+                       auto_increment_next=entry.get(
+                           'auto_increment_next',
+                           (tbl.auto_increment_next_values()
+                            if hasattr(tbl, 'auto_increment_next_values')
+                            else None)))
         if entry.get('partition'):
             newtbl.set_partition(entry['partition'])
         if entry.get('checks'):
@@ -2013,6 +2104,9 @@ class Database:
             options = dict(getattr(tbl, 'table_options', None) or {})
             comment = getattr(tbl, 'comment', '') or ''
             engine = getattr(tbl, 'requested_engine', 'LightDB')
+            auto_state = (tbl.auto_increment_next_values()
+                          if hasattr(tbl, 'auto_increment_next_values')
+                          else None)
             fulltext_cols = sorted(
                 getattr(getattr(tbl, '_fulltext', None), 'indexes', {}) or {})
             before_bytes = tbl.bp.file_size()
@@ -2031,7 +2125,8 @@ class Database:
                     LockManager(), MVCCManager(),
                     unique_indexes=unique,
                     secondary_indexes=secondary,
-                    requested_engine=engine)
+                    requested_engine=engine,
+                    auto_increment_next=auto_state)
                 if partition:
                     new.set_partition(partition)
                 new.set_checks(checks)
@@ -2077,6 +2172,7 @@ class Database:
                 'table_options': options, 'comment': comment,
                 'requested_engine': engine,
                 'fulltext_columns': fulltext_cols,
+                'auto_increment_next': auto_state,
             }
             # 3) 写 pending 意图（原子）—— 之后发生的崩溃由启动恢复补完
             self._ddl_begin(entry)
@@ -2104,7 +2200,8 @@ class Database:
             name, old_cols, str(self.data_dir),
             self.lock_manager, self.mvcc,
             unique_indexes=unique, secondary_indexes=secondary,
-            requested_engine=engine)
+            requested_engine=engine,
+            auto_increment_next=auto_state)
         if partition:
             new_tbl.set_partition(partition)
         new_tbl.set_checks(checks)
@@ -2189,6 +2286,13 @@ class Database:
                     n += 1
             except Exception as e:
                 logger.warn(f"checkpoint {tbl.name} 失败: {e}")
+        # P6：自增计数是**已分配号**的不变量（回滚/删除不回收），checkpoint
+        # 是确定性落盘点：把计数写进 `_meta.json`，重启后不会因"最大行被删"
+        # 而重用旧号。
+        try:
+            self.save_meta()
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.warn(f"checkpoint 后写元数据失败（忽略）: {e}")
         return n
 
     def shutdown(self):
@@ -2204,6 +2308,12 @@ class Database:
                 tbl.close()
             except Exception:
                 pass
+        # P6：正常停机也落一次元数据（自增计数 = 已分配号，回滚/删除不回收；
+        # 不写盘的话，重启后按现存最大行推断会重用被删/回滚掉的号）。
+        try:
+            self.save_meta()
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.warn(f"停机时写元数据失败（忽略）: {e}")
         if self._binlog is not None:
             try:
                 self._binlog.close()

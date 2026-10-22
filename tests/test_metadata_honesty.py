@@ -6,8 +6,9 @@
 
 1. `SHOW COLUMNS` 的 `Type` 保留长度/精度（`VARCHAR(20)` / `DECIMAL(10,2)`）；
 2. `SHOW COLUMNS` 的 `Default` 来自真实的 `DEFAULT` 声明；
-3. `SHOW COLUMNS` 的 `Extra` 不再由主键伪造（本引擎没有自增 → 恒空串，
-   且 `CREATE TABLE ... AUTO_INCREMENT` 现在**显式报错**而不是静默接受）；
+3. `SHOW COLUMNS` 的 `Extra` 只在列**真的声明** `AUTO_INCREMENT` 时
+   报 `auto_increment`（主键本身不再被推断成自增；P6 起自增是真语义，
+   见 `tests/test_auto_increment_p6.py`）；
 4. `SHOW DATABASES` 反映引擎真实的库集合（真实单库 + 真实可查询的
    `information_schema`），不是与实现无关的写死列表；
 5. `USE <不存在的库>` 显式报 1049（协议 `COM_INIT_DB` / `select_db` 同样
@@ -140,15 +141,14 @@ def test_inproc_default_is_applied_not_just_reported(inproc):
     assert r['rows'] == [(1, 'anon', 9.99, None)], r
 
 
-def test_inproc_auto_increment_accepted_but_never_claimed(inproc):
-    """`AUTO_INCREMENT`：**接受但绝不声称生效**（与 `ENGINE=InnoDB` 同一态度）
+def test_inproc_auto_increment_is_real_and_claimed(inproc):
+    """P6：`AUTO_INCREMENT` 已**真实实现**且元数据如实标注
 
-    决策（本会话）：保证 MySQL 兼容（mysqldump 一类 DDL 必须能建表），但只要
-    元数据不伪造，使用者就不会误以为它生效。故断言三件事：
-      1. 能解析、能建表（不再是 SyntaxError）；
-      2. `SHOW COLUMNS` 的 `Extra` 恒为 `''`（不由主键伪造 auto_increment）；
-      3. 插入时不提供主键值 = 普通的"主键为 NULL"插入（NOT NULL 主键显式报错），
-         **不会静默自增** —— 这是"接受但不生效"与"假自增"的分界。
+    历史背景：本用例曾锁定"接受但绝不声称生效"（Extra 恒空、插入不自增）。
+    P6 起自增是真语义，因此锁定新的诚实口径：
+      1. 建表成功且 `SHOW COLUMNS.Extra == 'auto_increment'`（不再低报）；
+      2. 省略 / 显式 NULL 插入自动分配递增整数（从 1 起）；
+      3. 显式值推进计数器（见 tests/test_auto_increment_p6.py 的完整矩阵）。
     """
     _db, ex = inproc
     r = ex.execute_sql('CREATE TABLE ai (id INT AUTO_INCREMENT PRIMARY KEY, v INT)', {})
@@ -157,16 +157,9 @@ def test_inproc_auto_increment_accepted_but_never_claimed(inproc):
     cols = ex.execute_sql('SHOW COLUMNS FROM ai', {})
     assert cols.get('type') != 'error', cols
     by_name = {row[0]: row for row in cols['rows']}
-    assert by_name['id'][5] == '', by_name['id']      # Extra 恒空，不伪造
+    assert by_name['id'][5] == 'auto_increment', by_name['id']
     assert by_name['id'][2] == 'NO', by_name['id']    # Null=NO 才是真话
 
-    # 实测（本会话）：本引擎在插入时对**省略的 INT 主键**取 `_next_pk`
-    # （`Table._insert_locked`），所以这类声明实际上是**生效**的 ——
-    # 不提供 id 也会拿到 1、2、3……（与 `AUTO_INCREMENT` 关键字无关：
-    # 任何 INT 单列主键都如此）。因此"接受该子句 = 承诺不存在的语义"
-    # 并不成立，接受它反而与真实行为一致。
-    # 反向的待办：`Extra=''` 对这类列是**低报**（MySQL 会报 auto_increment），
-    # 是否改为如实报出取决于"以关键字为准"还是"以行为为准"，留待决策。
     ins = ex.execute_sql('INSERT INTO ai (v) VALUES (7)', {})
     assert ins.get('type') == 'ok', ins
     got = ex.execute_sql('SELECT id, v FROM ai', {})
