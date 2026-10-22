@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LightDB Studio — WiX Toolset v3 (candle.exe + light.exe) 安装包源文件（P6，备选方案）。
+
+  ⚠️ 本机未安装 WiX，因此**未在本机实际编译验证**。scripts/build_installer.py
+  会优先使用 Inno Setup；只有检测到 WiX v3（candle.exe + light.exe）且没有
+  ISCC.exe 时才走本文件。构建命令（build_installer.py 自动生成）大致为：
+
+    candle.exe -dAppVersion=4.0.0 -dSourceDir="<repo>\dist\studio\LightDB-Studio" ^
+        -o obj\installer.wixobj packaging\installer.wxs
+    light.exe -o dist\installer\LightDB-Studio-Setup-4.0.0.msi obj\installer.wixobj
+
+  说明：
+  * 目录/开始菜单快捷方式/卸载项（Windows Installer 自动注册）都包含；
+  * 用 MajorUpgrade 保证升级时替换旧版本；
+  * 若只有 WiX v4+（wix.exe，CLI 语法不同）而没有 v3，build_installer.py
+    会显式报告“工具存在但本脚本按 v3 编写、未生成产物”，不会伪造 .msi。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="LightDB Studio"
+           Language="1033"
+           Version="$(var.AppVersion)"
+           Manufacturer="LightDB Team"
+           UpgradeCode="C2E7A64D-2F5F-4B77-9F16-2E4A8B7A1C10">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64"
+             Description="LightDB Studio desktop client" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of LightDB Studio is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- 安装目录：64 位 Program Files\LightDB Studio -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="LightDB Studio" />
+      </Directory>
+      <!-- 开始菜单组 -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppProgramMenuDir" Name="LightDB Studio" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <!-- onedir 产物整目录收集（$(var.SourceDir) 由 candle -d 传入） -->
+    <ComponentGroup Id="AppFiles" Directory="INSTALLDIR">
+      <Files Include="$(var.SourceDir)\**" />
+    </ComponentGroup>
+
+    <!-- 开始菜单快捷方式 + 卸载时删除菜单目录 -->
+    <DirectoryRef Id="AppProgramMenuDir">
+      <Component Id="StartMenuShortcut" Guid="6B1B0C43-7E8F-4A52-8D63-3F0D5A2C9B77">
+        <Shortcut Id="AppShortcut"
+                  Name="LightDB Studio"
+                  Description="LightDB Studio"
+                  Target="[INSTALLDIR]LightDB-Studio.exe"
+                  WorkingDirectory="INSTALLDIR" />
+        <RemoveFolder Id="RemoveAppProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\LightDB\Studio"
+                       Name="StartMenuShortcut" Type="integer" Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="LightDB Studio" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <UIRef Id="WixUI_Minimal" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Icon Id="AppIcon" SourceFile="$(var.SourceDir)\LightDB-Studio.exe" />
+  </Product>
+</Wix>
