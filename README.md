@@ -183,6 +183,14 @@
   `tests/test_mysql_compat_p4a.py` **18 passed**；mysql 5.0 老客户端元数据序列实跑通过。
   **已知限制**：UPDATE/DELETE 回滚到 SAVEPOINT 后再 COMMIT 的崩溃恢复暂缺补偿 WAL
   （进程内可见性正确）；mysqldump 恢复需先剥离 `ENGINE=InnoDB`。
+- **Navicat 10 真实点击兼容矩阵（2026-10-22）**：
+  [`docs/NAVICAT10_CLICK_COMPAT_MATRIX.md`](docs/NAVICAT10_CLICK_COMPAT_MATRIX.md)：
+  真实 GUI 自动化完成了 Navicat 10 启动、连接其既有 MySQL、新建 LightDB-8898 连接并保存
+  （重启后仍在）；受本机 DSH 前端持续抢焦点影响，"打开连接后的对象树/表数据/设计器/
+  导入导出/备份"未能可靠跑完，已如实标注。协议级矩阵（MySQL 5.0 老客户端，同代 libmysql）
+  给出剩余失败点清单：P0=`ENGINE=InnoDB` 拒绝（表设计器建表会失败）、`ALTER MODIFY COLUMN`
+  缺失；P1=`CREATE INDEX`、`SHOW GRANTS`、视图；P2=`PREPARE`、`SHOW BINARY LOGS`、
+  旧客户端字符集协商。
 - **GUI P0 已实施（2026-10-20）**：结果表**数值/日期感知排序**（NULL 恒末尾）、**结果过滤条**
   （1200 行 40.6ms、不查库）、**快照同名自动唯一 + 旧索引迁移**、**连接口令本地加密**
   （Windows DPAPI；`connections.json` 不再明文，旧明文自动迁移）、连接对话框**口令显示/隐藏**、

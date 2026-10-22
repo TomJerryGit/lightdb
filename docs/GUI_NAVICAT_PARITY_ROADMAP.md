@@ -130,6 +130,9 @@
   （SHOW COLLATION/CHARSET/ENGINES/TABLE STATUS/FULL COLUMNS/FULL TABLES/WARNINGS 均 OK）。
   **已知限制**：UPDATE/DELETE 回滚到 SAVEPOINT 后再 COMMIT 的崩溃恢复暂缺补偿 WAL
   （进程内可见性正确）；`ENGINE=InnoDB` 显式拒绝（mysqldump 恢复需先剥离选项）。
+- **真实点击矩阵**：Navicat 10 的 GUI 自动化结果与剩余失败点清单见
+  [`NAVICAT10_CLICK_COMPAT_MATRIX.md`](NAVICAT10_CLICK_COMPAT_MATRIX.md)（含未完成项说明；
+  E2 优先级据此排序：MODIFY COLUMN → CREATE INDEX → 视图 → SHOW GRANTS → ENGINE 兼容策略）。
 - **E2（后续）**：CREATE INDEX/VIEW、ALTER MODIFY COLUMN、视图/索引纳入对象树与导出、
   FK 产品决策（当前明确拒绝 → GUI 禁用外键设计入口并提示）。
 
