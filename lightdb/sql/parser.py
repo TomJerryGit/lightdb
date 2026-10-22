@@ -402,6 +402,16 @@ class Parser:
                 'FULL_COLUMNS', table=m.group(1), database=m.group(2),
                 like=self._like_literal(m.group(3)))
 
+        # Navicat 10 列表时发：SHOW FULL TABLES WHERE Table_type != 'VIEW'
+        m = re.match(
+            r'(?is)^SHOW\s+FULL\s+TABLES(?:\s+(?:FROM|IN)\s+'
+            r'[`"]?(\w+)[`"]?)?\s+WHERE\s+Table_type\s*'
+            r'(!=|<>|=)\s*[\'"]([^\'"]+)[\'"]\s*;?\s*$', sql)
+        if m:
+            return self._show_result(
+                'FULL_TABLES', database=m.group(1),
+                table_type_op=m.group(2), table_type=m.group(3))
+
         m = re.match(
             r'(?is)^SHOW\s+FULL\s+TABLES(?:\s+(?:FROM|IN)\s+'
             r'[`"]?(\w+)[`"]?)?(?:\s+LIKE\s+(.+?))?\s*;?\s*$', sql)

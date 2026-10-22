@@ -9960,6 +9960,14 @@ class Executor:
         if str(db_name).lower() == str(self.db.name).lower():
             rows += [(name, 'VIEW') for name in self.db.list_views()
                      if self._like_match(name, p.get('like'))]
+        # Navicat 10：SHOW FULL TABLES WHERE Table_type != 'VIEW'（只列表）
+        op = p.get('table_type_op')
+        tt = p.get('table_type')
+        if op and tt:
+            if op in ('!=', '<>'):
+                rows = [r for r in rows if str(r[1]) != str(tt)]
+            else:
+                rows = [r for r in rows if str(r[1]) == str(tt)]
         rows.sort(key=lambda r: (str(r[0]).lower(), str(r[1])))
         return self._rs([col, 'Table_type'], rows)
 
