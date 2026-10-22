@@ -115,6 +115,7 @@ import os
 import re
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -153,6 +154,11 @@ WAL_CHECKPOINT_BYTES_DEFAULT = 1 * 1024 * 1024
 WAL_CHECKPOINT_RECORDS_DEFAULT = 5000
 WAL_CHECKPOINT_BYTES_ENV = 'LIGHTDB_WAL_CHECKPOINT_BYTES'
 WAL_CHECKPOINT_RECORDS_ENV = 'LIGHTDB_WAL_CHECKPOINT_RECORDS'
+#: P5：**时间维度**的 checkpoint 阈值（秒）。0/None = 关闭该维度。
+#: 与大小/条数维度一起构成"WAL 有界"的三道触发条件；时间触发在下一次
+#: 写入收尾时检查（本引擎没有后台线程，空闲时不做无谓刷盘）。
+WAL_CHECKPOINT_SECONDS_DEFAULT = 60.0
+WAL_CHECKPOINT_SECONDS_ENV = 'LIGHTDB_WAL_CHECKPOINT_SECONDS'
 
 # 一个堆页剩余多少字节才值得登记为"可复用页"（页级回收）。
 # 太小（例如只剩 4 字节）的页登记进来只会让 `_find_heap_page_with_space`
@@ -309,6 +315,8 @@ class Table:
     #: checkpoint 触发阈值（测试/调用方可以直接改类属性；None = 用环境变量/默认值）
     wal_checkpoint_bytes = None
     wal_checkpoint_records = None
+    #: P5：时间阈值（秒；None = 取环境变量/默认 60s；0 = 关闭）
+    wal_checkpoint_seconds = None
 
     def __init__(self, name: str, cols: List[Dict], data_dir: str,
                  lock_manager: LockManager = None,
@@ -377,6 +385,15 @@ class Table:
 
         # 事务号 -> ReadView（供写路径的可见性判断 + 恢复用）
         self._read_views: Dict[int, Any] = {}
+
+        # P5：checkpoint 状态（供 SHOW WAL STATUS / 日志观测）。
+        # `_last_checkpoint_ts` 在时间阈值判定中使用；`_checkpoint_count`
+        # 是**真实完成**的 checkpoint 次数（幂等重复调用也会计数）。
+        self._last_checkpoint_ts = time.time()
+        self._checkpoint_count = 0
+        self._last_checkpoint_reason = ''
+        self._last_checkpoint_wal_bytes = 0
+        self._last_checkpoint_wal_records = 0
 
         # 崩溃恢复期的"版本位置重映射"（见 _resolve_old_loc），空闲时为空
         self._recovery_remap: Dict[tuple, tuple] = {}
@@ -4418,7 +4435,22 @@ class Table:
                 r = WAL_CHECKPOINT_RECORDS_DEFAULT
         return b, r
 
-    def checkpoint(self, force: bool = False) -> bool:
+    def wal_checkpoint_time_limit(self) -> float:
+        """当前生效的**时间**阈值（秒）；<=0 表示关闭该维度"""
+        v = self.wal_checkpoint_seconds
+        if v is None:
+            try:
+                v = float(os.environ.get(
+                    WAL_CHECKPOINT_SECONDS_ENV,
+                    WAL_CHECKPOINT_SECONDS_DEFAULT))
+            except (TypeError, ValueError):
+                v = WAL_CHECKPOINT_SECONDS_DEFAULT
+        try:
+            return max(0.0, float(v))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def checkpoint(self, force: bool = False, reason: str = 'manual') -> bool:
         """
         在线 checkpoint：把脏页安全落盘后**退休**（截断）WAL 段落。
 
@@ -4433,11 +4465,31 @@ class Table:
 
         返回是否真的做了 checkpoint。幂等：WAL 已经为空时再调用，
         结果仍是"页已落盘、WAL 为空"，不会报错、不会丢数据。
+        `reason`（size/records/time/manual）只用于状态与日志，不参与语义。
         """
         with self._lock:
             if self._read_views and not force:
                 return False
+            before_bytes = self.wal.size_bytes()
+            before_records = self.wal.record_count()
             self._retire_wal()
+            self._checkpoint_count += 1
+            self._last_checkpoint_ts = time.time()
+            self._last_checkpoint_reason = str(reason or 'manual')
+            self._last_checkpoint_wal_bytes = before_bytes
+            self._last_checkpoint_wal_records = before_records
+            if before_records:
+                # DEBUG 级：既有 crash 测试用 subprocess 捕获子进程 stdout
+                # 并直接 `json.loads`，高频 checkpoint 日志若走 INFO 会污染
+                # 该输出。常规状态观测走 `SHOW WAL STATUS`/`wal_status()`；
+                # 需要日志时把 logger 级别调到 DEBUG 即可看到。
+                logger.debug(
+                    f"checkpoint {self.name}: reason="
+                    f"{self._last_checkpoint_reason} "
+                    f"retired_wal_bytes={before_bytes} "
+                    f"retired_wal_records={before_records} "
+                    f"total_checkpoints={self._checkpoint_count} "
+                    f"(data pages fsynced, WAL truncated)")
             return True
 
     def _retire_wal(self, sync_truncate: bool = True):
@@ -4468,15 +4520,58 @@ class Table:
         self.wal.truncate(sync=sync_truncate)
 
     def _maybe_checkpoint(self) -> bool:
-        """按阈值判断是否需要 checkpoint（只在语句成功收尾后调用）"""
+        """按阈值判断是否需要 checkpoint（只在语句成功收尾后调用）
+
+        P5：三个维度 —— WAL 字节数 / 记录条数 / 距上次 checkpoint 的
+        时间。任一达到即执行；大小/条数优先报对应原因。
+        """
         limit_b, limit_r = self.wal_checkpoint_limits()
-        if limit_b <= 0 and limit_r <= 0:
+        limit_s = self.wal_checkpoint_time_limit()
+        if limit_b <= 0 and limit_r <= 0 and limit_s <= 0:
             return False
         if self._read_views:          # 有未提交事务：推迟，绝不刷未提交数据
             return False
-        if not self.wal.needs_checkpoint(limit_b, limit_r):
+        records = self.wal.record_count()
+        reason = None
+        if (limit_b > 0 or limit_r > 0) and \
+                self.wal.needs_checkpoint(limit_b, limit_r):
+            reason = 'size' if limit_b > 0 and \
+                self.wal.size_bytes() >= limit_b else 'records'
+        elif limit_s > 0 and records > 0 and \
+                (time.time() - self._last_checkpoint_ts) >= limit_s:
+            reason = 'time'
+        if reason is None:
             return False
-        return self.checkpoint()
+        return self.checkpoint(reason=reason)
+
+    def wal_status(self) -> dict:
+        """P5：checkpoint / WAL 状态（`SHOW WAL STATUS` 的唯一数据源）
+
+        所有取值都是**真实**的：WAL 字节/条数来自 WAL 计数量，checkpoint
+        次数/最近原因来自本表实际执行记录，`.dat` 大小为磁盘真实字节数。
+        """
+        try:
+            dat_bytes = self.bp.file_size()
+        except Exception:                         # pragma: no cover - 防御
+            dat_bytes = 0
+        limit_b, limit_r = self.wal_checkpoint_limits()
+        return {
+            'table': self.name,
+            'wal_bytes': self.wal.size_bytes(),
+            'wal_records': self.wal.record_count(),
+            'limit_bytes': limit_b,
+            'limit_records': limit_r,
+            'limit_seconds': self.wal_checkpoint_time_limit(),
+            'checkpoints': self._checkpoint_count,
+            'last_checkpoint_reason': self._last_checkpoint_reason,
+            'last_checkpoint_age_seconds': max(
+                0.0, time.time() - self._last_checkpoint_ts),
+            'last_checkpoint_wal_bytes': self._last_checkpoint_wal_bytes,
+            'last_checkpoint_wal_records': self._last_checkpoint_wal_records,
+            'dat_bytes': dat_bytes,
+            'free_pages': len(self.freelist.pages),
+            'rows': self.row_count,
+        }
 
     def flush(self):
         self.bp.flush()

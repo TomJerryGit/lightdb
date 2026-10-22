@@ -7572,6 +7572,82 @@ class Executor:
                 f"空闲页 {fs['registered_pages']} 个"))
         return self._rs(list(self._VACUUM_COLUMNS), rows)
 
+    #: `VACUUM FULL` / `COMPACT` 结果集列（P5 压实前后真实数字）
+    _COMPACT_COLUMNS = ['Table', 'Rows', 'Dat_before', 'Dat_after',
+                        'Bytes_freed', 'Pages_before', 'Pages_after',
+                        'Index_entries_before', 'Index_entries_after',
+                        'Msg_type', 'Msg_text']
+
+    def _show_compact(self, p, s):
+        """`VACUUM FULL [TABLE t...]` / `VACUUM COMPACT` —— 离线整表重写压实
+
+        与普通 `VACUUM` 的区别：普通 VACUUM 只回收**可判定为死**的版本 +
+        页内紧凑化 + 尾部截断（活行散落在各页时 `.dat` 不会变小）；
+        本命令把全部存活行写入**全新的紧凑数据文件**并原子切换，
+        因此多轮 UPDATE 造成的膨胀会真实回落。崩溃安全由
+        `Database._pre_recover_compact` + `pending_ddl` 完成标记保证。
+        返回每张表压实前后的真实字节数/页数/索引项数。
+        """
+        names = p.get('tables') or sorted(self.db.tables.keys())
+        stats = self.db.compact(names)
+        rows = []
+        for name in names:
+            st = stats.get(name) or {}
+            if st.get('skipped'):
+                rows.append((name, st.get('rows', 0),
+                             st.get('bytes_before', 0),
+                             st.get('bytes_after', st.get('bytes_before', 0)),
+                             0, 0, 0, 0, 0, 'status',
+                             f"跳过: {st.get('reason', '')}"))
+                continue
+            rows.append((
+                name, st.get('rows', 0),
+                st.get('bytes_before', 0), st.get('bytes_after', 0),
+                st.get('bytes_freed', 0),
+                st.get('pages_before', 0), st.get('pages_after', 0),
+                st.get('index_entries_before', 0),
+                st.get('index_entries_after', 0),
+                'status',
+                f"压实 {st.get('rows', 0)} 行，释放 "
+                f"{st.get('bytes_freed', 0)} 字节；索引项 "
+                f"{st.get('index_entries_before', 0)} → "
+                f"{st.get('index_entries_after', 0)}"
+                + ('' if st.get('integrity_ok', True)
+                   else '（完整性校验失败！）')))
+        return self._rs(list(self._COMPACT_COLUMNS), rows)
+
+    #: P5：`SHOW WAL STATUS` 列（真实 WAL/checkpoint 状态，不编造）
+    _WAL_STATUS_COLUMNS = [
+        'Table', 'Wal_bytes', 'Wal_records', 'Limit_bytes',
+        'Limit_records', 'Limit_seconds', 'Checkpoints',
+        'Last_checkpoint_reason', 'Last_checkpoint_age_seconds',
+        'Last_checkpoint_wal_bytes', 'Last_checkpoint_wal_records',
+        'Dat_bytes', 'Free_pages', 'Rows',
+    ]
+
+    def _show_wal_status(self, p, s):
+        """`SHOW WAL STATUS` —— 每张表当前 WAL 段落与 checkpoint 状态
+
+        取值为**真实**计数：WAL 字节/条数来自 WAL 自己的计量，checkpoint
+        次数/最近原因/退休量来自 `Table.checkpoint()` 的实际记录，
+        `.dat` 字节数是磁盘真实大小。阈值列是当前生效配置。
+        """
+        rows = []
+        for name in sorted(self.db.wal_status()):
+            st = self.db.wal_status()[name]
+            rows.append((
+                name, st.get('wal_bytes', 0), st.get('wal_records', 0),
+                st.get('limit_bytes', 0), st.get('limit_records', 0),
+                st.get('limit_seconds', 0), st.get('checkpoints', 0),
+                st.get('last_checkpoint_reason', ''),
+                round(float(st.get('last_checkpoint_age_seconds', 0.0)), 3),
+                st.get('last_checkpoint_wal_bytes', 0),
+                st.get('last_checkpoint_wal_records', 0),
+                st.get('dat_bytes', 0), st.get('free_pages', 0),
+                st.get('rows', 0),
+            ))
+        return self._rs(list(self._WAL_STATUS_COLUMNS), rows)
+
     def _show_optimize_table(self, p, s):
         """OPTIMIZE TABLE —— 真做回收 + 刷盘 + 刷新统计（列序同 CHECK TABLE）"""
         rows = []

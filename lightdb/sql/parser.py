@@ -450,6 +450,10 @@ class Parser:
         if re.match(r'(?is)^SHOW\s+ERRORS(?:\s+LIMIT\s+\d+)?\s*;?\s*$', sql):
             return self._show_result('WARNINGS')
 
+        if re.match(r'(?is)^SHOW\s+WAL\s+STATUS\s*;?\s*$', sql):
+            # P5：WAL / checkpoint 真实状态（扩展语句；MySQL 无此语句）
+            return self._show_result('WAL_STATUS')
+
         if re.match(r'(?is)^SHOW\s+CREATE\s+VIEW\b', sql):
             # E3：视图已实现 → 结果集（View/Create View/charset/collation）。
             vm = re.match(
@@ -554,6 +558,16 @@ class Parser:
         # **真的截断数据文件**、重建索引 —— 这类破坏性/耗时操作需要一个
         # 显式入口，让调用方明确知道"我要回收磁盘空间"。
         # 表名可省略（= 全库所有表）；一次可给多张表。
+        # P5：`VACUUM FULL`（或 COMPACT）是离线整表重写压实，专门解决
+        # 多轮 UPDATE 后活行散落导致 `.dat` 降不下来的问题。
+        vfm = re.match(
+            r'VACUUM\s+(?:FULL|COMPACT)(?:\s+(?:TABLE|TABLES))?\s*(.*)$',
+            sql, re.IGNORECASE | re.DOTALL)
+        if vfm:
+            rest = (vfm.group(1) or '').strip()
+            names = [t.strip().strip('`"')
+                     for t in self._split_top_level(rest) if t.strip()]
+            return self._show_result('COMPACT', tables=names or None)
         vm = re.match(
             r'VACUUM(?:\s+(?:TABLE|TABLES))?\s*(.*)$',
             sql, re.IGNORECASE | re.DOTALL)

@@ -23,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
 from pathlib import Path
 from typing import Dict, List
@@ -328,6 +329,9 @@ class Database:
         #: `save_meta()`。见 `_recover_pending_ddl`。
         self._pending_ddl = None
 
+        # P5：COMPACT 在 `_load()` 之前先把"崩溃中断的多文件替换"补完，
+        # 否则随后 `_load`/`_recover` 会看到新旧文件混在一起的状态。
+        self._pre_recover_compact()
         self._load()
         # 认证引导必须紧跟在用户表加载之后：新库要生成随机口令，旧数据目录
         # （root 仍为空口令）要在启动时安全迁移 —— 否则"升级后默认不再无认证"
@@ -1511,6 +1515,13 @@ class Database:
                     len(old_cols), len(new_cols), always_transform=True)
             elif op == 'TRUNCATE':
                 tbl.truncate_all()
+            elif op == 'COMPACT':
+                # 文件替换已在 `_pre_recover_compact()`（`_load` 之前）补完；
+                # 表已按新文件打开，这里只清 pending 标记并记日志。
+                logger.warn(f"崩溃恢复：补完未完成的 COMPACT TABLE {tname}")
+                self._pending_ddl = None
+                self.save_meta()
+                return
             else:
                 logger.error(f"无法识别的 pending DDL {op!r} —— 丢弃该记录")
                 self._pending_ddl = None
@@ -1891,6 +1902,270 @@ class Database:
                 out[name] = tbl.vacuum_stats()
             except Exception:
                 out[name] = {}
+        return out
+
+    # ==================== P5：WAL 状态 / 数据压实（COMPACT）====================
+
+    def wal_status(self) -> dict:
+        """P5：每张表的 WAL/checkpoint 真实状态（`SHOW WAL STATUS` 数据源）"""
+        out = {}
+        for name, tbl in list(self.tables.items()):
+            try:
+                out[name] = tbl.wal_status()
+            except Exception as e:               # pragma: no cover - 防御
+                out[name] = {'table': name, 'error': str(e)}
+        return out
+
+    def _pre_recover_compact(self):
+        """P5：进入 `_load()` 之前补完崩溃中断的 COMPACT **文件替换**（幂等）
+
+        COMPACT 的提交点是"多文件替换 + `_pending_ddl` 清空"。进程可能在
+        只替换了一部分文件时被硬杀；此时磁盘上可能是"新 .dat + 旧 .btroot"
+        这类混搭。必须在打开数据文件（`_load`）之前把临时目录里剩下的
+        文件 `os.replace` 到位，随后 `_load`/`_recover` 才能看到完整的新表。
+
+        另外清理"临时表已建好但 pending 标记还没写就崩了"留下的孤儿目录
+        （此时数据文件仍是旧的，临时目录直接丢弃即可）。
+        """
+        p = self._meta_path()
+        if not p.exists():
+            return
+        try:
+            meta = json.loads(p.read_text(encoding='utf-8'))
+        except Exception:                        # pragma: no cover - 防御
+            meta = {}
+        entry = meta.get('pending_ddl') or {}
+        name = str(entry.get('table') or '') if \
+            entry.get('op') == 'COMPACT' else ''
+        tmp = None
+        if name:
+            tmp = self.data_dir / str(entry.get('tmp_dir') or '')
+            try:
+                if tmp.exists():
+                    for suffix in ('.dat', '.btroot', '.free'):
+                        src = tmp / f'{name}{suffix}'
+                        if not src.exists():
+                            continue
+                        try:
+                            os.replace(str(src),
+                                       str(self.data_dir / f'{name}{suffix}'))
+                        except OSError as e:
+                            logger.error(
+                                f"补完 COMPACT {name} 时替换 {suffix} 失败: {e}")
+                # 旧 WAL 已在写 pending 前退休；新表 WAL 必须为空
+                wal_path = self.data_dir / f'{name}.wal'
+                try:
+                    with open(wal_path, 'w', encoding='utf-8'):
+                        pass
+                except OSError as e:             # pragma: no cover - 防御
+                    logger.warn(f"重置 COMPACT {name} 的 WAL 失败: {e}")
+                logger.warn(
+                    f"崩溃恢复：补完未完成的 COMPACT TABLE {name}"
+                    f"（临时文件已切换到目标位置）")
+            except Exception as e:               # pragma: no cover - 防御
+                logger.error(f"补完 COMPACT {name} 失败（保留 pending 记录）: {e}")
+            finally:
+                if tmp is not None and tmp.exists():
+                    shutil.rmtree(tmp, ignore_errors=True)
+            return
+        # 没有 COMPACT pending：清理孤儿临时目录（数据文件仍是旧的）
+        try:
+            for d in self.data_dir.glob('_compact_*'):
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception:                        # pragma: no cover - 防御
+            pass
+
+    def _compact_table(self, name: str) -> dict:
+        """P5：**离线** COMPACT（整表重写为紧凑文件，`.dat` 真实下降）
+
+        做法（崩溃安全）:
+          1) 安全门：表上不能有未提交事务（`_ddl_guard`）；
+          2) `checkpoint(force=True)` —— 脏页 fsync、WAL 截断（之后不需要
+             redo 任何旧记录）；
+          3) 在临时目录构建新表：只插入**当前存活行**（顺序无关，主键
+             与数据逐行校验一致），索引/约束/分区/全文索引按原定义重建；
+             新表 flush + close 后大小若没有变小 → 放弃（不缩反大）；
+          4) 写 `pending_ddl`（COMPACT 意图，原子落盘）→ 关闭旧表句柄 →
+             `os.replace` 逐个切换 `.dat/.btroot/.free` → 清空 `.wal`；
+             崩溃在任意一步都由 `_pre_recover_compact` 在下次启动补完；
+          5) 从磁盘重新打开新表，替换内存对象并清 pending。
+
+        这是一个**显式、离线**入口（无后台线程/无并发查询时调用）；返回
+        压实前后字节数、行数与索引一致性指标。
+        """
+        tbl = self._get_table_for_ddl(name)
+        if getattr(tbl, '_read_views', None):
+            raise DdlError(
+                f"表 {name} 上存在未提交事务，无法 COMPACT：请先 "
+                f"COMMIT / ROLLBACK（压实会重写整个数据文件）", errno=1105)
+        with tbl._lock:
+            self._ddl_guard(tbl, 'COMPACT TABLE')
+            # 1) 数据全部落盘 + 退休 WAL（此后不需要任何旧 WAL 重放）
+            if not tbl.checkpoint(force=True, reason='manual'):
+                raise DdlError(
+                    f"表 {name} 的 checkpoint 未能完成，放弃 COMPACT",
+                    errno=1105)
+            old_cols = [dict(c) for c in tbl.cols]
+            unique = tbl.unique_indexes()
+            secondary = tbl.secondary_indexes()
+            checks = [dict(c) for c in getattr(tbl, '_checks', [])]
+            partition = getattr(tbl, '_partition_spec', None)
+            options = dict(getattr(tbl, 'table_options', None) or {})
+            comment = getattr(tbl, 'comment', '') or ''
+            engine = getattr(tbl, 'requested_engine', 'LightDB')
+            fulltext_cols = sorted(
+                getattr(getattr(tbl, '_fulltext', None), 'indexes', {}) or {})
+            before_bytes = tbl.bp.file_size()
+            before_pages = tbl.bp.total_pages()
+            rows_before = tbl.row_count
+            old_int = tbl.integrity_scan(deep=True)
+            old_live = sorted((pk, tuple(values))
+                              for pk, values in tbl._live_rows())
+            # 2) 临时目录构建紧凑新表
+            tmp = self.data_dir / f'_compact_{name}'
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir(parents=True, exist_ok=True)
+            try:
+                new = Table(
+                    name, [dict(c) for c in old_cols], str(tmp),
+                    LockManager(), MVCCManager(),
+                    unique_indexes=unique,
+                    secondary_indexes=secondary,
+                    requested_engine=engine)
+                if partition:
+                    new.set_partition(partition)
+                new.set_checks(checks)
+                for col in fulltext_cols:
+                    new.create_fulltext_index([col])
+                for _pk, values in tbl._live_rows():
+                    new.insert(list(values))
+                new_int = new.integrity_scan(deep=True)
+                new_live = sorted((pk, tuple(values))
+                                  for pk, values in new._live_rows())
+                if new_live != old_live:
+                    raise DdlError(
+                        f"COMPACT {name} 自检失败：新表内容与旧表不一致"
+                        f"（{len(old_live)} vs {len(new_live)} 行），已放弃",
+                        errno=1105)
+                if new_int.get('index_entries') != rows_before or \
+                        new_int.get('live_rows') != rows_before:
+                    raise DdlError(
+                        f"COMPACT {name} 自检失败：新表索引/行数不一致 "
+                        f"{new_int}", errno=1105)
+                new.bp.flush()
+                new._save_btree_root(new.bt.root_page_id, sync=True)
+                new.close()
+                new_bytes = os.path.getsize(tmp / f'{name}.dat')
+                new_pages = max(1, -(-new_bytes // 4096))
+            except Exception:
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise
+            if new_bytes >= before_bytes:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return {'table': name, 'skipped': True,
+                        'reason': 'no_gain',
+                        'rows': rows_before,
+                        'bytes_before': before_bytes,
+                        'bytes_after': before_bytes}
+            entry = {
+                'op': 'COMPACT', 'table': name,
+                'tmp_dir': tmp.name,
+                'before_bytes': before_bytes, 'after_bytes': new_bytes,
+                'new_cols': old_cols,
+                'unique_indexes': unique, 'indexes': secondary,
+                'checks': checks, 'partition': partition,
+                'table_options': options, 'comment': comment,
+                'requested_engine': engine,
+                'fulltext_columns': fulltext_cols,
+            }
+            # 3) 写 pending 意图（原子）—— 之后发生的崩溃由启动恢复补完
+            self._ddl_begin(entry)
+            # 4) 关闭旧句柄（Windows 上不关闭无法 os.replace）并切换文件
+            try:
+                tbl.bp.close()
+                tbl.wal.close()
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"COMPACT 关闭旧表 {name} 句柄失败: {e}")
+        for suffix in ('.dat', '.btroot', '.free'):
+            src = tmp / f'{name}{suffix}'
+            dst = self.data_dir / f'{name}{suffix}'
+            try:
+                if src.exists():
+                    os.replace(str(src), str(dst))
+                elif suffix == '.free' and dst.exists():
+                    dst.unlink()
+            except OSError as e:
+                logger.error(f"COMPACT {name}: 替换 {suffix} 失败: {e}")
+        with open(self.data_dir / f'{name}.wal', 'w', encoding='utf-8'):
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+        # 5) 从磁盘打开新表并替换内存对象
+        new_tbl = Table(
+            name, old_cols, str(self.data_dir),
+            self.lock_manager, self.mvcc,
+            unique_indexes=unique, secondary_indexes=secondary,
+            requested_engine=engine)
+        if partition:
+            new_tbl.set_partition(partition)
+        new_tbl.set_checks(checks)
+        new_tbl.table_options = options
+        new_tbl.comment = comment
+        for col in fulltext_cols:
+            new_tbl.create_fulltext_index([col])
+        if fulltext_cols:
+            for pk, values in new_tbl._live_rows():
+                new_tbl._index_fulltext(pk, values)
+        self.tables[name] = new_tbl
+        self._pending_ddl = None
+        self.save_meta()
+        after_bytes = os.path.getsize(self.data_dir / f'{name}.dat')
+        after_pages = new_tbl.bp.total_pages()
+        after_int = new_tbl.integrity_scan(deep=True)
+        stats = {
+            'table': name, 'skipped': False,
+            'rows': rows_before,
+            'bytes_before': before_bytes,
+            'bytes_after': after_bytes,
+            'bytes_freed': max(0, before_bytes - after_bytes),
+            'pages_before': before_pages, 'pages_after': after_pages,
+            'reclaimed_versions': old_int.get('chain_versions', 0)
+            - after_int.get('live_rows', 0),
+            'index_entries_before': old_int.get('index_entries', 0),
+            'index_entries_after': after_int.get('index_entries', 0),
+            'live_rows_after': after_int.get('live_rows', 0),
+            'integrity_ok': (after_int.get('index_entries') == rows_before
+                             and after_int.get('live_rows') == rows_before),
+        }
+        # 状态观测主入口是 `SHOW WAL STATUS`/`Database.wal_status()`；
+        # 日志保持 ASCII + DEBUG 级（既有 subprocess 捕获 stdout 的测试
+        # 要求子进程 stdout 仍是纯 JSON）。
+        logger.debug(
+            f"COMPACT {name}: rows={rows_before} "
+            f"dat_bytes={before_bytes}->{after_bytes} "
+            f"freed={stats['bytes_freed']} "
+            f"pages={before_pages}->{after_pages} "
+            f"index_entries={stats['index_entries_before']}->"
+            f"{stats['index_entries_after']}")
+        return stats
+
+    def compact(self, tables=None) -> dict:
+        """P5：对指定表（默认全部）执行离线 COMPACT，返回每表量化结果"""
+        if tables:
+            names = [str(n) for n in tables]
+        else:
+            names = sorted(self.tables.keys())
+        out = {}
+        for name in names:
+            if name not in self.tables:
+                out[name] = {'table': name, 'skipped': True,
+                             'reason': 'no such table'}
+                continue
+            try:
+                out[name] = self._compact_table(name)
+            except Exception as e:
+                out[name] = {'table': name, 'skipped': True,
+                             'reason': str(e)}
+                logger.warn(f"COMPACT {name} 跳过: {e}")
         return out
 
     # ==================== checkpoint（WAL 轮转）====================
