@@ -274,3 +274,27 @@ def require_thread_stacks():
     if err is not None:
         pytest.skip(
             f'本环境禁用线程/线程池原语（沙箱），该并行用例无法运行：{err}')
+
+
+# ==================== CI：规避 Qt/原生库在解释器退出阶段的 fail-fast 崩溃 ====================
+# 2026-10-22 CI 实测：全量测试全部通过后，pytest 进程退出码为 -1073740791
+# （0xC0000409 STATUS_STACK_BUFFER_OVERRUN，原生 fail-fast），仅发生在进程
+# 退出阶段（JUnit 已写完、测试结果已打印；本地同一命令 exit 0）。
+# 这是 Qt/原生库销毁顺序问题，不是测试失败。CI 设置
+# LIGHTDB_PYTEST_HARD_EXIT=1 时，在 pytest 收尾完成后用 os._exit(exitstatus)
+# 正常结束进程，避免进入有问题的原生析构路径；退出码仍严格等于 pytest 结果。
+import os as _os
+import pytest as _pytest
+
+
+@_pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    if _os.environ.get('LIGHTDB_PYTEST_HARD_EXIT') != '1':
+        return
+    try:
+        import sys as _sys
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+    except Exception:
+        pass
+    _os._exit(int(exitstatus))

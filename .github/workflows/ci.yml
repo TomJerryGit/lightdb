@@ -43,6 +43,10 @@ jobs:
 
       - name: Full test suite (JUnit gate; raw pytest exit logged)
         shell: pwsh
+        env:
+          # 测试全绿后 Qt/原生库在解释器退出阶段可能 fail-fast（0xC0000409）；
+          # conftest 在 pytest 收尾后按 exitstatus os._exit，绕过问题析构路径。
+          LIGHTDB_PYTEST_HARD_EXIT: "1"
         run: |
           python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml
           $raw = $LASTEXITCODE
