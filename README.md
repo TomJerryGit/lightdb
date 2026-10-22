@@ -191,6 +191,16 @@
   给出剩余失败点清单：P0=`ENGINE=InnoDB` 拒绝（表设计器建表会失败）、`ALTER MODIFY COLUMN`
   缺失；P1=`CREATE INDEX`、`SHOW GRANTS`、视图；P2=`PREPARE`、`SHOW BINARY LOGS`、
   旧客户端字符集协商。
+- **E2 + G2 已实施（2026-10-22）**：引擎 E2 消除 Navicat 表设计器 P0/P1 阻塞——
+  `ENGINE=InnoDB/MyISAM/MEMORY/CSV` 作为 LightDB 原生兼容别名（SHOW 如实回显+标注
+  storage=LightDB-native）、`ALTER MODIFY COLUMN`（全量试算/失败零变化）、
+  `CREATE [UNIQUE] INDEX / DROP INDEX`（持久化/错误码/UNIQUE 1062）、`SHOW GRANTS`；
+  测试 20 passed + 指定 135 + 高风险 248/1 skipped。Studio G2：连接 JSON 导入/导出
+  （密码默认不导出、可选 DPAPI、冲突策略/回滚）、SSL CA/客户端证书字段与路径校验、
+  编辑器 40+ 函数补全/`表.`/别名推断、结果导出 JSON 与 SQL INSERT、对象树拖拽生成
+  SELECT/列名；测试 16 passed、指定回归 186 passed。已知限制：非唯一索引仅声明
+  （SCAN-ASSIST，不加速）；SSL 高级参数 UI 已就绪但尚未接入 pymysql（待接线）；
+  视图/PREPARE/SHOW BINARY LOGS 仍为剩余缺口。
 - **GUI P0 已实施（2026-10-20）**：结果表**数值/日期感知排序**（NULL 恒末尾）、**结果过滤条**
   （1200 行 40.6ms、不查库）、**快照同名自动唯一 + 旧索引迁移**、**连接口令本地加密**
   （Windows DPAPI；`connections.json` 不再明文，旧明文自动迁移）、连接对话框**口令显示/隐藏**、

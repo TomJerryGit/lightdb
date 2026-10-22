@@ -86,3 +86,19 @@ LightDB 8898 的实测结果如下（可复现）：
   （真实鼠标/键盘操作；可复跑）。
 - 协议探针：`_analysis_tmp/lead/feature_probe.py`、`feature_probe2.py`；E1 测试
   `tests/test_mysql_compat_p4a.py`。
+
+## 7. 2026-10-22 更新：E2 已消除 P0/P1 阻塞
+
+- ✅ `ENGINE=InnoDB/MyISAM/MEMORY/CSV` 已接受为 LightDB 原生存储兼容别名（请求引擎名
+  持久化，SHOW TABLE STATUS/SHOW CREATE 如实回显，Create_options 标注
+  `storage=LightDB-native`；未知引擎仍 1064）——Navicat 表设计器建表不再失败。
+- ✅ `ALTER TABLE ... MODIFY COLUMN` 实现（全量试算转换，不可转换显式错误且零变化）。
+- ✅ `CREATE [UNIQUE] INDEX / DROP INDEX` 实现（持久化、错误码、UNIQUE 冲突 1062；
+  非唯一索引 Index_type 如实报 `SCAN-ASSIST`，不谎称 BTREE）。
+- ✅ `SHOW GRANTS [FOR user]` 边界/协议测试补齐。
+- 验证：`tests/test_mysql_compat_e2.py` 20 passed；指定回归 135、高风险 248/1 skipped。
+- **仍剩余（P2）**：视图（CREATE/SHOW/DROP VIEW）、SQL 层 PREPARE、SHOW BINARY LOGS、
+  旧客户端字符集协商；P3 外键/全文/事件仍显式拒绝。
+- **G2 Studio 同步**：连接 JSON 导入导出（密码默认不导出/DPAPI/冲突策略）、SSL
+  高级字段、函数/别名补全、JSON/SQL INSERT 导出、对象树拖拽；16 tests/186 回归。
+  SSL 参数真正写入 pymysql 尚未接线（下一步）。
