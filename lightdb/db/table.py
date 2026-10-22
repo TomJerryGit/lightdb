@@ -313,11 +313,17 @@ class Table:
     def __init__(self, name: str, cols: List[Dict], data_dir: str,
                  lock_manager: LockManager = None,
                  mvcc: MVCCManager = None,
-                 unique_indexes: List[Dict] = None):
+                 unique_indexes: List[Dict] = None,
+                 secondary_indexes: List[Dict] = None,
+                 requested_engine: str = 'LightDB'):
         self.name = name
         self.cols = cols
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        #: E2：`CREATE/ALTER ... ENGINE=` 请求的引擎名（兼容别名）。
+        #: 实际存储始终是 LightDB 原生行存；这里只持久化并如实回显，
+        #: **不实现** InnoDB/MyISAM/MEMORY/CSV 的任何语义差异。
+        self.requested_engine = requested_engine or 'LightDB'
 
         # 最后一个堆页的缓存（见 _heap_insert；纯性能优化，不改变语义）
         self._last_heap_pid = None
@@ -410,6 +416,14 @@ class Table:
         # `unique_indexes` 条目）打开后也会自动补上并强制。
         self._unique_indexes = []
         self.set_unique_indexes(unique_indexes)
+
+        #: E2：**非唯一**索引声明（`CREATE INDEX` / 内联 `KEY idx (列)`）。
+        #: 本引擎没有二级 B+Tree，因此它们不加速查询（planner 仍全表扫描），
+        #: 但声明必须持久化并在 `SHOW INDEX` / `SHOW CREATE TABLE` 如实
+        #: 报出（Index_type=`SCAN-ASSIST`，不谎称 BTREE）；`Cardinality`
+        #: 给出真实的不同非 NULL 键值个数。
+        self._secondary_indexes = []
+        self.set_secondary_indexes(secondary_indexes)
 
     # ==================== CHECK 约束 ====================
 
@@ -554,6 +568,47 @@ class Table:
         """表级 `UNIQUE KEY/INDEX` 声明（不含列级自动推导的规格）"""
         return [s for s in self.unique_indexes()
                 if s.get('origin') != 'column']
+
+    # ==================== E2：非唯一索引（持久化的声明元数据） ====================
+
+    def set_secondary_indexes(self, specs):
+        """设置非唯一索引声明（独立 CREATE INDEX 与内联 KEY 共用）
+
+        结构统一为 `{'name', 'columns', 'unique': False}`；列不存在/
+        重名等合法性由 `Database.create_index` 在定义期校验（这里只做
+        结构归一化，避免旧元数据里的脏条目直接进入 SHOW 输出）。
+        """
+        out = []
+        for spec in (specs or []):
+            if not isinstance(spec, dict):
+                continue
+            columns = [str(c) for c in (spec.get('columns') or []) if str(c)]
+            if not columns:
+                continue
+            name = str(spec.get('name') or columns[0])
+            out.append({'name': name, 'columns': columns,
+                        'unique': False})
+        self._secondary_indexes = out
+        return self.secondary_indexes()
+
+    def secondary_indexes(self):
+        """全部非唯一索引声明（深拷贝）"""
+        return [{'name': s['name'], 'columns': list(s['columns']),
+                 'unique': False} for s in self._secondary_indexes]
+
+    def _index_cardinality(self, columns):
+        """索引列上**真实**的不同非 NULL 键值个数（不是估计值）"""
+        try:
+            idxs = [self._col_idx(c) for c in columns]
+        except KeyError:
+            return 0
+        seen = set()
+        for _pk, values in self._live_rows():
+            tup = self._key_tuple(values, idxs)
+            if self._key_has_null(tup):
+                continue
+            seen.add(tup)
+        return len(seen)
 
     def unique_columns(self):
         """被任意唯一性约束覆盖的列名集合（表级 + 列级）"""
@@ -1182,7 +1237,8 @@ class Table:
         return out
 
     def rewrite_row_payloads(self, transform, old_len: int, new_len: int,
-                            zero_removed: bool = False) -> dict:
+                            zero_removed: bool = False,
+                            always_transform: bool = False) -> dict:
         """把所有行版本的载荷按 `transform(values) -> new_values` 重写
 
         保证与语义：
@@ -1190,6 +1246,9 @@ class Table:
         * **按行载荷长度幂等**：长度已是 `new_len` 的行原样保留；长度是
           `old_len` 的行走 `transform`；其它长度 → 显式 `DdlError`
           （列数对不上的行是损坏，绝不猜测补齐，那会掩盖数据问题）。
+          `always_transform=True` 时**所有行版本**都走 transform（列数
+          不变的类型变更 `ALTER ... MODIFY COLUMN` 用；转换必须幂等，
+          崩溃恢复会再跑一次同一份 transform）。
           崩溃恢复会再次调用同一份 transform，靠这条判据判断"改过没有"。
         * 原地放不下的行搬到**本页的空闲区**（优先）、别的堆页，或新页；
           搬迁后索引项（pk → 链头位置）与版本链的 prev 指针**逐条改写**，
@@ -1210,9 +1269,9 @@ class Table:
         plans = []          # [pid, sid, nv, xmin, xmax, pp, ps, need]
         for pid, sid, values, xmin, xmax, pp, ps in snap:
             n = len(values)
-            if n == new_len:
+            if not always_transform and n == new_len:
                 nv = values
-            elif n == old_len:
+            elif always_transform or n == old_len:
                 nv = transform(values)
             else:
                 raise DdlError(
@@ -1449,6 +1508,15 @@ class Table:
                         'columns': list(spec['columns']),
                         'cardinality': self._unique_cardinality(spec),
                         'index_type': 'UNIQUE-CHECK'})
+        # E2：非唯一索引声明（`CREATE INDEX` / 内联 KEY）：真实存在的
+        # 只有**声明元数据**，查询仍全表扫描 —— Index_type 如实报
+        # `SCAN-ASSIST`，绝不谎称 BTREE；Cardinality 是真实不同值个数。
+        for spec in self._secondary_indexes:
+            out.append({'name': spec['name'], 'unique': False,
+                        'columns': list(spec['columns']),
+                        'cardinality': self._index_cardinality(
+                            spec['columns']),
+                        'index_type': 'SCAN-ASSIST'})
         return out
 
     def _unique_cardinality(self, spec):

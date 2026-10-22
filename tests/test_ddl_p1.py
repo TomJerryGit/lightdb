@@ -643,7 +643,8 @@ def test_concurrent_insert_during_add_column_never_mixes_arity(tmp_path):
 # ==================== 6. 不支持的 ALTER 变体：显式报错 ====================
 
 UNSUPPORTED_ALTER = [
-    'ALTER TABLE t MODIFY COLUMN age BIGINT',
+    # E2 起 MODIFY COLUMN / ENGINE= 兼容别名已实现，不再属于"不支持变体"
+    # （见 tests/test_mysql_compat_e2.py）。
     'ALTER TABLE t CHANGE COLUMN age years BIGINT',
     'ALTER TABLE t ALTER COLUMN age SET DEFAULT 1',
     'ALTER TABLE t ADD INDEX idx_age (age)',
@@ -657,7 +658,6 @@ UNSUPPORTED_ALTER = [
     'ALTER TABLE t DROP INDEX idx_age',
     'ALTER TABLE t DROP CHECK age_pos',
     'ALTER TABLE t RENAME COLUMN age TO years',
-    'ALTER TABLE t ENGINE=InnoDB',
     'ALTER TABLE t COMMENT = "x"',
     'ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4',
     'ALTER TABLE t ORDER BY id',
@@ -1050,7 +1050,7 @@ def test_protocol_errors_match_inproc(served):
 
         cases = [
             ("ALTER TABLE e ADD COLUMN x INT NOT NULL", 1138),   # 已有行 + 无默认
-            ("ALTER TABLE e MODIFY COLUMN age BIGINT", 1064),
+            ("ALTER TABLE e MODIFY COLUMN age BIGINT", None),    # E2：已实现
             ("ALTER TABLE e CHANGE COLUMN age years BIGINT", 1064),
             ("ALTER TABLE e ADD INDEX i (age)", 1064),
             ("ALTER TABLE e ADD CONSTRAINT ck CHECK (age > 0)", 1064),

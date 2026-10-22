@@ -138,6 +138,12 @@ class Parser:
 
         if upper.startswith('CREATE TABLE'):
             return self._create_table(sql)
+        # E2：独立索引语句（Navicat 表设计器「索引」页保存时发送）。
+        # 必须在通用 CREATE 兜底之前识别。
+        if re.match(r'CREATE\s+(?:UNIQUE\s+)?INDEX\b', sql, re.IGNORECASE):
+            return self._create_index(sql)
+        if re.match(r'DROP\s+INDEX\b', sql, re.IGNORECASE):
+            return self._drop_index(sql)
         if upper.startswith('DROP TABLE'):
             return self._drop_table(sql)
         # `ALTER TABLE` 有自己的动作解析（见 `_alter_table`）：本引擎只实现了
@@ -2102,6 +2108,10 @@ class Parser:
         table_pk = None
         #: 表级 `UNIQUE [KEY|INDEX] [名字] (...)`（每条都真的强制唯一性）
         unique_indexes = []
+        #: E2：表级**非唯一** `[KEY|INDEX] [名字] (列...)`。本引擎没有二级
+        #: 索引结构，但声明会随表持久化并在 SHOW INDEX/SHOW CREATE 如实
+        #: 展示（Index_type 标明「扫描辅助/不声称 BTREE」），绝不静默丢弃。
+        secondary_indexes = []
         for part in self._split_top_level(body):
             part_stripped = part.strip()
             up = part_stripped.upper()
@@ -2142,7 +2152,7 @@ class Parser:
                         f"（本引擎只支持 CONSTRAINT <名字> CHECK / UNIQUE / "
                         f"PRIMARY KEY）")
                 table_pk, unique_indexes = self._apply_table_key(
-                    kd, table_pk, unique_indexes)
+                    kd, table_pk, unique_indexes, secondary_indexes)
                 continue
 
             # ---- 表级索引/键声明 ----
@@ -2159,7 +2169,7 @@ class Parser:
             kd = self._parse_table_key(part_stripped)
             if kd is not None:
                 table_pk, unique_indexes = self._apply_table_key(
-                    kd, table_pk, unique_indexes)
+                    kd, table_pk, unique_indexes, secondary_indexes)
                 continue
 
             col = self._column_def(part_stripped)
@@ -2249,6 +2259,9 @@ class Parser:
             # 落成**真实强制**的唯一约束（写入路径检查 + `_meta.json`
             # 持久化 + `SHOW INDEX` 如实列出）。不再静默丢弃。
             'unique_indexes': unique_indexes,
+            # E2：表级非唯一 KEY/INDEX（持久化并在 SHOW INDEX/SHOW CREATE
+            # 如实展示；查询仍走扫描，不谎称 BTREE）。
+            'secondary_indexes': secondary_indexes,
             # `CREATE TABLE IF NOT EXISTS` 原实现被正则吃掉后丢掉：执行器
             # 于是"表已存在就报错"，同一份 dump 无法重复恢复。此处如实
             # 回传，由执行器决定幂等语义。
@@ -2378,16 +2391,21 @@ class Parser:
             cols.append(cm.group(1))
         return cols
 
-    def _apply_table_key(self, kd, table_pk, unique_indexes):
+    def _apply_table_key(self, kd, table_pk, unique_indexes,
+                         secondary_indexes=None):
         """把一条表级键声明落到建表结果上；**做不到的一律显式报错**
 
         支持：`PRIMARY KEY (...)`（单列）、`UNIQUE [KEY|INDEX] ...`
-        （单列/多列，都真强制）。其余（非唯一 KEY/INDEX、FULLTEXT、
-        SPATIAL、FOREIGN KEY）本引擎没有对应实现，声明会被静默丢弃 ——
-        这里改为 SyntaxError，报文说明"没有这个能力"以及替代做法。
+        （单列/多列，都真强制）、**E2** 非唯一 `[KEY|INDEX] [名字] (列...)`
+        （落成持久化元数据并在 SHOW INDEX/SHOW CREATE 如实展示；查询仍走
+        扫描，Index_type 不声称 BTREE）。其余（FULLTEXT、SPATIAL、
+        FOREIGN KEY）本引擎没有对应实现，声明会被静默丢弃 —— 这里改为
+        SyntaxError。
         """
         kind = kd['kind']
         original = kd.get('original') or ''
+        secondary = (secondary_indexes if secondary_indexes is not None
+                     else [])
 
         if kind == 'PRIMARY':
             if kd['tail']:
@@ -2427,11 +2445,27 @@ class Parser:
             return table_pk, unique_indexes
 
         if kind == 'KEY' or kind == 'INDEX':
-            raise SyntaxError(
-                f"本引擎不支持二级索引：CREATE TABLE 里的非唯一 "
-                f"KEY/INDEX 声明 `{original[:80]}` 无法生效（只有主键 "
-                f"B+Tree 与 UNIQUE 唯一性检查）。请删除该 KEY 声明后重试。"
-                f"注意：含 KEY 行的 mysqldump 一类 DDL **不能**直接恢复")
+            # E2：非唯一索引声明不再拒绝 —— 落成持久化元数据（与
+            # `CREATE INDEX` 共用同一份结构），SHOW INDEX/SHOW CREATE 如实
+            # 展示；本引擎没有二级 B+Tree，查询仍走扫描（Index_type 标明，
+            # 不谎称 BTREE）。
+            if kd['tail']:
+                um = re.fullmatch(r'USING\s+(BTREE|HASH)', kd['tail'],
+                                  re.IGNORECASE)
+                if um:
+                    raise SyntaxError(
+                        f"非唯一索引的 USING {um.group(1).upper()} 无法实现："
+                        f"本引擎没有二级索引结构（SHOW INDEX 的 Index_type "
+                        f"会如实报 SCAN-ASSIST），请删除 USING 子句后重试: "
+                        f"{original[:120]}")
+                raise SyntaxError(
+                    f"索引声明后面有多余内容 {kd['tail']!r}: "
+                    f"{original[:120]}")
+            name = kd.get('name') or kd['columns'][0]
+            secondary.append({'name': name,
+                              'columns': list(kd['columns']),
+                              'unique': False})
+            return table_pk, unique_indexes
 
         if kind == 'FULLTEXT':
             raise SyntaxError(
@@ -2892,6 +2926,58 @@ class Parser:
             'sql': sql.strip()[:200],
         }
 
+    # ============ E2：独立索引语句（CREATE [UNIQUE] INDEX / DROP INDEX） ============
+
+    def _create_index(self, sql: str) -> Dict:
+        """`CREATE [UNIQUE] INDEX name [USING BTREE] ON t (col, ...)`
+
+        与 CREATE TABLE 内联索引共用同一份持久化结构（见
+        `Database.create_index`）；列清单不支持表达式/前缀长度，不支持
+        `USING HASH`（本引擎没有哈希索引，也不谎称 BTREE）。
+        """
+        m = re.match(
+            r'CREATE\s+(UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+            r'[`"]?([A-Za-z_]\w*)[`"]?\s*'
+            r'(?:USING\s+([A-Za-z]+)\s+)?ON\s+'
+            r'[`"]?([A-Za-z_]\w*)[`"]?\s*\(', sql, re.IGNORECASE)
+        if not m:
+            raise SyntaxError(
+                f"CREATE INDEX 语法错误: {sql[:120]}"
+                f"（形如 CREATE [UNIQUE] INDEX idx ON t (col1, col2)）")
+        using = (m.group(3) or '').upper()
+        if using:
+            raise SyntaxError(
+                f"CREATE INDEX 的 `USING {using}` 无法实现：本引擎没有"
+                f"按指定结构建的二级索引（索引声明会持久化并在 SHOW INDEX "
+                f"如实报 SCAN-ASSIST），请删除 USING 子句: {sql[:120]}")
+        inner, end = self._extract_paren(sql, m.end() - 1)
+        columns = self._parse_key_columns(inner, 'INDEX')
+        tail = sql[end + 1:].strip()
+        if tail:
+            um = re.fullmatch(r'USING\s+([A-Za-z]+)', tail,
+                              re.IGNORECASE)
+            if um:
+                raise SyntaxError(
+                    f"CREATE INDEX 的 `USING {um.group(1).upper()}` 无法"
+                    f"实现（本引擎没有二级索引结构），请删除 USING 子句")
+            raise SyntaxError(
+                f"CREATE INDEX 尾部有多余内容 {tail[:80]!r}")
+        return {'command': 'CREATE INDEX', 'table': m.group(4),
+                'name': m.group(2), 'columns': columns,
+                'unique': bool(m.group(1))}
+
+    def _drop_index(self, sql: str) -> Dict:
+        """`DROP INDEX name ON t`（MySQL 的独立删索引语句）"""
+        m = re.match(
+            r'DROP\s+INDEX\s+[`"]?([A-Za-z_]\w*)[`"]?\s+ON\s+'
+            r'[`"]?([A-Za-z_]\w*)[`"]?\s*$', sql, re.IGNORECASE)
+        if not m:
+            raise SyntaxError(
+                f"DROP INDEX 语法错误: {sql[:120]}"
+                f"（形如 DROP INDEX idx ON t）")
+        return {'command': 'DROP INDEX', 'name': m.group(1),
+                'table': m.group(2)}
+
     def _alter_table(self, sql: str) -> Dict:
         m = re.match(
             r'ALTER\s+(?:IGNORE\s+)?TABLE\s+(?:IF\s+EXISTS\s+)?'
@@ -2914,6 +3000,31 @@ class Parser:
                 sql)
         action = actions[0]
         up = action.upper()
+
+        # ---- E2：MODIFY [COLUMN] 列定义（改类型/长度/NULL/DEFAULT）----
+        mm = re.match(r'MODIFY\s+(?:COLUMN\s+)?(.+)$', action,
+                      re.IGNORECASE | re.DOTALL)
+        if mm:
+            rest = mm.group(1).strip()
+            pm = re.search(r'\s+(FIRST|AFTER\s+[`"]?\w+[`"]?)\s*$',
+                           rest, re.IGNORECASE)
+            if pm:
+                return self._unsupported_alter(
+                    table, 'ALTER TABLE ... MODIFY COLUMN ... FIRST/AFTER',
+                    sql)
+            col = self._column_def(rest)
+            if not col:
+                raise SyntaxError(
+                    f"ALTER TABLE MODIFY COLUMN 的列定义无法解析: {rest[:80]}")
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'MODIFY COLUMN', 'column': col}
+
+        # ---- E2：ENGINE= 兼容别名（InnoDB/MyISAM/MEMORY/CSV → 原生存储）----
+        em = re.fullmatch(r'ENGINE\s*=\s*[`"]?([A-Za-z_]\w*)[`"]?',
+                          action, re.IGNORECASE)
+        if em:
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'ENGINE', 'engine': em.group(1)}
 
         # ---- 明确不支持的变体（先判前缀，避免被 ADD/DROP 抢先匹配）----
         for prefix, label in sorted(self._ALTER_UNSUPPORTED_ACTIONS,

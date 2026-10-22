@@ -1410,6 +1410,29 @@ class Executor:
     #: `_ci` 不接受（表级排序规则会影响比较，不能只记录不生效）。
     OLAP_E1_TABLE_COLLATIONS = ('utf8mb4_bin', 'utf8_bin')
 
+    #: E2：CREATE/ALTER 里可接受的存储引擎名 → 展示名。它们全部映射到
+    #: **LightDB 原生存储**（没有任何对应语义：InnoDB 的 MVCC/隔离级别、
+    #: MyISAM 表锁、MEMORY 临时存储、CSV 文件格式都**未实现**），只作为
+    #: Navicat 表设计器/导入向导的兼容别名持久化并如实回显。
+    ENGINE_ALIASES = {
+        'LIGHTDB': 'LightDB',
+        'INNODB': 'InnoDB',
+        'MYISAM': 'MyISAM',
+        'MEMORY': 'MEMORY',
+        'CSV': 'CSV',
+        'HEAP': 'MEMORY',          # MySQL 的 HEAP 是 MEMORY 的旧名
+    }
+
+    @classmethod
+    def _normalize_engine_name(cls, raw):
+        """引擎名归一化；未知引擎抛 KeyError（调用方回显式 1064）"""
+        key = str(raw or '').strip().upper()
+        if not key:
+            return 'LightDB'
+        if key not in cls.ENGINE_ALIASES:
+            raise KeyError(key)
+        return cls.ENGINE_ALIASES[key]
+
     def _validate_table_options(self, options: dict):
         """校验 CREATE TABLE 表选项 → `(normalized, error_result|None)`
 
@@ -1423,13 +1446,17 @@ class Executor:
         out = {'engine': 'LightDB', 'charset': 'utf8mb4',
                'collate': 'utf8mb4_bin', 'comment': None}
         engine = (opts.get('engine') or '').upper()
-        if engine and engine not in ('LIGHTDB',):
-            return None, self._err(
-                1064,
-                f"不支持 ENGINE={opts.get('engine')}：本引擎的存储引擎是 "
-                f"LightDB（纯 Python 行存）。EXPLICIT 拒绝以免 SHOW TABLE "
-                f"STATUS 的 Engine 列变成假值。请去掉 ENGINE 选项"
-                f"（或写 ENGINE=LightDB）")
+        if engine:
+            try:
+                out['engine'] = self._normalize_engine_name(engine)
+            except KeyError:
+                return None, self._err(
+                    1064,
+                    f"Unknown storage engine '{opts.get('engine')}': "
+                    f"本引擎真实存储是 LightDB；兼容别名只接受 "
+                    f"InnoDB / MyISAM / MEMORY / CSV / LightDB"
+                    f"（别名不实现对应引擎语义，SHOW TABLE STATUS 的 "
+                    f"Create_options 会标明 native storage）")
         charset = (opts.get('charset') or '').lower()
         if charset:
             if charset not in self.OLAP_E1_TABLE_CHARSETS:
@@ -1493,13 +1520,19 @@ class Executor:
                              # 由 `create_table` 从 cols 推导成等价规格。
                              # 两类唯一性都由写入路径强制，`SHOW INDEX`
                              # 会列出 UNIQUE-CHECK。
-                             unique_indexes=p.get('unique_indexes'))
+                             unique_indexes=p.get('unique_indexes'),
+                             # E2：内联非唯一 KEY/INDEX（与独立 CREATE INDEX
+                             # 共用同一份持久化声明）
+                             secondary_indexes=p.get('secondary_indexes'),
+                             # E2：ENGINE= 兼容别名（持久化请求名）
+                             requested_engine=table_options['engine'])
         # E1：引擎扩展元数据（表选项/注释）持久化到 _meta.json，
         # SHOW CREATE TABLE / SHOW TABLE STATUS 如实回显。
         tbl = self.db.tables[p['table']]
         table_options['user_specified'] = bool(p.get('table_options'))
         tbl.table_options = table_options
         tbl.comment = table_options.get('comment') or ''
+        tbl.requested_engine = table_options['engine']
         self.db.save_meta()
         return self._ok(
             message=f"Table '{p['table']}' created")
@@ -1544,19 +1577,51 @@ class Executor:
         table = p.get('table')
         if action == 'UNSUPPORTED':
             # 错误码选 1064（`ER_PARSE_ERROR`）而不是 1235
-            # （`ER_NOT_SUPPORTED_YET`）：本引擎的 ALTER TABLE **语法**只有
-            # ADD COLUMN / DROP COLUMN / RENAME TO 三种动作，其余动作在语法
-            # 层面就不被接受 —— 这正是 1064 的语义。报文里明确写出是哪一种
-            # 变体、以及本引擎支持哪些，所以使用者不会把它误当成"我写错了
-            # 什么"（`tests/test_phase0_integrity.py` 也把
-            # `ALTER TABLE ... ADD CHECK` 的码锁在 1064/1105，不能改）。
+            # （`ER_NOT_SUPPORTED_YET`）：本引擎的 ALTER TABLE **语法**只
+            # 实现了 ADD COLUMN / DROP COLUMN / RENAME TO / MODIFY COLUMN /
+            # ENGINE= 兼容别名五种动作，其余动作在语法层面就不被接受。
             return self._err(
                 1064,
                 f"ALTER TABLE 的 '{p.get('variant')}' 变体本引擎未实现："
-                f"只支持 ADD COLUMN / DROP COLUMN / RENAME TO，"
+                f"只支持 ADD COLUMN / DROP COLUMN / RENAME TO / "
+                f"MODIFY COLUMN / ENGINE=<别名>，"
                 f"其余变体一律显式报错、绝不静默成功"
                 f"（语句: {p.get('sql')}）")
         self._implicit_commit_ddl(s, f"ALTER TABLE {table}")
+        if action == 'MODIFY COLUMN':
+            # E2：改类型/长度/NULL/DEFAULT；已有数据先逐行试算转换，
+            # 不可转换/会截断 → 显式错误且表结构与数据完全不变。
+            col = dict(p['column'])
+            stats = self.db.alter_modify_column(table, col)
+            return self._ok(
+                message=(f"Table '{table}' altered: column "
+                         f"'{col['name']}' modified to "
+                         f"{col.get('type')}, "
+                         f"{stats.get('rows_rewritten', 0)} row "
+                         f"version(s) rewritten"))
+        if action == 'ENGINE':
+            # E2：ENGINE= 兼容别名。物理存储不迁移（始终是 LightDB 原生
+            # 行存），只持久化"请求的引擎名"并在 SHOW 中如实回显；
+            # **不实现** InnoDB/MyISAM/MEMORY/CSV 的任何语义。
+            try:
+                display = self._normalize_engine_name(p.get('engine'))
+            except KeyError:
+                return self._err(
+                    1064,
+                    f"Unknown storage engine '{p.get('engine')}': "
+                    f"兼容别名只接受 InnoDB / MyISAM / MEMORY / CSV / "
+                    f"LightDB（不实现对应引擎语义）")
+            tbl = self.db.get_table(table)
+            tbl.requested_engine = display
+            opts = dict(getattr(tbl, 'table_options', None) or {})
+            opts.setdefault('engine', 'LightDB')
+            opts['engine'] = display
+            tbl.table_options = opts
+            self.db.save_meta()
+            return self._ok(
+                message=(f"Table '{table}' altered: ENGINE set to "
+                         f"{display}（兼容别名；实际存储为 LightDB 原生"
+                         f"行存，不实现 {display} 语义）"))
         if action == 'ADD COLUMN':
             col = dict(p['column'])
             stats = self.db.alter_add_column(table, col)
@@ -1582,7 +1647,37 @@ class Executor:
         return self._err(
             1064,
             f"ALTER TABLE 的动作 {action!r} 本引擎未实现"
-            f"（只支持 ADD COLUMN / DROP COLUMN / RENAME TO）")
+            f"（只支持 ADD COLUMN / DROP COLUMN / RENAME TO / "
+            f"MODIFY COLUMN / ENGINE=<别名>）")
+
+    # ---------- E2：独立索引语句（与表内联 KEY 共用持久化） ----------
+
+    def _cmd_create_index(self, p, s):
+        """`CREATE [UNIQUE] INDEX name ON t (列...)`"""
+        table = p['table']
+        name = p['name']
+        self._implicit_commit_ddl(s, f"CREATE INDEX {name} ON {table}")
+        stats = self.db.create_index(
+            table, name, p.get('columns') or [],
+            unique=bool(p.get('unique')))
+        if not stats.get('created'):
+            return self._ok(
+                message=f"Index '{name}' already exists on '{table}'")
+        kind = 'UNIQUE INDEX' if stats.get('unique') else 'INDEX'
+        return self._ok(
+            message=(f"{kind} '{stats.get('name')}' created on "
+                     f"'{table}' ({', '.join(stats.get('columns') or [])})"))
+
+    def _cmd_drop_index(self, p, s):
+        """`DROP INDEX name ON t`"""
+        table = p['table']
+        name = p['name']
+        self._implicit_commit_ddl(s, f"DROP INDEX {name} ON {table}")
+        stats = self.db.drop_index(table, name)
+        kind = 'UNIQUE INDEX' if stats.get('unique') else 'INDEX'
+        return self._ok(
+            message=f"{kind} '{stats.get('dropped')}' dropped from "
+                    f"'{table}'")
 
     def _cmd_alter_unsupported(self, p, s):
         """`ALTER DATABASE` / `ALTER USER` 等非 TABLE 形态：显式不支持
@@ -7204,10 +7299,15 @@ class Executor:
         opts = getattr(tbl, 'table_options', None) or {}
         tcomment = getattr(tbl, 'comment', '') or ''
         partition_spec = getattr(tbl, '_partition_spec', None)
+        engine = (getattr(tbl, 'requested_engine', None)
+                  or opts.get('engine') or 'LightDB')
+        secondary = (getattr(tbl, 'secondary_indexes', lambda: [])() or [])
         # 没有任何"check_ddl 不导出"的真实语义时，保持与 check_ddl
         # **逐字节一致**（既有契约：SHOW CREATE 与逻辑 dump 同一份文本）。
         has_extras = bool(gen_map or comment_map or tcomment
                           or partition_spec
+                          or secondary
+                          or engine != 'LightDB'
                           or opts.get('comment')
                           or opts.get('user_specified'))
         if not has_extras:
@@ -7233,8 +7333,23 @@ class Executor:
             lines[i] = body + (',' if has_comma else '')
         ddl = '\n'.join(lines)
 
+        # E2：非唯一索引声明（`CREATE INDEX` / 内联 KEY）写进 SHOW CREATE，
+        # 文本形态可被本引擎重新解析（CREATE TABLE ... KEY name (列)）。
+        if secondary:
+            key_lines = [
+                "  KEY " + str(s.get('name')) + " ("
+                + ', '.join(str(c) for c in (s.get('columns') or []))
+                + ")"
+                for s in secondary]
+            close = ddl.rfind(')')
+            if close >= 0:
+                head = ddl[:close].rstrip()
+                if not head.endswith(','):
+                    head += ','
+                ddl = head + '\n' + ',\n'.join(key_lines) + '\n' + ddl[close:]
+
         opts = getattr(tbl, 'table_options', None) or {}
-        suffix = (f" ENGINE={opts.get('engine') or 'LightDB'}"
+        suffix = (f" ENGINE={engine}"
                   f" DEFAULT CHARSET={opts.get('charset') or 'utf8mb4'}"
                   f" COLLATE={opts.get('collate') or 'utf8mb4_bin'}")
         tcomment = getattr(tbl, 'comment', '') or ''
@@ -9385,13 +9500,20 @@ class Executor:
             except Exception:
                 auto_inc = None
             opts = getattr(tbl, 'table_options', {}) or {}
+            # E2：Engine 列如实显示"请求的引擎名"（兼容别名）；真实存储
+            # 始终是 LightDB 原生行存，因此 Create_options 一并标明
+            # `storage=LightDB-native`，避免客户端以为 InnoDB 语义生效。
+            engine = (getattr(tbl, 'requested_engine', None)
+                      or opts.get('engine') or 'LightDB')
+            create_options = ('' if engine == 'LightDB'
+                              else 'storage=LightDB-native')
             rows.append((
-                name, 'LightDB', 10, 'Dynamic', n_rows,
+                name, engine, 10, 'Dynamic', n_rows,
                 (data_len // n_rows) if (data_len and n_rows) else 0,
                 data_len, None, None, data_free, auto_inc,
                 ctime, None, None,
                 opts.get('collate') or self._REAL_COLLATION,
-                None, '', getattr(tbl, 'comment', '') or '',
+                None, create_options, getattr(tbl, 'comment', '') or '',
             ))
         return self._rs(cols, rows)
 

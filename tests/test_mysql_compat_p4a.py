@@ -246,7 +246,8 @@ def test_show_collation_charset_engines_warnings(served):
 # ==================== 2. 静默语义审计 ====================
 
 @pytest.mark.parametrize('ddl,code', [
-    ("CREATE TABLE e_eng (id INT PRIMARY KEY) ENGINE=InnoDB", 1064),
+    # E2 起 ENGINE=InnoDB 作为兼容别名被接受（见 test_mysql_compat_e2）；
+    # 未知引擎仍显式 1064（E2 测试覆盖）。
     ("CREATE TABLE e_cs (id INT PRIMARY KEY) DEFAULT CHARSET=gbk", 1115),
     ("CREATE TABLE e_co (id INT PRIMARY KEY) COLLATE=utf8mb4_general_ci",
      1273),

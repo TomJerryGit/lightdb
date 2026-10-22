@@ -140,6 +140,51 @@ def resolve_unique_indexes(table: str, cols: List[dict], specs) -> List[dict]:
     return out
 
 
+def resolve_secondary_indexes(table: str, cols: List[dict], specs,
+                              reserved_names=()) -> List[dict]:
+    """校验并规范化 **E2 非唯一索引**声明（`CREATE INDEX` / 内联 `KEY`）
+
+    本引擎没有二级索引结构，但这不代表可以"声明了然后丢掉"：索引声明
+    会持久化，`SHOW INDEX` 报 `Index_type='SCAN-ASSIST'`（不谎称 BTREE），
+    `SHOW CREATE TABLE` 会写出 `KEY 名字 (列...)`（可被本引擎重新解析）。
+    定义期拒绝坏声明：未知列 1072 / 重名 1061 / 同索引重复列 1060 /
+    非法名字 1064（名字要能写进 DDL 原样读回）。
+    """
+    names = [c.get('name') for c in cols]
+    out = []
+    seen = {str(n).lower() for n in (reserved_names or ()) if n}
+    for spec in (specs or []):
+        if not isinstance(spec, dict):
+            raise DdlError(
+                f"表 {table} 的索引声明格式错误: {spec!r}", errno=1064)
+        columns = [str(c) for c in (spec.get('columns') or [])]
+        if not columns:
+            raise DdlError(
+                f"表 {table} 的索引声明没有列清单", errno=1064)
+        if len(set(columns)) != len(columns):
+            raise DdlError(
+                f"表 {table} 的索引声明列清单里有重复列: {columns}",
+                errno=1060)
+        for cname in columns:
+            if cname not in names:
+                raise DdlError(
+                    f"Key column '{cname}' doesn't exist in table "
+                    f"'{table}'", errno=1072, sqlstate='42022')
+        name = str(spec.get('name') or columns[0]).strip()
+        if not _UNIQUE_NAME_RE.match(name):
+            raise DdlError(
+                f"表 {table} 的索引名 {name!r} 含不支持的字符"
+                f"（只支持 [A-Za-z_]\\w*；否则 SHOW CREATE TABLE 无法往返）",
+                errno=1064)
+        low = name.lower()
+        if low == 'primary' or low in seen:
+            raise DdlError(f"Duplicate key name '{name}'", errno=1061,
+                           sqlstate='42000')
+        seen.add(low)
+        out.append({'name': name, 'columns': columns, 'unique': False})
+    return out
+
+
 def column_default(col: dict):
     """列的**真实**默认值；没声明 `DEFAULT` 时返回 None（= SQL NULL）
 
@@ -462,6 +507,12 @@ class Database:
                     # 因此老 `_meta.json`（没有 unique_indexes 条目）也
                     # 会在打开时补上（见 `_sync_column_unique_indexes`）。
                     unique_indexes=tinfo.get('unique_indexes'),
+                    # E2：非唯一索引声明 + 请求的引擎名（兼容别名）
+                    # 必须跨重启保留：SHOW INDEX/SHOW CREATE/TABLE STATUS
+                    # 否则会在重启后"变回"没建过索引/LightDB 引擎。
+                    secondary_indexes=tinfo.get('indexes'),
+                    requested_engine=(tinfo.get('requested_engine')
+                                      or 'LightDB'),
                 )
                 if tinfo.get('partition'):
                     # 分区描述随表元数据一起持久化（SHOW PARTITIONS /
@@ -510,6 +561,12 @@ class Database:
                     # 表级约束在这里）。没有它，重启后表级 CHECK 就消失，
                     # 违规数据会被静默写进来。
                     'checks': getattr(t, '_checks', None),
+                    # E2：非唯一索引声明 + 请求的引擎名（兼容别名）。
+                    # 都是真实生效/回显的元数据，必须随元数据持久化。
+                    'indexes': t.secondary_indexes()
+                    if hasattr(t, 'secondary_indexes') else [],
+                    'requested_engine': getattr(t, 'requested_engine',
+                                                'LightDB'),
                     # E1：表选项/注释（CREATE TABLE 的 ENGINE/CHARSET/
                     # COLLATE/COMMENT 真实生效并回显，重启后保持）。
                     'table_options': getattr(t, 'table_options', None),
@@ -579,7 +636,9 @@ class Database:
                      cols: List[dict],
                      partition: dict = None,
                      checks: List[dict] = None,
-                     unique_indexes: List[dict] = None) -> Table:
+                     unique_indexes: List[dict] = None,
+                     secondary_indexes: List[dict] = None,
+                     requested_engine: str = None) -> Table:
         """建表
 
         `checks` 是 `CREATE TABLE` 里表级 CHECK 约束（`sql/parser.py` 的
@@ -618,10 +677,17 @@ class Database:
                                          'columns': [cname],
                                          'origin': 'column'})
         unique_specs = resolve_unique_indexes(name, cols, merged_specs)
+        # E2：非唯一 KEY/INDEX 声明（CREATE TABLE 内联）与独立 CREATE INDEX
+        # 共用同一份持久化结构；名字不得与 PRIMARY/UNIQUE 冲突。
+        reserved = [s['name'] for s in unique_specs]
+        secondary_specs = resolve_secondary_indexes(
+            name, cols, secondary_indexes, reserved_names=reserved)
         tbl = Table(
             name, cols, str(self.data_dir),
             self.lock_manager, self.mvcc,
-            unique_indexes=unique_specs)
+            unique_indexes=unique_specs,
+            secondary_indexes=secondary_specs,
+            requested_engine=requested_engine or 'LightDB')
         if partition:
             tbl.set_partition(partition)
         tbl.set_checks(checks)
@@ -853,6 +919,15 @@ class Database:
                     f"'{uspec['name']}'，删除它会破坏唯一性"
                     f"（本引擎不支持连带删除约束）",
                     errno=1091, sqlstate='42000')
+        # E2：被非唯一索引引用的列同样不能直接删（MySQL 会连带删索引，
+        # 本引擎不做连带操作 → 显式拒绝而不是留下悬空索引声明）。
+        for ispec in (getattr(tbl, 'secondary_indexes', lambda: [])() or []):
+            if colname in ispec.get('columns', []):
+                raise DdlError(
+                    f"Can't DROP '{colname}'; 该列属于索引 "
+                    f"'{ispec['name']}'，删除它会留下悬空索"
+                    f"引声明（请先 DROP INDEX）", errno=1091,
+                    sqlstate='42000')
         # 被 CHECK 引用的列（MySQL 的 3959 就是这个场景）
         from ..sql.checks import check_columns, parse_check_predicate
         for spec in tbl.check_constraints():
@@ -891,6 +966,315 @@ class Database:
             tbl.refresh_schema_meta()
             self._ddl_commit(tbl)
         return {'column': colname, 'rows_rewritten': stats['rows'], **stats}
+
+    # ==================== E2：ALTER MODIFY COLUMN ====================
+
+    #: `MODIFY COLUMN` 支持的目标类型（与解析器归一化后的类型基名一致）
+    _MODIFY_TARGET_TYPES = frozenset((
+        'INT', 'BIGINT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'INTEGER',
+        'VARCHAR', 'CHAR', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'TINYTEXT',
+        'DOUBLE', 'FLOAT', 'DECIMAL', 'NUMERIC', 'BOOLEAN', 'BOOL',
+        'DATETIME', 'DATE', 'TIME', 'TIMESTAMP', 'JSON',
+    ))
+    #: 主键列允许的目标类型（主键 B+Tree 键按 uint32 存储）
+    _PK_COMPATIBLE_TYPES = frozenset((
+        'INT', 'BIGINT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'INTEGER',
+    ))
+
+    @staticmethod
+    def _base_type(col_type) -> str:
+        m = re.match(r'^([A-Z_][A-Z0-9_]*)',
+                     str(col_type or '').strip().upper())
+        return m.group(1) if m else ''
+
+    def _convert_existing_value(self, value, cname, old_type, new_type):
+        """把已有值转换到新类型；**不可转换/会静默截断** → 显式 DdlError
+
+        刻意比 MySQL 的非严格模式更严：`DOUBLE 1.5 → INT`、`VARCHAR(10)
+        '12345' → VARCHAR(3)`、`'abc' → INT` 这类会改变数据的转换一律显式
+        失败（1265/1406/1366），绝不静默截断 —— 本引擎没有 warning
+        通道，静默改值等于数据损坏。
+        """
+        if value is None:
+            return None
+        try:
+            conv = coerce(value, new_type)
+        except Exception as e:
+            raise DdlError(
+                f"列 '{cname}' 的已有值 {value!r} 无法转换为 {new_type}"
+                f"（不静默截断/丢数据）: {e}",
+                errno=getattr(e, 'errno', 1366),
+                sqlstate=getattr(e, 'sqlstate', 'HY000'))
+        base = self._base_type(new_type)
+        if base in ('VARCHAR', 'CHAR', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT',
+                    'TINYTEXT'):
+            if isinstance(value, str) and conv != value:
+                raise DdlError(
+                    f"Data truncated for column '{cname}': {value!r} 无法"
+                    f"无损转换为 {new_type}", errno=1265, sqlstate='01000')
+        elif base in ('INT', 'BIGINT', 'TINYINT', 'SMALLINT', 'MEDIUMINT',
+                      'INTEGER'):
+            if isinstance(value, float) and conv != value:
+                raise DdlError(
+                    f"Data truncated for column '{cname}': {value!r} 无法"
+                    f"无损转换为 {new_type}（拒绝静默取整）",
+                    errno=1265, sqlstate='01000')
+            if isinstance(value, str):
+                try:
+                    if float(value) != float(conv):
+                        raise DdlError(
+                            f"Data truncated for column '{cname}': "
+                            f"{value!r} 无法无损转换为 {new_type}",
+                            errno=1265, sqlstate='01000')
+                except ValueError:
+                    pass
+        elif base in ('BOOLEAN', 'BOOL'):
+            if value not in (0, 1, True, False, '0', '1',
+                             'true', 'false', 'TRUE', 'FALSE'):
+                raise DdlError(
+                    f"Data truncated for column '{cname}': {value!r} 无法"
+                    f"无损转换为 BOOLEAN", errno=1265, sqlstate='01000')
+        return conv
+
+    def _modify_transform(self, entry: dict):
+        """`MODIFY COLUMN` 的行转换函数（执行路径与崩溃恢复共用同一份）"""
+        idx = int(entry.get('at'))
+        old_cols = entry.get('old_cols') or []
+        new_cols = entry.get('new_cols') or []
+        cname = str(new_cols[idx].get('name') or '')
+        old_type = old_cols[idx].get('type')
+        new_type = new_cols[idx].get('type')
+        notnull = bool(new_cols[idx].get('notnull'))
+
+        def transform(values):
+            out = list(values)
+            out[idx] = self._convert_existing_value(
+                out[idx], cname, old_type, new_type)
+            if notnull and out[idx] is None:
+                raise DdlError(
+                    f"Invalid use of NULL value（列 '{cname}' 声明 NOT NULL，"
+                    f"但已有行是 NULL）", errno=1138, sqlstate='22004')
+            return out
+        return transform
+
+    def _prevalidate_modify(self, tbl, entry: dict):
+        """`MODIFY COLUMN` 落盘前的语义校验（转换/NOT NULL/CHECK/UNIQUE）
+
+        在改写任何页之前跑：转换不可行、NOT NULL 冲突、转换后违反 CHECK、
+        或转换后唯一性被破坏 → 显式错误且表结构/数据完全不变。
+        """
+        transform = self._modify_transform(entry)
+        new_rows = []
+        for pk, values in tbl._live_rows():
+            conv = transform(values)          # 不可转换/NOT NULL → DdlError
+            try:
+                tbl._validate_checks(conv)
+            except Exception as e:
+                raise DdlError(
+                    f"已有行（主键 {pk!r}）在 MODIFY 转换后违反 CHECK 约束: "
+                    f"{e}", errno=getattr(e, 'errno', 3819),
+                    sqlstate=getattr(e, 'sqlstate', 'HY000'))
+            new_rows.append((pk, conv))
+        for spec in tbl.unique_indexes():
+            idxs = [tbl._col_idx(c) for c in spec['columns']]
+            seen = set()
+            for _pk, conv in new_rows:
+                tup = tuple(conv[i] for i in idxs)
+                if any(v is None for v in tup):
+                    continue
+                if tup in seen:
+                    shown = '-'.join('NULL' if v is None else str(v)
+                                     for v in tup)
+                    raise DdlError(
+                        f"Duplicate entry '{shown}' for key "
+                        f"'{spec['name']}'（MODIFY 转换后唯一性被破坏）",
+                        errno=1062, sqlstate='23000')
+                seen.add(tup)
+
+    def alter_modify_column(self, name: str, col: dict) -> dict:
+        """`ALTER TABLE t MODIFY [COLUMN] c <type> [NULL|NOT NULL] [DEFAULT]`
+
+        语义与边界：
+        * 类型/长度、NOT NULL、DEFAULT 真实生效（`SHOW CREATE`/`SHOW COLUMNS`
+          立即反映新定义）；
+        * 已有全部行版本在**动手改写之前**先做一次转换试算
+          （`rewrite_row_payloads` 的 planning 阶段），任何一行不可转换/
+          会截断 → 显式错误且表结构与数据完全不变；
+        * 主键/唯一/CHECK/注释等既有语义不会被"没写全的列定义"静默丢掉
+          （MODIFY 只要求写新类型；主键、UNIQUE、生成列表达式、列注释在
+          新定义缺省时保留）；
+        * 与 ADD/DROP COLUMN 共用同一套 DDL 原子提交/崩溃恢复流程。
+        """
+        tbl = self._get_table_for_ddl(name)
+        col = dict(col or {})
+        cname = str(col.get('name') or '')
+        names = [c.get('name') for c in tbl.cols]
+        if cname not in names:
+            raise DdlError(f"Unknown column '{cname}' in '{name}'",
+                           errno=1054, sqlstate='42S22')
+        idx = names.index(cname)
+        old = tbl.cols[idx]
+        new_type = str(col.get('type') or '')
+        base = self._base_type(new_type)
+        if base not in self._MODIFY_TARGET_TYPES:
+            raise DdlError(
+                f"MODIFY COLUMN 不支持把列 '{cname}' 改成 {new_type!r}"
+                f"（支持 INT/BIGINT/VARCHAR/DOUBLE/DECIMAL/BOOLEAN/"
+                f"DATETIME 等）", errno=1064)
+        new = dict(old)
+        new['type'] = new_type
+        new['notnull'] = bool(col.get('notnull')) or bool(old.get('primary'))
+        new['primary'] = bool(old.get('primary') or col.get('primary'))
+        new['unique'] = bool(old.get('unique') or col.get('unique'))
+        new['has_default'] = bool(col.get('has_default'))
+        new['default'] = col.get('default')
+        for key in ('generated', 'check', 'comment'):
+            if col.get(key) is not None:
+                new[key] = col.get(key)
+        if new.get('primary') and base not in self._PK_COMPATIBLE_TYPES:
+            raise DdlError(
+                f"主键列 '{cname}' 只能改成整数类型（主键 B+Tree 的键按 "
+                f"uint32 存储），拒绝改成 {new_type}", errno=1064)
+        if new.get('has_default') and new.get('default') is not None:
+            # 默认值本身也必须能转成新类型（否则定义就是自相矛盾的）
+            self._convert_existing_value(
+                new['default'], cname, old.get('type'), new_type)
+        old_cols = [dict(c) for c in tbl.cols]
+        new_cols = [dict(c) for c in tbl.cols]
+        new_cols[idx] = new
+        entry = {'op': 'MODIFY COLUMN', 'table': name, 'at': idx,
+                 'old_cols': old_cols, 'new_cols': new_cols}
+        transform = self._modify_transform(entry)
+        with tbl._lock:
+            self._ddl_guard(tbl, 'ALTER TABLE ... MODIFY COLUMN')
+            # 先做语义预校验（全部行转换试算 + CHECK/UNIQUE），失败时页上
+            # 一个字节都没动；通过后才退休 WAL / 写 pending / 真正改写。
+            self._prevalidate_modify(tbl, entry)
+            self._ddl_retire_wal(tbl, 'MODIFY COLUMN')
+            self._ddl_begin(entry)
+            # always_transform=True：列数不变，必须逐行做类型转换。
+            # planning 阶段会先把全部行试算一遍（失败时页上一个字节都没动），
+            # 因此"不可转换 → 显式错误 + 表不变"是真实成立的。
+            stats = tbl.rewrite_row_payloads(
+                transform, len(old_cols), len(new_cols),
+                always_transform=True)
+            tbl.cols = new_cols
+            tbl.refresh_schema_meta()
+            self._ddl_commit(tbl)
+        return {'column': cname, 'new_type': new_type,
+                'rows_rewritten': stats['rows'], **stats}
+
+    # ==================== E2：CREATE / DROP INDEX ====================
+
+    def _ensure_unique_data(self, tbl, spec):
+        """建 UNIQUE 索引前检查已有数据（冲突 → 1062，绝不先建后炸）"""
+        columns = list(spec.get('columns') or [])
+        idxs = [tbl._col_idx(c) for c in columns]
+        seen = {}
+        for _pk, values in tbl._live_rows():
+            tup = tuple(values[i] for i in idxs)
+            if any(v is None for v in tup):
+                continue
+            if tup in seen:
+                shown = '-'.join(str(v) for v in tup)
+                raise DdlError(
+                    f"Duplicate entry '{shown}' for key '{spec.get('name')}'",
+                    errno=1062, sqlstate='23000')
+            seen[tup] = True
+
+    def create_index(self, table: str, name: str, columns: List[str],
+                     unique: bool = False,
+                     if_not_exists: bool = False) -> dict:
+        """`CREATE [UNIQUE] INDEX name ON t (列...)`
+
+        * 声明持久化到 `_meta.json`（重启后仍在）；
+        * UNIQUE → 与表级 UNIQUE 共用同一套**真实强制**的写入期唯一性
+          检查（含已有数据冲突检查：1062）；
+        * 非唯一 → `SCAN-ASSIST` 声明元数据（本引擎没有二级索引结构，
+          查询仍全表扫描；`SHOW INDEX` 的 Index_type 如实报出，不谎称
+          BTREE），`SHOW CREATE TABLE` 可往返；
+        * 重名 1061 / 未知列 1072 / 同索引重复列 1060 / 未知表 1146。
+        """
+        tbl = self._get_table_for_ddl(table)
+        cols = [str(c) for c in (columns or [])]
+        low_name = str(name or '').strip().lower()
+        existing = (tbl.unique_indexes() + tbl.secondary_indexes())
+        for spec in existing:
+            if str(spec['name']).lower() == low_name:
+                if if_not_exists:
+                    return {'created': False, 'existed': True,
+                            'name': name, 'unique': bool(
+                                spec.get('origin') != 'column')}
+                raise DdlError(f"Duplicate key name '{name}'", errno=1061,
+                               sqlstate='42000')
+        if low_name == 'primary':
+            raise DdlError(f"Duplicate key name '{name}'", errno=1061,
+                           sqlstate='42000')
+        if unique:
+            merged = [dict(s) for s in tbl.unique_indexes()
+                      if s.get('origin') != 'column']
+            merged.append({'name': name, 'columns': cols})
+            resolved = resolve_unique_indexes(table, tbl.cols, merged)
+            new_spec = {'name': name, 'columns': cols}
+            self._ensure_unique_data(tbl, new_spec)
+            with tbl._lock:
+                tbl.set_unique_indexes(resolved)
+            self.save_meta()
+            return {'created': True, 'existed': False, 'name': name,
+                    'columns': cols, 'unique': True}
+        specs = tbl.secondary_indexes() + [
+            {'name': name, 'columns': cols, 'unique': False}]
+        reserved = [s['name'] for s in tbl.unique_indexes()]
+        normalized = resolve_secondary_indexes(
+            table, tbl.cols, specs, reserved_names=reserved)
+        with tbl._lock:
+            tbl.set_secondary_indexes(normalized)
+        self.save_meta()
+        return {'created': True, 'existed': False, 'name': name,
+                'columns': cols, 'unique': False}
+
+    def drop_index(self, table: str, name: str) -> dict:
+        """`DROP INDEX name ON t` —— 删除真实存在的声明（不存在显式 1091）"""
+        tbl = self._get_table_for_ddl(table)
+        low = str(name or '').strip().lower()
+        if low == 'primary':
+            raise DdlError(
+                "Can't DROP 'PRIMARY'; 主键索引不能通过 DROP INDEX 删除",
+                errno=1091, sqlstate='42000')
+        for spec in tbl.unique_indexes():
+            if str(spec['name']).lower() != low:
+                continue
+            if spec.get('origin') == 'column':
+                # 列级 UNIQUE 的自动索引：同时清掉列上的 UNIQUE 标志，
+                # 否则 `_sync_column_unique_indexes` 会立刻把它推导回来。
+                new_cols = [dict(c) for c in tbl.cols]
+                for c in new_cols:
+                    if c.get('name') in spec['columns'] and c.get('unique'):
+                        c['unique'] = False
+                with tbl._lock:
+                    tbl.cols = new_cols
+                    tbl.set_unique_indexes(
+                        [dict(s) for s in tbl.unique_indexes()
+                         if str(s['name']).lower() != low])
+                    tbl.refresh_schema_meta()
+            else:
+                with tbl._lock:
+                    tbl.set_unique_indexes(
+                        [dict(s) for s in tbl.unique_indexes()
+                         if str(s['name']).lower() != low])
+            self.save_meta()
+            return {'dropped': spec['name'], 'unique': True}
+        for spec in tbl.secondary_indexes():
+            if str(spec['name']).lower() == low:
+                with tbl._lock:
+                    tbl.set_secondary_indexes(
+                        [x for x in tbl.secondary_indexes()
+                         if str(x['name']).lower() != low])
+                self.save_meta()
+                return {'dropped': spec['name'], 'unique': False}
+        raise DdlError(
+            f"Can't DROP '{name}'; check that column/key exists",
+            errno=1091, sqlstate='42000')
 
     def truncate_table(self, name: str) -> dict:
         """`TRUNCATE TABLE t` —— 清空所有行，**保留表定义**
@@ -938,6 +1322,10 @@ class Database:
                  # 表级 UNIQUE 约束跟着改名走：漏了它，改名后唯一性
                  # 就悄悄失效（声明还在，强制没了）。
                  'unique_indexes': tbl.unique_indexes(),
+                 # E2：非唯一索引与请求的引擎名跟着改名走
+                 'indexes': tbl.secondary_indexes(),
+                 'requested_engine': getattr(tbl, 'requested_engine',
+                                             'LightDB'),
                  'checks': [dict(c) for c in getattr(tbl, '_checks', [])]}
         self._ddl_begin(entry)
         self._finish_rename(entry)
@@ -976,7 +1364,12 @@ class Database:
                        unique_indexes=(entry.get('unique_indexes')
                                        if entry.get('unique_indexes')
                                        is not None
-                                       else tbl.unique_indexes()))
+                                       else tbl.unique_indexes()),
+                       secondary_indexes=entry.get(
+                           'indexes', tbl.secondary_indexes()),
+                       requested_engine=entry.get(
+                           'requested_engine',
+                           getattr(tbl, 'requested_engine', 'LightDB')))
         if entry.get('partition'):
             newtbl.set_partition(entry['partition'])
         if entry.get('checks'):
@@ -1030,6 +1423,11 @@ class Database:
                 tbl.rewrite_row_payloads(
                     lambda values: list(values)[:at] + list(values)[at + 1:],
                     len(old_cols), len(new_cols), zero_removed=True)
+            elif op == 'MODIFY COLUMN':
+                # 列数不变的类型变更：所有行都重新走一次幂等转换
+                tbl.rewrite_row_payloads(
+                    self._modify_transform(entry),
+                    len(old_cols), len(new_cols), always_transform=True)
             elif op == 'TRUNCATE':
                 tbl.truncate_all()
             else:
