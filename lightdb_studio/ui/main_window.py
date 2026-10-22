@@ -677,6 +677,25 @@ class MainWindow(QMainWindow):
         a.triggered.connect(lambda: self._show_right_tab('ai_chat'))
         m_tools.addAction(a)
 
+        # task-43：AI SQL 助手（建表/存储过程生成）+ 离线示例库
+        a = QAction("🪄 AI SQL 助手...", self)
+        a.setToolTip('自然语言生成 CREATE TABLE/CREATE PROCEDURE，'
+                     '预览 + parser 校验 + 二次确认执行')
+        a.triggered.connect(self._open_ai_sql_dialog)
+        m_tools.addAction(a)
+
+        m_examples = m_tools.addMenu("📚 SQL 示例库")
+        try:
+            from .ai_examples import example_menu_entries
+            for example_id, title in example_menu_entries():
+                act = QAction(title, self)
+                act.triggered.connect(
+                    lambda _checked=False, eid=example_id:
+                    self._insert_sql_example(eid))
+                m_examples.addAction(act)
+        except Exception:
+            pass
+
         a = QAction("💬 协作会话", self)
         a.triggered.connect(lambda: self._show_right_tab('collab_panel'))
         m_tools.addAction(a)
@@ -2207,6 +2226,40 @@ class MainWindow(QMainWindow):
         except Exception as exc:                      # noqa: BLE001
             self._shortcut_apply_result = {'ok': False, 'error': str(exc)}
             return self._shortcut_apply_result
+
+    # ==================== task-43：AI SQL 助手 / 示例库 ====================
+
+    def _schema_snapshot_safe(self):
+        try:
+            return self._schema_snapshot()
+        except Exception:
+            return [], {}
+
+    def _open_ai_sql_dialog(self):
+        from .ai_sql_dialog import AISQLDialog
+        dlg = AISQLDialog(schema_provider=self._schema_snapshot_safe,
+                          parent=self)
+        dlg.insert_requested.connect(self._insert_sql_to_editor)
+
+        def _execute_generated(sql):
+            editor, result = self._current_widgets()
+            if editor is None:
+                self._add_new_query_tab(auto_switch=True)
+                editor, result = self._current_widgets()
+            self._execute_sql_async(sql, editor, result)
+
+        dlg.execute_requested.connect(_execute_generated)
+        dlg.exec()
+        return dlg
+
+    def _insert_sql_example(self, example_id):
+        from .ai_examples import get_example
+        example = get_example(example_id)
+        if not example:
+            return False
+        self._insert_sql_to_editor(example['sql'])
+        self.status_label.setText(f"已插入示例：{example['title']}")
+        return True
 
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
