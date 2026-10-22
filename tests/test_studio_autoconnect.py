@@ -37,7 +37,7 @@ except ImportError:                       # 直接 python tests/test_studio_auto
 SERVER_PORT = 8934
 HOME_PREFIX = 'lightdb_studio'
 CONN_KEYS = {'name', 'host', 'port', 'user', 'password', 'database',
-             'charset', 'ssl'}
+             'charset', 'ssl', 'ssl_options'}
 
 _APP = None
 
@@ -108,7 +108,7 @@ def _write_config(tmp_home, connections, last='', auto_connect=None):
 
 def _conn(name, port, **kw):
     d = {'name': name, 'host': '127.0.0.1', 'port': port, 'user': 'root',
-         'password': '', 'database': '', 'charset': 'utf8mb4', 'ssl': False}
+         'password': '', 'database': '', 'charset': 'utf8mb4', 'ssl': False, 'ssl_options': {}}
     d.update(kw)
     return d
 

@@ -85,7 +85,7 @@ def test_save_hides_password_and_load_restores(tmp_path, monkeypatch):
     assert stored and 'P@ss-中文-123' not in stored
     assert set(raw['connections'][0]) == {
         'name', 'host', 'port', 'user', 'password', 'database',
-        'charset', 'ssl'}, 'connections.json schema 必须保持 8 键'
+        'charset', 'ssl', 'ssl_options'}, 'connections.json schema（8+ssl_options）'
 
     loaded = AppConfig()
     back = loaded.find('prod')
@@ -115,7 +115,7 @@ def test_legacy_plaintext_migrates_on_load(tmp_path, monkeypatch):
         'connections': [{
             'name': 'old', 'host': '127.0.0.1', 'port': 8899, 'user': 'root',
             'password': 'legacy-secret-中文', 'database': '',
-            'charset': 'utf8mb4', 'ssl': False,
+            'charset': 'utf8mb4', 'ssl': False, 'ssl_options': {},
         }],
         'last_connection': 'old',
     }
@@ -142,7 +142,7 @@ def test_corrupt_ciphertext_keeps_connection_with_warning(tmp_path, monkeypatch,
         'connections': [{
             'name': 'broken', 'host': '127.0.0.1', 'port': 8899,
             'user': 'root', 'password': 'dpapi:v1:AAAA',
-            'database': '', 'charset': 'utf8mb4', 'ssl': False,
+            'database': '', 'charset': 'utf8mb4', 'ssl': False, 'ssl_options': {},
         }],
         'last_connection': 'broken',
     }

@@ -41,7 +41,7 @@ _APP = None
 
 HOME_PREFIX = 'lightdb_studio'
 CONN_KEYS = {'name', 'host', 'port', 'user', 'password', 'database',
-             'charset', 'ssl'}
+             'charset', 'ssl', 'ssl_options'}
 
 
 # ==================== 环境 ====================
@@ -388,7 +388,7 @@ def test_dialog_output_is_8_fields_and_roundtrips_config(tmp_path):
         keys = {f.name for f in fields(info)}
         print(f'\n【C-6】对话框产出：{asdict(info)}')
         assert keys == CONN_KEYS, sorted(keys)
-        assert len(asdict(info)) == 8
+        assert len(asdict(info)) == 9
         assert (info.host, info.port, info.user) == ('127.0.0.1', 8899, 'root')
         assert (info.password, info.database, info.charset, info.ssl) == \
             ('', '', 'utf8mb4', False)
