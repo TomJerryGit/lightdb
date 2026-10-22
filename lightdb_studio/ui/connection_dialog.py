@@ -149,6 +149,67 @@ class ConnectionDialog(QDialog):
             lambda: self._browse_ssl_file(self.ssl_key_edit, '客户端私钥'))
         self.ssl_check.toggled.connect(self._update_ssl_controls)
 
+        # task-42：SSH 隧道（可选依赖 paramiko；未安装时显式禁用，不假成功）
+        self._ssh_available = False
+        try:
+            from ..db.ssh_tunnel import paramiko_available
+            self._ssh_available = paramiko_available()
+        except Exception:
+            self._ssh_available = False
+        self.ssh_check = QCheckBox('使用 SSH 隧道')
+        form.addRow('', self.ssh_check)
+        self._ssh_rows = []
+        for label, attr, spin in (
+                ('SSH 主机:', 'ssh_host_edit', None),
+                ('SSH 端口:', 'ssh_port_spin', 'port'),
+                ('SSH 用户:', 'ssh_user_edit', None),
+                ('SSH 密码:', 'ssh_pwd_edit', None),
+                ('SSH 私钥:', 'ssh_key_edit', None),
+                ('远程库主机:', 'ssh_remote_host_edit', None),
+                ('远程库端口:', 'ssh_remote_port_spin', 'port')):
+            if spin == 'port':
+                widget = QSpinBox()
+                widget.setRange(1, 65535)
+                widget.setValue(22 if 'SSH' in label else 8888)
+            else:
+                widget = QLineEdit()
+                if attr == 'ssh_pwd_edit':
+                    widget.setEchoMode(QLineEdit.Password)
+            setattr(self, attr, widget)
+            if attr == 'ssh_key_edit':
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.addWidget(widget, 1)
+                btn = QPushButton('浏览...')
+                btn.clicked.connect(
+                    lambda: self._browse_ssh_key(self.ssh_key_edit))
+                row.addWidget(btn)
+                self.ssh_key_btn = btn
+                form.addRow(label, row)
+                self._ssh_rows.extend([widget, btn])
+            else:
+                form.addRow(label, widget)
+                self._ssh_rows.append(widget)
+        self.ssh_status = QLabel('')
+        self.ssh_status.setWordWrap(True)
+        if self._ssh_available:
+            self.ssh_status.setText(
+                'SSH 隧道已就绪（paramiko 已安装）；连接时通过本地端口转发。')
+            self.ssh_status.setStyleSheet('color: #89d185;')
+        else:
+            msg = ('未安装 paramiko，SSH 隧道不可用：pip install paramiko '
+                   '或 pip install ".[ssh]"')
+            self.ssh_status.setText(msg)
+            self.ssh_status.setStyleSheet('color: #f48771;')
+            self.ssh_check.setEnabled(False)
+            self.ssh_check.setToolTip(msg)
+            for widget in self._ssh_rows:
+                widget.setEnabled(False)
+                widget.setToolTip(msg)
+        form.addRow('', self.ssh_status)
+        self.ssh_check.toggled.connect(self._update_ssh_controls)
+        self._update_ssh_controls()
+
         layout.addLayout(form)
 
         # 即时提示（一行 label，不弹窗）：LightDB 给可照抄的启动命令；端口
@@ -207,6 +268,22 @@ class ConnectionDialog(QDialog):
             self.ssl_cert_edit.setText(str(ssl_opts.get('cert') or ''))
             self.ssl_key_edit.setText(str(ssl_opts.get('key') or ''))
         self._update_ssl_controls()
+
+        # SSH 隧道字段回填
+        ssh_opts = self.info.ssh_options or {}
+        if isinstance(ssh_opts, dict):
+            self.ssh_check.setChecked(bool(
+                ssh_opts.get('enabled') and self._ssh_available))
+            self.ssh_host_edit.setText(str(ssh_opts.get('host') or ''))
+            self.ssh_port_spin.setValue(int(ssh_opts.get('port') or 22))
+            self.ssh_user_edit.setText(str(ssh_opts.get('user') or ''))
+            self.ssh_pwd_edit.setText(str(ssh_opts.get('password') or ''))
+            self.ssh_key_edit.setText(str(ssh_opts.get('key_path') or ''))
+            self.ssh_remote_host_edit.setText(
+                str(ssh_opts.get('remote_host') or '127.0.0.1'))
+            self.ssh_remote_port_spin.setValue(int(
+                ssh_opts.get('remote_port') or self.info.port or 8888))
+        self._update_ssh_controls()
 
         # 预选类型（反推得到）。切换会 `_apply_defaults`：这里字段刚按
         # info 填好，所以只有「仍等于旧类型默认值」的字段会被新类型覆盖。
@@ -329,8 +406,66 @@ class ConnectionDialog(QDialog):
             charset=self.charset_combo.currentText(),
             ssl=self.ssl_check.isChecked(),
             ssl_options=self.build_ssl_params(silent=True),
+            ssh_options=self.build_ssh_options(),
         )
         return info
+
+    # ---------- task-42：SSH 隧道字段 ----------
+
+    def _update_ssh_controls(self, *_args):
+        enabled = bool(self._ssh_available and self.ssh_check.isChecked())
+        for widget in getattr(self, '_ssh_rows', []):
+            widget.setEnabled(enabled)
+        if self._ssh_available:
+            self.ssh_check.setEnabled(True)
+            if enabled:
+                self.ssh_status.setText('SSH 隧道已启用：连接将先建立本地转发。')
+                self.ssh_status.setStyleSheet('color: #89d185;')
+            else:
+                self.ssh_status.setText('SSH 隧道未启用。')
+                self.ssh_status.setStyleSheet('color: #969696;')
+
+    def build_ssh_options(self):
+        if not self.ssh_check.isChecked():
+            return {}
+        return {
+            'enabled': True,
+            'host': self.ssh_host_edit.text().strip(),
+            'port': int(self.ssh_port_spin.value()),
+            'user': self.ssh_user_edit.text().strip(),
+            'password': self.ssh_pwd_edit.text(),
+            'key_path': self.ssh_key_edit.text().strip(),
+            'remote_host': self.ssh_remote_host_edit.text().strip()
+            or '127.0.0.1',
+            'remote_port': int(self.ssh_remote_port_spin.value()),
+            'auto_add_host_key': True,
+        }
+
+    def validate_ssh_options(self):
+        if not self.ssh_check.isChecked():
+            return True, ''
+        if not self._ssh_available:
+            return False, ('未安装 paramiko，SSH 隧道不可用：'
+                           'pip install paramiko 或 pip install ".[ssh]"')
+        host = self.ssh_host_edit.text().strip()
+        user = self.ssh_user_edit.text().strip()
+        if not host:
+            return False, 'SSH 主机不能为空'
+        if not user:
+            return False, 'SSH 用户不能为空'
+        key_path = self.ssh_key_edit.text().strip()
+        if key_path and not os.path.isfile(key_path):
+            return False, f'SSH 私钥不存在: {key_path}'
+        if not self.ssh_pwd_edit.text() and not key_path:
+            return False, 'SSH 密码和私钥至少填写一个'
+        return True, ''
+
+    def _browse_ssh_key(self, edit):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '选择 SSH 私钥', edit.text() or '',
+            '私钥 (*.pem *.key *.ppk);;所有文件 (*.*)')
+        if path:
+            edit.setText(path)
 
     # ---------- G2：SSL 高级字段 ----------
 
@@ -431,6 +566,10 @@ class ConnectionDialog(QDialog):
         if not ok:
             QMessageBox.warning(self, 'SSL 配置错误', ssl_error)
             return
+        ok, ssh_error = self.validate_ssh_options()
+        if not ok:
+            QMessageBox.warning(self, 'SSH 配置错误', ssh_error)
+            return
         info = self._collect()
         if not info.name:
             QMessageBox.warning(self, "提示", "请填写连接名称")
@@ -471,7 +610,8 @@ def duplicate_connection(config, source_name, new_name=None):
         name=new_name, host=source.host, port=source.port,
         user=source.user, password=source.password,
         database=source.database, charset=source.charset, ssl=source.ssl,
-        ssl_options=dict(getattr(source, 'ssl_options', None) or {}))
+        ssl_options=dict(getattr(source, 'ssl_options', None) or {}),
+        ssh_options=dict(getattr(source, 'ssh_options', None) or {}))
     try:
         config.add_connection(info)
     except Exception as exc:                          # noqa: BLE001
@@ -516,10 +656,13 @@ def edit_connection(parent, config, name, dialog_class=None):
         name=info.name, host=info.host, port=info.port, user=info.user,
         password=info.password, database=info.database,
         charset=info.charset, ssl=info.ssl,
-        ssl_options=dict(getattr(info, 'ssl_options', None) or {})))
-    # 保留高级 SSL 配置（若原连接带有时）
+        ssl_options=dict(getattr(info, 'ssl_options', None) or {}),
+        ssh_options=dict(getattr(info, 'ssh_options', None) or {})))
+    # 保留高级 SSL/SSH 配置（若原连接带有时）
     if getattr(info, 'ssl_options', None):
         dlg.info.ssl_options = dict(info.ssl_options)
+    if getattr(info, 'ssh_options', None):
+        dlg.info.ssh_options = dict(info.ssh_options)
 
         for edit_name, key in (('ssl_ca_edit', 'ca'),
                                ('ssl_cert_edit', 'cert'),
@@ -559,6 +702,18 @@ def _connection_to_export_dict(conn, include_passwords=False):
     ssl_options = getattr(conn, 'ssl_options', None)
     if ssl_options:
         d['ssl_options'] = dict(ssl_options)
+    ssh_options = getattr(conn, 'ssh_options', None)
+    if ssh_options:
+        ssh_copy = dict(ssh_options)
+        # SSH 密码与数据库密码同等对待：默认不导出；可选 DPAPI 加密
+        if ssh_copy.get('password'):
+            if include_passwords:
+                from ..core.credentials import encrypt_password
+                ssh_copy['password'] = encrypt_password(ssh_copy['password'])
+            else:
+                ssh_copy.pop('password', None)
+                ssh_copy['password_omitted'] = True
+        d['ssh_options'] = ssh_copy
     if include_passwords and conn.password:
         from ..core.credentials import encrypt_password
         d['password'] = encrypt_password(conn.password)
@@ -609,7 +764,7 @@ def _parse_connection_item(item, index):
     if not (1 <= port <= 65535):
         raise ValueError(f'连接 {name} 的 port 超出范围: {port}')
     known = {'name', 'host', 'port', 'user', 'password', 'database',
-             'charset', 'ssl', 'ssl_options'}
+             'charset', 'ssl', 'ssl_options', 'ssh_options'}
     warnings = []
     unknown = sorted(set(item) - known)
     if unknown:
@@ -623,6 +778,25 @@ def _parse_connection_item(item, index):
     ssl_options = item.get('ssl_options')
     if isinstance(ssl_options, dict):
         info.ssl_options = dict(ssl_options)
+    ssh_options = item.get('ssh_options')
+    if isinstance(ssh_options, dict):
+        ssh_copy = dict(ssh_options)
+        ssh_pwd = ssh_copy.get('password')
+        if ssh_pwd:
+            from ..core.credentials import decrypt_password, is_encrypted
+            if is_encrypted(ssh_pwd):
+                try:
+                    ssh_copy['password'] = decrypt_password(ssh_pwd)
+                except Exception as exc:              # noqa: BLE001
+                    raise ValueError(
+                        f'连接 {name} 的 SSH 密码无法解密: {exc}')
+            else:
+                warnings.append(f'连接 {name} 的 SSH 密码为明文（保存时自动加密）')
+        elif ssh_copy.get('password_omitted'):
+            needs_password = True
+            warnings.append(f'连接 {name} 的 SSH 密码未导出，需重新填写')
+        ssh_copy.pop('password_omitted', None)
+        info.ssh_options = ssh_copy
     needs_password = not info.password
     if info.password:
         from ..core.credentials import decrypt_password, is_encrypted

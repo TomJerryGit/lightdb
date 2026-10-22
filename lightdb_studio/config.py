@@ -24,6 +24,9 @@ class ConnectionInfo:
     # G2-b：SSL 高级参数（CA/客户端证书/私钥/验证模式）。旧 JSON 无此字段 →
     # 默认空 dict；导出/导入与连接对话框读写；DBConnection 会真正传给 pymysql。
     ssl_options: dict = field(default_factory=dict)
+    # task-42：SSH 隧道参数（enabled/host/port/user/password/key_path/
+    # remote_host/remote_port/...）。旧 JSON 无此字段 → 默认空 dict。
+    ssh_options: dict = field(default_factory=dict)
 
 
 # `connections.json` 里一条连接**恰好**是这些字段（`AppConfig.save()` 用
@@ -50,6 +53,8 @@ def _connection_from_dict(d: dict) -> ConnectionInfo:
     # 旧 JSON 没有 ssl_options / 手写值不是对象 → 归零，不把一条连接搞坏
     opts = known.get('ssl_options')
     known['ssl_options'] = dict(opts) if isinstance(opts, dict) else {}
+    ssh_opts = known.get('ssh_options')
+    known['ssh_options'] = dict(ssh_opts) if isinstance(ssh_opts, dict) else {}
     return ConnectionInfo(**known)
 
 

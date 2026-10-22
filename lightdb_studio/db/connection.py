@@ -191,6 +191,11 @@ def build_ssl_params(config):
     return params
 
 
+from .ssh_tunnel import (
+    SSHUnavailableError, SshTunnel, SshTunnelConfig, from_connection_info,
+)
+
+
 class DBConnection:
     """单条数据库连接（会话）"""
 
@@ -204,6 +209,9 @@ class DBConnection:
         self.conn: Optional['pymysql.connections.Connection'] = None
         self.lock = threading.RLock()
         self.server_version = ""
+        self._ssh_tunnel = None
+        self._connect_host = None
+        self._connect_port = None
         try:
             self.read_timeout = int(read_timeout) if read_timeout else None
         except (TypeError, ValueError):
@@ -214,25 +222,71 @@ class DBConnection:
             raise RuntimeError("请先安装 pymysql: pip install pymysql")
 
         ssl_param = build_ssl_params(self.config)
-
-        self.conn = pymysql.connect(
-            host=self.config.host,
-            port=self.config.port,
-            user=self.config.user,
-            password=self.config.password,
-            database=self.config.database or None,
-            charset=self.config.charset or 'utf8mb4',
-            autocommit=True,
-            connect_timeout=10,
-            read_timeout=self.read_timeout,
-            ssl=ssl_param,
-            cursorclass=pymysql.cursors.Cursor,
-        )
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT VERSION()")
-            row = cur.fetchone()
-            self.server_version = row[0] if row else "unknown"
+        host, port = self.config.host, self.config.port
+        # task-42：SSH 隧道（惰性 paramiko；失败显式且关闭隧道，不泄漏）
+        tunnel_config = from_connection_info(self.config)
+        if tunnel_config is not None:
+            tunnel = SshTunnel(tunnel_config)
+            try:
+                tunnel.start()
+            except Exception:
+                tunnel.close()
+                self._ssh_tunnel = None
+                raise
+            self._ssh_tunnel = tunnel
+            host, port = '127.0.0.1', tunnel.local_port
+        try:
+            self.conn = pymysql.connect(
+                host=host,
+                port=port,
+                user=self.config.user,
+                password=self.config.password,
+                database=self.config.database or None,
+                charset=self.config.charset or 'utf8mb4',
+                autocommit=True,
+                connect_timeout=10,
+                read_timeout=self.read_timeout,
+                ssl=ssl_param,
+                cursorclass=pymysql.cursors.Cursor,
+            )
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT VERSION()")
+                row = cur.fetchone()
+                self.server_version = row[0] if row else "unknown"
+        except Exception:
+            try:
+                if self.conn is not None:
+                    self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            self._close_tunnel()
+            raise
+        self._connect_host = host
+        self._connect_port = port
         return self
+
+    def _close_tunnel(self):
+        tunnel, self._ssh_tunnel = self._ssh_tunnel, None
+        if tunnel is not None:
+            try:
+                tunnel.close()
+            except Exception:
+                pass
+        self._connect_host = None
+        self._connect_port = None
+
+    @property
+    def effective_host(self):
+        return self._connect_host or self.config.host
+
+    @property
+    def effective_port(self):
+        return self._connect_port or self.config.port
+
+    @property
+    def ssh_tunnel(self):
+        return self._ssh_tunnel
 
     def is_connected(self) -> bool:
         if self.conn is None:
@@ -251,6 +305,7 @@ class DBConnection:
                 except Exception:
                     pass
                 self.conn = None
+            self._close_tunnel()
 
     @contextmanager
     def cursor(self):
@@ -424,8 +479,8 @@ class DBConnection:
         killer = None
         try:
             killer = pymysql.connect(
-                host=self.config.host,
-                port=self.config.port,
+                host=self.effective_host,
+                port=self.effective_port,
                 user=self.config.user,
                 password=self.config.password,
                 charset=self.config.charset or 'utf8mb4',
