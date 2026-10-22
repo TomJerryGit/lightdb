@@ -792,6 +792,9 @@ class Executor:
         'DROP INDEX': 'INDEX',
         'CREATE TRIGGER': 'CREATE',
         'ANALYZE': 'SELECT',
+        # E3：视图名字空间与表共用；权限按库级 CREATE/DROP 判定
+        'CREATE VIEW': 'CREATE',
+        'DROP VIEW': 'DROP',
     }
     #: 需要「库级」权限的命令 → 所需权限（None = 该库上任意权限即可）
     _PRIV_DB_COMMANDS = {
@@ -813,16 +816,22 @@ class Executor:
     _ADMIN_SHOW_TAGS = frozenset({
         'security', 'audit_log', 'ip_whitelist', 'master_status',
         'slave_status', 'binlog_events', 'vacuum', 'optimize_table',
-        'check_table', 'engine',
+        'check_table', 'engine', 'binary_logs',
     })
     #: SHOW 标签 → 需要 SELECT（有表名按表级 1142，否则库级 1044）
     _SELECT_SHOW_TAGS = frozenset({
         'create_table', 'index', 'partitions', 'triggers', 'functions',
+        'create_view', 'full_columns', 'full_tables', 'table_status',
+        'collation', 'charset', 'engines', 'warnings',
     })
     #: 任何已登录账户都可以执行的命令（无数据访问 / 会话控制）
     _PUBLIC_COMMANDS = frozenset({
         'BEGIN', 'COMMIT', 'ROLLBACK', 'SELECT VARIABLES',
         'CALL', 'EXPLAIN', 'SHOW DATABASES',
+        # E3：PREPARE/EXECUTE 自身不访问数据；内层语句会走一遍完整
+        # 执行（含鉴权），因此把外层命令放行不会绕过权限。
+        'PREPARE', 'EXECUTE PREPARED', 'DEALLOCATE PREPARE',
+        'SET USER VARIABLE',
     })
 
     #: 引擎内部的**服务身份**（不是数据库账户）。事件调度器等内部组件用
@@ -1394,18 +1403,20 @@ class Executor:
 
     # ==================== DDL ====================
 
-    #: E1：本引擎真实支持的字符集（存储/协议均为 UTF-8；不做 gbk/latin1
-    #: 转码，因此这些字符集**显式拒绝**而不是"按 utf8 收下"）。
-    #: `latin1` 是历史客户端兼容名（既有协议测试锁定可记录），但同样
-    #: 不做转码 —— 服务端按 UTF-8 解码，非法字节显式 1366。
-    OLAP_E1_CHARSETS = ('utf8', 'utf8mb4', 'utf8mb3', 'latin1')
-    #: CREATE TABLE 的 CHARSET 选项：latin1 不做转码，表选项层**不接受**
-    #: （避免"声明 latin1 实际按 UTF-8 存"的静默语义）。
+    #: E1/E3：可接受的连接字符集。utf8 家族存储/收发为 UTF-8；E3 起
+    #: gbk/latin1 在服务端按声明编码**真正转码**（见 net/server.py）。
+    OLAP_E1_CHARSETS = ('utf8', 'utf8mb4', 'utf8mb3', 'latin1', 'gbk')
+    #: CREATE TABLE 的 CHARSET 选项：latin1/gbk 不做存储转码，表选项层
+    #: **不接受**（避免"声明 gbk 实际按 UTF-8 存"的静默语义）。
     OLAP_E1_TABLE_CHARSETS = ('utf8', 'utf8mb4', 'utf8mb3')
-    #: E1：可接受的连接排序规则（bin = 真实比较语义；`_general_ci` 仅作
-    #: 连接元数据记录，不改变 Python 码点比较语义）。
+    #: E1/E3：可接受的连接排序规则（bin = 真实比较语义；`_general_ci`/
+    #: `_swedish_ci`/`_chinese_ci` 仅作连接元数据记录，不改变码点比较）。
     OLAP_E1_COLLATIONS = ('utf8mb4_bin', 'utf8_bin',
-                          'utf8mb4_general_ci', 'utf8_general_ci')
+                          'utf8mb4_general_ci', 'utf8_general_ci',
+                          'utf8mb4_unicode_ci', 'utf8_unicode_ci',
+                          'latin1_bin', 'latin1_swedish_ci',
+                          'latin1_general_ci',
+                          'gbk_bin', 'gbk_chinese_ci')
     #: CREATE TABLE 的 COLLATE 选项：只有 `*_bin` 与真实比较语义一致；
     #: `_ci` 不接受（表级排序规则会影响比较，不能只记录不生效）。
     OLAP_E1_TABLE_COLLATIONS = ('utf8mb4_bin', 'utf8_bin')
@@ -1678,6 +1689,345 @@ class Executor:
         return self._ok(
             message=f"{kind} '{stats.get('dropped')}' dropped from "
                     f"'{table}'")
+
+    # ==================== E3：视图（物化 + 外层查询展开） ====================
+
+    @staticmethod
+    def _view_refs(ast) -> set:
+        """从 SELECT AST 里收集引用的表/视图名（含 FROM/JOIN/子查询/CTE）"""
+        refs = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                for key, val in node.items():
+                    if key in ('table', 'table_name') and isinstance(val, str):
+                        v = val.strip()
+                        if v and not v.lower().startswith(
+                                'information_schema.'):
+                            refs.add(v)
+                    else:
+                        walk(val)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    walk(item)
+
+        walk(ast)
+        return refs
+
+    @classmethod
+    def _view_graph_has_cycle(cls, graph: dict, start: str) -> bool:
+        """视图依赖图里从 start 出发能否回到 start（循环依赖）"""
+        seen = set()
+        stack = list(graph.get(start, []))
+        while stack:
+            cur = stack.pop()
+            if cur == start:
+                return True
+            if cur in graph and cur not in seen:
+                seen.add(cur)
+                stack.extend(graph.get(cur, []))
+        return False
+
+    def _select_from_view(self, p, s, view_name):
+        """`SELECT ... FROM view ...`：物化视图查询 + 复用外层查询路径
+
+        * 视图定义查询先执行（支持 WHERE/单表/聚合/子查询等执行器已有能力）；
+        * 外层 WHERE / GROUP BY / HAVING / ORDER BY / LIMIT 走
+          `_select_from_relation`（与 CTE/FROM 子查询同一条已实现路径）；
+        * 循环依赖（A→B→A）与过深嵌套显式 1356，绝不无限递归；
+        * `SELECT ... FROM view JOIN ...` 暂不支持 → 显式 1105（不静默错答）。
+        """
+        if p.get('joins'):
+            return self._err(
+                1105,
+                f"从视图 '{view_name}' JOIN 其他表暂不支持（显式错误，"
+                f"不静默返回错误结果）；请改写成子查询或直接查基表")
+        view = self.db.get_view(view_name)
+        if view is None:
+            return self._err(1146, f"View '{view_name}' doesn't exist",
+                             sqlstate='42S02')
+        stack = getattr(self, '_view_expansion_stack', None)
+        if stack is None:
+            stack = []
+            self._view_expansion_stack = stack
+        key = str(view_name).lower()
+        if key in stack:
+            return self._err(
+                1356,
+                f"View '{view_name}' 循环依赖（展开时检测到递归引用）",
+                sqlstate='HY000')
+        if len(stack) >= 16:
+            return self._err(
+                1356, "视图嵌套层数超过 16（疑似循环依赖）", sqlstate='HY000')
+        from .parser import parser as _parser
+        stack.append(key)
+        try:
+            try:
+                inner = _parser.parse(view['sql'])
+            except Exception as e:
+                return self._err(
+                    1064, f"View '{view_name}' 定义无法解析: {e}")
+            if not isinstance(inner, dict):
+                return self._err(
+                    1064, f"View '{view_name}' 定义不是可执行查询")
+            res = self.execute(inner, s)
+        finally:
+            stack.pop()
+        if not isinstance(res, dict) or res.get('type') == 'error':
+            return res if isinstance(res, dict) else self._err(
+                1105, f"View '{view_name}' 执行失败")
+        cols = list(res.get('columns') or [])
+        rows = list(res.get('rows') or [])
+        if view.get('columns'):
+            if len(view['columns']) != len(cols):
+                return self._err(
+                    1356,
+                    f"View '{view_name}' 的列别名数量 ({len(view['columns'])})"
+                    f" 与查询列数 ({len(cols)}) 不一致", sqlstate='HY000')
+            cols = list(view['columns'])
+        rel = _CTERelation(view_name, cols, rows)
+        return self._select_from_relation(p, s, rel)
+
+    def _cmd_create_view(self, p, s):
+        """`CREATE [OR REPLACE] VIEW name [(列...)] AS SELECT ...`"""
+        name = p['table']
+        sql_text = str(p.get('select_sql') or '').strip()
+        # 名字空间：与真实表同名 → 1050（先于循环/引用检查，MySQL 同码）
+        if any(t.lower() == str(name).lower() for t in self.db.tables):
+            return self._err(1050, f"Table '{name}' already exists",
+                             sqlstate='42S01')
+        existing_view = self.db.get_view(name)
+        if existing_view is not None and not p.get('or_replace'):
+            return self._err(1050, f"Table '{name}' already exists",
+                             sqlstate='42S01')
+        from .parser import parser as _parser
+        try:
+            ast = _parser.parse(sql_text)
+        except Exception as e:
+            return self._err(
+                1064, f"CREATE VIEW 的 SELECT 无法解析: {e}")
+        if not isinstance(ast, dict) or ast.get('show_stmt') or \
+                ast.get('command') not in ('SELECT', 'UNION'):
+            return self._err(
+                1064,
+                "CREATE VIEW 只支持 SELECT 查询（复杂形态显式拒绝，"
+                "绝不接受后静默不生效）")
+        refs = self._view_refs(ast)
+        for ref in refs:
+            if ref.lower() == str(name).lower():
+                return self._err(
+                    1356, f"View '{name}' 引用了自身（循环依赖）",
+                    sqlstate='HY000')
+            if ref not in self.db.tables and self.db.get_view(ref) is None:
+                return self._err(1146, f"Table '{ref}' doesn't exist",
+                                 sqlstate='42S02')
+        # 循环依赖检查：把已有视图的依赖图与新定义合并后做可达性检查
+        graph = {}
+        for vname in self.db.list_views():
+            if vname.lower() == str(name).lower():
+                continue
+            vinfo = self.db.get_view(vname)
+            try:
+                vast = _parser.parse(vinfo['sql'])
+            except Exception:                    # pragma: no cover - 防御
+                continue
+            graph[vname.lower()] = [r.lower()
+                                    for r in self._view_refs(vast)]
+        graph[str(name).lower()] = [r.lower() for r in refs]
+        if self._view_graph_has_cycle(graph, str(name).lower()):
+            return self._err(
+                1356, f"View '{name}' 存在循环依赖（显式拒绝）",
+                sqlstate='HY000')
+        res = self.db.create_view(
+            name, sql_text, or_replace=bool(p.get('or_replace')),
+            columns=p.get('columns') or [])
+        msg = f"View '{res['name']}' created"
+        if res.get('replaced'):
+            msg += " (replaced)"
+        return self._ok(message=msg)
+
+    def _cmd_drop_view(self, p, s):
+        """`DROP VIEW [IF EXISTS] v1 [, v2]`"""
+        names = list(p.get('tables') or [])
+        if_exists = bool(p.get('if_exists'))
+        if not if_exists:
+            missing = [n for n in names if self.db.get_view(n) is None]
+            if missing:
+                return self._err(
+                    1051, f"Unknown table '{self.db.name}.{missing[0]}'",
+                    sqlstate='42S02')
+        dropped = []
+        for name in names:
+            res = self.db.drop_view(name, if_exists=if_exists)
+            if res.get('dropped'):
+                dropped.append(res['name'])
+        if not dropped:
+            return self._ok(message="View(s) dropped (none existed)")
+        return self._ok(
+            message="View(s) dropped: " + ", ".join(dropped))
+
+    # ==================== E3：SQL 层 PREPARE / EXECUTE / DEALLOCATE ====================
+
+    def _cmd_set_user_variable(self, p, s):
+        """进程内 `SET @x = <literal>`（网络路径由 server 会话层处理）"""
+        store = self._pl_user_var_store(s)
+        for assign in (p.get('assignments') or []):
+            raw = str(assign.get('expr') or '')
+            try:
+                value = self._parse_set_literal(raw)
+            except ValueError as e:
+                return self._err(1064, f"SET 用户变量失败: {e}")
+            store[str(assign['name'])] = value
+        return self._ok(message="Query OK")
+
+    @staticmethod
+    def _parse_set_literal(raw):
+        """把 SET @x = <literal> 的右值转成 Python 值（只支持字面量）"""
+        text = str(raw or '').strip()
+        if not text:
+            raise ValueError("右值为空")
+        low = text.lower()
+        if low == 'null':
+            return None
+        if low in ('true', 'false'):
+            return low == 'true'
+        if re.fullmatch(r'[-+]?\d+', text):
+            return int(text)
+        if re.fullmatch(r'[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?',
+                        text):
+            return float(text)
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+            inner = text[1:-1]
+            return (inner.replace("''", "'") if text[0] == "'"
+                    else inner.replace('""', '"'))
+        raise ValueError(
+            f"不支持的字面量 {text[:60]!r}（只支持 NULL/数字/布尔/字符串）")
+
+    def _cmd_prepare(self, p, s):
+        """`PREPARE name FROM 'SELECT ...'` / `FROM @var`"""
+        name = str(p.get('name') or '')
+        if not name:
+            return self._err(1064, "PREPARE 缺少语句名")
+        if p.get('from_var'):
+            value = self._pl_user_var_store(s).get(p['from_var'])
+            if value is None:
+                return self._err(
+                    1064, f"PREPARE 失败: 用户变量 @{p['from_var']} 未设置")
+            sql_text = str(value)
+        else:
+            sql_text = str(p.get('sql') or '')
+        sql_text = sql_text.strip()
+        if not sql_text:
+            return self._err(1064, "PREPARE 失败: SQL 为空")
+        from .parser import parser as _parser
+        try:
+            ast = _parser.parse(sql_text)
+        except Exception as e:
+            return self._err(1064, f"PREPARE 失败: SQL 解析错误: {e}")
+        if ast is None:
+            return self._err(1064, "PREPARE 失败: SQL 无法解析")
+        param_count = _parser.count_placeholders(sql_text)
+        store = s.setdefault('prepared_stmts', {}) if isinstance(s, dict) \
+            else {}
+        # MySQL：同名语句会被隐式 deallocate 后用新定义替换
+        for old in [k for k in store if k.lower() == name.lower()]:
+            store.pop(old, None)
+        store[name] = {'sql': sql_text, 'param_count': param_count,
+                       'command': ast.get('command')}
+        return self._ok(message=f"Statement '{name}' prepared")
+
+    def _cmd_deallocate_prepare(self, p, s):
+        """`DEALLOCATE PREPARE name` / `DROP PREPARE name`"""
+        name = str(p.get('name') or '')
+        store = s.get('prepared_stmts') or {} if isinstance(s, dict) else {}
+        key = next((k for k in store if k.lower() == name.lower()), None)
+        if key is None:
+            return self._err(
+                1243,
+                f"Unknown prepared statement handler ({name}) given to "
+                f"DEALLOCATE PREPARE", sqlstate='HY000')
+        store.pop(key, None)
+        return self._ok(message=f"Statement '{key}' deallocated")
+
+    @staticmethod
+    def _substitute_placeholders(sql_text: str, values: list):
+        """把 SQL 文本里**顶层**的 `?` 替换成 SQL 字面量"""
+        out = []
+        i = 0
+        n = 0
+        text = str(sql_text or '')
+        ln = len(text)
+        while i < ln:
+            ch = text[i]
+            if ch in ("'", '"', '`'):
+                q = ch
+                out.append(ch)
+                i += 1
+                while i < ln:
+                    out.append(text[i])
+                    if text[i] == '\\' and q in ("'", '"'):
+                        if i + 1 < ln:
+                            out.append(text[i + 1])
+                        i += 2
+                        continue
+                    if text[i] == q:
+                        if i + 1 < ln and text[i + 1] == q:
+                            out.append(text[i + 1])
+                            i += 2
+                            continue
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == '?':
+                if n >= len(values):
+                    raise ValueError("占位符数量多于 EXECUTE 参数")
+                out.append(Executor._sql_literal(values[n]))
+                n += 1
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        if n != len(values):
+            raise ValueError(
+                f"占位符数量 ({n}) 与参数个数 ({len(values)}) 不一致")
+        return ''.join(out)
+
+    def _cmd_execute_prepared(self, p, s):
+        """`EXECUTE name [USING @a, @b]`：替换 `?` 后走完整执行路径"""
+        name = str(p.get('name') or '')
+        store = s.get('prepared_stmts') or {} if isinstance(s, dict) else {}
+        key = next((k for k in store if k.lower() == name.lower()), None)
+        if key is None:
+            return self._err(
+                1243,
+                f"Unknown prepared statement handler ({name}) given to "
+                f"EXECUTE", sqlstate='HY000')
+        entry = store[key]
+        using = list(p.get('using') or [])
+        if len(using) != int(entry.get('param_count') or 0):
+            return self._err(
+                1210,
+                f"Incorrect arguments to EXECUTE: 语句需要 "
+                f"{entry.get('param_count')} 个参数，实际给了 {len(using)} 个",
+                sqlstate='HY000')
+        uv = self._pl_user_var_store(s)
+        values = [uv.get(v) for v in using]
+        try:
+            expanded = self._substitute_placeholders(entry['sql'], values)
+        except ValueError as e:
+            return self._err(1210, f"Incorrect arguments to EXECUTE: {e}",
+                             sqlstate='HY000')
+        from .parser import parser as _parser
+        try:
+            ast = _parser.parse(expanded)
+        except Exception as e:
+            return self._err(
+                1064, f"EXECUTE 失败: 替换参数后的 SQL 无法解析: {e}")
+        if ast is None:
+            return self._err(1064, "EXECUTE 失败: SQL 无法解析")
+        # 内层语句走完整 execute()：鉴权/事务/错误映射与文本协议完全一致。
+        return self.execute(ast, s)
 
     def _cmd_alter_unsupported(self, p, s):
         """`ALTER DATABASE` / `ALTER USER` 等非 TABLE 形态：显式不支持
@@ -2001,6 +2351,14 @@ class Executor:
                 and table not in self.db.tables):
             cols, rows = self.info_schema.query(table)
             return self._rs(cols, rows)
+
+        # E3：视图 —— 与 CTE 同一条「物化后查询」路径：
+        #   1) 执行视图定义查询，得到 (cols, rows)；
+        #   2) 包成 _CTERelation，外层 WHERE/聚合/ORDER BY/LIMIT 复用既有实现。
+        # 名字空间保证视图与表不同名（CREATE VIEW 时校验），所以这里在
+        # CTE 之后、真实表之前判定不会遮蔽任何真实表。
+        if self.db.get_view(table) is not None:
+            return self._select_from_view(p, s, table)
 
         # CTE：WITH 物化出来的内存关系（优先于真实表）
         rel = self._cte_relations.get(table.lower())
@@ -6753,6 +7111,37 @@ class Executor:
         except Exception as e:
             return self._err(1105, f"读取 binlog 位点失败: {e}")
 
+    def _show_binary_logs(self, p, s):
+        """`SHOW BINARY LOGS` / `SHOW MASTER LOGS` —— 真实 binlog 文件清单
+
+        数据来源：`Database.binlog_log`（真 append-only binlog）的
+        `file_names()` + 磁盘上每个文件的实际 `st_size`。binlog 未启用时
+        按 MySQL 语义返回 **1381 `You are not using binary logging`**
+        （显式错误，不伪造文件清单/大小）。
+        """
+        cols = ['Log_name', 'File_size']
+        writer = self._binlog_writer()
+        if writer is None:
+            return self._err(1381, "You are not using binary logging",
+                             sqlstate='HY000')
+        try:
+            names = list(writer.file_names())
+            current = getattr(writer, 'current_file', None)
+        except Exception as e:
+            return self._err(1105, f"读取 binlog 文件清单失败: {e}")
+        if current and current not in names:
+            names.append(current)
+        base = os.path.join(str(self.db.data_dir), 'binlog')
+        rows = []
+        for fname in sorted(set(names)):
+            path = os.path.join(base, fname)
+            try:
+                size = os.path.getsize(path) if os.path.exists(path) else 0
+            except OSError:                       # pragma: no cover - 防御
+                size = 0
+            rows.append((fname, size))
+        return self._rs(cols, rows)
+
     #: MySQL `SHOW SLAVE STATUS` 的列清单（**严格按文档顺序**）
     #
     #: 来源：MySQL 5.7 Reference Manual 13.7.5.34「SHOW SLAVE STATUS
@@ -7361,6 +7750,30 @@ class Executor:
         if idx >= 0:
             ddl = ddl[:idx + 1] + suffix + ddl[idx + 1:]
         return ddl
+
+    def _show_create_view(self, p, s):
+        """`SHOW CREATE VIEW v`（MySQL 5.7 四列）
+
+        * `View` = 视图名；
+        * `Create View` = 可执行 DDL（ALGORITHM/DEFINER/SQL SECURITY 形态
+          与 MySQL 一致；定义来自真实持久化元数据，不是编造）；
+        * `character_set_client` / `collation_connection` = 本引擎连接默认
+          （存储/比较是 UTF-8；比较语义为码点比较，见 SHOW COLLATION）。
+        视图不存在 → 1146（与 MySQL 一致，不返回空结果集）。
+        """
+        name = p.get('table')
+        view = self.db.get_view(name)
+        if view is None:
+            return self._err(1146, f"View '{name}' doesn't exist",
+                             sqlstate='42S02')
+        user = str((s or {}).get('user') or 'root')
+        ddl = (f"CREATE ALGORITHM=UNDEFINED DEFINER=`{user}`@`%` "
+               f"SQL SECURITY DEFINER VIEW `{view['name']}` AS "
+               f"{view['sql']}")
+        cols = ['View', 'Create View', 'character_set_client',
+                'collation_connection']
+        return self._rs(cols, [(view['name'], ddl, 'utf8mb4',
+                                'utf8mb4_bin')])
 
     #: MySQL 8.0 `SHOW INDEX` 的列清单（顺序照官方文档 13.7.7.22）
     _SHOW_INDEX_COLUMNS = (
@@ -9387,7 +9800,12 @@ class Executor:
             return self._err(
                 1049, f"Unknown database '{db_name}'", sqlstate='42000')
         cols = [f"Tables_in_{db_name}"]
-        rows = [(name,) for name in self.db.visible_table_names(db_name)]
+        # E3：SHOW TABLES 与 MySQL 一致，**包含视图**（类型区分靠
+        # SHOW FULL TABLES 的 Table_type=VIEW）；排序稳定。
+        names = set(self.db.visible_table_names(db_name))
+        if str(db_name).lower() == str(self.db.name).lower():
+            names.update(self.db.list_views())
+        rows = [(name,) for name in sorted(names)]
         return self._rs(cols, rows)
 
     def _cmd_show_databases(self, p, s):
@@ -9515,6 +9933,16 @@ class Executor:
                 opts.get('collate') or self._REAL_COLLATION,
                 None, create_options, getattr(tbl, 'comment', '') or '',
             ))
+        # E3：视图也出现在 SHOW TABLE STATUS 里（MySQL 语义）：
+        # 除 Name/Comment='VIEW' 外全部 NULL（视图没有存储/行数等属性，
+        # 不编造 Rows/Data_length 等值）。
+        for vname in self.db.list_views():
+            if not self._like_match(vname, p.get('like')):
+                continue
+            rows.append((
+                vname, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, '', 'VIEW',
+            ))
         return self._rs(cols, rows)
 
     def _show_full_tables(self, p, s):
@@ -9527,6 +9955,12 @@ class Executor:
         rows = [(name, 'BASE TABLE')
                 for name in self.db.visible_table_names(db_name)
                 if self._like_match(name, p.get('like'))]
+        # E3：视图以 Table_type=VIEW 出现在同一结果集里（Navicat 对象树
+        # 的「视图」分类就靠这一列）。
+        if str(db_name).lower() == str(self.db.name).lower():
+            rows += [(name, 'VIEW') for name in self.db.list_views()
+                     if self._like_match(name, p.get('like'))]
+        rows.sort(key=lambda r: (str(r[0]).lower(), str(r[1])))
         return self._rs([col, 'Table_type'], rows)
 
     def _show_full_columns(self, p, s):
@@ -9715,17 +10149,34 @@ class Executor:
             return self._err(
                 1115, f"Unknown character set: '{charset}'",
                 sqlstate='42000')
+        if charset == 'utf8mb3':
+            charset = 'utf8'
+        # 排序规则必须属于声明字符集（与 net/server.py 同一张表；错误码同
+        # MySQL：未知/不匹配 → 1273）。
+        allowed = {
+            'utf8mb4': ('utf8mb4_bin', 'utf8mb4_general_ci',
+                        'utf8mb4_unicode_ci'),
+            'utf8': ('utf8_bin', 'utf8_general_ci', 'utf8_unicode_ci'),
+            'latin1': ('latin1_bin', 'latin1_swedish_ci',
+                       'latin1_general_ci'),
+            'gbk': ('gbk_bin', 'gbk_chinese_ci'),
+        }.get(charset, ())
         collation = p.get('collation') or ''
-        if collation and collation not in self.OLAP_E1_COLLATIONS:
+        if collation and collation not in allowed:
             return self._err(
-                1273, f"Unknown collation: '{collation}'", sqlstate='HY000')
+                1273,
+                f"Unknown collation: '{collation}'"
+                f"（字符集 {charset} 支持: {', '.join(allowed) or '无'}）",
+                sqlstate='HY000')
         if isinstance(s, dict):
             s.setdefault('variables', {}).update({
                 'character_set_client': charset,
                 'character_set_connection': charset,
                 'character_set_results': charset,
                 'collation_connection':
-                    collation or ('utf8_bin' if charset == 'utf8'
+                    collation or ('utf8_bin' if charset == 'utf8' else
+                                  'latin1_swedish_ci' if charset == 'latin1'
+                                  else 'gbk_chinese_ci' if charset == 'gbk'
                                   else 'utf8mb4_bin'),
             })
         return self._ok(message="Query OK")

@@ -6,14 +6,15 @@
 1. **SHOW 元数据兼容**（Navicat/mysql CLI 高频序列，列名对齐 MySQL、
    取值真实不编造）：SHOW TABLE STATUS / FULL COLUMNS / FULL TABLES /
    COLLATION / CHARSET / CHARACTER SET / ENGINES / WARNINGS / GRANTS /
-   SHOW CREATE TABLE；`SHOW CREATE VIEW` 显式报错（视图是 E2）。
+   SHOW CREATE TABLE；`SHOW CREATE VIEW` 在不存在的视图上返回 1146
+   （E3 起视图已实现，见 tests/test_mysql_compat_e3.py）。
 2. **静默语义审计**：`PARTITION BY`、`CREATE PROCEDURE`/`CALL`、
    `ENGINE=`/`CHARSET=`/`COLLATE=`/`AUTO_INCREMENT=`/`ROW_FORMAT=`/
    `ON UPDATE`/生成列 —— 支持的有真实用例，不支持的一律**显式错误**，
    绝无"接受但未生效"。
 3. **字符集严格化**：非法 UTF-8 字节 → **1366**（不存 U+FFFD）；
-   `SET NAMES` 只接受 utf8/utf8mb4/utf8mb3（gbk/latin1 → 1115）；
-   不支持 `_ci` 排序规则（→1273）。
+   `SET NAMES` 只接受已支持字符集（E1 时 utf8/utf8mb4；E3 起新增
+   gbk/latin1 真转码），未知字符集仍显式 1115；未知排序规则 → 1273。
 4. **SAVEPOINT**：SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT
    的嵌套/重名/不存在语义，与 BEGIN/COMMIT/ROLLBACK/MVCC 协作。
 
@@ -162,10 +163,11 @@ def test_navicat_connection_show_sequence(served):
         cur.execute('SELECT COUNT(*) FROM nav')
         assert cur.fetchone()[0] == 2
 
-        # 视图是 E2：SHOW CREATE VIEW 必须**显式报错**，不能 500/空结果
+        # E3 起视图已实现；不存在的视图按 MySQL 语义返回 1146
+        # （不是 500/空结果集，也不是"功能未实现"的 1064）。
         with pytest.raises(Exception) as ei:
             cur.execute('SHOW CREATE VIEW no_view')
-        assert '视图' in str(ei.value) or 'VIEW' in str(ei.value), ei.value
+        assert getattr(ei.value, 'args', (None,))[0] == 1146, ei.value
 
 
 def test_show_metadata_values_are_real(served):
@@ -359,8 +361,10 @@ def test_set_names_supported_and_rejected(served):
         cur.execute('SELECT @@character_set_client')
         assert cur.fetchone()[0] in ('utf8', 'utf8mb4')
 
+        # E3 起 gbk/latin1 已被真正支持（见 tests/test_mysql_compat_e3.py）；
+        # 这里验证**未支持**字符集仍显式 1115，绝不"接受后按 utf8 收下"。
         with pytest.raises(pymysql_err()) as ei:
-            cur.execute('SET NAMES gbk')
+            cur.execute('SET NAMES koi8r')
         assert ei.value.args[0] == 1115, ei.value
         with pytest.raises(pymysql_err()) as ei:
             cur.execute('SET NAMES utf8mb4 COLLATE utf8mb4_unicode_520_ci')

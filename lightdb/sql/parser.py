@@ -140,6 +140,41 @@ class Parser:
             return self._create_table(sql)
         # E2：独立索引语句（Navicat 表设计器「索引」页保存时发送）。
         # 必须在通用 CREATE 兜底之前识别。
+        # ---- E3：视图（CREATE [OR REPLACE] VIEW / DROP VIEW）----
+        if re.match(r'CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b', sql,
+                    re.IGNORECASE):
+            return self._create_view(sql)
+        if re.match(r'DROP\s+VIEW\b', sql, re.IGNORECASE):
+            return self._drop_view(sql)
+        # ---- E3：SQL 层 PREPARE / EXECUTE / DEALLOCATE ----
+        pm = re.match(r'(?is)^PREPARE\s+[`"]?(\w+)[`"]?\s+FROM\s+(.+)$', sql)
+        if pm:
+            return self._prepare_stmt(pm.group(1), pm.group(2).strip())
+        em = re.match(
+            r'(?is)^EXECUTE\s+[`"]?(\w+)[`"]?'
+            r'(?:\s+USING\s+(.+?))?\s*;?\s*$', sql)
+        if em:
+            using_raw = (em.group(2) or '').strip()
+            using = []
+            if using_raw:
+                for part in self._split_top_level(using_raw):
+                    item = part.strip()
+                    if not item.startswith('@'):
+                        raise SyntaxError(
+                            f"EXECUTE ... USING 只支持用户变量（@name）: "
+                            f"{item!r}")
+                    using.append(item[1:].strip())
+            return {'command': 'EXECUTE PREPARED', 'name': em.group(1),
+                    'using': using}
+        dm = re.match(
+            r'(?is)^(?:DEALLOCATE|DROP)\s+PREPARE\s+'
+            r'[`"]?(\w+)[`"]?\s*;?\s*$', sql)
+        if dm:
+            return {'command': 'DEALLOCATE PREPARE',
+                    'name': dm.group(1)}
+        # ---- E3：进程内 `SET @x = <literal>`（网络路径由 server 会话层处理）----
+        if re.match(r'(?is)^SET\s+@', sql):
+            return self._set_user_variables(sql)
         if re.match(r'CREATE\s+(?:UNIQUE\s+)?INDEX\b', sql, re.IGNORECASE):
             return self._create_index(sql)
         if re.match(r'DROP\s+INDEX\b', sql, re.IGNORECASE):
@@ -406,11 +441,14 @@ class Parser:
             return self._show_result('WARNINGS')
 
         if re.match(r'(?is)^SHOW\s+CREATE\s+VIEW\b', sql):
-            # 视图未实现（路线图 E2）：显式报错，不返回假 DDL。
-            raise SyntaxError(
-                "SHOW CREATE VIEW 不支持：本引擎尚未实现视图"
-                "（路线图 E2）。CREATE VIEW 同样会被显式拒绝，"
-                "不会静默接受。")
+            # E3：视图已实现 → 结果集（View/Create View/charset/collation）。
+            vm = re.match(
+                r'(?is)^SHOW\s+CREATE\s+VIEW\s+[`"]?(\w+)[`"]?\s*;?\s*$',
+                sql)
+            if not vm:
+                raise SyntaxError(
+                    f"SHOW CREATE VIEW 语法错误: {sql[:100]}")
+            return self._show_result('CREATE_VIEW', table=vm.group(1))
         return None
 
     def _parse_ops_stmt(self, sql: str, upper: str):
@@ -431,6 +469,9 @@ class Parser:
         # ---- 复制状态 ----
         if upper in ('SHOW MASTER STATUS', 'SHOW BINARY LOG STATUS'):
             return self._show_result('MASTER_STATUS')
+        # E3：SHOW BINARY LOGS / SHOW MASTER LOGS —— 真实 binlog 文件清单
+        if re.match(r'(?is)^SHOW\s+(?:BINARY|MASTER)\s+LOGS\s*;?\s*$', sql):
+            return self._show_result('BINARY_LOGS')
         if upper in ('SHOW SLAVE STATUS', 'SHOW REPLICA STATUS'):
             return self._show_result('SLAVE_STATUS')
         if upper.startswith('SHOW BINLOG EVENTS'):
@@ -2977,6 +3018,130 @@ class Parser:
                 f"（形如 DROP INDEX idx ON t）")
         return {'command': 'DROP INDEX', 'name': m.group(1),
                 'table': m.group(2)}
+
+    # ============ E3：视图（CREATE [OR REPLACE] VIEW / DROP VIEW） ============
+
+    def _create_view(self, sql: str) -> Dict:
+        """`CREATE [OR REPLACE] VIEW name [(列...)] AS SELECT ...`
+
+        视图只存定义（SELECT 文本 + 可选列别名），SELECT 时展开到底层
+        查询；复杂到本引擎执行不了的查询会在使用处显式报错（不静默）。
+        """
+        m = re.match(
+            r'(?is)^CREATE\s+(OR\s+REPLACE\s+)?VIEW\s+[`"]?(\w+)[`"]?\s*'
+            r'(?:\(([^)]*)\)\s*)?AS\s+(.+)$', sql)
+        if not m:
+            raise SyntaxError(
+                f"CREATE VIEW 语法错误: {sql[:120]}"
+                f"（形如 CREATE [OR REPLACE] VIEW v AS SELECT ...）")
+        or_replace = bool(m.group(1))
+        name = m.group(2)
+        columns = []
+        if m.group(3):
+            columns = [c.strip().strip('`"')
+                       for c in self._split_top_level(m.group(3))
+                       if c.strip()]
+            for c in columns:
+                if not re.match(r'^[A-Za-z_]\w*$', c):
+                    raise SyntaxError(f"视图列名非法: {c!r}")
+            if len(set(c.lower() for c in columns)) != len(columns):
+                raise SyntaxError(f"视图列名重复: {columns}")
+        select_sql = m.group(4).strip().rstrip(';').strip()
+        if not select_sql:
+            raise SyntaxError("CREATE VIEW 缺少 AS SELECT ...")
+        return {'command': 'CREATE VIEW', 'table': name,
+                'or_replace': or_replace, 'columns': columns,
+                'select_sql': select_sql}
+
+    def _drop_view(self, sql: str) -> Dict:
+        """`DROP VIEW [IF EXISTS] v1 [, v2 ...]`"""
+        m = re.match(r'(?is)^DROP\s+VIEW\s+(IF\s+EXISTS\s+)?(.+)$', sql)
+        if not m:
+            raise SyntaxError(f"DROP VIEW 语法错误: {sql[:120]}")
+        if_exists = bool(m.group(1))
+        names = []
+        for part in self._split_top_level(m.group(2)):
+            item = part.strip().rstrip(';').strip()
+            nm = re.fullmatch(r'[`"]?(\w+)[`"]?', item)
+            if not nm:
+                raise SyntaxError(f"DROP VIEW 的表名非法: {item!r}")
+            names.append(nm.group(1))
+        if not names:
+            raise SyntaxError("DROP VIEW 缺少视图名")
+        return {'command': 'DROP VIEW', 'tables': names,
+                'if_exists': if_exists}
+
+    # ============ E3：SQL 层 PREPARE / EXECUTE / DEALLOCATE ============
+
+    def _prepare_stmt(self, name: str, source: str) -> Dict:
+        """`PREPARE stmt FROM 'SQL'` / `PREPARE stmt FROM @sql_var`"""
+        src = source.strip().rstrip(';').strip()
+        if src.startswith('@'):
+            vname = src[1:].strip()
+            if not re.fullmatch(r'[\w$]+', vname):
+                raise SyntaxError(f"PREPARE ... FROM 的变量名非法: {src!r}")
+            return {'command': 'PREPARE', 'name': name,
+                    'from_var': vname, 'sql': None, 'param_count': None}
+        if len(src) >= 2 and src[0] == src[-1] and src[0] in ("'", '"'):
+            inner = src[1:-1]
+            text = (inner.replace("''", "'") if src[0] == "'"
+                    else inner.replace('""', '"'))
+            return {'command': 'PREPARE', 'name': name, 'from_var': None,
+                    'sql': text,
+                    'param_count': self.count_placeholders(text)}
+        raise SyntaxError(
+            f"PREPARE ... FROM 只支持字符串字面量或用户变量: {src[:80]!r}")
+
+    @staticmethod
+    def count_placeholders(sql_text: str) -> int:
+        """统计**顶层** `?` 占位符（跳过引号/反引号/注释里的 `?`）"""
+        n = 0
+        i = 0
+        text = str(sql_text or '')
+        ln = len(text)
+        while i < ln:
+            ch = text[i]
+            if ch in ("'", '"', '`'):
+                q = ch
+                i += 1
+                while i < ln:
+                    if text[i] == '\\' and q in ("'", '"'):
+                        i += 2
+                        continue
+                    if text[i] == q:
+                        if i + 1 < ln and text[i + 1] == q:
+                            i += 2
+                            continue
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == '#' or (ch == '-' and text[i:i + 2] == '--'):
+                j = text.find('\n', i)
+                i = ln if j < 0 else j + 1
+                continue
+            if ch == '/' and text[i:i + 2] == '/*':
+                j = text.find('*/', i + 2)
+                i = ln if j < 0 else j + 2
+                continue
+            if ch == '?':
+                n += 1
+            i += 1
+        return n
+
+    def _set_user_variables(self, sql: str) -> Dict:
+        """进程内 `SET @x = <literal>[, @y = ...]`（字面量/简单表达式文本）"""
+        body = re.sub(r'(?is)^SET\s+', '', sql).strip()
+        assigns = []
+        for part in self._split_top_level(body):
+            item = part.strip()
+            am = re.match(r'@([\w$]+)\s*(?::=|=)\s*(.+)$', item,
+                          re.DOTALL)
+            if not am:
+                raise SyntaxError(f"SET 用户变量语法错误: {item[:80]!r}")
+            assigns.append({'name': am.group(1),
+                            'expr': am.group(2).strip()})
+        return {'command': 'SET USER VARIABLE', 'assignments': assigns}
 
     def _alter_table(self, sql: str) -> Dict:
         m = re.match(

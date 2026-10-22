@@ -420,9 +420,14 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         return (resolved, None) if err is None else (None, err)
 
     def _visible_tables(self, db_name):
-        """给定库下可见的表（真实表 + `information_schema` 虚拟表）"""
+        """给定库下可见的表（真实表 + `information_schema` 虚拟表 + 视图）"""
         try:
-            return list(self.db.visible_table_names(db_name))
+            names = list(self.db.visible_table_names(db_name))
+            # E3：SHOW TABLES（网络内置分支）同样包含视图（MySQL 语义）。
+            if self.db is not None and str(db_name).lower() == str(
+                    getattr(self.db, 'name', '')).lower():
+                names.extend(getattr(self.db, 'list_views', lambda: [])())
+            return sorted(set(names))
         except Exception as e:                # pragma: no cover - 防御
             logger.warn(f"读取表列表失败 ({db_name}): {e}")
             return []
@@ -451,23 +456,50 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
     # ==================== 命令分发 ====================
 
-    #: E1：客户端 SQL 文本必须是**合法 UTF-8**（本引擎字符集只有 utf8/
-    #: utf8mb4）。非法字节/未支持字符集 → 1366；绝不
-    #: `decode(errors='replace')` 后把 U+FFFD 存进库（那会静默污染数据，
-    #: 客户端拿到 OK 却永远读不回原字节）。
-    def _decode_client_utf8(self, raw: bytes, what: str = 'query'):
-        """严格解码客户端字节流；失败返回 `(None, ERR 包 1366)`"""
+    #: E3：连接字符集 → Python codec。SET NAMES gbk/latin1 后，客户端
+    #: 发来的 SQL 字节按该编码严格解码，结果集/错误文本按
+    #: `character_set_results` 编码回写 —— 真正的入/出转码。
+    _CHARSET_CODECS = {
+        'utf8': 'utf-8', 'utf8mb3': 'utf-8', 'utf8mb4': 'utf-8',
+        'latin1': 'latin-1', 'gbk': 'gbk',
+    }
+
+    def _session_charset(self, key: str) -> str:
         try:
-            return bytes(raw).decode('utf-8'), None
+            variables = (self.session or {}).get('variables') or {}
+            return str(variables.get(key) or 'utf8mb4').lower()
+        except Exception:                         # pragma: no cover - 防御
+            return 'utf8mb4'
+
+    def _client_codec(self) -> str:
+        cs = self._session_charset('character_set_client')
+        return self._CHARSET_CODECS.get(cs, 'utf-8')
+
+    def _result_codec(self) -> str:
+        cs = self._session_charset('character_set_results')
+        return self._CHARSET_CODECS.get(cs, 'utf-8')
+
+    def _decode_client_utf8(self, raw: bytes, what: str = 'query'):
+        """按会话字符集**严格**解码客户端字节流；失败返回 `(None, ERR 1366)`
+
+        E1 起拒绝 `decode(errors='replace')` 静默写入 U+FFFD；E3 起按
+        SET NAMES 声明（utf8/utf8mb4/latin1/gbk）真正解码——非法序列显式
+        1366，错误分类/信息与 MySQL `Incorrect string value` 对齐。
+        """
+        codec = self._client_codec()
+        try:
+            return bytes(raw).decode(codec), None
         except UnicodeDecodeError as e:
             raw = bytes(raw)
             bad = raw[max(0, e.start):e.start + 16]
             shown = ''.join('\\x%02X' % b for b in bad)
+            charset = self._session_charset('character_set_client')
             return None, mp.make_err_packet(
                 1366, 'HY000',
                 f"Incorrect string value: '{shown}' for column 'query' "
-                f"（{what} 必须为合法 UTF-8；本引擎不支持 latin1/gbk "
-                f"隐式转码，也不会用 U+FFFD 替换后写入）")
+                f"（{what} 字节序列不是合法的 {charset} 编码；本引擎"
+                f"不会用替换字符静默写入）",
+                encoding=self._result_codec())
 
     def _dispatch(self, packet: bytes):
         cmd = packet[0]
@@ -827,7 +859,8 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             affected_rows=affected_rows,
             last_insert_id=last_insert_id,
             status_flags=self._status_flags(),
-            message=message)
+            message=message,
+            encoding=self._result_codec())
 
     def _begin_session_txn(self):
         """在连接级 session 上开事务（autocommit=0 的隐式事务起点）
@@ -987,34 +1020,38 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         if m is not None:
             charset = (m.group(2) or 'utf8mb4').lower()
             collation = (m.group(3) or '').lower()
-            # E1 字符集严格化：只接受本引擎**真实支持**的 UTF-8 家族
-            # （utf8/utf8mb4/utf8mb3）。gbk 等不做转码 → 显式 1115，绝不
-            # "接受但按 utf8 收下"（那会让客户端写中文时静默乱码）。
-            # `latin1` 作为**历史客户端兼容名**保留（既有协议测试锁定了
-            # 它可被记录），但不做转码：服务端始终按 UTF-8 解码，latin1
-            # 非 ASCII 字节会在解码处显式 1366（不是静默替换）。
-            if charset not in ('utf8', 'utf8mb4', 'utf8mb3', 'latin1'):
+            # E3：SET NAMES gbk/latin1 真正转码（入：SQL 字节按该编码严格
+            # 解码，非法→1366；出：结果集按该编码回写）。utf8/utf8mb4
+            # 语义与 E1 一致；其它未支持字符集仍显式 1115。
+            if charset not in ('utf8', 'utf8mb4', 'utf8mb3', 'latin1',
+                               'gbk'):
                 self._send_packet(mp.make_err_packet(
                     1115, '42000',
-                    f"Unknown character set: '{charset}'"))
+                    f"Unknown character set: '{charset}'",
+                    encoding=self._result_codec()))
                 return
             if charset == 'utf8mb3':
                 charset = 'utf8'
-            if collation and collation not in (
-                    'utf8mb4_bin', 'utf8_bin',
-                    'utf8mb4_general_ci', 'utf8_general_ci'):
-                # 排序规则：bin 是真实比较语义（码点/二进制）；`_general_ci`
-                # 仅作为连接元数据记录（不改比较语义，见 status 说明）。
+            # 排序规则：只接受与声明字符集匹配的已知 collation；bin 是真实
+            # 比较语义，`_general_ci`/`_swedish_ci`/`_chinese_ci` 仅作为
+            # 连接元数据记录（不改比较语义）。
+            allowed_collations = {
+                'utf8mb4': ('utf8mb4_bin', 'utf8mb4_general_ci',
+                            'utf8mb4_unicode_ci'),
+                'utf8': ('utf8_bin', 'utf8_general_ci',
+                         'utf8_unicode_ci'),
+                'latin1': ('latin1_bin', 'latin1_swedish_ci',
+                           'latin1_general_ci'),
+                'gbk': ('gbk_bin', 'gbk_chinese_ci'),
+            }.get(charset, ())
+            if collation and collation not in allowed_collations:
                 self._send_packet(mp.make_err_packet(
                     1273, 'HY000',
                     f"Unknown collation: '{collation}'"
-                    f"（本引擎真实比较语义为大小写敏感；仅接受 "
-                    f"utf8mb4_bin / utf8_bin / utf8mb4_general_ci / "
-                    f"utf8_general_ci 作为连接元数据）"))
+                    f"（字符集 {charset} 支持: "
+                    f"{', '.join(allowed_collations) or '无'}）",
+                    encoding=self._result_codec()))
                 return
-            # 只记录、不改变协议编码（服务端始终以 UTF-8 收发）；
-            # 但 @@character_set_client / SHOW VARIABLES 必须如实反映，
-            # 否则客户端会以为字符集协商生效了。
             session['variables']['character_set_client'] = charset
             session['variables']['character_set_connection'] = charset
             session['variables']['character_set_results'] = charset
@@ -1126,6 +1163,9 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         columns: [(name, type, length), ...]
         rows: [(val1, val2, ...), ...]
         """
+        # E3：结果集按会话 `character_set_results` 编码（latin1/gbk 老客户端
+        # 拿到自己声明的字节；utf8mb4 默认路径与旧行为逐字节一致）。
+        enc = self._result_codec()
         # 列数
         self._send_packet(
             mp.write_lenenc_int(len(columns)))
@@ -1133,7 +1173,8 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         # 列定义
         for name, ctype, length in columns:
             self._send_packet(
-                mp.make_column_definition(name, ctype, length))
+                mp.make_column_definition(name, ctype, length,
+                                          encoding=enc))
 
         # EOF（带真实会话状态：autocommit / in-trans 标志）
         self._send_packet(
@@ -1141,7 +1182,7 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
         # 数据行
         for row in rows:
-            self._send_packet(mp.make_text_row(list(row)))
+            self._send_packet(mp.make_text_row(list(row), encoding=enc))
 
         # 结束 EOF
         self._send_packet(
@@ -1163,7 +1204,8 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._send_packet(mp.make_err_packet(
                 code,
                 sqlstate,
-                str(result.get('message', 'execution error'))[:200]))
+                str(result.get('message', 'execution error'))[:200],
+                encoding=self._result_codec()))
             return
 
         if cmd == 'INSERT':
@@ -1183,8 +1225,23 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                    'TRUNCATE', 'BEGIN', 'COMMIT',
                    'ROLLBACK', 'GRANT', 'REVOKE',
                    'SET PASSWORD', 'ALTER TABLE',
-                   'USE', 'ANALYZE'):
+                   'USE', 'ANALYZE',
+                   # E3：视图 DDL / SQL 层 PREPARE 回 OK
+                   'CREATE VIEW', 'DROP VIEW', 'PREPARE',
+                   'DEALLOCATE PREPARE', 'SET USER VARIABLE'):
             self._send_packet(self._ok_packet())
+            return
+
+        if cmd == 'EXECUTE PREPARED':
+            # SQL 层 `EXECUTE ... USING`：内层语句若返回结果集，按**文本
+            # 协议**结果集回包（与直接执行该语句完全一致）。
+            if result.get('type') == 'resultset':
+                self._send_resultset(
+                    self._infer_columns(
+                        result['columns'], result['rows']),
+                    result['rows'])
+            else:
+                self._send_packet(self._ok_packet())
             return
 
         if cmd == 'EXPLAIN':
@@ -2145,16 +2202,18 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
     def _send_binary_resultset(self, columns, rows):
         """二进制结果集：列数 + 列定义 + EOF + 二进制行 + EOF"""
+        enc = self._result_codec()
         meta = self._binary_columns(columns, rows)
         self._send_packet(mp.write_lenenc_int(len(meta)))
         for name, ctype, length in meta:
             self._send_packet(
-                mp.make_column_definition(name, ctype, length))
+                mp.make_column_definition(name, ctype, length,
+                                          encoding=enc))
         self._send_packet(
             mp.make_eof_packet(status_flags=self._status_flags()))
         for row in rows:
             self._send_packet(
-                mp.make_binary_row(list(row), meta))
+                mp.make_binary_row(list(row), meta, encoding=enc))
         self._send_packet(
             mp.make_eof_packet(status_flags=self._status_flags()))
 

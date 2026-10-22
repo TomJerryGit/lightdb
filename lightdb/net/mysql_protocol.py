@@ -133,11 +133,11 @@ def read_lenenc_int(data: bytes, offset: int = 0):
     return 0, offset + 1
 
 
-def write_lenenc_str(s) -> bytes:
+def write_lenenc_str(s, encoding: str = 'utf-8') -> bytes:
     if s is None:
         return b'\xfb'
     if isinstance(s, str):
-        s = s.encode('utf-8')
+        s = s.encode(encoding)
     return write_lenenc_int(len(s)) + s
 
 
@@ -149,11 +149,11 @@ def read_lenenc_str(data: bytes, offset: int = 0):
     return s.decode('utf-8', errors='replace'), offset + n
 
 
-def write_null_str(s: str) -> bytes:
+def write_null_str(s: str, encoding: str = 'utf-8') -> bytes:
     if s is None:
         return b'\x00'
     if isinstance(s, str):
-        s = s.encode('utf-8')
+        s = s.encode(encoding)
     return s + b'\x00'
 
 
@@ -196,7 +196,7 @@ def make_handshake_v10(connection_id: int, auth_seed: bytes,
 
 def make_ok_packet(affected_rows: int = 0, last_insert_id: int = 0,
                    status_flags: int = SERVER_STATUS_AUTOCOMMIT,
-                   message: str = "") -> bytes:
+                   message: str = "", encoding: str = 'utf-8') -> bytes:
     """OK包"""
     payload = b'\x00'  # OK header
     payload += write_lenenc_int(affected_rows)
@@ -204,16 +204,26 @@ def make_ok_packet(affected_rows: int = 0, last_insert_id: int = 0,
     payload += struct.pack('<H', status_flags)
     payload += struct.pack('<H', 0)  # warnings
     if message:
-        payload += message.encode('utf-8')
+        try:
+            payload += message.encode(encoding)
+        except UnicodeEncodeError:
+            # 连接字符集（latin1/gbk）编码不了这条文本时用替换字符兜底：
+            # 保住连接与错误码，绝不让编码异常把会话打断。
+            payload += message.encode(encoding, errors='replace')
     return payload
 
 
-def make_err_packet(code: int = 1064, sql_state: str = "42000", message: str = "Error") -> bytes:
+def make_err_packet(code: int = 1064, sql_state: str = "42000",
+                    message: str = "Error",
+                    encoding: str = 'utf-8') -> bytes:
     """ERR包"""
     payload = b'\xff'
     payload += struct.pack('<H', code)
     payload += b'#' + sql_state.encode('ascii')[:5]
-    payload += message.encode('utf-8')
+    try:
+        payload += message.encode(encoding)
+    except UnicodeEncodeError:
+        payload += message.encode(encoding, errors='replace')
     return payload
 
 
@@ -226,15 +236,16 @@ def make_eof_packet(status_flags: int = SERVER_STATUS_AUTOCOMMIT) -> bytes:
 
 
 def make_column_definition(name: str, col_type: int, length: int = 255,
-                           flags: int = 0, decimals: int = 0) -> bytes:
+                           flags: int = 0, decimals: int = 0,
+                           encoding: str = 'utf-8') -> bytes:
     """列定义（结果集用）"""
     payload = b''
     payload += write_lenenc_str(b'def')         # catalog
     payload += write_lenenc_str(b'lightdb')     # schema
     payload += write_lenenc_str(b'')            # table (alias)
     payload += write_lenenc_str(b'')            # org_table
-    payload += write_lenenc_str(name)           # name
-    payload += write_lenenc_str(name)           # org_name
+    payload += write_lenenc_str(name, encoding)  # name
+    payload += write_lenenc_str(name, encoding)  # org_name
     payload += b'\x0c'                          # length of fixed fields
     payload += struct.pack('<H', CHARSET_UTF8MB4)
     payload += struct.pack('<I', length)
@@ -245,14 +256,14 @@ def make_column_definition(name: str, col_type: int, length: int = 255,
     return payload
 
 
-def make_text_row(values: list) -> bytes:
+def make_text_row(values: list, encoding: str = 'utf-8') -> bytes:
     """文本协议行"""
     payload = b''
     for v in values:
         if v is None:
             payload += b'\xfb'
         else:
-            payload += write_lenenc_str(str(v))
+            payload += write_lenenc_str(str(v), encoding)
     return payload
 
 
@@ -743,7 +754,8 @@ def _encode_temporal_value(value, type_code: int) -> bytes:
     return struct.pack('<B', 7) + body
 
 
-def _encode_binary_value(value, type_code: int) -> bytes:
+def _encode_binary_value(value, type_code: int,
+                         encoding: str = 'utf-8') -> bytes:
     code = int(type_code)
     if code == MYSQL_TYPE_TINY:
         return struct.pack('<b', int(value))
@@ -765,14 +777,14 @@ def _encode_binary_value(value, type_code: int) -> bytes:
                 MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_LONG_BLOB,
                 MYSQL_TYPE_GEOMETRY):
         raw = value if isinstance(value, (bytes, bytearray)) else str(
-            value).encode('utf-8')
+            value).encode(encoding)
         return write_lenenc_int(len(raw)) + bytes(raw)
     text = value if isinstance(value, str) else str(value)
-    raw = text.encode('utf-8')
+    raw = text.encode(encoding)
     return write_lenenc_int(len(raw)) + raw
 
 
-def make_binary_row(values, columns) -> bytes:
+def make_binary_row(values, columns, encoding: str = 'utf-8') -> bytes:
     """构造二进制协议行
 
     `columns`：与文本结果集同一份 `[(name, ctype, length), ...]`。
@@ -788,5 +800,5 @@ def make_binary_row(values, columns) -> bytes:
         if value is None or int(ctype) == MYSQL_TYPE_NULL:
             bitmap[(i + 2) // 8] |= 1 << ((i + 2) % 8)
             continue
-        parts.append(_encode_binary_value(value, ctype))
+        parts.append(_encode_binary_value(value, ctype, encoding))
     return b'\x00' + bytes(bitmap) + b''.join(parts)

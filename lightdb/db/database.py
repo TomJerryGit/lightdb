@@ -268,6 +268,11 @@ class Database:
         self.mvcc = MVCCManager()
 
         self.tables: Dict[str, Table] = {}
+        #: E3：视图定义（`CREATE VIEW`）。只存定义（名字 / SELECT 文本 /
+        #: 可选列别名），不落盘数据；随 `_meta.json` 持久化，重启后仍在。
+        #: SELECT 展开在执行器（`Executor._select_from_view`），等价于把
+        #: 视图查询物化后做外层 WHERE/聚合/排序。
+        self.views: Dict[str, dict] = {}
         self.users: Dict[str, dict] = {
             'root': {
                 'auth_hash': hash_native_password(''),
@@ -534,6 +539,21 @@ class Database:
                     or '')
             if 'users' in meta:
                 self.users = meta['users']
+            # E3：视图定义随元数据恢复（重启后 SHOW FULL TABLES/CREATE/
+            # SELECT 仍可用；损坏条目丢弃并告警，绝不让半个视图进入目录）。
+            loaded_views = meta.get('views') or {}
+            if isinstance(loaded_views, dict):
+                for vname, vinfo in loaded_views.items():
+                    if not isinstance(vinfo, dict):
+                        continue
+                    sql = str(vinfo.get('sql') or '').strip()
+                    if not sql:
+                        continue
+                    self.views[str(vname)] = {
+                        'sql': sql,
+                        'columns': [str(c) for c in
+                                    (vinfo.get('columns') or [])],
+                    }
             self._pending_ddl = meta.get('pending_ddl')
         except Exception as e:
             logger.error(f"加载元数据失败: {e}")
@@ -574,6 +594,9 @@ class Database:
                 for n, t in list(self.tables.items())
             },
             'users': self.users,
+            # E3：视图定义（名字 → {'sql','columns'}）。不导出数据，
+            # 只持久化定义，SELECT 时展开到底层查询。
+            'views': self.views,
             # ★ 进行中的结构变更（崩溃恢复的唯一依据）。它有值 = "结构变更
             #   还没提交"：重启后按它把剩余的行补完（见 `_recover_pending_ddl`）。
             #   写在**同一份** `_meta.json` 里，是为了让"新列定义"与
@@ -710,6 +733,64 @@ class Database:
         if name not in self.tables:
             raise KeyError(f"表 {name} 不存在")
         return self.tables[name]
+
+    # ==================== E3：视图（定义持久化 + 名字空间） ====================
+    #
+    # 视图只存定义（SELECT 文本 + 可选列别名），不存数据；`SELECT` 时由
+    # 执行器物化定义查询再做外层过滤/聚合。名字空间与表共用（MySQL 里
+    # 表与视图不能同名）：CREATE VIEW 遇到同名表显式 1050。
+
+    def get_view(self, name):
+        """按名字取视图定义（大小写不敏感）；不存在返回 None"""
+        want = str(name or '').strip().lower()
+        if not want:
+            return None
+        for vname, vinfo in list(self.views.items()):
+            if vname.lower() == want:
+                return {'name': vname, **dict(vinfo)}
+        return None
+
+    def list_views(self) -> List[str]:
+        """全部视图名（排序稳定，供 SHOW 输出）"""
+        return sorted(self.views.keys())
+
+    def create_view(self, name: str, sql: str, or_replace: bool = False,
+                    columns=None) -> dict:
+        """登记视图定义；名字与表/视图冲突按 MySQL 语义显式报错"""
+        name = str(name or '').strip()
+        if not re.match(r'^[A-Za-z_]\w*$', name):
+            raise DdlError(
+                f"Incorrect view name '{name}'（只支持 [A-Za-z_]\\w*）",
+                errno=1103, sqlstate='42000')
+        if any(t.lower() == name.lower() for t in self.tables):
+            raise DdlError(f"Table '{name}' already exists", errno=1050,
+                           sqlstate='42S01')
+        existing = self.get_view(name)
+        if existing is not None and not or_replace:
+            raise DdlError(f"Table '{name}' already exists", errno=1050,
+                           sqlstate='42S01')
+        real_name = existing['name'] if existing is not None else name
+        self.views[real_name] = {
+            'sql': str(sql or '').strip(),
+            'columns': [str(c) for c in (columns or [])],
+        }
+        self.save_meta()
+        return {'name': real_name,
+                'sql': self.views[real_name]['sql'],
+                'replaced': bool(existing)}
+
+    def drop_view(self, name: str, if_exists: bool = False) -> dict:
+        """删除视图；不存在时 IF EXISTS 成功、否则显式 1051"""
+        view = self.get_view(name)
+        if view is None:
+            if if_exists:
+                return {'dropped': False, 'name': str(name)}
+            raise DdlError(
+                f"Unknown table '{self.name}.{name}'", errno=1051,
+                sqlstate='42S02')
+        self.views.pop(view['name'], None)
+        self.save_meta()
+        return {'dropped': True, 'name': view['name']}
 
     # ==================== DDL：结构变更（ALTER / TRUNCATE） ====================
     #
