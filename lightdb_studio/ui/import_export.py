@@ -227,23 +227,120 @@ class ExportCancelled(Exception):
     """导出被取消（内部用；文件已被删除）。"""
 
 
+def _jsonable(value):
+    """导出 JSON 的可序列化值：bytes→hex、日期→ISO、其它按原类型。"""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        return '0x' + value.hex()
+    try:
+        import datetime as _dt
+        if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+            return value.isoformat()
+    except Exception:
+        pass
+    return str(value)
+
+
+def _sql_ident(name):
+    return '`' + str(name).replace('`', '``') + '`'
+
+
+def _sql_literal(value, null_as_empty=False):
+    """SQL 字面量：NULL/数字/布尔/bytes/字符串（转义安全）。"""
+    if value is None:
+        return '' if null_as_empty else 'NULL'
+    if isinstance(value, bool):
+        return '1' if value else '0'
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, bytes):
+        return "0x" + value.hex()
+    text = str(value)
+    escaped = (text.replace('\\', '\\\\')
+               .replace("'", "\\'")
+               .replace('\x00', ''))
+    return "'" + escaped + "'"
+
+
 def write_export_chunked(filepath, columns, rows, fmt='csv',
                          with_header=True, null_as_empty=True,
                          batch_size=DEFAULT_BATCH_SIZE,
                          progress_cb=None, cancel_cb=None,
-                         chunk_delay=0.0):
-    """分块写导出文件（CSV / XLSX）。
+                         chunk_delay=0.0, table_name='query_result'):
+    """分块写导出文件（CSV / XLSX / JSON / SQL INSERT）。
 
-    - 分块遍历（每批 `batch_size` 行），进度回调 `(done, total)`；
-    - `cancel_cb()` 为真 → 抛 `ExportCancelled` 并**删除不完整文件**；
-    - 其它异常同样删除不完整文件后重抛；
+    - JSON：对象数组（键=列名），值经 `_jsonable` 处理；
+    - SQL INSERT：`INSERT INTO <表> (<列>) VALUES (...)`，NULL/字符串转义安全；
+    - 分块、进度回调、取消删除不完整文件语义与 CSV/XLSX 一致。
     返回写入行数。
     """
     columns = list(columns or [])
     rows = list(rows or [])
     total = len(rows)
     fmt = (fmt or 'csv').lower()
+    if fmt in ('sql', 'insert', 'sql_insert'):
+        fmt = 'sql_insert'
     written = 0
+    if fmt == 'json':
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write('[\n')
+                first = True
+                for batch in chunk_rows(rows, batch_size):
+                    if cancel_cb is not None and cancel_cb():
+                        raise ExportCancelled('cancelled')
+                    for row in batch:
+                        obj = {str(col): _jsonable(row[i] if i < len(row)
+                                                   else None)
+                               for i, col in enumerate(columns)}
+                        if not first:
+                            f.write(',\n')
+                        f.write(json.dumps(obj, ensure_ascii=False))
+                        first = False
+                        written += 1
+                    if progress_cb is not None:
+                        progress_cb(written, total)
+                    if chunk_delay:
+                        time.sleep(chunk_delay)
+                f.write('\n]\n')
+            return written
+        except ExportCancelled:
+            _safe_remove(filepath)
+            raise
+        except Exception:
+            _safe_remove(filepath)
+            raise
+
+    if fmt == 'sql_insert':
+        table = _sql_ident(table_name or 'query_result')
+        col_sql = ', '.join(_sql_ident(c) for c in columns)
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write('-- LightDB Studio SQL INSERT export\n')
+                f.write(f'-- rows: {total}\n')
+                for batch in chunk_rows(rows, batch_size):
+                    if cancel_cb is not None and cancel_cb():
+                        raise ExportCancelled('cancelled')
+                    for row in batch:
+                        values = ', '.join(
+                            _sql_literal(v, null_as_empty=False)
+                            for v in row)
+                        f.write(f'INSERT INTO {table} ({col_sql}) '
+                                f'VALUES ({values});\n')
+                        written += 1
+                    if progress_cb is not None:
+                        progress_cb(written, total)
+                    if chunk_delay:
+                        time.sleep(chunk_delay)
+            return written
+        except ExportCancelled:
+            _safe_remove(filepath)
+            raise
+        except Exception:
+            _safe_remove(filepath)
+            raise
+
     if fmt == 'xlsx':
         # 注：调用方已经持有 rows 列表；这里用普通 Workbook 按批 append，
         # 取消时**不 save**，因此不会产生不完整文件（也无法留下半截 xlsx）。
@@ -354,11 +451,12 @@ class ImportWorker(QRunnable):
 
 
 class ExportWorker(QRunnable):
-    """后台分块导出 worker（CSV/XLSX，取消删除不完整文件）。"""
+    """后台分块导出 worker（CSV/XLSX/JSON/SQL INSERT；取消删除不完整文件）。"""
 
     def __init__(self, filepath, columns, rows, fmt='csv',
                  with_header=True, null_as_empty=True,
-                 batch_size=DEFAULT_BATCH_SIZE, chunk_delay=0.0):
+                 batch_size=DEFAULT_BATCH_SIZE, chunk_delay=0.0,
+                 table_name='query_result'):
         super().__init__()
         self.setAutoDelete(False)
         self.filepath = filepath
@@ -369,6 +467,7 @@ class ExportWorker(QRunnable):
         self.null_as_empty = bool(null_as_empty)
         self.batch_size = int(batch_size or DEFAULT_BATCH_SIZE)
         self.chunk_delay = float(chunk_delay or 0.0)
+        self.table_name = table_name or 'query_result'
         self.signals = TransferSignals()
         self._cancel_event = threading.Event()
 
@@ -389,7 +488,8 @@ class ExportWorker(QRunnable):
                 progress_cb=lambda done, total:
                     self.signals.progress.emit(int(done), int(total)),
                 cancel_cb=lambda: self._cancel_event.is_set(),
-                chunk_delay=self.chunk_delay)
+                chunk_delay=self.chunk_delay,
+                table_name=self.table_name)
             self.signals.finished.emit({
                 'ok': True, 'cancelled': False, 'written': written,
                 'path': self.filepath, 'file_deleted': False})
@@ -681,8 +781,12 @@ class ExportCSVDialog(QDialog):
         self._progress = None
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
+        stem = os.path.splitext(str(default_name or 'export'))[0]
+        import re as _re
+        self.table_name = (_re.sub(r'[^A-Za-z0-9_$]', '_', stem)
+                           or 'query_result')
         self.setWindowTitle("导出结果")
-        self.resize(560, 300)
+        self.resize(560, 340)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -693,6 +797,8 @@ class ExportCSVDialog(QDialog):
         self.fmt_combo = QComboBox()
         self.fmt_combo.addItem("CSV", 'csv')
         self.fmt_combo.addItem("Excel (XLSX)", 'xlsx')
+        self.fmt_combo.addItem("JSON (对象数组)", 'json')
+        self.fmt_combo.addItem("SQL INSERT", 'sql_insert')
         self.fmt_combo.currentIndexChanged.connect(self._on_format_changed)
         fmt_row.addWidget(self.fmt_combo)
         fmt_row.addStretch()
@@ -731,20 +837,22 @@ class ExportCSVDialog(QDialog):
     def _on_format_changed(self, _index):
         fmt = self.export_format()
         path = self.path_edit.text().strip()
+        ext = {'xlsx': '.xlsx', 'json': '.json',
+               'sql_insert': '.sql'}.get(fmt, '.csv')
         if path:
             base = os.path.splitext(path)[0]
-            self.path_edit.setText(base + ('.xlsx' if fmt == 'xlsx' else '.csv'))
+            self.path_edit.setText(base + ext)
 
     def _browse(self):
         fmt = self.export_format()
-        if fmt == 'xlsx':
-            path, _ = QFileDialog.getSaveFileName(
-                self, "保存 Excel", self.path_edit.text(),
-                "Excel 文件 (*.xlsx)")
-        else:
-            path, _ = QFileDialog.getSaveFileName(
-                self, "保存 CSV", self.path_edit.text(),
-                "CSV 文件 (*.csv)")
+        filters = {
+            'xlsx': ("保存 Excel", "Excel 文件 (*.xlsx)"),
+            'json': ("保存 JSON", "JSON 文件 (*.json)"),
+            'sql_insert': ("保存 SQL", "SQL 文件 (*.sql)"),
+        }
+        title, filt = filters.get(fmt, ("保存 CSV", "CSV 文件 (*.csv)"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, title, self.path_edit.text(), filt)
         if path:
             self.path_edit.setText(path)
 
@@ -756,7 +864,8 @@ class ExportCSVDialog(QDialog):
         if self._worker is not None:
             return
         fmt = self.export_format()
-        want_ext = '.xlsx' if fmt == 'xlsx' else '.csv'
+        want_ext = {'xlsx': '.xlsx', 'json': '.json',
+                    'sql_insert': '.sql'}.get(fmt, '.csv')
         if not path.lower().endswith(want_ext):
             path += want_ext
             self.path_edit.setText(path)
@@ -771,7 +880,8 @@ class ExportCSVDialog(QDialog):
             path, self.columns, self.rows, fmt=fmt,
             with_header=self.with_header.isChecked(),
             null_as_empty=self.null_as_empty.isChecked(),
-            batch_size=DEFAULT_BATCH_SIZE)
+            batch_size=DEFAULT_BATCH_SIZE,
+            table_name=self.table_name)
         self._worker = worker
         self._signals = worker.signals
         worker.signals.progress.connect(self._on_export_progress)

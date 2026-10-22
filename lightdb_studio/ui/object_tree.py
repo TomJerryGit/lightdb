@@ -1,13 +1,14 @@
 """左侧对象浏览器：连接 / 数据库 / 表（P1-6：懒加载 + 右键菜单）"""
+import json
 import re
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
     QMenu, QMessageBox, QInputDialog, QToolBar, QLineEdit,
-    QPushButton, QHBoxLayout, QLabel, QApplication
+    QPushButton, QHBoxLayout, QLabel, QApplication, QAbstractItemView
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QIcon, QFont, QColor
+from PySide6.QtCore import Qt, Signal, QMimeData
+from PySide6.QtGui import QAction, QIcon, QFont, QColor, QDrag
 
 from ..db.connection import DBConnection
 from ..db.metadata import MetadataLoader
@@ -34,6 +35,30 @@ NODE_EVENT = 'event'
 _LOADING_TEXT = "加载中..."
 
 
+class _DraggableTree(QTreeWidget):
+    """G2：支持拖表/列到 SQL 编辑器（自定义 MIME + 文本兜底）。"""
+
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
+        self.setDefaultDropAction(Qt.CopyAction)
+
+    def startDrag(self, supported_actions):
+        item = self.currentItem()
+        payload = self.owner.drag_payload(item) if item is not None else None
+        if not payload:
+            return
+        mime = QMimeData()
+        mime.setData(self.owner.DRAG_MIME,
+                     json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+        mime.setText(payload['text'])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.CopyAction)
+
+
 class ObjectTree(QWidget):
     """对象浏览器"""
 
@@ -45,6 +70,7 @@ class ObjectTree(QWidget):
     design_table_requested = Signal(str, str, str)   # conn, db, table
     import_data_requested = Signal(str, str, str)
     export_data_requested = Signal(str, str, str)
+    DRAG_MIME = 'application/x-lightdb-object'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,7 +103,7 @@ class ObjectTree(QWidget):
         layout.addWidget(bar)
 
         # 树
-        self.tree = QTreeWidget()
+        self.tree = _DraggableTree(self)
         self.tree.setHeaderHidden(True)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_menu)
@@ -642,6 +668,33 @@ class ObjectTree(QWidget):
                 child.setHidden(not visible)
             else:
                 self._filter_node(child)
+
+    # ==================== G2：拖拽生成 SQL ====================
+
+    def drag_payload(self, item):
+        """返回拖拽 payload：表→SELECT 模板/列→列名；其它节点 None。"""
+        if item is None:
+            return None
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return None
+        node_type, name = data
+        meta = item.data(0, Qt.UserRole + 1) or {}
+        if node_type == NODE_TABLE:
+            return {
+                'kind': 'table', 'table': name,
+                'db': meta.get('db', ''), 'conn': meta.get('conn', ''),
+                'text': f'SELECT * FROM `{name}` LIMIT 200;',
+            }
+        if node_type == NODE_COLUMN:
+            table = meta.get('table', '')
+            return {
+                'kind': 'column', 'column': name, 'table': table,
+                'db': meta.get('db', ''), 'conn': meta.get('conn', ''),
+                'text': name,
+                'insert_sql': f'`{table}`.`{name}`' if table else f'`{name}`',
+            }
+        return None
 
     # ==================== G1：库/表/列对象管理 ====================
 

@@ -16,10 +16,14 @@
     （`db_types.kind_for_port`：8899→LightDB，3306→MySQL，其它→其它 MySQL
     兼容）。
 """
+import json
+import os
+from datetime import datetime
+
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QSpinBox, QComboBox,
     QDialogButtonBox, QVBoxLayout, QHBoxLayout, QPushButton,
-    QMessageBox, QCheckBox, QLabel
+    QMessageBox, QCheckBox, QLabel, QFileDialog
 )
 from PySide6.QtCore import Qt
 
@@ -116,6 +120,34 @@ class ConnectionDialog(QDialog):
 
         self.ssl_check = QCheckBox("启用 SSL")
         form.addRow("", self.ssl_check)
+        # G2：SSL 客户端高级字段（验证文件存在/可读；pymysql ssl 参数）
+        self._ssl_form = form
+        self._ssl_rows = []
+        for label, attr, btn_attr in (
+                ("CA 证书:", 'ssl_ca_edit', 'ssl_ca_btn'),
+                ("客户端证书:", 'ssl_cert_edit', 'ssl_cert_btn'),
+                ("客户端私钥:", 'ssl_key_edit', 'ssl_key_btn')):
+            edit = QLineEdit()
+            edit.setPlaceholderText('（可选）')
+            btn = QPushButton("浏览...")
+            setattr(self, attr, edit)
+            setattr(self, btn_attr, btn)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(edit, 1)
+            row.addWidget(btn)
+            form.addRow(label, row)
+            self._ssl_rows.append((edit, btn))
+        self.ssl_ca_edit.setPlaceholderText("CA 证书路径（可选）")
+        self.ssl_cert_edit.setPlaceholderText("客户端证书（可选）")
+        self.ssl_key_edit.setPlaceholderText("客户端私钥（可选）")
+        self.ssl_ca_btn.clicked.connect(
+            lambda: self._browse_ssl_file(self.ssl_ca_edit, 'CA 证书'))
+        self.ssl_cert_btn.clicked.connect(
+            lambda: self._browse_ssl_file(self.ssl_cert_edit, '客户端证书'))
+        self.ssl_key_btn.clicked.connect(
+            lambda: self._browse_ssl_file(self.ssl_key_edit, '客户端私钥'))
+        self.ssl_check.toggled.connect(self._update_ssl_controls)
 
         layout.addLayout(form)
 
@@ -169,6 +201,12 @@ class ConnectionDialog(QDialog):
         if idx >= 0:
             self.charset_combo.setCurrentIndex(idx)
         self.ssl_check.setChecked(bool(self.info.ssl))
+        ssl_opts = getattr(self.info, 'ssl_options', None) or {}
+        if isinstance(ssl_opts, dict):
+            self.ssl_ca_edit.setText(str(ssl_opts.get('ca') or ''))
+            self.ssl_cert_edit.setText(str(ssl_opts.get('cert') or ''))
+            self.ssl_key_edit.setText(str(ssl_opts.get('key') or ''))
+        self._update_ssl_controls()
 
         # 预选类型（反推得到）。切换会 `_apply_defaults`：这里字段刚按
         # info 填好，所以只有「仍等于旧类型默认值」的字段会被新类型覆盖。
@@ -281,7 +319,7 @@ class ConnectionDialog(QDialog):
         return text
 
     def _collect(self) -> ConnectionInfo:
-        return ConnectionInfo(
+        info = ConnectionInfo(
             name=self.name_edit.text().strip(),
             host=self.host_edit.text().strip() or '127.0.0.1',
             port=self.port_spin.value(),
@@ -291,6 +329,65 @@ class ConnectionDialog(QDialog):
             charset=self.charset_combo.currentText(),
             ssl=self.ssl_check.isChecked(),
         )
+        # 高级 SSL 配置作为运行时附加属性（config schema 不变，不写明文私钥）
+        info.ssl_options = self.build_ssl_params(silent=True)
+        return info
+
+    # ---------- G2：SSL 高级字段 ----------
+
+    def _update_ssl_controls(self, *_args):
+        enabled = self.ssl_check.isChecked()
+        for edit, btn in getattr(self, '_ssl_rows', []):
+            edit.setEnabled(enabled)
+            btn.setEnabled(enabled)
+
+    def _browse_ssl_file(self, edit, label):
+        path, _ = QFileDialog.getOpenFileName(
+            self, f'选择{label}', edit.text() or '',
+            '证书/私钥 (*.pem *.crt *.cer *.key *.p12);;所有文件 (*.*)')
+        if path:
+            edit.setText(path)
+        return path
+
+    def validate_ssl_paths(self):
+        """校验 SSL 路径；返回 (ok, error)。仅在校验 SSL 开启时要求文件存在可读。"""
+        if not self.ssl_check.isChecked():
+            return True, ''
+        ca = self.ssl_ca_edit.text().strip()
+        cert = self.ssl_cert_edit.text().strip()
+        key = self.ssl_key_edit.text().strip()
+        if bool(cert) != bool(key):
+            return False, '客户端证书与私钥必须同时提供（或都留空）'
+        for label, path in (('CA 证书', ca), ('客户端证书', cert),
+                            ('客户端私钥', key)):
+            if not path:
+                continue
+            if not os.path.isfile(path):
+                return False, f'{label}不存在: {path}'
+            try:
+                if not os.access(path, os.R_OK):
+                    return False, f'{label}不可读: {path}'
+            except Exception as exc:                  # noqa: BLE001
+                return False, f'{label}不可读: {path}（{exc}）'
+        return True, ''
+
+    def build_ssl_params(self, silent=False):
+        """构造 pymysql ssl 参数字典；路径非法时显式报错（silent=True 返回空）。"""
+        if not self.ssl_check.isChecked():
+            return {}
+        ok, error = self.validate_ssl_paths()
+        if not ok:
+            if silent:
+                return {}
+            raise ValueError(error)
+        params = {'check_hostname': False}
+        for field, key in (('ssl_ca_edit', 'ca'),
+                           ('ssl_cert_edit', 'cert'),
+                           ('ssl_key_edit', 'key')):
+            value = getattr(self, field).text().strip()
+            if value:
+                params[key] = value
+        return params
 
     def _toggle_password_visibility(self, visible: bool):
         """显示/隐藏口令。只改输入框回显方式，不改变保存值。"""
@@ -330,6 +427,10 @@ class ConnectionDialog(QDialog):
                 self, "暂不支持",
                 '暂不支持：%s' % db_types.unsupported_reason(
                     self.current_db_type()))
+            return
+        ok, ssl_error = self.validate_ssl_paths()
+        if not ok:
+            QMessageBox.warning(self, 'SSL 配置错误', ssl_error)
             return
         info = self._collect()
         if not info.name:
@@ -411,7 +512,19 @@ def edit_connection(parent, config, name, dialog_class=None):
     if info is None:
         return {'ok': False, 'error': f'连接不存在: {name}'}
     cls = dialog_class or ConnectionDialog
-    dlg = cls(parent, info=ConnectionInfo(**info.__dict__))
+    dlg = cls(parent, info=ConnectionInfo(
+        name=info.name, host=info.host, port=info.port, user=info.user,
+        password=info.password, database=info.database,
+        charset=info.charset, ssl=info.ssl))
+    # 保留高级 SSL 配置（若原连接带有时）
+    if getattr(info, 'ssl_options', None):
+        dlg.info.ssl_options = dict(info.ssl_options)
+        for edit_name, key in (('ssl_ca_edit', 'ca'),
+                               ('ssl_cert_edit', 'cert'),
+                               ('ssl_key_edit', 'key')):
+            edit = getattr(dlg, edit_name, None)
+            if edit is not None:
+                edit.setText(str(info.ssl_options.get(key) or ''))
     if not dlg.exec():
         return {'ok': False, 'error': '用户取消', 'cancelled': True}
     edited = dlg.get_connection()
@@ -423,3 +536,190 @@ def edit_connection(parent, config, name, dialog_class=None):
     except Exception as exc:                          # noqa: BLE001
         return {'ok': False, 'error': f'保存连接失败: {exc}'}
     return {'ok': True, 'connection': edited, 'name': edited.name, 'error': ''}
+
+
+# ==================== G2：连接导入 / 导出（JSON） ====================
+
+EXPORT_VERSION = 1
+EXPORT_REQUIRED = ('name', 'host', 'port', 'user')
+
+
+def _connection_to_export_dict(conn, include_passwords=False):
+    d = {
+        'name': conn.name,
+        'host': conn.host,
+        'port': int(conn.port),
+        'user': conn.user,
+        'database': conn.database,
+        'charset': conn.charset,
+        'ssl': bool(conn.ssl),
+    }
+    ssl_options = getattr(conn, 'ssl_options', None)
+    if ssl_options:
+        d['ssl_options'] = dict(ssl_options)
+    if include_passwords and conn.password:
+        from ..core.credentials import encrypt_password
+        d['password'] = encrypt_password(conn.password)
+    return d
+
+
+def export_connections_json(connections, filepath, include_passwords=False):
+    """导出连接为 JSON；默认不包含密码（敏感信息显式提示）。"""
+    try:
+        payload = {
+            'version': EXPORT_VERSION,
+            'app': 'LightDB Studio',
+            'exported_at': datetime.now().isoformat(timespec='seconds'),
+            'passwords_included': bool(include_passwords),
+            'warning': ('包含 DPAPI 加密的密码串；文件仍属敏感信息，请妥善保管'
+                        if include_passwords else
+                        '未导出密码；导入后需重新填写密码'),
+            'connections': [_connection_to_export_dict(
+                c, include_passwords=include_passwords)
+                for c in connections],
+        }
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as exc:                          # noqa: BLE001
+        return {'ok': False, 'error': f'导出连接失败: {exc}',
+                'path': str(filepath), 'count': 0}
+    return {'ok': True, 'path': str(filepath),
+            'count': len(payload['connections']),
+            'passwords_included': bool(include_passwords),
+            'warning': payload['warning'],
+            'sensitive': bool(include_passwords), 'error': ''}
+
+
+def _parse_connection_item(item, index):
+    if not isinstance(item, dict):
+        raise ValueError(f'第 {index + 1} 条连接不是对象')
+    name = str(item.get('name') or '').strip()
+    if not name:
+        raise ValueError(f'第 {index + 1} 条连接缺少 name')
+    host = str(item.get('host') or '').strip()
+    user = str(item.get('user') or '').strip()
+    if not host or not user:
+        raise ValueError(f'连接 {name} 缺少 host/user')
+    try:
+        port = int(item.get('port', 0))
+    except (TypeError, ValueError):
+        raise ValueError(f'连接 {name} 的 port 非法')
+    if not (1 <= port <= 65535):
+        raise ValueError(f'连接 {name} 的 port 超出范围: {port}')
+    known = {'name', 'host', 'port', 'user', 'password', 'database',
+             'charset', 'ssl', 'ssl_options'}
+    warnings = []
+    unknown = sorted(set(item) - known)
+    if unknown:
+        warnings.append(f'连接 {name} 忽略未知字段: {unknown}')
+    info = ConnectionInfo(
+        name=name, host=host, port=port, user=user,
+        password=str(item.get('password') or ''),
+        database=str(item.get('database') or ''),
+        charset=str(item.get('charset') or 'utf8mb4'),
+        ssl=bool(item.get('ssl')))
+    ssl_options = item.get('ssl_options')
+    if isinstance(ssl_options, dict):
+        info.ssl_options = dict(ssl_options)
+    needs_password = not info.password
+    if info.password:
+        from ..core.credentials import decrypt_password, is_encrypted
+        if is_encrypted(info.password):
+            try:
+                info.password = decrypt_password(info.password)
+            except Exception as exc:                  # noqa: BLE001
+                raise ValueError(f'连接 {name} 的密码无法解密（请重新导出/手填）: {exc}')
+            needs_password = False
+        else:
+            warnings.append(f'连接 {name} 使用明文密码（保存时将自动加密）')
+    return info, needs_password, warnings
+
+
+def parse_connections_payload(data):
+    """解析导出 JSON（不修改 config）；返回 (items, warnings, needs_password_names)。"""
+    if not isinstance(data, dict):
+        raise ValueError('连接文件必须是 JSON 对象')
+    version = data.get('version')
+    if version != EXPORT_VERSION:
+        raise ValueError(f'不支持的连接文件版本: {version!r}（支持 {EXPORT_VERSION}）')
+    raw = data.get('connections')
+    if not isinstance(raw, list) or not raw:
+        raise ValueError('连接文件没有 connections 数组或为空')
+    items, warnings, needs = [], [], []
+    for i, item in enumerate(raw):
+        info, need_pw, warns = _parse_connection_item(item, i)
+        items.append(info)
+        warnings.extend(warns)
+        if need_pw:
+            needs.append(info.name)
+    return items, warnings, needs
+
+
+def import_connections_json(config, filepath, conflict='ask', confirm=None):
+    """导入连接；失败不改动现有连接；冲突策略 skip/rename/overwrite/ask。
+
+    `confirm(question: str) -> bool`：overwrite/ask 等需要用户确认；未提供时
+    overwrite 视为取消，ask 默认自动重命名（安全默认）。
+    """
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        items, warnings, needs = parse_connections_payload(data)
+    except Exception as exc:                          # noqa: BLE001
+        return {'ok': False, 'error': f'导入失败（现有连接未改动）: {exc}',
+                'imported': 0}
+    existing = {c.name for c in getattr(config, 'connections', [])}
+    imported, skipped, renamed = [], [], []
+    planned = []
+    for info in items:
+        if info.name not in existing:
+            planned.append(info)
+            continue
+        policy = conflict
+        if policy == 'ask':
+            policy = ('overwrite' if (confirm and confirm(
+                f'连接 {info.name} 已存在，是否覆盖？')) else 'rename')
+        if policy == 'skip':
+            skipped.append(info.name)
+        elif policy == 'overwrite':
+            if confirm is not None and not confirm(
+                    f'确认覆盖已有连接 {info.name}？（会替换本地配置）'):
+                return {'ok': False, 'error': '用户取消导入',
+                        'cancelled': True, 'imported': 0}
+            target = config.find(info.name)
+            planned.append(info)
+            imported.append(info.name)
+            if target is None:
+                imported.pop()
+                planned.pop()
+        elif policy == 'rename':
+            base = info.name
+            n = 2
+            while f'{base} ({n})' in existing or any(
+                    f'{base} ({n})' == p.name for p in planned):
+                n += 1
+            info.name = f'{base} ({n})'
+            planned.append(info)
+            renamed.append(info.name)
+        else:
+            return {'ok': False, 'error': f'未知的冲突策略: {conflict!r}',
+                    'imported': 0}
+    backup = list(getattr(config, 'connections', []))
+    try:
+        for info in planned:
+            if config.find(info.name) is not None:
+                idx = [i for i, c in enumerate(config.connections)
+                       if c.name == info.name][0]
+                config.connections[idx] = info
+            else:
+                config.connections.append(info)
+        config.save()
+    except Exception as exc:                          # noqa: BLE001
+        config.connections = backup
+        return {'ok': False, 'error': f'保存失败，已回滚（现有连接未改动）: {exc}',
+                'imported': 0}
+    return {'ok': True, 'imported': len(planned), 'imported_names': [
+                i.name for i in planned], 'skipped': skipped,
+            'renamed': renamed, 'needs_password': needs,
+            'warnings': warnings, 'error': ''}
+

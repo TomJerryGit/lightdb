@@ -13,6 +13,7 @@ P1-3（GUI 路线图）：
    下次成功执行调用 `clear_error_highlight()` 清除。
 3. 保留原有 Ctrl+Return / Ctrl+Shift+Return / F5 快捷键与行号区域行为。
 """
+import json
 import re
 
 from PySide6.QtWidgets import (
@@ -41,6 +42,17 @@ SQL_KEYWORDS = sorted({
     'DATABASE', 'SHOW', 'DESCRIBE', 'EXPLAIN', 'USE', 'BEGIN', 'COMMIT',
     'ROLLBACK', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC',
     'PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE', 'NOT NULL', 'DEFAULT',
+})
+
+# G2：常用函数补全（可维护列表；补全只插入函数名）
+SQL_FUNCTIONS = sorted({
+    'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'COALESCE', 'IFNULL', 'NULLIF',
+    'NOW', 'CURDATE', 'CURTIME', 'DATE_FORMAT', 'DATE_ADD', 'DATE_SUB',
+    'DATEDIFF', 'TIMESTAMPDIFF', 'JSON_EXTRACT', 'JSON_UNQUOTE',
+    'JSON_OBJECT', 'JSON_ARRAY', 'CONCAT', 'CONCAT_WS', 'SUBSTRING',
+    'TRIM', 'UPPER', 'LOWER', 'LENGTH', 'CHAR_LENGTH', 'ROUND', 'FLOOR',
+    'CEIL', 'ABS', 'MOD', 'POWER', 'GROUP_CONCAT', 'ROW_NUMBER',
+    'RANK', 'DENSE_RANK', 'IF', 'CAST', 'CONVERT',
 })
 
 # 错误文本里的定位信息（引擎会回 "near '<出错处起的 SQL 尾巴>'"）
@@ -96,6 +108,8 @@ class SQLEditor(QPlainTextEdit):
         self._find_bar_visible = False
         self.find_error = ''
         self.last_action_error = ''
+        # G2：接受对象树拖拽（表 → SELECT；列 → 列名）
+        self.setAcceptDrops(True)
 
         self.line_number_area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_line_number_area_width)
@@ -286,15 +300,38 @@ class SQLEditor(QPlainTextEdit):
         return self._schema_cache
 
     def _context_table(self) -> str:
-        """当前光标前的 `表.` / 最近 FROM/JOIN 的表名（用于列补全）。"""
+        """光标前 `表.` / 最近 FROM/JOIN 的表名；G2：别名解析回真实表。
+
+        单表简单别名：`FROM users AS u` 后输入 `u.` → 返回 `users`。
+        """
         text = self.toPlainText()[:self.textCursor().position()]
         m = re.search(r'([A-Za-z_][\w]*)\.\s*$', text)
         if m:
-            return m.group(1)
+            name = m.group(1)
+            return self.schema_aliases().get(name.lower(), name)
         matches = re.findall(
             r'(?i)\b(?:FROM|JOIN|INTO|UPDATE)\s+[`"\[]?([A-Za-z_][\w]*)',
             text)
         return matches[-1] if matches else ''
+
+    def schema_aliases(self) -> dict:
+        """从 SQL 文本推断单表简单别名：`FROM t [AS] a` → {'a': 't'}。"""
+        text = self.toPlainText()
+        aliases = {}
+        pattern = re.compile(
+            r'(?i)\b(?:FROM|JOIN)\s+[`"\[]?([A-Za-z_]\w*)[`"\]]?'
+            r'\s+(?:AS\s+)?([A-Za-z_]\w*)')
+        keywords = {'where', 'group', 'order', 'limit', 'having', 'on',
+                    'join', 'left', 'right', 'inner', 'outer', 'union',
+                    'set', 'values', 'as', 'using'}
+        for table, alias in pattern.findall(text or ''):
+            if alias.lower() in keywords or alias.lower() == table.lower():
+                continue
+            aliases[alias.lower()] = table
+        return aliases
+
+    def completion_functions(self) -> list:
+        return list(SQL_FUNCTIONS)
 
     def _current_word_prefix(self) -> str:
         text = self.toPlainText()[:self.textCursor().position()]
@@ -307,7 +344,7 @@ class SQLEditor(QPlainTextEdit):
         tables, columns = self._schema()
         context = context_table if context_table is not None \
             else self._context_table()
-        candidates = list(SQL_KEYWORDS)
+        candidates = list(SQL_KEYWORDS) + list(SQL_FUNCTIONS)
         lowered = {t.lower() for t in tables}
         if context and context.lower() in lowered:
             for tname, cols in columns.items():
@@ -856,6 +893,73 @@ class SQLEditor(QPlainTextEdit):
             return False
         self.execute_statement_requested.emit(sql)
         return True
+
+    # ==================== G2：对象树拖拽插入 ====================
+
+    DRAG_MIME = 'application/x-lightdb-object'
+
+    def drop_payload(self, payload):
+        """处理对象树拖拽数据（表→SELECT 模板；列→列名）；返回插入文本。"""
+        if not isinstance(payload, dict):
+            return ''
+        kind = payload.get('kind')
+        if kind == 'table':
+            table = str(payload.get('table') or '').strip()
+            if not table:
+                return ''
+            text = f'SELECT * FROM `{table}` LIMIT 200;'
+        elif kind == 'column':
+            text = str(payload.get('column') or payload.get('name') or '').strip()
+            if not text:
+                return ''
+        else:
+            return ''
+        cursor = self.textCursor()
+        before = self.toPlainText()[:cursor.position()]
+        prefix = '\n' if before and not before.endswith('\n') else ''
+        cursor.insertText(prefix + text)
+        if kind == 'table':
+            cursor.insertText('\n')
+        self.setTextCursor(cursor)
+        self.setFocus()
+        return text
+
+    def _drop_has_payload(self, event) -> bool:
+        try:
+            mime = event.mimeData()
+            return mime.hasFormat(self.DRAG_MIME)
+        except Exception:
+            return False
+
+    def dragEnterEvent(self, event):
+        if self._drop_has_payload(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._drop_has_payload(event):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if not self._drop_has_payload(event):
+            super().dropEvent(event)
+            return
+        try:
+            raw = bytes(event.mimeData().data(self.DRAG_MIME)).decode('utf-8')
+            payload = json.loads(raw)
+        except Exception as exc:                      # noqa: BLE001
+            self.last_action_error = f'拖拽数据解析失败: {exc}'
+            event.ignore()
+            return
+        inserted = self.drop_payload(payload)
+        if inserted:
+            event.acceptProposedAction()
+        else:
+            self.last_action_error = '拖拽对象不是表/列节点'
+            event.ignore()
 
     # ==================== 执行 ====================
 

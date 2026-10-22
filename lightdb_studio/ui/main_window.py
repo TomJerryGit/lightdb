@@ -60,7 +60,7 @@ from .review_panel import ReviewPanel, ReviewSubmitDialog
 from .snapshot_dialog import SnapshotDialog
 from .connection_dialog import (
     ConnectionDialog, delete_connection, duplicate_connection,
-    edit_connection)
+    edit_connection, export_connections_json, import_connections_json)
 from .error_prompts import (show_connection_error,
                             show_connection_error_nonblocking)
 from .object_tree import ObjectTree
@@ -70,7 +70,8 @@ from .workers import QueryWorker
 from .data_editor import DataEditor
 from .table_designer import TableDesigner
 from .query_history import QueryHistoryPanel
-from .import_export import ImportCSVDialog, ExportCSVDialog
+from .import_export import (
+    ImportCSVDialog, ExportCSVDialog, write_export_chunked)
 from .snippet_panel import SnippetPanel
 from .catalog_panel import CatalogPanel
 from .profiler_view import ProfilerView
@@ -513,6 +514,12 @@ class MainWindow(QMainWindow):
         a = QAction("删除当前连接...", self)
         a.triggered.connect(self._delete_current_connection)
         m_file.addAction(a)
+        a = QAction("导出连接...", self)
+        a.triggered.connect(self._export_connections)
+        m_file.addAction(a)
+        a = QAction("导入连接...", self)
+        a.triggered.connect(self._import_connections)
+        m_file.addAction(a)
 
         a = QAction("新建查询", self)
         a.setShortcut(QKeySequence("Ctrl+N"))
@@ -529,6 +536,15 @@ class MainWindow(QMainWindow):
         a = QAction("保存 SQL...", self)
         a.setShortcut(QKeySequence("Ctrl+S"))
         a.triggered.connect(self._save_sql_file)
+        m_file.addAction(a)
+
+        # G2：导出 JSON / SQL INSERT（当前结果集）
+        a = QAction("导出当前结果为 JSON...", self)
+        a.triggered.connect(lambda: self._export_current_result_as('json'))
+        m_file.addAction(a)
+        a = QAction("导出当前结果为 SQL INSERT...", self)
+        a.triggered.connect(
+            lambda: self._export_current_result_as('sql_insert'))
         m_file.addAction(a)
 
         m_file.addSeparator()
@@ -986,6 +1002,80 @@ class MainWindow(QMainWindow):
         self._on_tab_changed(self.tabs.currentIndex())
         # P1-3：连接建立后后台刷新 schema 缓存（首次补全前就有候选）
         self._refresh_schema_cache_async(conn)
+
+    # ==================== G2：连接导入/导出 + JSON/SQL 导出 ====================
+
+    def _export_connections(self):
+        name = self._current_connection_name()
+        conns = [c for c in self.config.connections if c.name == name] \
+            if name else list(self.config.connections)
+        if not conns:
+            QMessageBox.information(self, '提示', '没有可导出的连接')
+            return None
+        path, _ = QFileDialog.getSaveFileName(
+            self, '导出连接', 'lightdb_connections.json',
+            'JSON 文件 (*.json)')
+        if not path:
+            return None
+        include = QMessageBox.question(
+            self, '导出选项',
+            '是否包含密码？\n密码以 DPAPI 加密串写入，文件仍属敏感信息。\n'
+            '选择「否」则导入后需重新填写密码。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        result = export_connections_json(
+            conns, path, include_passwords=(include == QMessageBox.Yes))
+        if result.get('ok'):
+            self.status_label.setText(
+                f"已导出 {result['count']} 个连接"
+                f"（含密码={result['passwords_included']}）")
+        else:
+            QMessageBox.warning(self, '导出连接失败', result.get('error', ''))
+        return result
+
+    def _import_connections(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '导入连接', '', 'JSON 文件 (*.json);;所有文件 (*.*)')
+        if not path:
+            return None
+        result = import_connections_json(
+            self.config, path, conflict='ask',
+            confirm=lambda question: QMessageBox.question(
+                self, '连接冲突', question,
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes)
+        if not result.get('ok'):
+            if not result.get('cancelled'):
+                QMessageBox.warning(self, '导入连接失败',
+                                    result.get('error', ''))
+            return result
+        self.status_label.setText(
+            f"已导入 {result.get('imported', 0)} 个连接配置"
+            f"（需重新连接；自动重命名 {len(result.get('renamed') or [])}）")
+        return result
+
+    def _export_current_result_as(self, fmt):
+        result = self._current_widgets()[1]
+        rows = [list(r) for r in getattr(result, '_orig_rows', [])] \
+            if result is not None else []
+        if not rows:
+            QMessageBox.information(self, '提示', '当前没有可导出的结果')
+            return None
+        columns = list(getattr(result, '_all_columns', []) or [])
+        ext = {'json': '.json', 'sql_insert': '.sql'}[fmt]
+        path, _ = QFileDialog.getSaveFileName(
+            self, '导出查询结果', 'query_result' + ext,
+            f"{fmt.upper()} (*{ext})")
+        if not path:
+            return None
+        if not path.lower().endswith(ext):
+            path += ext
+        try:
+            count = write_export_chunked(
+                path, columns, rows, fmt=fmt, table_name='query_result')
+        except Exception as exc:                      # noqa: BLE001
+            QMessageBox.critical(self, '导出失败', str(exc))
+            return {'ok': False, 'error': str(exc)}
+        QMessageBox.information(self, '完成', f'已导出 {count} 行到:\n{path}')
+        return {'ok': True, 'rows': count, 'path': path}
 
     # ==================== G1：连接编辑/复制/删除 ====================
 
