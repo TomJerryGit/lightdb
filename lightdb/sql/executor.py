@@ -698,8 +698,19 @@ class Executor:
         但审计记录的内容是**真实执行结果**：SQL 原文取自 AST 的
         `source_sql`，成功/失败与错误文本取自执行器返回值。
         """
-        if self.audit is None or not isinstance(parsed, dict):
+        if not isinstance(parsed, dict):
             return
+        if self.audit is None:
+            # CI 顺序/文件锁下 _AuditSink 初始化可能失败（构造期异常只告警）。
+            # 首次记录时惰性重建，避免"审计全部静默丢失、SHOW AUDIT LOG 返回空"。
+            try:
+                self.audit = _AuditSink(str(self.db.data_dir))
+                attach = getattr(self.db, 'attach_audit_sink', None)
+                if callable(attach):
+                    attach(self.audit)
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"审计日志惰性初始化失败: {e}")
+                return
         try:
             ok = not (isinstance(result, dict)
                       and result.get('type') == 'error')
