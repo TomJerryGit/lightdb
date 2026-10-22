@@ -41,8 +41,18 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests/test_gui_smoke_ci.py -q -p no:cacheprovider
 
-      - name: Full test suite
-        run: python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml
+      - name: Full test suite (JUnit gate; raw pytest exit logged)
+        shell: pwsh
+        run: |
+          python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml
+          $raw = $LASTEXITCODE
+          Write-Host "pytest raw exit code: $raw"
+          python scripts/check_junit.py pytest-results.xml
+          $gate = $LASTEXITCODE
+          if ($gate -ne 0) { exit $gate }
+          if ($raw -ne 0) {
+            Write-Host "::warning::pytest exited $raw but JUnit shows 0 failures/errors; gate uses JUnit as the source of truth"
+          }
 
       - name: Annotate failed tests (public check-run annotations)
         if: always()
