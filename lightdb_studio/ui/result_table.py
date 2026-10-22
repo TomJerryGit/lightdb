@@ -20,9 +20,9 @@ from PySide6.QtWidgets import (
     QLabel, QHBoxLayout, QHeaderView, QAbstractItemView,
     QPlainTextEdit, QPushButton, QApplication, QLineEdit, QComboBox,
     QCheckBox, QMenu, QDialog, QDialogButtonBox, QListWidget,
-    QListWidgetItem, QFileDialog,
+    QListWidgetItem, QFileDialog, QTableView,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QFont, QAction
 
 # 从 `format_db_error` 的文本里回捞字段（如 `错误码  : 1064` / `SQLSTATE: 42000`）。
@@ -136,7 +136,264 @@ def typed_sort_key(value, text=None):
     return (2, s2.casefold())
 
 
+VIRTUAL_THRESHOLD = 5000
+
+
+class ResultTableModel(QAbstractTableModel):
+    """G3：承载全量结果（10 万行也不构建 QTableWidgetItem）。
+
+    - 原始行只存 Python 值；视图只请求可见单元格（Qt 虚拟化）；
+    - 排序（类型化 + NULL 最后）、文本过滤、列值筛选都在模型内部完成；
+    - 列可见性由 QTableView.setColumnHidden 处理；
+    - `append_rows` 只扩展 rows，不重排已有数据。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._columns = []
+        self._rows = []
+        self._visible = []
+        self._sort_column = -1
+        self._sort_order = Qt.AscendingOrder
+        self._filter_text = ''
+        self._filter_column = -1
+        self._filter_case = False
+        self._value_filters = {}
+
+    # ---------- 数据 ----------
+
+    def set_data(self, columns, rows):
+        self.beginResetModel()
+        self._columns = [str(c) for c in columns or []]
+        self._rows = [list(r) for r in rows or []]
+        self._sort_column = -1
+        self._filter_text = ''
+        self._filter_column = -1
+        self._filter_case = False
+        self._value_filters = {}
+        self._visible = list(range(len(self._rows)))
+        self.endResetModel()
+
+    def append_rows(self, rows):
+        rows = [list(r) for r in rows or []]
+        if not rows:
+            return 0
+        start = len(self._rows)
+        self.beginInsertRows(QModelIndex(), start, start + len(rows) - 1)
+        self._rows.extend(rows)
+        self.endInsertRows()
+        self._recompute()
+        return len(rows)
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._visible)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        raw_row = self._visible[index.row()]
+        col = index.column()
+        row = self._rows[raw_row]
+        value = row[col] if col < len(row) else None
+        if role == Qt.DisplayRole:
+            if value is None:
+                return 'NULL'
+            if isinstance(value, bytes):
+                return f'<binary {len(value)} bytes>'
+            return str(value)
+        if role == Qt.UserRole:
+            return value
+        if role == Qt.ForegroundRole:
+            if value is None:
+                return QColor('#808080')
+            return None
+        if role == Qt.TextAlignmentRole:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(Qt.AlignRight | Qt.AlignVCenter)
+            return int(Qt.AlignLeft | Qt.AlignVCenter)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return self._columns[section] if 0 <= section < len(
+                self._columns) else None
+        return section + 1
+
+    # ---------- 原始值/辅助 ----------
+
+    def raw_value(self, view_row, col):
+        if not (0 <= view_row < len(self._visible)):
+            return None
+        raw_row = self._visible[view_row]
+        row = self._rows[raw_row]
+        return row[col] if 0 <= col < len(row) else None
+
+    def raw_row(self, view_row):
+        if not (0 <= view_row < len(self._visible)):
+            return []
+        return self._rows[self._visible[view_row]]
+
+    def column_name(self, col):
+        return self._columns[col] if 0 <= col < len(self._columns) else ''
+
+    def visible_count(self):
+        return len(self._visible)
+
+    # ---------- 排序 ----------
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        if not (0 <= column < len(self._columns)) or len(self._rows) <= 1:
+            return 0
+        self._sort_column = column
+        self._sort_order = order
+        self._recompute()
+        return self.visible_count()
+
+    def clear_sort(self):
+        self._sort_column = -1
+        self._sort_order = Qt.AscendingOrder
+        self._recompute()
+
+    def _recompute(self):
+        self.beginResetModel()
+        indices = list(range(len(self._rows)))
+        text = self._filter_text
+        if text.strip():
+            needle = text if self._filter_case else text.casefold()
+            col = self._filter_column
+            cols = [col] if col >= 0 else range(len(self._columns))
+            keep = []
+            for i in indices:
+                row = self._rows[i]
+                hit = False
+                for c in cols:
+                    if c >= len(row):
+                        continue
+                    cell = row[c]
+                    s = '' if cell is None else str(cell)
+                    if not self._filter_case:
+                        s = s.casefold()
+                    if needle in s:
+                        hit = True
+                        break
+                if hit:
+                    keep.append(i)
+            indices = keep
+        if self._value_filters:
+            keep = []
+            for i in indices:
+                row = self._rows[i]
+                ok = True
+                for col, values in self._value_filters.items():
+                    cell = row[col] if col < len(row) else None
+                    text_cell = 'NULL' if cell is None else str(cell)
+                    if text_cell not in values:
+                        ok = False
+                        break
+                if ok:
+                    keep.append(i)
+            indices = keep
+        if self._sort_column >= 0:
+            col = self._sort_column
+            nulls, valid = [], []
+            for i in indices:
+                row = self._rows[i]
+                val = row[col] if col < len(row) else None
+                (nulls if val is None else valid).append(i)
+
+            def _key(i):
+                row = self._rows[i]
+                val = row[col] if col < len(row) else None
+                return typed_sort_key(val, 'NULL' if val is None else str(val))
+
+            reverse = (self._sort_order == Qt.DescendingOrder)
+            try:
+                valid.sort(key=_key, reverse=reverse)
+            except TypeError:
+                valid.sort(key=lambda i: str(
+                    self._rows[i][col] if col < len(self._rows[i]) else '')
+                    .casefold(), reverse=reverse)
+            indices = valid + nulls
+        self._visible = indices
+        self.endResetModel()
+
+    # ---------- 过滤 ----------
+
+    def set_filter(self, text='', column=-1, case=False):
+        self._filter_text = str(text or '')
+        self._filter_column = int(column)
+        self._filter_case = bool(case)
+        self._recompute()
+        return self.visible_count()
+
+    def set_value_filters(self, filters):
+        self._value_filters = {int(k): {str(x) for x in v}
+                               for k, v in (filters or {}).items() if v}
+        self._recompute()
+        return self.visible_count()
+
+    def distinct_values(self, col, limit=100):
+        seen, out = set(), []
+        for row in self._rows:
+            value = row[col] if col < len(row) else None
+            text = 'NULL' if value is None else str(value)
+            if text not in seen:
+                seen.add(text)
+                out.append(text)
+        out.sort(key=str.casefold)
+        return out[:max(1, int(limit))]
+
+    def statistics(self, col):
+        values, nulls = [], 0
+        for row in self._rows:
+            raw = row[col] if col < len(row) else None
+            if raw is None:
+                nulls += 1
+            else:
+                values.append(raw)
+        numeric = []
+        for v in values:
+            if isinstance(v, bool):
+                numeric.append(int(v))
+            elif isinstance(v, (int, float)):
+                numeric.append(float(v))
+            elif isinstance(v, str) and _NUM_RE.match(v.strip()):
+                try:
+                    numeric.append(float(v.strip()))
+                except ValueError:
+                    pass
+        stats = {'column': self.column_name(col), 'count': len(self._rows),
+                 'non_null': len(values), 'nulls': nulls,
+                 'unique': len({self._raw_key(v) for v in values}),
+                 'numeric_count': len(numeric), 'min': None, 'max': None,
+                 'sum': None, 'avg': None,
+                 'based_on': '当前已加载结果集（非全表）'}
+        if numeric:
+            stats['min'] = min(numeric)
+            stats['max'] = max(numeric)
+            stats['sum'] = sum(numeric)
+            stats['avg'] = sum(numeric) / len(numeric)
+        return stats
+
+    @staticmethod
+    def _raw_key(value):
+        try:
+            hash(value)
+            return ('v', value)
+        except TypeError:
+            return ('r', repr(value))
+    # ==================== UI ====================
+
 class ResultTable(QWidget):
+    """查询结果表格（小结果集用 QTableWidget；≥VIRTUAL_THRESHOLD 自动虚拟化）。"""
+
     # P1-2：结果被 max_result_rows 截断后点「加载更多」→ 主窗口继续取下一批
     load_more_requested = Signal()
 
@@ -149,15 +406,17 @@ class ResultTable(QWidget):
         self._filter_column = -1
         self._filter_case = False
         self._result_row_count = 0
-        # 有界结果状态（P1-2）
         self._columns = []
         self.rows_loaded = 0
         self._truncated = False
         self.error_category_key = 'query'
         self.error_category = ERROR_CATEGORIES['query'][0]
+        self._all_columns = []
+        self._hidden_columns = set()
+        self._value_filters = {}
+        self._orig_rows = []
+        self._virtual_active = False
         self._build_ui()
-
-    # ==================== UI ====================
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -255,6 +514,31 @@ class ResultTable(QWidget):
 
         layout.addWidget(self.table)
 
+        # G3：完整虚拟化视图（≥VIRTUAL_THRESHOLD 行时替代 QTableWidget）
+        self.virtual_model = ResultTableModel(self)
+        self.virtual_view = QTableView()
+        self.virtual_view.setModel(self.virtual_model)
+        self.virtual_view.setAlternatingRowColors(True)
+        self.virtual_view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.virtual_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.virtual_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.virtual_view.setSortingEnabled(False)
+        self.virtual_view.horizontalHeader().setSortIndicatorShown(True)
+        self.virtual_view.horizontalHeader().setStretchLastSection(True)
+        self.virtual_view.horizontalHeader().setSectionsMovable(True)
+        self.virtual_view.horizontalHeader().sectionClicked.connect(
+            self._on_virtual_header_clicked)
+        self.virtual_view.horizontalHeader().setContextMenuPolicy(
+            Qt.CustomContextMenu)
+        self.virtual_view.horizontalHeader().customContextMenuRequested.connect(
+            self._on_virtual_header_context_menu)
+        self.virtual_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.virtual_view.customContextMenuRequested.connect(
+            self._on_virtual_context_menu)
+        self.virtual_view.doubleClicked.connect(self._on_virtual_double_clicked)
+        self.virtual_view.setVisible(False)
+        layout.addWidget(self.virtual_view)
+
         # 错误视图
         # 背景：以前 show_error() 完全不用入参，界面只剩「错误」两个字，
         # SQLSTATE / 错误码 / 报文全部丢失。这里用只读 QPlainTextEdit 承载
@@ -335,6 +619,12 @@ class ResultTable(QWidget):
 
     def show_result(self, columns, rows, elapsed_ms=0.0, truncated=False):
         self._hide_error_view()
+        if len(rows) >= VIRTUAL_THRESHOLD:
+            return self._show_virtual_result(columns, rows, elapsed_ms,
+                                             truncated)
+        self._virtual_active = False
+        self.virtual_view.setVisible(False)
+        self.virtual_model.set_data([], [])
         self.table.setSortingEnabled(False)
         self.table.clear()
         self.table.setRowCount(len(rows))
@@ -385,6 +675,24 @@ class ResultTable(QWidget):
         - `truncated` 为 None 表示沿用当前状态，否则更新"是否还有更多"。
         返回实际追加的行数。
         """
+        if self._virtual_active:
+            rows = list(rows or [])
+            if not rows:
+                self._update_info_label()
+                self.show_load_more(self._truncated)
+                return 0
+            if truncated is not None:
+                self._truncated = bool(truncated)
+            self.virtual_model.append_rows(rows)
+            self._orig_rows.extend([list(r) for r in rows])
+            self.rows_loaded = len(self._orig_rows)
+            self._result_row_count = self.rows_loaded
+            if self._sort_column >= 0:
+                self.virtual_model.sort(self._sort_column, self._sort_order)
+            self._apply_filter()
+            self._update_info_label()
+            self.show_load_more(self._truncated)
+            return len(rows)
         rows = list(rows or [])
         if truncated is not None:
             self._truncated = bool(truncated)
@@ -445,6 +753,10 @@ class ResultTable(QWidget):
     def show_message(self, message: str):
         # 修复已知缺陷：无结果集的语句（INSERT/UPDATE…）必须收起上一次错误视图，
         # 否则用户看到的报错是过期的（tests/test_studio_smoke.py 的 xfail 记录）。
+        self._virtual_active = False
+        self.virtual_view.setVisible(False)
+        self.virtual_model.set_data([], [])
+        self.table.setVisible(True)
         self._hide_error_view()
         self._hide_filter(True)
         self.table.setSortingEnabled(False)
@@ -454,6 +766,69 @@ class ResultTable(QWidget):
         self._result_row_count = 0
         self._reset_load_more()
         self.info_label.setText(message)
+
+    # ==================== G3：完整虚拟化 ====================
+
+    def _show_virtual_result(self, columns, rows, elapsed_ms=0.0,
+                             truncated=False):
+        self._virtual_active = True
+        self.table.setVisible(False)
+        self.virtual_view.setVisible(True)
+        self._columns = list(columns)
+        self._orig_rows = [list(r) for r in rows]
+        if list(columns) != list(getattr(self, '_all_columns', [])):
+            self._all_columns = list(columns)
+            self._hidden_columns = set()
+            self._value_filters = {}
+        self.virtual_model.set_data(columns, rows)
+        self.virtual_model.set_value_filters({})
+        self._sort_column = -1
+        self._sort_order = Qt.AscendingOrder
+        self.virtual_view.horizontalHeader().setSortIndicator(
+            -1, Qt.AscendingOrder)
+        self._apply_column_visibility()
+        self.rows_loaded = len(rows)
+        self._truncated = bool(truncated)
+        self._result_row_count = len(rows)
+        self._reset_filter(columns)
+        self._update_info_label(elapsed_ms)
+        self.show_load_more(self._truncated)
+        self.filter_bar.setVisible(True)
+        self.empty_label.setVisible(False)
+        return len(rows)
+
+    def _on_virtual_header_clicked(self, section):
+        if (self._sort_column == section
+                and self._sort_order == Qt.AscendingOrder):
+            order = Qt.DescendingOrder
+        else:
+            order = Qt.AscendingOrder
+        self.sort_by(section, order)
+
+    def _on_virtual_header_context_menu(self, pos):
+        section = self.virtual_view.horizontalHeader().logicalIndexAt(pos)
+        if section < 0:
+            return
+        self.build_header_menu(section).exec(
+            self.virtual_view.horizontalHeader().mapToGlobal(pos))
+
+    def _on_virtual_context_menu(self, pos):
+        self.build_context_menu().exec(
+            self.virtual_view.viewport().mapToGlobal(pos))
+
+    def _on_virtual_double_clicked(self, index):
+        if index.isValid():
+            self.show_cell_detail(index.row(), index.column())
+
+    def virtual_row_count(self):
+        return self.virtual_model.rowCount()
+
+    def is_virtual(self):
+        return bool(self._virtual_active)
+
+    def virtual_visible_rows(self):
+        """当前虚拟模型可见行数（过滤后）。"""
+        return self.virtual_model.visible_count()
 
     # ==================== 类型化排序（P0-1） ====================
 
@@ -472,6 +847,16 @@ class ResultTable(QWidget):
 
     def sort_by(self, section: int, order: Qt.SortOrder = Qt.AscendingOrder):
         """按列 `section` 的类型化值排序；NULL 恒排最后（升/降序都一样）。"""
+        if self._virtual_active:
+            if not (0 <= section < self.virtual_model.columnCount()):
+                return 0
+            count = self.virtual_model.sort(section, order)
+            self._sort_column = section
+            self._sort_order = order
+            self.virtual_view.horizontalHeader().setSortIndicator(
+                section, order)
+            self._apply_filter()
+            return count
         n_rows = self.table.rowCount()
         n_cols = self.table.columnCount()
         if n_rows <= 1 or not (0 <= section < n_cols):
@@ -549,6 +934,14 @@ class ResultTable(QWidget):
             for w in (self.filter_edit, self.filter_col, self.filter_case):
                 w.blockSignals(False)
         self.empty_label.setVisible(False)
+        if self._virtual_active:
+            self.virtual_model.set_filter('', -1, False)
+            self.virtual_model.set_value_filters({})
+            n_rows = self.virtual_model.rowCount()
+            self.filter_count.setText(f"{n_rows} 行" if n_rows else "")
+            self.filter_bar.setVisible(n_rows > 0)
+            self.virtual_view.setVisible(True)
+            return
         for r in range(self.table.rowCount()):
             self.table.setRowHidden(r, False)
         self.filter_count.setText(
@@ -600,6 +993,22 @@ class ResultTable(QWidget):
         needle = text if case else text.casefold()
         self._filter_text, self._filter_column, self._filter_case = \
             text, column, case
+        if self._virtual_active:
+            self.virtual_model.set_value_filters(self._value_filters)
+            visible = self.virtual_model.set_filter(text, column, case)
+            n_rows = self.virtual_model.rowCount()
+            self.empty_label.setVisible(bool(text.strip()) and visible == 0
+                                        and n_rows > 0)
+            self.virtual_view.setVisible(not self.empty_label.isVisible())
+            self.filter_bar.setVisible(n_rows > 0)
+            if n_rows:
+                self.filter_count.setText(
+                    f"显示 {visible}/{n_rows} 行"
+                    if (text.strip() or self._value_filters)
+                    else f"{n_rows} 行")
+            else:
+                self.filter_count.setText("")
+            return visible
 
         n_rows = self.table.rowCount()
         has_text = bool(text.strip())
@@ -672,7 +1081,10 @@ class ResultTable(QWidget):
 
     def _hide_error_view(self):
         self.error_view.setVisible(False)
-        self.table.setVisible(True)
+        if self._virtual_active:
+            self.virtual_view.setVisible(True)
+        else:
+            self.table.setVisible(True)
         self.info_label.setStyleSheet("color: #969696;")
 
     def show_error(self, error: str, errno=None, sqlstate=None, sql: str = None):
@@ -720,6 +1132,7 @@ class ResultTable(QWidget):
 
         self.error_text.setPlainText(full)
         self.error_view.setVisible(True)
+        self.virtual_view.setVisible(False)
         self.table.setVisible(False)
 
         # 表格区域被错误视图取代，状态栏给出「有完整诊断」的指引
@@ -752,6 +1165,10 @@ class ResultTable(QWidget):
     def clear(self):
         self._hide_error_view()
         self._hide_filter(True)
+        self._virtual_active = False
+        self.virtual_view.setVisible(False)
+        self.virtual_model.set_data([], [])
+        self.table.setVisible(True)
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
@@ -766,6 +1183,8 @@ class ResultTable(QWidget):
     # ==================== G1：结果网格细节 ====================
 
     def _raw_value(self, row, col):
+        if self._virtual_active:
+            return self.virtual_model.raw_value(row, col)
         item = self.table.item(row, col)
         if item is None:
             return None
@@ -773,6 +1192,8 @@ class ResultTable(QWidget):
         return None if val is NULL_SENTINEL else val
 
     def _column_name(self, section):
+        if self._virtual_active:
+            return self.virtual_model.column_name(section)
         item = self.table.horizontalHeaderItem(section)
         return item.text() if item is not None else f'列{section + 1}'
 
@@ -792,6 +1213,14 @@ class ResultTable(QWidget):
 
     def clear_sort(self):
         """取消排序：恢复原始结果顺序，并隐藏表头箭头。"""
+        if self._virtual_active:
+            self.virtual_model.clear_sort()
+            self._sort_column = -1
+            self._sort_order = Qt.AscendingOrder
+            self.virtual_view.horizontalHeader().setSortIndicator(
+                -1, Qt.AscendingOrder)
+            self._apply_filter()
+            return True
         self._rebuild_from_original()
         self._sort_column = -1
         self._sort_order = Qt.AscendingOrder
@@ -823,25 +1252,42 @@ class ResultTable(QWidget):
         self._apply_column_visibility()
 
     def _apply_column_visibility(self):
+        if self._virtual_active:
+            for c in range(self.virtual_model.columnCount()):
+                self.virtual_view.setColumnHidden(c, c in self._hidden_columns)
+            return
         n_cols = self.table.columnCount()
         for c in range(n_cols):
             self.table.setColumnHidden(c, c in self._hidden_columns)
 
     def visible_columns(self):
+        if self._virtual_active:
+            return [c for c in range(self.virtual_model.columnCount())
+                    if not self.virtual_view.isColumnHidden(c)]
         return [c for c in range(self.table.columnCount())
                 if not self.table.isColumnHidden(c)]
 
     def hide_column(self, section):
-        if 0 <= section < self.table.columnCount():
+        count = self.virtual_model.columnCount() if self._virtual_active \
+            else self.table.columnCount()
+        if 0 <= section < count:
             self._hidden_columns.add(section)
-            self.table.setColumnHidden(section, True)
+            if self._virtual_active:
+                self.virtual_view.setColumnHidden(section, True)
+            else:
+                self.table.setColumnHidden(section, True)
             return True
         return False
 
     def show_column(self, section):
         self._hidden_columns.discard(section)
-        if 0 <= section < self.table.columnCount():
-            self.table.setColumnHidden(section, False)
+        count = self.virtual_model.columnCount() if self._virtual_active \
+            else self.table.columnCount()
+        if 0 <= section < count:
+            if self._virtual_active:
+                self.virtual_view.setColumnHidden(section, False)
+            else:
+                self.table.setColumnHidden(section, False)
             return True
         return False
 
@@ -908,6 +1354,10 @@ class ResultTable(QWidget):
 
     def column_statistics(self, section):
         """列统计（明确基于当前结果集；数值列才有 min/max/sum/avg）。"""
+        if self._virtual_active:
+            if not (0 <= section < self.virtual_model.columnCount()):
+                return None
+            return self.virtual_model.statistics(section)
         n = self.table.rowCount()
         if not (0 <= section < self.table.columnCount()):
             return None
@@ -974,6 +1424,10 @@ class ResultTable(QWidget):
 
     def distinct_values(self, section, limit=100):
         """当前结果集该列的去重值（最多 limit 项，排序后返回）。"""
+        if self._virtual_active:
+            if not (0 <= section < self.virtual_model.columnCount()):
+                return []
+            return self.virtual_model.distinct_values(section, limit)
         if not (0 <= section < self.table.columnCount()):
             return []
         seen, out = set(), []
@@ -988,7 +1442,9 @@ class ResultTable(QWidget):
 
     def apply_value_filter(self, section, values):
         """按列值列表筛选（基于当前结果集，可与文本过滤叠加）。"""
-        if not (0 <= section < self.table.columnCount()):
+        col_count = self.virtual_model.columnCount() if self._virtual_active \
+            else self.table.columnCount()
+        if not (0 <= section < col_count):
             return 0
         vals = [str(v) for v in (values or [])]
         if vals:
@@ -1003,7 +1459,9 @@ class ResultTable(QWidget):
 
     def filter_by_column(self, section, text=''):
         """表头菜单「按本列过滤」：只对该列应用文本过滤。"""
-        if not (0 <= section < self.table.columnCount()):
+        col_count = self.virtual_model.columnCount() if self._virtual_active \
+            else self.table.columnCount()
+        if not (0 <= section < col_count):
             return 0
         return self.apply_filter(text=str(text), column=section)
 
@@ -1129,7 +1587,18 @@ class ResultTable(QWidget):
     # ---------- 复制 / 导出选中 ----------
 
     def _selected_matrix(self):
-        """返回 (rows, cols) 选中的矩形单元格原始值；无选择返回 ([], [])。"""
+        """返回 (rows, cols) 选中的矩形单元格原始值；无选择返回 ([], [], [])。"""
+        if self._virtual_active:
+            selection = self.virtual_view.selectionModel()
+            indexes = sorted(selection.selectedIndexes(),
+                             key=lambda i: (i.row(), i.column())) \
+                if selection is not None else []
+            if not indexes:
+                return [], [], []
+            rows = sorted({i.row() for i in indexes})
+            cols = sorted({i.column() for i in indexes})
+            matrix = [[self._raw_value(r, c) for c in cols] for r in rows]
+            return rows, cols, matrix
         ranges = self.table.selectedRanges()
         if not ranges:
             return [], [], []

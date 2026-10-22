@@ -1,14 +1,20 @@
 """数据编辑器 - 可视化增删改（P1-5：类型编辑 + 单事务原子提交）"""
 import json
-from datetime import datetime
+import random
+import threading
+from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QMessageBox, QAbstractItemView, QSpinBox,
     QComboBox, QDateEdit, QDateTimeEdit, QLineEdit,
     QStyledItemDelegate, QStyleOptionViewItem,
+    QDialog, QFormLayout, QDialogButtonBox, QProgressDialog,
+    QDoubleSpinBox, QTableWidget,
 )
-from PySide6.QtCore import Qt, Signal, QDate, QDateTime
+from PySide6.QtCore import (
+    Qt, Signal, QDate, QDateTime, QRunnable, QThreadPool, QObject,
+)
 from PySide6.QtGui import QColor, QBrush, QIntValidator, QDoubleValidator
 
 from ..db.table_ops import (
@@ -306,6 +312,11 @@ class DataEditor(QWidget):
         self.refresh_btn = QPushButton("🔄 刷新")
         self.refresh_btn.clicked.connect(self.reload)
         tl.addWidget(self.refresh_btn)
+
+        self.gen_btn = QPushButton("🧪 生成测试数据...")
+        self.gen_btn.setToolTip("按列策略生成测试数据（预览确认后分批 INSERT）")
+        self.gen_btn.clicked.connect(self.open_data_generator)
+        tl.addWidget(self.gen_btn)
 
         tl.addStretch()
 
@@ -708,3 +719,345 @@ class DataEditor(QWidget):
         rows = [r['values'] for r in self._row_data
                 if self._row_data.index(r) not in self.deleted_rows]
         return self.column_names, rows
+
+    def open_data_generator(self):
+        """G3：为当前表打开数据生成器（预览确认后分批 INSERT）。"""
+        dlg = DataGeneratorDialog(self.conn, self.table_name,
+                                  self.columns_meta, self)
+        dlg.exec()
+        if dlg.last_result and dlg.last_result.get('inserted'):
+            self.reload()
+        return dlg
+
+
+# ==================== G3：数据生成器（纯函数 + 对话框 + 分批写入） ====================
+
+GENERATOR_STRATEGIES = (
+    'random_int', 'random_float', 'sequence', 'name', 'email', 'date',
+    'random_text', 'constant', 'null',
+)
+
+_FIRST_NAMES = ('Alice', 'Bob', 'Carol', 'David', 'Eve', 'Frank', 'Grace',
+                'Heidi', 'Ivan', 'Judy', 'Mallory', 'Niaj', 'Olivia', 'Peggy',
+                'Rupert', 'Sybil', 'Trent', 'Victor', 'Walter', 'Yvonne')
+_LAST_NAMES = ('Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia',
+               'Miller', 'Davis', 'Rodriguez', 'Martinez', 'Hernandez',
+               'Lopez', 'Wilson', 'Anderson', 'Thomas', 'Taylor', 'Moore')
+
+
+def default_strategy_for_type(col_type):
+    upper = str(col_type or '').upper()
+    if 'INT' in upper or 'BIT' in upper:
+        return 'sequence'
+    if 'FLOAT' in upper or 'DOUBLE' in upper or 'DECIMAL' in upper:
+        return 'random_float'
+    if 'DATE' in upper or 'TIME' in upper:
+        return 'date'
+    return 'random_text'
+
+
+def generate_rows(columns_meta, count, strategies=None, null_ratio=0.0,
+                  seed=None, ranges=None):
+    """生成测试行（不写库）；columns_meta 元素需有 name/type。"""
+    count = max(0, int(count))
+    null_ratio = min(max(float(null_ratio or 0.0), 0.0), 1.0)
+    rng = random.Random(seed)
+    columns_meta = list(columns_meta or [])
+    strategies = dict(strategies or {})
+    ranges = dict(ranges or {})
+    rows = []
+    for i in range(count):
+        row = []
+        for col in columns_meta:
+            name = col.get('name', '')
+            ctype = col.get('type', '')
+            strategy = strategies.get(name) or default_strategy_for_type(ctype)
+            if strategy == 'null' or (rng.random() < null_ratio):
+                row.append(None)
+                continue
+            lo, hi = ranges.get(name, (1, 1000))
+            if strategy == 'sequence':
+                row.append(i + 1)
+            elif strategy == 'random_int':
+                row.append(rng.randint(int(lo), int(hi)))
+            elif strategy == 'random_float':
+                row.append(round(rng.uniform(float(lo), float(hi)), 4))
+            elif strategy == 'name':
+                row.append(f'{rng.choice(_FIRST_NAMES)} '
+                           f'{rng.choice(_LAST_NAMES)}')
+            elif strategy == 'email':
+                row.append(f'user{i + 1}@example.test')
+            elif strategy == 'date':
+                base = datetime(2024, 1, 1) + timedelta(
+                    days=rng.randint(0, 730),
+                    seconds=rng.randint(0, 86399))
+                row.append(base.strftime('%Y-%m-%d %H:%M:%S')
+                           if 'TIME' in str(ctype).upper()
+                           or 'DATETIME' in str(ctype).upper()
+                           else base.strftime('%Y-%m-%d'))
+            elif strategy == 'constant':
+                row.append(str(col.get('default', '') or 'const'))
+            else:
+                row.append(f'text-{i + 1}-{rng.randint(1000, 9999)}')
+        rows.append(row)
+    return rows
+
+
+def build_generator_insert_sql(table, columns):
+    cols = ', '.join('`%s`' % str(c).replace('`', '``') for c in columns)
+    placeholders = ', '.join(['%s'] * len(columns))
+    return f'INSERT INTO `{str(table).replace("`", "``")}` ({cols}) VALUES ({placeholders})'
+
+
+def insert_generated_rows(conn, table, columns, rows, batch_size=100,
+                          progress_cb=None, cancel_cb=None):
+    """分批 INSERT 生成数据；取消/失败显式返回，不静默半成功。"""
+    sql = build_generator_insert_sql(table, columns)
+    rows = list(rows or [])
+    result = {'ok': True, 'inserted': 0, 'failed': 0, 'batches': 0,
+              'errors': [], 'cancelled': False, 'total': len(rows)}
+    if not rows:
+        return result
+    batch_size = max(1, int(batch_size or 100))
+    for start in range(0, len(rows), batch_size):
+        if cancel_cb is not None and cancel_cb():
+            result['cancelled'] = True
+            result['ok'] = False
+            break
+        batch = rows[start:start + batch_size]
+        try:
+            outcome = conn.execute_many(sql, batch)
+            if isinstance(outcome, tuple):
+                n = outcome[0] if outcome else 0
+                err = outcome[1] if len(outcome) > 1 else None
+            else:
+                n, err = outcome, None
+        except Exception as exc:                      # noqa: BLE001
+            n, err = 0, str(exc)
+        if err:
+            result['errors'].append({'batch_start': start + 1,
+                                     'count': len(batch),
+                                     'error': str(err)})
+            result['failed'] += len(batch)
+            result['ok'] = False
+        else:
+            result['inserted'] += int(n or 0)
+        result['batches'] += 1
+        if progress_cb is not None:
+            progress_cb(min(start + len(batch), len(rows)), len(rows))
+    return result
+
+
+class GeneratorSignals(QObject):
+    progress = Signal(int, int)
+    finished = Signal(object)
+    failed = Signal(str)
+
+
+class DataGeneratorWorker(QRunnable):
+    def __init__(self, conn, table, columns, rows, batch_size=100):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.conn = conn
+        self.table = table
+        self.columns = list(columns)
+        self.rows = list(rows)
+        self.batch_size = batch_size
+        self.signals = GeneratorSignals()
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    def run(self):
+        try:
+            result = insert_generated_rows(
+                self.conn, self.table, self.columns, self.rows,
+                batch_size=self.batch_size,
+                progress_cb=lambda d, t: self.signals.progress.emit(
+                    int(d), int(t)),
+                cancel_cb=lambda: self._cancel.is_set())
+            self.signals.finished.emit(result)
+        except BaseException as exc:                  # noqa: BLE001
+            self.signals.failed.emit(str(exc))
+
+
+class DataGeneratorDialog(QDialog):
+    """行数/列策略/NULL 比例 → 预览确认 → 分批 INSERT（进度/取消/失败显式）。"""
+
+    def __init__(self, conn, table_name, columns_meta, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.table_name = table_name
+        self.columns_meta = list(columns_meta or [])
+        self.last_result = None
+        self._worker = None
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+        self.setWindowTitle(f'生成测试数据 → {table_name}')
+        self.resize(760, 620)
+        self._build_ui()
+        self.refresh_preview()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(0, 1000000)
+        self.count_spin.setValue(100)
+        form.addRow('行数:', self.count_spin)
+        self.null_ratio_spin = QDoubleSpinBox()
+        self.null_ratio_spin.setRange(0.0, 1.0)
+        self.null_ratio_spin.setSingleStep(0.05)
+        self.null_ratio_spin.setDecimals(2)
+        form.addRow('NULL 比例:', self.null_ratio_spin)
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 2 ** 31 - 1)
+        self.seed_spin.setValue(42)
+        form.addRow('随机种子:', self.seed_spin)
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(1, 10000)
+        self.batch_spin.setValue(100)
+        form.addRow('每批行数:', self.batch_spin)
+        layout.addLayout(form)
+        layout.addWidget(QLabel('列策略（逐列选择；默认按类型推断）:'))
+        self.strategy_table = QTableWidget()
+        self.strategy_table.setColumnCount(3)
+        self.strategy_table.setHorizontalHeaderLabels(['列', '类型', '策略'])
+        self.strategy_table.setRowCount(len(self.columns_meta))
+        for r, col in enumerate(self.columns_meta):
+            self.strategy_table.setItem(r, 0, QTableWidgetItem(
+                str(col.get('name', ''))))
+            self.strategy_table.setItem(r, 1, QTableWidgetItem(
+                str(col.get('type', ''))))
+            combo = QComboBox()
+            combo.addItems(GENERATOR_STRATEGIES)
+            combo.setCurrentText(default_strategy_for_type(
+                col.get('type', '')))
+            combo.currentTextChanged.connect(self.refresh_preview)
+            self.strategy_table.setCellWidget(r, 2, combo)
+        self.strategy_table.resizeColumnsToContents()
+        layout.addWidget(self.strategy_table)
+        layout.addWidget(QLabel('预览（前 20 行；确认后才写入数据库）:'))
+        self.preview = QTableWidget()
+        layout.addWidget(self.preview, 1)
+        row = QHBoxLayout()
+        self.preview_btn = QPushButton('刷新预览')
+        self.preview_btn.clicked.connect(self.refresh_preview)
+        row.addWidget(self.preview_btn)
+        self.generate_btn = QPushButton('生成并写入（需确认）')
+        self.generate_btn.clicked.connect(self.start_generate)
+        row.addWidget(self.generate_btn)
+        row.addStretch()
+        close = QPushButton('关闭')
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        layout.addLayout(row)
+        self.status = QLabel('')
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+    def strategies(self):
+        out = {}
+        for r, col in enumerate(self.columns_meta):
+            combo = self.strategy_table.cellWidget(r, 2)
+            if combo is not None:
+                out[str(col.get('name', ''))] = combo.currentText()
+        return out
+
+    def preview_rows(self, count=None):
+        return generate_rows(
+            self.columns_meta, min(20, int(count or self.count_spin.value())),
+            strategies=self.strategies(),
+            null_ratio=self.null_ratio_spin.value(),
+            seed=self.seed_spin.value())
+
+    def refresh_preview(self, *_args):
+        rows = self.preview_rows()
+        cols = [c.get('name', '') for c in self.columns_meta]
+        self.preview.setColumnCount(len(cols))
+        self.preview.setHorizontalHeaderLabels(cols)
+        self.preview.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, value in enumerate(row):
+                self.preview.setItem(r, c, QTableWidgetItem(
+                    'NULL' if value is None else str(value)))
+        self.preview.resizeColumnsToContents()
+        return rows
+
+    def build_rows(self):
+        return generate_rows(
+            self.columns_meta, self.count_spin.value(),
+            strategies=self.strategies(),
+            null_ratio=self.null_ratio_spin.value(),
+            seed=self.seed_spin.value())
+
+    def generate_sync(self):
+        """同步生成并写入（测试/无事件循环场景）；返回结果 dict。"""
+        rows = self.build_rows()
+        result = insert_generated_rows(
+            self.conn, self.table_name,
+            [c.get('name', '') for c in self.columns_meta], rows,
+            batch_size=self.batch_spin.value())
+        self.last_result = result
+        self._show_result(result)
+        return result
+
+    def _show_result(self, result):
+        text = (f"插入 {result.get('inserted', 0)} 行"
+                f"（失败 {result.get('failed', 0)} 行，"
+                f"{result.get('batches', 0)} 批）")
+        if result.get('cancelled'):
+            text = '已取消（已提交的批次保留）: ' + text
+        if result.get('errors'):
+            text += '\n' + '\n'.join(
+                f"批次 {e['batch_start']} 失败: {e['error']}"
+                for e in result['errors'][:5])
+        self.status.setText(text)
+        self.status.setStyleSheet(
+            'color: #89d185;' if result.get('ok') else 'color: #f48771;')
+
+    def start_generate(self):
+        if self._worker is not None:
+            return
+        rows = self.build_rows()
+        if not rows:
+            self.status.setText('行数为 0，没有可生成的数据')
+            return
+        ret = QMessageBox.question(
+            self, '确认写入',
+            f"将向表 {self.table_name} 插入 {len(rows)} 行测试数据，"
+            '可能修改真实数据。是否继续？')
+        if ret != QMessageBox.Yes:
+            return
+        self._progress = QProgressDialog('写入中...', '取消', 0, len(rows), self)
+        self._progress.setWindowModality(Qt.WindowModal)
+        self._progress.setMinimumDuration(0)
+        worker = DataGeneratorWorker(
+            self.conn, self.table_name,
+            [c.get('name', '') for c in self.columns_meta],
+            rows, batch_size=self.batch_spin.value())
+        self._worker = worker
+        worker.signals.progress.connect(self._progress.setValue)
+        worker.signals.finished.connect(self._on_finished)
+        worker.signals.failed.connect(self._on_failed)
+        self._progress.canceled.connect(worker.cancel)
+        self._pool.start(worker)
+
+    def _on_finished(self, result):
+        self._worker = None
+        self.last_result = result
+        try:
+            self._progress.close()
+        except Exception:
+            pass
+        self._show_result(result)
+
+    def _on_failed(self, error):
+        self._worker = None
+        self.status.setText(f'生成失败（不完整批次见错误）: {error}')
+        self.status.setStyleSheet('color: #f48771;')
+        try:
+            self._progress.close()
+        except Exception:
+            pass

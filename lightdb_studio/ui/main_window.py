@@ -222,6 +222,7 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._setup_accessibility()
         self._apply_settings()
+        self._apply_shortcut_settings()
 
         # 启动后台服务
         self.scheduler.start()
@@ -867,6 +868,12 @@ class MainWindow(QMainWindow):
             editor.set_schema_provider(self._schema_snapshot)
             editor.set_auto_complete(
                 bool(getattr(self.settings, 'editor_auto_complete', True)))
+        except Exception:
+            pass
+        # G3：快捷键自定义（持久化在 settings.shortcuts）
+        try:
+            from .shortcuts import apply_to_editor
+            apply_to_editor(editor, getattr(self.settings, 'shortcuts', {}))
         except Exception:
             pass
 
@@ -2190,6 +2197,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '新建窗口失败', str(exc))
             return None
 
+    def _apply_shortcut_settings(self):
+        """G3：应用自定义快捷键到菜单/编辑器（冲突显式，不弹模态）。"""
+        try:
+            from .shortcuts import apply_to_window
+            result = apply_to_window(self, getattr(self.settings, 'shortcuts', {}))
+            self._shortcut_apply_result = result
+            return result
+        except Exception as exc:                      # noqa: BLE001
+            self._shortcut_apply_result = {'ok': False, 'error': str(exc)}
+            return self._shortcut_apply_result
+
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec() == QDialog.Accepted:
@@ -2197,6 +2215,7 @@ class MainWindow(QMainWindow):
             i18n.set_lang(self.settings.language)
             self._apply_settings()
             self._retranslate_ui()
+            self._apply_shortcut_settings()
 
     def _open_profiler(self):
         dlg = QDialog(self)

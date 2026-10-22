@@ -151,16 +151,15 @@ class SettingsDialog(QDialog):
         self.shortcut_table.setColumnWidth(1, 180)
         layout.addWidget(self.shortcut_table)
 
-        self._shortcut_defs = [
-            ('新建查询', 'Ctrl+N'), ('执行', 'Ctrl+Return'),
-            ('执行选中', 'Ctrl+Shift+Return'), ('EXPLAIN', 'Ctrl+E'),
-            ('打开 SQL', 'Ctrl+O'), ('保存 SQL', 'Ctrl+S'),
-            ('关闭标签', 'Ctrl+W'), ('刷新', 'F9'), ('性能面板', 'Ctrl+P'),
-            ('查询历史', 'Ctrl+H'), ('数据图表', 'Ctrl+G'), ('设置', 'Ctrl+,'),
-        ]
-        self.shortcut_table.setRowCount(len(self._shortcut_defs))
-        for i, (name, key) in enumerate(self._shortcut_defs):
-            self.shortcut_table.setItem(i, 0, QTableWidgetItem(name))
+        self._shortcut_defs = []
+        self._shortcut_ids = []
+        from .shortcuts import shortcuts_for_settings_page
+        page = shortcuts_for_settings_page()
+        self.shortcut_table.setRowCount(len(page))
+        for i, (action_id, label, key, editor_only) in enumerate(page):
+            self._shortcut_ids.append(action_id)
+            self._shortcut_defs.append((label, key))
+            self.shortcut_table.setItem(i, 0, QTableWidgetItem(label))
             self.shortcut_table.setItem(i, 1, QTableWidgetItem(key))
 
         btn_row = QHBoxLayout()
@@ -232,6 +231,15 @@ class SettingsDialog(QDialog):
         self.log_level_combo.setCurrentText(s.log_level)
         self.query_timeout_spin.setValue(s.query_timeout)
         self.max_rows_spin.setValue(s.max_result_rows)
+        from .shortcuts import load_shortcuts
+        saved_shortcuts = load_shortcuts(s.shortcuts)
+        for i, action_id in enumerate(getattr(self, '_shortcut_ids', [])):
+            if i < self.shortcut_table.rowCount():
+                item = self.shortcut_table.item(i, 1)
+                if item is None:
+                    item = QTableWidgetItem('')
+                    self.shortcut_table.setItem(i, 1, item)
+                item.setText(saved_shortcuts.get(action_id, ''))
 
     def _collect(self):
         s = self.settings
@@ -251,15 +259,28 @@ class SettingsDialog(QDialog):
         s.query_timeout = self.query_timeout_spin.value()
         s.max_result_rows = self.max_rows_spin.value()
         s.shortcuts = {}
-        for i in range(self.shortcut_table.rowCount()):
-            name = self.shortcut_table.item(i, 0).text()
-            key = self.shortcut_table.item(i, 1).text()
-            s.shortcuts[name] = key
+        for i, action_id in enumerate(getattr(self, '_shortcut_ids', [])):
+            item = self.shortcut_table.item(i, 1)
+            key = item.text().strip() if item is not None else ''
+            s.shortcuts[action_id] = key
         return s
 
     def apply_settings(self) -> dict:
         """保存设置并立即切换 i18n 语言（主窗口监听后热重译）。"""
         s = self._collect()
+        from .shortcuts import validate_shortcuts
+        validation = validate_shortcuts(s.shortcuts)
+        if not validation['ok']:
+            lines = []
+            for c in validation['conflicts']:
+                lines.append(f"{c['key']}: " + ' / '.join(c['labels']))
+            lines.extend(validation['errors'])
+            QMessageBox.warning(
+                self, '快捷键冲突', '存在重复/非法快捷键，未保存：\n'
+                + '\n'.join(lines[:10]))
+            return {'ok': False, 'language': s.language,
+                    'conflicts': validation['conflicts'],
+                    'errors': validation['errors']}
         s.save()
         changed = i18n.set_lang(s.language)
         # 自身文案也刷新（保持打开时不再显示旧语言）

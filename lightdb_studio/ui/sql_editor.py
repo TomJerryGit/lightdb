@@ -121,27 +121,38 @@ class SQLEditor(QPlainTextEdit):
         # ---- P1-3 自动补全 ----
         self._setup_completer()
 
-        # 快捷键（保持原有执行快捷键不变）
-        QShortcut(QKeySequence("Ctrl+Return"), self, self._exec_all)
-        QShortcut(QKeySequence("Ctrl+Shift+Return"), self, self._exec_selection)
-        QShortcut(QKeySequence("F5"), self, self._exec_all)
-        # 手动补全
-        QShortcut(QKeySequence("Ctrl+Space"), self,
-                  lambda: self.show_completion(force=True))
-        # ---- G1 编辑器细节快捷键 ----
-        QShortcut(QKeySequence("Ctrl+F"), self,
-                  lambda: self.open_find_bar(replace=False))
-        QShortcut(QKeySequence("Ctrl+H"), self,
-                  lambda: self.open_find_bar(replace=True))
+        # 快捷键（保持原有执行快捷键不变；G3：保存引用供自定义应用）
+        self._shortcut_refs = {
+            'run': QShortcut(QKeySequence("Ctrl+Return"), self, self._exec_all),
+            'run_selection': QShortcut(
+                QKeySequence("Ctrl+Shift+Return"), self, self._exec_selection),
+            'completion': QShortcut(
+                QKeySequence("Ctrl+Space"), self,
+                lambda: self.show_completion(force=True)),
+            'find': QShortcut(
+                QKeySequence("Ctrl+F"), self,
+                lambda: self.open_find_bar(replace=False)),
+            'replace': QShortcut(
+                QKeySequence("Ctrl+H"), self,
+                lambda: self.open_find_bar(replace=True)),
+            'goto_line': QShortcut(
+                QKeySequence("Ctrl+L"), self, self.goto_line_dialog),
+            'toggle_comment': QShortcut(
+                QKeySequence("Ctrl+/"), self, self.toggle_comment),
+            'duplicate_line': QShortcut(
+                QKeySequence("Ctrl+D"), self, self.duplicate_line),
+            'move_line_up': QShortcut(
+                QKeySequence("Alt+Up"), self, lambda: self.move_line(-1)),
+            'move_line_down': QShortcut(
+                QKeySequence("Alt+Down"), self, lambda: self.move_line(1)),
+            'execute_statement': QShortcut(
+                QKeySequence("Ctrl+Shift+E"), self,
+                self.execute_current_statement),
+        }
+        # Ctrl+R 也打开替换（不进自定义表，保持兼容）
         QShortcut(QKeySequence("Ctrl+R"), self,
                   lambda: self.open_find_bar(replace=True))
-        QShortcut(QKeySequence("Ctrl+L"), self, self.goto_line_dialog)
-        QShortcut(QKeySequence("Ctrl+/"), self, self.toggle_comment)
-        QShortcut(QKeySequence("Ctrl+D"), self, self.duplicate_line)
-        QShortcut(QKeySequence("Alt+Up"), self, lambda: self.move_line(-1))
-        QShortcut(QKeySequence("Alt+Down"), self, lambda: self.move_line(1))
-        QShortcut(QKeySequence("Ctrl+Shift+E"), self,
-                  self.execute_current_statement)
+        QShortcut(QKeySequence("F5"), self, self._exec_all)
         self._build_find_bar()
 
     # ==================== 行号区域 ====================
@@ -962,6 +973,23 @@ class SQLEditor(QPlainTextEdit):
             event.ignore()
 
     # ==================== 执行 ====================
+
+    def apply_shortcut_map(self, mapping):
+        """G3：按设置里的 id→键序列应用快捷键；返回应用数量。"""
+        from PySide6.QtGui import QKeySequence
+        applied = 0
+        for action_id, ref in getattr(self, '_shortcut_refs', {}).items():
+            if action_id not in (mapping or {}):
+                continue
+            key = str(mapping.get(action_id) or '').strip()
+            if not key:
+                continue
+            try:
+                ref.setKey(QKeySequence(key))
+                applied += 1
+            except Exception:
+                pass
+        return applied
 
     def _exec_all(self):
         sql = self.toPlainText().strip()
