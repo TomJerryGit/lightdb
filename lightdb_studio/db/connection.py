@@ -1,4 +1,5 @@
 """数据库连接封装（基于 PyMySQL）"""
+import os
 import threading
 from contextlib import contextmanager
 from typing import Optional, List, Tuple, Any
@@ -149,6 +150,47 @@ def _raise_db_error(exc: BaseException, sql: str = None):
     ) from exc
 
 
+def build_ssl_params(config):
+    """把 ConnectionInfo 的 ssl/ssl_options 变成 pymysql `ssl=` 参数。
+
+    返回 None（未启用 SSL）或 dict；高级字段来自 G2-b 的 ssl_options：
+    ca/cert/key/check_hostname/verify_mode/ssl_verify_cert/ssl_verify_identity。
+    路径不存在/不可读时显式抛 RuntimeError（不静默降级成明文）。
+    """
+    if not getattr(config, 'ssl', False):
+        return None
+    options = dict(getattr(config, 'ssl_options', None) or {})
+    params = {'check_hostname': bool(options.get('check_hostname', False))}
+    verify = str(options.get('verify_mode', '')).lower()
+    if verify in ('none', 'disable', 'disabled'):
+        params['check_hostname'] = False
+        params['ssl_verify_cert'] = False
+        params['ssl_verify_identity'] = False
+    elif verify in ('required', 'require', 'strict'):
+        params['check_hostname'] = True
+        params['ssl_verify_cert'] = True
+        params['ssl_verify_identity'] = True
+    elif verify in ('cert', 'ca'):
+        params['ssl_verify_cert'] = True
+    for key in ('ca', 'cert', 'key'):
+        value = options.get(key)
+        if not value:
+            continue
+        path = str(value)
+        if not os.path.isfile(path):
+            raise RuntimeError(f'SSL {key} 文件不存在: {path}')
+        try:
+            with open(path, 'rb'):
+                pass
+        except OSError as exc:
+            raise RuntimeError(f'SSL {key} 文件不可读: {path}（{exc}）')
+        params[key] = path
+    for key in ('ssl_verify_cert', 'ssl_verify_identity'):
+        if key in options and key not in params:
+            params[key] = bool(options[key])
+    return params
+
+
 class DBConnection:
     """单条数据库连接（会话）"""
 
@@ -171,9 +213,7 @@ class DBConnection:
         if pymysql is None:
             raise RuntimeError("请先安装 pymysql: pip install pymysql")
 
-        ssl_param = None
-        if getattr(self.config, 'ssl', False):
-            ssl_param = {'check_hostname': False}
+        ssl_param = build_ssl_params(self.config)
 
         self.conn = pymysql.connect(
             host=self.config.host,
@@ -380,9 +420,7 @@ class DBConnection:
         except (TypeError, ValueError):
             return False, f'thread_id 非法: {thread_id!r}'
 
-        ssl_param = None
-        if getattr(self.config, 'ssl', False):
-            ssl_param = {'check_hostname': False}
+        ssl_param = build_ssl_params(self.config)
         killer = None
         try:
             killer = pymysql.connect(

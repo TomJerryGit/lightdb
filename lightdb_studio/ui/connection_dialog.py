@@ -328,9 +328,8 @@ class ConnectionDialog(QDialog):
             database=self.db_edit.text().strip(),
             charset=self.charset_combo.currentText(),
             ssl=self.ssl_check.isChecked(),
+            ssl_options=self.build_ssl_params(silent=True),
         )
-        # 高级 SSL 配置作为运行时附加属性（config schema 不变，不写明文私钥）
-        info.ssl_options = self.build_ssl_params(silent=True)
         return info
 
     # ---------- G2：SSL 高级字段 ----------
@@ -471,7 +470,8 @@ def duplicate_connection(config, source_name, new_name=None):
     info = ConnectionInfo(
         name=new_name, host=source.host, port=source.port,
         user=source.user, password=source.password,
-        database=source.database, charset=source.charset, ssl=source.ssl)
+        database=source.database, charset=source.charset, ssl=source.ssl,
+        ssl_options=dict(getattr(source, 'ssl_options', None) or {}))
     try:
         config.add_connection(info)
     except Exception as exc:                          # noqa: BLE001
@@ -515,10 +515,12 @@ def edit_connection(parent, config, name, dialog_class=None):
     dlg = cls(parent, info=ConnectionInfo(
         name=info.name, host=info.host, port=info.port, user=info.user,
         password=info.password, database=info.database,
-        charset=info.charset, ssl=info.ssl))
+        charset=info.charset, ssl=info.ssl,
+        ssl_options=dict(getattr(info, 'ssl_options', None) or {})))
     # 保留高级 SSL 配置（若原连接带有时）
     if getattr(info, 'ssl_options', None):
         dlg.info.ssl_options = dict(info.ssl_options)
+
         for edit_name, key in (('ssl_ca_edit', 'ca'),
                                ('ssl_cert_edit', 'cert'),
                                ('ssl_key_edit', 'key')):

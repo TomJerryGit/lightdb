@@ -343,6 +343,126 @@ def execute_plan(conn, plan, confirmer=None):
     return result
 
 
+# ==================== G2-b：安全结构同步（事务 + 逐条报告） ====================
+
+SAFE_PLAN_KINDS = {'create_table', 'create_index'}
+# 本引擎不支持 ALTER MODIFY / ALTER TABLE ...（E2 之前）；这些差异只作为
+# 手工说明存在，绝不自动执行（避免假同步/半成功）。
+UNSUPPORTED_PLAN_KINDS = {'alter_table', 'alter_column', 'drop_column',
+                          'drop_index', 'add_column'}
+
+
+def plan_safe_statements(plan):
+    """从计划中挑出安全可执行语句；返回 (safe, blocked)。"""
+    safe, blocked = [], []
+    for stmt in plan.get('statements') or []:
+        kind = stmt.get('kind')
+        if stmt.get('manual'):
+            blocked.append({'sql': stmt.get('sql', ''), 'kind': kind,
+                            'table': stmt.get('table'),
+                            'reason': '需手工处理，自动同步禁止执行'})
+        elif stmt.get('high_risk'):
+            blocked.append({'sql': stmt.get('sql', ''), 'kind': kind,
+                            'table': stmt.get('table'),
+                            'reason': '高风险 DDL（DROP 等），安全同步不自动执行'})
+        elif kind in UNSUPPORTED_PLAN_KINDS:
+            blocked.append({'sql': stmt.get('sql', ''), 'kind': kind,
+                            'table': stmt.get('table'),
+                            'reason': '引擎不支持 ALTER 类变更，需手工处理'})
+        elif kind in SAFE_PLAN_KINDS:
+            safe.append(stmt)
+        else:
+            blocked.append({'sql': stmt.get('sql', ''), 'kind': kind,
+                            'table': stmt.get('table'),
+                            'reason': f'不在安全白名单内: {kind}'})
+    return safe, blocked
+
+
+def execute_plan_transactional(conn, plan, confirmer=None, dry_run=False):
+    """预演 → 二次确认 → 事务执行安全 SQL（CREATE TABLE/CREATE INDEX）。
+
+    返回 {'ok','dry_run','cancelled','executed','total','rolled_back',
+          'results','blocked','preview','error'}；失败 rollback 并逐条报告，
+    不静默半成功；引擎不支持的 ALTER 差异进入 blocked 且禁止执行。
+    """
+    safe, blocked = plan_safe_statements(plan)
+    result = {
+        'ok': True, 'dry_run': bool(dry_run), 'cancelled': False,
+        'executed': 0, 'total': len(safe), 'rolled_back': False,
+        'results': [], 'blocked': blocked, 'preview': plan_sql_text(plan),
+        'error': '',
+    }
+    if dry_run:
+        return result
+    if not safe:
+        result.update({'ok': True, 'executed': 0,
+                       'message': '没有可安全执行的语句（仅手工/高风险/不支持项）'})
+        return result
+    if confirmer is not None and not confirmer(plan):
+        result.update({'ok': False, 'cancelled': True,
+                       'error': '用户取消同步'})
+        return result
+    raw = getattr(conn, 'conn', None)
+    if raw is None:
+        result.update({
+            'ok': False, 'rolled_back': True,
+            'error': '目标连接未建立或不支持事务（需要底层 pymysql 连接）'})
+        return result
+    old_autocommit = None
+    cursor = None
+    try:
+        if hasattr(raw, 'get_autocommit'):
+            try:
+                old_autocommit = bool(raw.get_autocommit())
+            except Exception:
+                old_autocommit = None
+        raw.autocommit(False)
+        cursor = raw.cursor()
+        for stmt in safe:
+            sql = stmt.get('sql', '')
+            entry = {'sql': sql, 'kind': stmt.get('kind'),
+                     'table': stmt.get('table')}
+            try:
+                cursor.execute(sql)
+            except Exception as exc:                  # noqa: BLE001
+                entry.update({'status': 'failed', 'error': str(exc)})
+                result['results'].append(entry)
+                try:
+                    raw.rollback()
+                except Exception as roll_exc:         # noqa: BLE001
+                    result['error'] = (f'执行失败且回滚失败: {exc} / {roll_exc}')
+                else:
+                    result['error'] = f'执行失败，已回滚: {exc}'
+                result['rolled_back'] = True
+                result['ok'] = False
+                return result
+            entry.update({'status': 'executed', 'error': ''})
+            result['results'].append(entry)
+            result['executed'] += 1
+        raw.commit()
+        result['ok'] = True
+        result['message'] = f'事务提交成功：{result["executed"]} 条'
+        return result
+    except Exception as exc:                          # noqa: BLE001
+        try:
+            raw.rollback()
+        except Exception:
+            pass
+        result.update({'ok': False, 'rolled_back': True,
+                       'error': f'事务执行失败，已回滚: {exc}'})
+        return result
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        try:
+            raw.autocommit(True if old_autocommit is None else old_autocommit)
+        except Exception:
+            pass
+
+
 # ==================== 对话框 ====================
 
 class DBCompareDialog(QDialog):
@@ -420,6 +540,14 @@ class DBCompareDialog(QDialog):
         self.sync_btn.setEnabled(False)
         self.sync_btn.clicked.connect(self._sync)
         bottom.addWidget(self.sync_btn)
+        self.safe_sync_btn = QPushButton('🛡 安全同步（仅 CREATE）')
+        self.safe_sync_btn.setEnabled(False)
+        self.safe_sync_btn.setToolTip(
+            '预演 → 二次确认 → 事务内只执行 CREATE TABLE / CREATE INDEX；\n'
+            'ALTER、DROP 等风险/不支持差异不执行，逐条报告并失败回滚。')
+        self.safe_sync_btn.clicked.connect(
+            lambda: self.execute_sync_safe(interactive=True))
+        bottom.addWidget(self.safe_sync_btn)
         close_btn = QPushButton('关闭')
         close_btn.clicked.connect(self.reject)
         bottom.addWidget(close_btn)
@@ -482,6 +610,7 @@ class DBCompareDialog(QDialog):
         self.sql_view.setPlainText(plan_sql_text(self.plan))
         have = bool(self.plan['statements'])
         self.sync_btn.setEnabled(have)
+        self.safe_sync_btn.setEnabled(have)
         self.save_btn.setEnabled(True)
         s = self.diff_result['summary']
         self.summary.setText(
@@ -599,3 +728,41 @@ class DBCompareDialog(QDialog):
 
     def _sync(self):
         self.execute_sync(interactive=True)
+
+    def execute_sync_safe(self, interactive=True):
+        """G2-b：预演 → 确认 → 事务执行安全 SQL；风险/不支持项显式报告。"""
+        if not self.plan:
+            return {'ok': False, 'cancelled': True, 'error': '请先执行对比',
+                    'executed': 0, 'total': 0, 'results': [], 'blocked': []}
+        conn_b = self._get_conns()[1]
+        safe, blocked = plan_safe_statements(self.plan)
+        preview = self.plan['sql_preview'] if isinstance(
+            self.plan, dict) and 'sql_preview' in self.plan \
+            else plan_sql_text(self.plan)
+        if interactive:
+            ret = QMessageBox.question(
+                self, '安全同步预演',
+                f"将向目标库执行 {len(safe)} 条安全 DDL"
+                f"（CREATE TABLE / CREATE INDEX）；"
+                f"{len(blocked)} 条风险/不支持项不会执行。\n\n"
+                f"{preview[:1800]}\n\n是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return {'ok': False, 'cancelled': True,
+                        'error': '用户取消安全同步', 'executed': 0,
+                        'total': len(safe), 'results': [], 'blocked': blocked}
+        result = execute_plan_transactional(conn_b, self.plan)
+        if result.get('ok'):
+            QMessageBox.information(
+                self, '安全同步完成',
+                f"事务提交成功 {result.get('executed', 0)} 条；"
+                f"{len(result.get('blocked') or [])} 条因风险/不支持未执行。")
+        else:
+            detail = result.get('error') or ''
+            failed = [e for e in result.get('results') or []
+                      if e.get('status') == 'failed']
+            if failed:
+                detail += '\n' + '\n'.join(
+                    f"{e.get('table')}: {e.get('error')}" for e in failed[:6])
+            QMessageBox.critical(self, '安全同步失败', detail)
+        return result

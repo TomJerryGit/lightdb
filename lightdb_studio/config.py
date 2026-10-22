@@ -21,6 +21,9 @@ class ConnectionInfo:
     database: str = ""
     charset: str = "utf8mb4"
     ssl: bool = False
+    # G2-b：SSL 高级参数（CA/客户端证书/私钥/验证模式）。旧 JSON 无此字段 →
+    # 默认空 dict；导出/导入与连接对话框读写；DBConnection 会真正传给 pymysql。
+    ssl_options: dict = field(default_factory=dict)
 
 
 # `connections.json` 里一条连接**恰好**是这些字段（`AppConfig.save()` 用
@@ -44,6 +47,9 @@ def _connection_from_dict(d: dict) -> ConnectionInfo:
     if unknown:
         print(f"连接 {known.get('name')!r} 里有未知字段，已忽略: {unknown}"
               f"（合法字段: {sorted(CONNECTION_FIELDS)}）", file=sys.stderr)
+    # 旧 JSON 没有 ssl_options / 手写值不是对象 → 归零，不把一条连接搞坏
+    opts = known.get('ssl_options')
+    known['ssl_options'] = dict(opts) if isinstance(opts, dict) else {}
     return ConnectionInfo(**known)
 
 

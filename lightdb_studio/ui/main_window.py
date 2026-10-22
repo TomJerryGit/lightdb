@@ -581,6 +581,10 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._exec_explain)
         m_query.addAction(a)
 
+        a = QAction("📊 可视化 EXPLAIN...", self)
+        a.triggered.connect(self._open_visual_explain)
+        m_query.addAction(a)
+
         self._cancel_action = QAction("取消当前查询", self)
         self._cancel_action.setToolTip("取消正在执行的后台查询（KILL 连接）")
         self._cancel_action.setEnabled(False)
@@ -737,6 +741,15 @@ class MainWindow(QMainWindow):
         a = QAction("⚙️ 设置...", self)
         a.setShortcut(QKeySequence("Ctrl+,"))
         a.triggered.connect(self._open_settings)
+        m_tools.addAction(a)
+
+        m_tools.addSeparator()
+        a = QAction("👥 用户管理...", self)
+        a.triggered.connect(self._open_user_management)
+        m_tools.addAction(a)
+        a = QAction("🪟 新建窗口", self)
+        a.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        a.triggered.connect(self._new_window)
         m_tools.addAction(a)
 
         # ---------- 帮助 ----------
@@ -2130,6 +2143,53 @@ class MainWindow(QMainWindow):
         dlg = AuditViewer(self._get_current_conn, parent=self)
         dlg.exec()
 
+    # ==================== G2-b：可视化 EXPLAIN / 用户管理 / 多窗口 ====================
+
+    def _current_sql_text(self):
+        editor = self._current_widgets()[0]
+        if editor is None:
+            return ''
+        return editor.toPlainText().strip()
+
+    def _open_visual_explain(self):
+        conn = self._get_current_conn()
+        if conn is None:
+            QMessageBox.warning(self, '提示', '请先选择一个连接')
+            return None
+        sql = self._current_sql_text()
+        if not sql:
+            QMessageBox.information(self, '提示', '当前编辑器没有 SQL')
+            return None
+        from .explain_view import ExplainViewDialog
+        dlg = ExplainViewDialog(conn, sql, self)
+        dlg.exec()
+        return dlg
+
+    def _open_user_management(self):
+        conn = self._get_current_conn()
+        if conn is None:
+            QMessageBox.warning(self, '提示', '请先选择一个连接')
+            return None
+        dlg = UserManagementDialog(conn, self)
+        dlg.exec()
+        return dlg
+
+    def _new_window(self):
+        """G2-b：独立 MainWindow（关闭互不影响；失败显式，不假成功）。"""
+        try:
+            from ..config import AppConfig
+            cfg = AppConfig()
+            win = MainWindow(cfg)
+            win.show()
+            if not hasattr(self, '_extra_windows'):
+                self._extra_windows = []
+            self._extra_windows.append(win)
+            self.status_label.setText('已打开新窗口')
+            return win
+        except Exception as exc:                      # noqa: BLE001
+            QMessageBox.warning(self, '新建窗口失败', str(exc))
+            return None
+
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec() == QDialog.Accepted:
@@ -2575,3 +2635,138 @@ class MainWindow(QMainWindow):
             pass
 
         event.accept()
+
+
+class UserManagementDialog(QDialog):
+    """G2-b：用户管理（引擎能列用户则展示；不能则显式提示，不造假数据）。"""
+
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.users_error = ''
+        self.users = []
+        self.last_result = None
+        self.setWindowTitle('用户管理')
+        self.resize(640, 520)
+        self._build_ui()
+        self.load_users()
+
+    def _build_ui(self):
+        from PySide6.QtWidgets import (
+            QFormLayout, QLineEdit, QComboBox, QTextEdit, QPushButton,
+            QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit)
+        layout = QVBoxLayout(self)
+        self.engine_status = QLabel('')
+        self.engine_status.setWordWrap(True)
+        self.engine_status.setStyleSheet('color: #d7ba7d;')
+        layout.addWidget(self.engine_status)
+        self.user_list = QPlainTextEdit()
+        self.user_list.setReadOnly(True)
+        self.user_list.setMaximumHeight(120)
+        layout.addWidget(QLabel('已有用户（真实查询结果；不支持时为空并显示原因）:'))
+        layout.addWidget(self.user_list)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit('app_user')
+        form.addRow('用户名:', self.name_edit)
+        self.host_edit = QLineEdit('localhost')
+        form.addRow('Host:', self.host_edit)
+        self.pwd_edit = QLineEdit()
+        self.pwd_edit.setEchoMode(QLineEdit.Password)
+        form.addRow('密码:', self.pwd_edit)
+        self.db_edit = QLineEdit()
+        form.addRow('授权库:', self.db_edit)
+        self.priv_combo = QComboBox()
+        self.priv_combo.addItems(['SELECT', 'INSERT', 'UPDATE', 'DELETE',
+                                  'SELECT, INSERT, UPDATE, DELETE', 'ALL'])
+        form.addRow('权限:', self.priv_combo)
+        layout.addLayout(form)
+        self.sql_preview = QTextEdit()
+        self.sql_preview.setReadOnly(True)
+        self.sql_preview.setMaximumHeight(110)
+        layout.addWidget(QLabel('将执行的 SQL（预演）:'))
+        layout.addWidget(self.sql_preview)
+
+        row = QHBoxLayout()
+        gen = QPushButton('生成 SQL')
+        gen.clicked.connect(self.generate_sql)
+        row.addWidget(gen)
+        exec_btn = QPushButton('执行（显式结果）')
+        exec_btn.clicked.connect(self.execute)
+        row.addWidget(exec_btn)
+        row.addStretch()
+        close = QPushButton('关闭')
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        layout.addLayout(row)
+        self.result_label = QLabel('')
+        self.result_label.setWordWrap(True)
+        layout.addWidget(self.result_label)
+        self.generate_sql()
+
+    def load_users(self):
+        self.users = []
+        self.users_error = ''
+        try:
+            _cols, rows = self.conn.query('SELECT user, host FROM mysql.user')
+            self.users = [tuple(r) for r in (rows or [])]
+            self.user_list.setPlainText('\n'.join(
+                f'{r[0]}@{r[1]}' for r in self.users) or '（无用户）')
+            self.engine_status.setText(
+                f'引擎返回 {len(self.users)} 个用户（真实数据）')
+            self.engine_status.setStyleSheet('color: #89d185;')
+        except Exception as exc:                      # noqa: BLE001
+            self.users_error = str(exc)
+            self.user_list.setPlainText('')
+            self.engine_status.setText(
+                '引擎暂不支持列出用户（显式提示，不造假数据）: ' + str(exc))
+            self.engine_status.setStyleSheet('color: #f48771;')
+        return self.users
+
+    def generate_sql(self):
+        import re
+        name = self.name_edit.text().strip() or 'app_user'
+        host = self.host_edit.text().strip() or 'localhost'
+        pwd = self.pwd_edit.text()
+        db = self.db_edit.text().strip()
+        priv = self.priv_combo.currentText()
+        if not re.fullmatch(r'[A-Za-z0-9_.$@-]{1,64}', name) or \
+                not re.fullmatch(r'[A-Za-z0-9_.$@%:-]{1,128}', host):
+            self.result_label.setText('用户名/Host 含非法字符（已拒绝生成 SQL）')
+            self.result_label.setStyleSheet('color: #f48771;')
+            if hasattr(self, 'sql_preview'):
+                self.sql_preview.setPlainText('')
+            return ''
+        if re.search(r'[`\x00]', db or ''):
+            self.result_label.setText('授权库名非法（已拒绝生成 SQL）')
+            self.result_label.setStyleSheet('color: #f48771;')
+            return ''
+        pwd_sql = pwd.replace('\\', '\\\\').replace("'", "\\'")
+        create = (f"CREATE USER '{name}'@'{host}' "
+                  f"IDENTIFIED BY '{pwd_sql}';")
+        grant = (f"GRANT {priv} ON `{db or '*'}`.* TO '{name}'@'{host}';")
+        text = create + '\n' + grant
+        if hasattr(self, 'sql_preview'):
+            self.sql_preview.setPlainText(text)
+        return text
+
+    def execute(self):
+        statements = [s for s in self.generate_sql().splitlines() if s.strip()]
+        results = []
+        for sql in statements:
+            try:
+                n, err = self.conn.execute(sql)
+                results.append({'sql': sql, 'ok': not err,
+                                 'error': err or '', 'affected': n})
+            except Exception as exc:                  # noqa: BLE001
+                results.append({'sql': sql, 'ok': False,
+                                 'error': str(exc), 'affected': 0})
+        self.last_result = {'ok': all(r['ok'] for r in results),
+                            'results': results}
+        lines = [f"{'OK' if r['ok'] else 'FAIL'}: {r['sql']}"
+                 + (f" -> {r['error']}" if r['error'] else '')
+                 for r in results]
+        self.result_label.setText('\n'.join(lines))
+        self.result_label.setStyleSheet(
+            'color: #89d185;' if self.last_result['ok'] else 'color: #f48771;')
+        return self.last_result
