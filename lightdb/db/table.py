@@ -160,6 +160,20 @@ WAL_CHECKPOINT_RECORDS_ENV = 'LIGHTDB_WAL_CHECKPOINT_RECORDS'
 WAL_CHECKPOINT_SECONDS_DEFAULT = 60.0
 WAL_CHECKPOINT_SECONDS_ENV = 'LIGHTDB_WAL_CHECKPOINT_SECONDS'
 
+#: P6.2：AUTO_INCREMENT **崩溃持久化**的区间预留大小。
+#:
+#: 语义：每次持久化一个"预留上界 R"（文件 `<name>.autoinc`，原子写 + fsync），
+#: 之后从内存计数器分配号码；只要分配号 < R 就无需再写盘。硬杀重启时从
+#: `max(meta 计数, 文件预留上界)` 继续 —— **绝不重用**任何已分配号，代价是
+#: 最多跳过一个预留区间（默认 1000 个号）。这样每 N 次插入才有一次 fsync，
+#: 批量插入吞吐几乎不受影响（量化见 tests/test_auto_increment_durability.py）。
+#: 交付权衡：预留越大，fsync 次数越少、吞吐越好；崩溃重启后跳号上界
+#: 也越大。默认 10000：实测本机一次 fsync≈55ms，默认块下 4000 行批量
+#: 插入只有 1 次预留写盘（约 +55ms，见 test_auto_increment_durability.py
+#: 的吞吐量化），而硬杀最多跳过 1 万个号（允许跳号、禁止复用）。
+AUTO_INCREMENT_BLOCK_DEFAULT = 10000
+AUTO_INCREMENT_BLOCK_ENV = 'LIGHTDB_AUTO_INCREMENT_BLOCK'
+
 # 一个堆页剩余多少字节才值得登记为"可复用页"（页级回收）。
 # 太小（例如只剩 4 字节）的页登记进来只会让 `_find_heap_page_with_space`
 # 白查一次再剔除；64 字节足够放一行窄行（含 21 字节行头 + 一个槽位项）。
@@ -317,6 +331,8 @@ class Table:
     wal_checkpoint_records = None
     #: P5：时间阈值（秒；None = 取环境变量/默认 60s；0 = 关闭）
     wal_checkpoint_seconds = None
+    #: P6.2：自增号预留区间大小（None = 取环境变量/默认 1000）
+    auto_increment_block = None
 
     def __init__(self, name: str, cols: List[Dict], data_dir: str,
                  lock_manager: LockManager = None,
@@ -384,7 +400,12 @@ class Table:
         # `_auto_next` = 每列"下一个待分配号"（列名 → int），随表元数据
         # 持久化（`Database.save_meta`）。INSERT 省略/NULL 时在表锁内分配，
         # 显式值推进计数器；回滚**不回收**已分配号（MySQL 语义）。
+        # P6.2：`_auto_reserved` = 已**持久化**的预留上界（排他），分配号
+        # 必须 < 上界；不足时先原子写 `<name>.autoinc` + fsync 再继续。
+        self._autoinc_path = self.data_dir / f"{name}.autoinc"
         self._auto_next = {}
+        self._auto_reserved = {}
+        self._load_autoinc_reservations()
         for _k, _v in (auto_increment_next or {}).items():
             try:
                 self._auto_next[str(_k)] = int(_v)
@@ -1263,19 +1284,130 @@ class Table:
             return None
         return mx
 
+    # ---------- P6.2：自增号的崩溃持久化（区间预留） ----------
+
+    def _auto_block_size(self) -> int:
+        """预留区间大小（类属性 > 环境变量 > 默认 1000；最小 1）"""
+        v = self.auto_increment_block
+        if v is None:
+            try:
+                v = int(os.environ.get(
+                    AUTO_INCREMENT_BLOCK_ENV,
+                    AUTO_INCREMENT_BLOCK_DEFAULT))
+            except (TypeError, ValueError):
+                v = AUTO_INCREMENT_BLOCK_DEFAULT
+        try:
+            return max(1, int(v))
+        except (TypeError, ValueError):
+            return AUTO_INCREMENT_BLOCK_DEFAULT
+
+    def _load_autoinc_reservations(self):
+        """读取 `<name>.autoinc`：每列**已持久化**的预留上界（排他）
+
+        上界 R 的语义：`< R` 的号可能已经被分配，恢复时必须从 R 继续
+        （允许跳号，但绝不重用）。文件不存在/损坏 → 空（启动时再按
+        meta 计数 / 现存最大值兜底）。
+        """
+        self._auto_reserved = {}
+        path = getattr(self, '_autoinc_path', None)
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    try:
+                        self._auto_reserved[str(k)] = max(0, int(v))
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.warn(f"读取自增预留文件失败 {self.name}: {e}")
+
+    def _write_autoinc_file(self, mapping: Dict[str, int]):
+        """原子写 `<name>.autoinc`（tmp + fsync + os.replace）
+
+        这是"INSERT 成功前持久化分配"的落盘点：写盘之后才允许把区间内的
+        号发给调用方。每个预留区间只写一次，逐行插入不会 fsync。
+        """
+        try:
+            payload = {str(k): int(v) for k, v in (mapping or {}).items()}
+            if not payload:
+                try:
+                    self._autoinc_path.unlink()
+                except OSError:
+                    pass
+                return
+            self._autoinc_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._autoinc_path.with_suffix('.autoinc.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(self._autoinc_path))
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.error(f"写自增预留文件失败 {self.name}: {e}")
+            raise
+
+    def _reserve_auto_block(self, idx: int, need_next: int) -> int:
+        """确保 `need_next` 之前的号都已持久化；不足则写新的预留区间
+
+        返回新的预留上界（排他）。调用方必须在**返回号码之前**调用本方法
+        成功执行（写盘失败会抛异常，语句失败，而不是发出一个不持久号）。
+        """
+        name = self.cols[idx]['name']
+        reserved = int(self._auto_reserved.get(name, 0) or 0)
+        if need_next < reserved:
+            return reserved
+        block = self._auto_block_size()
+        new_reserved = max(int(need_next), reserved) + block
+        mapping = dict(self._auto_reserved)
+        mapping[name] = new_reserved
+        self._write_autoinc_file(mapping)
+        self._auto_reserved[name] = new_reserved
+        return new_reserved
+
+    def _persist_auto_reservation(self, exact: bool = False):
+        """把当前自增状态写盘（exact=True 时同时把预留上界收敛到真实下一号）
+
+        调用点：`checkpoint()` / `close()` / TRUNCATE / ALTER AUTO_INCREMENT。
+        exact=True 之后重启会从**精确**下一号开始（不跳号）；正常分配过程
+        中则只按区间写盘（允许跳号，禁止复用）。
+        """
+        if not getattr(self, '_auto_cols', None):
+            try:
+                if self._autoinc_path.exists():
+                    self._autoinc_path.unlink()
+            except OSError:
+                pass
+            return
+        if exact:
+            mapping = {k: int(v) for k, v in self._auto_next.items()}
+            self._auto_reserved = dict(mapping)
+        else:
+            mapping = {k: int(v) for k, v in self._auto_reserved.items()}
+        self._write_autoinc_file(mapping)
+
     def _init_auto_increment_state(self):
-        """初始化自增列/计数（构造期；持久化计数优先，其次扫描现存最大值）"""
+        """初始化自增列/计数（构造期）
+
+        下一号 = max(meta 计数, 磁盘预留上界, 现存最大值+1, 起始号)；
+        之后 `_auto_reserved` 取两者的较大值 —— 崩溃恢复后从预留上界继续，
+        **不会重用**任何已分配号（最多跳过未用完的预留区间）。
+        """
         self._auto_cols = [i for i, c in enumerate(self.cols)
                            if c.get('auto_increment')]
         for i in self._auto_cols:
             name = self.cols[i]['name']
             nxt = int(self._auto_next.get(name, 1) or 1)
+            reserved = int(self._auto_reserved.get(name, 0) or 0)
+            nxt = max(nxt, reserved)
             mx = self._max_existing_auto_value(i)
             if mx is not None:
                 nxt = max(nxt, mx + 1)
             if i == self.pk_idx and self._next_pk > nxt:
                 nxt = self._next_pk
             self._auto_next[name] = max(1, nxt)
+            self._auto_reserved[name] = max(reserved, nxt)
         if self._auto_start_pending is not None and self._auto_cols:
             name = self.cols[self._auto_cols[0]]['name']
             self._auto_next[name] = max(
@@ -1288,6 +1420,7 @@ class Table:
                            if c.get('auto_increment')]
         for i in self._auto_cols:
             self._auto_next.setdefault(self.cols[i]['name'], 1)
+            self._auto_reserved.setdefault(self.cols[i]['name'], 0)
 
     def auto_increment_columns(self) -> List[str]:
         return [self.cols[i]['name'] for i in self._auto_cols]
@@ -1295,6 +1428,10 @@ class Table:
     def auto_increment_next_values(self) -> Dict[str, int]:
         """持久化用的"每列下一个待分配号"快照"""
         return {k: int(v) for k, v in self._auto_next.items()}
+
+    def auto_increment_reservations(self) -> Dict[str, int]:
+        """已持久化的预留上界（排他）：`< R` 的号不可再用（诊断/测试用）"""
+        return {k: int(v) for k, v in self._auto_reserved.items()}
 
     def next_auto_increment_value(self):
         """下一个将分配的自增号（没有自增列时 None；SHOW TABLE STATUS 用）"""
@@ -1304,20 +1441,30 @@ class Table:
         return int(self._auto_next.get(name, 1) or 1)
 
     def _allocate_auto_value(self, idx: int) -> int:
-        """在表锁内分配下一个号（只前进，不回退；回滚也不回收）"""
+        """在表锁内分配下一个号（只前进，不回退；回滚也不回收）
+
+        **先确保持久化**（区间没覆盖就写盘+fsync），再返回号码 ——
+        进程随后在任何点被硬杀，重启都不会重用这个号。
+        """
         name = self.cols[idx]['name']
         nxt = int(self._auto_next.get(name, 1) or 1)
+        self._reserve_auto_block(idx, nxt + 1)
         self._auto_next[name] = nxt + 1
         if idx == self.pk_idx:
             self._next_pk = max(self._next_pk, nxt + 1)
         return nxt
 
     def _advance_auto_value(self, idx: int, value: int):
-        """显式插入值推进计数器（大于当前才推进，绝不因小值回退）"""
+        """显式插入值推进计数器（大于当前才推进，绝不因小值回退）
+
+        显式大值同样要先持久化：否则硬杀后重启会重新发出这些号。
+        """
         name = self.cols[idx]['name']
         value = int(value)
-        self._auto_next[name] = max(
-            int(self._auto_next.get(name, 1) or 1), value + 1)
+        new_next = max(int(self._auto_next.get(name, 1) or 1), value + 1)
+        if new_next > int(self._auto_reserved.get(name, 0) or 0):
+            self._reserve_auto_block(idx, new_next)
+        self._auto_next[name] = new_next
         if idx == self.pk_idx:
             self._next_pk = max(self._next_pk, value + 1)
 
@@ -1326,6 +1473,7 @@ class Table:
 
         不允许把计数设到"现存最大值 + 1"之下（MySQL 的取值下限语义）：
         返回**实际生效**的下一号（真实值，不装作已经设成更小的数）。
+        设置结果立即持久化（写预留文件 + 由調用方 save_meta）。
         """
         with self._lock:
             if not self._auto_cols:
@@ -1339,6 +1487,10 @@ class Table:
             name = self.cols[idx]['name']
             self._auto_next[name] = new
             self._next_pk = max(self._next_pk, new)
+            # 收敛预留：文件写 exact=new，重启从 new 开始（不跳号）
+            mapping = dict(self._auto_next)
+            self._auto_reserved = dict(mapping)
+            self._write_autoinc_file(mapping)
             return new
 
     # ==================== 结构变更（ALTER TABLE：ADD / DROP COLUMN） ====================
@@ -1601,7 +1753,15 @@ class Table:
             self._next_pk = 1
             # TRUNCATE 是 DDL：MySQL 同时把 AUTO_INCREMENT 重置回起点。
             for i in self._auto_cols:
-                self._auto_next[self.cols[i]['name']] = 1
+                name = self.cols[i]['name']
+                self._auto_next[name] = 1
+                self._auto_reserved[name] = 1
+            try:
+                # 重置也必须是**持久**的：否则硬杀后重启会从旧的预留上界
+                # 继续，TRUNCATE 语义（回到 1）就没生效。
+                self._persist_auto_reservation(exact=True)
+            except Exception as e:                # pragma: no cover - 防御
+                logger.warn(f"TRUNCATE 写自增预留失败 {self.name}: {e}")
             self._last_heap_pid = None
             # 全文索引是**派生**数据（不持久化），清空表就必须一起清空，
             # 否则 MATCH ... AGAINST 还能搜到已经删掉的行。这里保留索引
@@ -4620,6 +4780,12 @@ class Table:
             before_bytes = self.wal.size_bytes()
             before_records = self.wal.record_count()
             self._retire_wal()
+            # P6.2：checkpoint 是确定性落盘点：把自增预留收敛到**精确**
+            # 下一号（重启不跳号），并保证已分配号在盘上。
+            try:
+                self._persist_auto_reservation(exact=True)
+            except Exception as e:               # pragma: no cover - 防御
+                logger.error(f"checkpoint 写自增预留失败 {self.name}: {e}")
             self._checkpoint_count += 1
             self._last_checkpoint_ts = time.time()
             self._last_checkpoint_reason = str(reason or 'manual')
@@ -4740,6 +4906,11 @@ class Table:
             self._retire_wal(sync_truncate=False)
         except Exception as e:
             logger.warn(f"关闭时 truncate WAL 失败: {e}")
+        # P6.2：干净关闭把自增预留收敛到精确下一号（重启不跳号）
+        try:
+            self._persist_auto_reservation(exact=True)
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.warn(f"关闭时写自增预留失败 {self.name}: {e}")
         self.bp.close()
         self.wal.close()
 

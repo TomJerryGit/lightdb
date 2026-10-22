@@ -775,7 +775,7 @@ class Database:
             raise ValueError(f"表 {name} 不存在")
         tbl = self.tables.pop(name)
         tbl.close()
-        for suffix in ('.dat', '.btroot', '.wal', '.free'):
+        for suffix in ('.dat', '.btroot', '.wal', '.free', '.autoinc'):
             p = self.data_dir / f"{name}{suffix}"
             if p.exists():
                 p.unlink()
@@ -1520,7 +1520,7 @@ class Database:
             tbl.close()
         except Exception as e:                       # pragma: no cover
             logger.warn(f"改名时关闭表 {old} 失败: {e}")
-        for suffix in ('.dat', '.btroot', '.wal', '.free'):
+        for suffix in ('.dat', '.btroot', '.wal', '.free', '.autoinc'):
             src = self.data_dir / f"{old}{suffix}"
             dst = self.data_dir / f"{new}{suffix}"
             try:
@@ -2033,7 +2033,7 @@ class Database:
             tmp = self.data_dir / str(entry.get('tmp_dir') or '')
             try:
                 if tmp.exists():
-                    for suffix in ('.dat', '.btroot', '.free'):
+                    for suffix in ('.dat', '.btroot', '.free', '.autoinc'):
                         src = tmp / f'{name}{suffix}'
                         if not src.exists():
                             continue
@@ -2182,13 +2182,13 @@ class Database:
                 tbl.wal.close()
             except Exception as e:               # pragma: no cover - 防御
                 logger.warn(f"COMPACT 关闭旧表 {name} 句柄失败: {e}")
-        for suffix in ('.dat', '.btroot', '.free'):
+        for suffix in ('.dat', '.btroot', '.free', '.autoinc'):
             src = tmp / f'{name}{suffix}'
             dst = self.data_dir / f'{name}{suffix}'
             try:
                 if src.exists():
                     os.replace(str(src), str(dst))
-                elif suffix == '.free' and dst.exists():
+                elif suffix in ('.free', '.autoinc') and dst.exists():
                     dst.unlink()
             except OSError as e:
                 logger.error(f"COMPACT {name}: 替换 {suffix} 失败: {e}")
@@ -2212,6 +2212,16 @@ class Database:
         if fulltext_cols:
             for pk, values in new_tbl._live_rows():
                 new_tbl._index_fulltext(pk, values)
+        # P6.2：压实会重建数据文件；自增预留文件按 entry 里的精确计数收敛，
+        # 保证压实前后 `SHOW TABLE STATUS.Auto_increment` 一致（不跳号）。
+        try:
+            if auto_state:
+                new_tbl._auto_next = {k: int(v) for k, v in
+                                      auto_state.items()}
+                new_tbl._auto_reserved = dict(new_tbl._auto_next)
+            new_tbl._persist_auto_reservation(exact=True)
+        except Exception as e:                   # pragma: no cover - 防御
+            logger.warn(f"COMPACT 后写自增预留失败 {name}: {e}")
         self.tables[name] = new_tbl
         self._pending_ddl = None
         self.save_meta()
