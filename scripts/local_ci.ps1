@@ -43,11 +43,11 @@ Step 'GUI smoke (offscreen)' {
     & $python -m lightdb_studio.app --smoke
 }
 Step 'full pytest (JUnit)' {
-    & $python -m pytest tests -q -p no:cacheprovider `
-        --junitxml=(Join-Path $outDir 'pytest-results.xml') 2>&1 |
-        Tee-Object -FilePath (Join-Path $outDir 'pytest.log') -Append
+    $junit = Join-Path $outDir 'pytest-results.xml'
+    $log = Join-Path $outDir 'pytest.log'
+    & $python -m pytest tests -q -p no:cacheprovider "--junitxml=$junit" *> $log
     $code = $LASTEXITCODE
-    & $python scripts/check_junit.py (Join-Path $outDir 'pytest-results.xml')
+    & $python scripts/check_junit.py $junit
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if ($code -ne 0) { exit $code }
     exit 0
