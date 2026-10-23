@@ -1270,15 +1270,25 @@ class Database:
         for key in ('generated', 'check', 'comment'):
             if col.get(key) is not None:
                 new[key] = col.get(key)
-        # P6：MODIFY 的列定义里若没写 AUTO_INCREMENT，保留旧声明（避免
-        # "改个长度就把自增静默丢掉"）；写了则要求整数且全表仍只有一列自增。
-        new['auto_increment'] = bool(old.get('auto_increment')
-                                     or col.get('auto_increment'))
+        # P6.3：MODIFY 省略 AUTO_INCREMENT = **真正移除自增**（MySQL 语义：
+        # MODIFY 给的是完整的新列定义，没写 AUTO_INCREMENT 就是没有）。
+        # 旧实现用 `old or new` 静默保留，导致"去自增"永不生效 —— 正是本
+        # 任务要修掉的静默语义。计数条目不清除：之后重新加回自增时从原
+        # 计数继续（不复用旧号，见 `Table._sync_auto_columns`）。
+        auto_removed = bool(old.get('auto_increment')
+                            and not col.get('auto_increment'))
+        auto_added = bool(col.get('auto_increment')
+                          and not old.get('auto_increment'))
+        new['auto_increment'] = bool(col.get('auto_increment'))
         if new['auto_increment']:
             if not Table.is_auto_increment_integer_type(new_type):
                 raise DdlError(
                     f"AUTO_INCREMENT 列 '{cname}' 必须是整数类型，"
                     f"不能改成 {new_type}", errno=1063, sqlstate='42000')
+            if new.get('generated'):
+                raise DdlError(
+                    f"AUTO_INCREMENT 不能与生成列同时声明（列 '{cname}'）",
+                    errno=1063, sqlstate='42000')
             others = [c for j, c in enumerate(tbl.cols)
                       if j != idx and c.get('auto_increment')]
             if others:
@@ -1286,6 +1296,20 @@ class Database:
                     "Incorrect table definition; there can be only one auto "
                     "column and it must be defined as a key", errno=1075,
                     sqlstate='42000')
+            # 必须是显式声明的键（主键 / 列级 UNIQUE / 表级唯一约束覆盖）
+            unique_covered = set()
+            for spec in tbl.unique_indexes():
+                unique_covered.update(spec.get('columns') or [])
+            explicit_key = (
+                (bool(new.get('primary')) and not new.get('implicit_pk'))
+                or bool(new.get('unique')) or cname in unique_covered)
+            if not explicit_key:
+                raise DdlError(
+                    "Incorrect table definition; there can be only one auto "
+                    "column and it must be defined as a key",
+                    errno=1075, sqlstate='42000')
+            # MySQL：AUTO_INCREMENT 列隐式 NOT NULL
+            new['notnull'] = True
         if new.get('primary') and base not in self._PK_COMPATIBLE_TYPES:
             raise DdlError(
                 f"主键列 '{cname}' 只能改成整数类型（主键 B+Tree 的键按 "
@@ -1315,9 +1339,18 @@ class Database:
                 always_transform=True)
             tbl.cols = new_cols
             tbl.refresh_schema_meta()
+            if auto_removed or auto_added:
+                # 重新加回自增时把计数/预留文件按当前状态落盘，确保
+                # SHOW 状态与重启后一致（不复用移除前的旧号）。
+                try:
+                    tbl._persist_auto_reservation(exact=True)
+                except Exception as e:            # pragma: no cover - 防御
+                    logger.warn(f"MODIFY 自增状态落盘失败 {name}: {e}")
             self._ddl_commit(tbl)
         return {'column': cname, 'new_type': new_type,
-                'rows_rewritten': stats['rows'], **stats}
+                'rows_rewritten': stats['rows'],
+                'auto_increment_removed': auto_removed,
+                'auto_increment_added': auto_added, **stats}
 
     # ==================== E2：CREATE / DROP INDEX ====================
 

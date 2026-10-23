@@ -1372,8 +1372,16 @@ class Table:
         调用点：`checkpoint()` / `close()` / TRUNCATE / ALTER AUTO_INCREMENT。
         exact=True 之后重启会从**精确**下一号开始（不跳号）；正常分配过程
         中则只按区间写盘（允许跳号，禁止复用）。
+
+        注意：列上的 AUTO_INCREMENT 被 `MODIFY` 移除后，其计数条目**保留**
+        在 `_auto_next`/`_auto_reserved` 里（并继续写 `.autoinc`）。这样：
+          * 移除自增不会丢失"已分配号"信息；
+          * 之后重新加回自增时从原计数继续（不复用旧号，也不退回 1）；
+          * 若整表再无任何自增列且从未有过计数（普通表），才删除该文件。
         """
-        if not getattr(self, '_auto_cols', None):
+        keys = set(getattr(self, '_auto_next', {}) or {}) | \
+            set(getattr(self, '_auto_reserved', {}) or {})
+        if not keys:
             try:
                 if self._autoinc_path.exists():
                     self._autoinc_path.unlink()
@@ -1381,10 +1389,13 @@ class Table:
                 pass
             return
         if exact:
-            mapping = {k: int(v) for k, v in self._auto_next.items()}
+            mapping = {k: int(self._auto_next.get(k, 1) or 1) for k in keys}
             self._auto_reserved = dict(mapping)
         else:
-            mapping = {k: int(v) for k, v in self._auto_reserved.items()}
+            mapping = {
+                k: max(int(self._auto_next.get(k, 1) or 1),
+                       int(self._auto_reserved.get(k, 0) or 0))
+                for k in keys}
         self._write_autoinc_file(mapping)
 
     def _init_auto_increment_state(self):
@@ -1393,6 +1404,9 @@ class Table:
         下一号 = max(meta 计数, 磁盘预留上界, 现存最大值+1, 起始号)；
         之后 `_auto_reserved` 取两者的较大值 —— 崩溃恢复后从预留上界继续，
         **不会重用**任何已分配号（最多跳过未用完的预留区间）。
+
+        没有自增列的列名条目（`MODIFY` 移除自增后留下的计数）不参与分配，
+        但**原样保留**，供之后重新加回自增时继续使用（不复用旧号）。
         """
         self._auto_cols = [i for i, c in enumerate(self.cols)
                            if c.get('auto_increment')]
@@ -1415,12 +1429,29 @@ class Table:
         self._auto_start_pending = None
 
     def _sync_auto_columns(self):
-        """列定义变化后同步自增列下标（ADD/DROP COLUMN、MODIFY 后调用）"""
+        """列定义变化后同步自增列下标（ADD/DROP COLUMN、MODIFY 后调用）
+
+        移除自增：只把该列从 `_auto_cols` 摘掉，**保留计数条目**（见
+        `_persist_auto_reservation` 的说明）。
+        重新加回自增：以现存数据最大值为下限抬升计数（避免把新号分配到
+        已存在的显式值上；也不复用移除前的旧号）。
+        """
+        old_cols = set(getattr(self, '_auto_cols', []) or [])
         self._auto_cols = [i for i, c in enumerate(self.cols)
                            if c.get('auto_increment')]
         for i in self._auto_cols:
-            self._auto_next.setdefault(self.cols[i]['name'], 1)
-            self._auto_reserved.setdefault(self.cols[i]['name'], 0)
+            name = self.cols[i]['name']
+            self._auto_next.setdefault(name, 1)
+            self._auto_reserved.setdefault(name, 0)
+            if i not in old_cols:
+                # 重新加回 AUTO_INCREMENT：不能被现存显式值撞号
+                mx = self._max_existing_auto_value(i)
+                floor = (mx + 1) if mx is not None else 1
+                self._auto_next[name] = max(
+                    int(self._auto_next.get(name, 1) or 1), floor)
+                self._auto_reserved[name] = max(
+                    int(self._auto_reserved.get(name, 0) or 0),
+                    self._auto_next[name])
 
     def auto_increment_columns(self) -> List[str]:
         return [self.cols[i]['name'] for i in self._auto_cols]
@@ -1752,8 +1783,12 @@ class Table:
                     dropped += 1
             self._next_pk = 1
             # TRUNCATE 是 DDL：MySQL 同时把 AUTO_INCREMENT 重置回起点。
+            # 也重置"曾被 MODIFY 移除自增"留下的计数条目（与重新加回自增
+            # 的语义一致：空表从 1 开始）。
+            names = set(self._auto_next) | set(self._auto_reserved)
             for i in self._auto_cols:
-                name = self.cols[i]['name']
+                names.add(self.cols[i]['name'])
+            for name in names:
                 self._auto_next[name] = 1
                 self._auto_reserved[name] = 1
             try:

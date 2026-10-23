@@ -1629,12 +1629,17 @@ class Executor:
             # 不可转换/会截断 → 显式错误且表结构与数据完全不变。
             col = dict(p['column'])
             stats = self.db.alter_modify_column(table, col)
+            extra = ''
+            if stats.get('auto_increment_removed'):
+                extra = '（AUTO_INCREMENT 已移除：列元数据/Extra/SHOW CREATE 同步生效）'
+            elif stats.get('auto_increment_added'):
+                extra = '（AUTO_INCREMENT 已加回：计数从原分配状态继续，不复用旧号）'
             return self._ok(
                 message=(f"Table '{table}' altered: column "
                          f"'{col['name']}' modified to "
                          f"{col.get('type')}, "
                          f"{stats.get('rows_rewritten', 0)} row "
-                         f"version(s) rewritten"))
+                         f"version(s) rewritten" + extra))
         if action == 'ENGINE':
             # E2：ENGINE= 兼容别名。物理存储不迁移（始终是 LightDB 原生
             # 行存），只持久化"请求的引擎名"并在 SHOW 中如实回显；
@@ -10040,13 +10045,10 @@ class Executor:
                 data_free = None
             auto_inc = None
             try:
-                # P6：真实 AUTO_INCREMENT 下一号（有自增列时优先）；
-                # 没有自增列时保留旧行为：INT 主键报内部下一个主键号。
+                # P6：真实 AUTO_INCREMENT 下一号；没有自增列时按 MySQL 语义
+                # 报 NULL（不再用"内部下一个主键号"冒充 Auto_increment —
+                # 那会让客户端以为还有自增，尤其 MODIFY 移除自增之后）。
                 auto_inc = tbl.next_auto_increment_value()
-                if auto_inc is None and (
-                        tbl.cols and tbl.cols[tbl.pk_idx].get(
-                            'type', '').upper() in ('INT', 'BIGINT')):
-                    auto_inc = int(getattr(tbl, '_next_pk', 0) or 0)
             except Exception:
                 auto_inc = None
             opts = getattr(tbl, 'table_options', {}) or {}
