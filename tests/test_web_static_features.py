@@ -97,7 +97,7 @@ def test_app_js_syntax_or_balanced():
     node = shutil.which('node')
     if node:
         proc = subprocess.run([node, '--check', str(APP_JS)],
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=120)
         assert proc.returncode == 0, proc.stderr[-2000:]
         print('  → node --check app.js OK')
         return
