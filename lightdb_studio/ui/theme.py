@@ -1,7 +1,16 @@
-"""主题管理 - 深色 / 浅色 / 高对比度"""
+"""主题管理 - 深色 / 浅色 / 高对比度（N1：design tokens + Navicat 风格 QSS）"""
 import os
 
 from PySide6.QtGui import QColor
+
+# N1 design tokens：间距/圆角/字号/图标尺寸（QSS 与控件共用，避免魔法数）
+DESIGN_TOKENS = {
+    'spacing': {'xs': 2, 'sm': 4, 'md': 8, 'lg': 12, 'xl': 16},
+    'radius': {'sm': 3, 'md': 5, 'lg': 7},
+    'font_size': {'xs': 11, 'sm': 12, 'base': 13, 'lg': 15},
+    'icon_size': {'toolbar': 18, 'ribbon': 30, 'menu': 16},
+    'ribbon_button': {'min_width': 60, 'min_height': 58},
+}
 
 
 class Theme:
@@ -230,7 +239,89 @@ QListWidget::item:hover {{
     background: {c['hover']};
 }}
 """
-        return base + self.extra_qss
+        return base + self.extra_qss + self._navicat_qss()
+
+    def _navicat_qss(self):
+        """N1：Ribbon / 焦点环 / 选中态 / 分栏等 Navicat 风格补充样式。"""
+        c = self.colors
+        t = DESIGN_TOKENS
+        r = t['radius']
+        return f"""
+/* ==================== N1 theme tokens ==================== */
+QToolBar#RibbonBar {{
+    background: {c['ribbon_bg']};
+    border-bottom: 1px solid {c['border']};
+    spacing: {t['spacing']['xs']}px;
+    padding: {t['spacing']['xs']}px {t['spacing']['sm']}px;
+}}
+QToolBar#RibbonBar::separator {{
+    width: 1px;
+    background: {c['border']};
+    margin: 4px 3px;
+}}
+QToolButton[ribbon="true"] {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {r['md']}px;
+    padding: {t['spacing']['xs']}px {t['spacing']['sm']}px;
+    min-width: {t['ribbon_button']['min_width']}px;
+    min-height: {t['ribbon_button']['min_height']}px;
+    color: {c['ribbon_text']};
+    font-size: {t['font_size']['xs']}px;
+}}
+QToolButton[ribbon="true"]:hover {{
+    background: {c['ribbon_hover']};
+    border-color: {c['border_soft']};
+}}
+QToolButton[ribbon="true"]:pressed {{
+    background: {c['selection']};
+    color: {c['selection_fg']};
+}}
+QToolButton[ribbon="true"]:disabled {{
+    color: {c['fg_dim']};
+    background: transparent;
+}}
+QLabel[ribbonGroup="true"] {{
+    color: {c['fg_dim']};
+    font-size: {t['font_size']['xs']}px;
+    padding: 1px {t['spacing']['sm']}px;
+}}
+QFrame#RibbonGroup {{
+    background: transparent;
+    border-right: 1px solid {c['border_soft']};
+    padding: 2px {t['spacing']['sm']}px;
+}}
+QPushButton:focus, QToolButton:focus, QComboBox:focus, QSpinBox:focus {{
+    border: 2px solid {c['focus_ring']};
+}}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {{
+    border: 2px solid {c['focus_ring']};
+}}
+QTableView::item:selected, QTableWidget::item:selected,
+QTreeView::item:selected, QTreeWidget::item:selected {{
+    background: {c['selection']};
+    color: {c['selection_fg']};
+}}
+QTableView::item:focus, QTableWidget::item:focus {{
+    border: 1px solid {c['focus_ring']};
+}}
+QTabBar::tab {{
+    border-top-left-radius: {r['sm']}px;
+    border-top-right-radius: {r['sm']}px;
+}}
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit {{
+    border-radius: {r['sm']}px;
+}}
+QPushButton {{
+    border-radius: {r['sm']}px;
+}}
+QSplitter::handle:horizontal {{
+    width: 4px;
+}}
+QSplitter::handle:vertical {{
+    height: 4px;
+}}
+"""
 
 
 DARK_THEME = Theme('dark', {
@@ -243,6 +334,9 @@ DARK_THEME = Theme('dark', {
     'accent': '#007acc',
     'alt_bg': '#252526',
     'scrollbar': '#424242', 'scrollbar_hover': '#4e4e4e',
+    'ribbon_bg': '#2b2b2b', 'ribbon_hover': '#37373d',
+    'ribbon_text': '#d4d4d4', 'border_soft': '#4a4a4a',
+    'focus_ring': '#4daafc',
 })
 
 LIGHT_THEME = Theme('light', {
@@ -255,6 +349,9 @@ LIGHT_THEME = Theme('light', {
     'accent': '#0078d4',
     'alt_bg': '#f8f8f8',
     'scrollbar': '#c0c0c0', 'scrollbar_hover': '#a0a0a0',
+    'ribbon_bg': '#eef1f5', 'ribbon_hover': '#e0e6ee',
+    'ribbon_text': '#2c2c2c', 'border_soft': '#cdd3da',
+    'focus_ring': '#0078d4',
 })
 
 HC_THEME = Theme('highcontrast', {
@@ -267,6 +364,9 @@ HC_THEME = Theme('highcontrast', {
     'accent': '#ffff00',
     'alt_bg': '#1a1a1a',
     'scrollbar': '#ffff00', 'scrollbar_hover': '#ffff66',
+    'ribbon_bg': '#1a1a1a', 'ribbon_hover': '#333333',
+    'ribbon_text': '#ffffff', 'border_soft': '#ffff00',
+    'focus_ring': '#ffff00',
 })
 
 
@@ -282,6 +382,24 @@ _LEGACY = os.environ.get('LIGHTDB_STUDIO_LEGACY_STARTUP', '') \
     .strip().lower() not in ('', '0', 'false', 'no', 'off') \
     or os.environ.get('LIGHTDB_STUDIO_LEGACY_THEME', '') \
     .strip().lower() not in ('', '0', 'false', 'no', 'off')
+
+
+def available_themes():
+    return list(THEMES.keys())
+
+
+def theme_tokens(theme_name='dark'):
+    """N1：返回该主题的 design tokens + 颜色（供控件/测试使用）。"""
+    theme = THEMES.get(theme_name, DARK_THEME)
+    tokens = {k: dict(v) if isinstance(v, dict) else v
+              for k, v in DESIGN_TOKENS.items()}
+    tokens['colors'] = dict(theme.colors)
+    tokens['theme'] = theme.name
+    return tokens
+
+
+def theme_qss(theme_name='dark'):
+    return THEMES.get(theme_name, DARK_THEME).qss()
 
 
 def apply_theme(app, theme_name: str):

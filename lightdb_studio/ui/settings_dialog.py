@@ -69,6 +69,9 @@ class SettingsDialog(QDialog):
         self.theme_combo = self._a11y(QComboBox(), '主题 / Theme')
         self.theme_combo.addItems(['深色 (Dark)', '浅色 (Light)',
                                    '高对比度 (High Contrast)'])
+        self.theme_combo.setToolTip(
+            'N1 主题：深色/浅色 Navicat 风格；切换立即预览，Apply 后持久化')
+        self.theme_combo.currentIndexChanged.connect(self._preview_theme)
         form.addRow(i18n.t('settings.theme'), self.theme_combo)
 
         self.lang_combo = self._a11y(QComboBox(), '语言 / Language')
@@ -212,6 +215,17 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(w, i18n.t('settings.tab.advanced'))
 
     # ==================== 加载 / 保存 ====================
+
+    def _preview_theme(self, *_args):
+        """N1：主题切换立即预览（Apply 时才保存到 settings）。"""
+        try:
+            from PySide6.QtWidgets import QApplication
+            from .theme import apply_theme
+            names = ['dark', 'light', 'highcontrast']
+            apply_theme(QApplication.instance(),
+                        names[self.theme_combo.currentIndex()])
+        except Exception:
+            pass
 
     def _load_values(self):
         s = self.settings

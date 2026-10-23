@@ -569,6 +569,28 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._format_sql)
         m_edit.addAction(a)
 
+        # ---------- 视图（N1：现有动作不丢，快捷切主题/面板） ----------
+        m_view = mb.addMenu(i18n.t('menu.view'))
+        a = QAction("显示/隐藏工具面板", self)
+        a.triggered.connect(self._toggle_right_dock)
+        m_view.addAction(a)
+        a = QAction("刷新对象浏览器", self)
+        a.triggered.connect(self._refresh_tree)
+        m_view.addAction(a)
+        a = QAction("显示/隐藏对象浏览器", self)
+        a.triggered.connect(
+            lambda: self.tree_dock.setVisible(not self.tree_dock.isVisible()))
+        m_view.addAction(a)
+        m_theme = m_view.addMenu("主题")
+        for theme_id, label in (('dark', '深色（Navicat）'),
+                                ('light', '浅色（Navicat）'),
+                                ('highcontrast', '高对比度')):
+            act = QAction(label, self)
+            act.triggered.connect(
+                lambda _checked=False, t=theme_id:
+                self._set_theme_from_menu(t))
+            m_theme.addAction(act)
+
         # ---------- 查询 ----------
         m_query = mb.addMenu("查询(&Q)")
 
@@ -772,6 +794,21 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._new_window)
         m_tools.addAction(a)
 
+        # ---------- 窗口（N1：菜单结构 文件/编辑/视图/查询/工具/窗口/帮助） ----------
+        m_window = mb.addMenu("窗口(&W)")
+        a = QAction("新建窗口", self)
+        a.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        a.triggered.connect(self._new_window)
+        m_window.addAction(a)
+        a = QAction("关闭当前标签", self)
+        a.setShortcut(QKeySequence("Ctrl+W"))
+        a.triggered.connect(
+            lambda: self._close_tab(self.tabs.currentIndex()))
+        m_window.addAction(a)
+        a = QAction("关闭窗口", self)
+        a.triggered.connect(self.close)
+        m_window.addAction(a)
+
         # ---------- 帮助 ----------
         m_help = mb.addMenu("帮助(&H)")
 
@@ -786,40 +823,82 @@ class MainWindow(QMainWindow):
         m_help.addAction(a)
 
     def _build_toolbar(self):
-        tb = QToolBar(i18n.t('toolbar.title'))
-        tb.setIconSize(QSize(18, 18))
-        tb.setMovable(False)
+        """N1：Ribbon 分组大图标工具栏（保留现有动作 + 显式禁用态）。"""
+        from .toolbar import RibbonActionSpec, RibbonBar
+        specs = [
+            RibbonActionSpec(
+                'new_connection', i18n.t('action.new_connection'), '新建连接',
+                self._new_connection, 'mdi.plug', 'connect', '连接'),
+            RibbonActionSpec(
+                'edit_connection', '编辑连接', '编辑连接',
+                self._edit_current_connection, 'mdi.connection', 'edit',
+                '连接', needs_connection=True),
+            RibbonActionSpec(
+                'refresh_tree', i18n.t('toolbar.refresh'), '刷新对象树',
+                self._refresh_tree, 'mdi.refresh', 'refresh', '连接'),
+            RibbonActionSpec(
+                'new_table', i18n.t('toolbar.new_table'), '新建表',
+                self._new_table_designer, 'mdi.table-plus', 'table', '表'),
+            RibbonActionSpec(
+                'edit_data', i18n.t('toolbar.edit_data'), '编辑数据',
+                self._edit_current_table, 'mdi.table-edit', 'edit', '表',
+                needs_connection=True),
+            RibbonActionSpec(
+                'design_table', '设计表', '设计表',
+                self._design_current_table, 'mdi.table-cog', 'design', '表',
+                needs_connection=True),
+            RibbonActionSpec(
+                'import_data', i18n.t('toolbar.import'), '导入数据',
+                self._import_current_table, 'mdi.import', 'import', '表',
+                needs_connection=True),
+            RibbonActionSpec(
+                'export_data', i18n.t('toolbar.export'), '导出结果',
+                self._export_current_result, 'mdi.export', 'export', '表',
+                needs_connection=True),
+            RibbonActionSpec(
+                'backup', '备份/快照', '备份',
+                self._open_snapshot, 'mdi.backup-restore', 'backup', '表',
+                needs_connection=True),
+            RibbonActionSpec(
+                'toggle_panels', '显示/隐藏工具面板', '面板',
+                self._toggle_right_dock, 'mdi.view-dashboard', 'view', '视图'),
+            RibbonActionSpec(
+                'new_query', i18n.t('toolbar.query'), '新建查询',
+                lambda: self._add_new_query_tab(True), 'mdi.file-document-plus',
+                'query', '查询'),
+            RibbonActionSpec(
+                'execute', i18n.t('toolbar.execute'), '执行',
+                self._exec_current, 'mdi.play', 'run', '查询',
+                needs_connection=True),
+            RibbonActionSpec(
+                'explain', i18n.t('toolbar.explain'), 'EXPLAIN',
+                self._exec_explain, 'mdi.chart-timeline', 'explain', '查询',
+                needs_connection=True),
+            RibbonActionSpec(
+                'ai_assistant', 'AI SQL 助手', 'AI 助手',
+                self._open_ai_sql_dialog, 'mdi.robot', 'ai', '工具'),
+            RibbonActionSpec(
+                'settings', '设置', '设置',
+                self._open_settings, 'mdi.cog', 'tool', '工具'),
+        ]
+        tb = RibbonBar(specs, self)
         self.addToolBar(tb)
         self._main_toolbar = tb
+        tb.setAccessibleName(i18n.t('a11y.toolbar'))
+        self.ribbon = tb
+        if getattr(self, 'env_bar', None) is not None:
+            tb.addWidget(self.env_bar)
+        self._update_ribbon_state()
 
-        items = [
-            ("🔌 连接", self._new_connection),
-            ("📝 查询", lambda: self._add_new_query_tab(True)),
-            None,
-            ("▶ 执行", self._exec_current),
-            ("📊 EXPLAIN", self._exec_explain),
-            None,
-            ("➕ 新建表", self._new_table_designer),
-            ("✏ 编辑数据", self._edit_current_table),
-            None,
-            ("📥 导入", self._import_current_table),
-            ("📤 导出", self._export_current_result),
-            None,
-            ("🔄 刷新", self._refresh_tree),
-        ]
-
-        for item in items:
-            if item is None:
-                tb.addSeparator()
-                continue
-            text, slot = item
-            a = QAction(text, self)
-            a.triggered.connect(slot)
-            tb.addAction(a)
-
-        # 环境条
-        tb.addSeparator()
-        tb.addWidget(self.env_bar)
+    def _update_ribbon_state(self):
+        ribbon = getattr(self, 'ribbon', None)
+        if ribbon is None:
+            return
+        try:
+            connected = self._get_current_conn() is not None
+        except Exception:
+            connected = False
+        ribbon.update_availability(connected)
 
     def _build_statusbar(self):
         sb = QStatusBar()
@@ -929,6 +1008,8 @@ class MainWindow(QMainWindow):
                 f"已连接: {info.name} @ {info.host}:{info.port}")
         else:
             self.conn_label.setText("未连接")
+        # N1：Ribbon 依赖连接的动作显式禁用/启用
+        self._update_ribbon_state()
 
     def _current_widgets(self):
         w = self.tabs.currentWidget()
@@ -1852,6 +1933,52 @@ class MainWindow(QMainWindow):
         if buf.strip():
             stmts.append(buf.strip())
         return stmts
+
+    # ==================== N1：主题 / Ribbon 辅助 ====================
+
+    def _set_theme_from_menu(self, theme_name):
+        """运行时切换主题并持久化到 settings（浅/深/高对比）。"""
+        try:
+            from PySide6.QtWidgets import QApplication
+            from .theme import apply_theme
+            self.settings.theme = str(theme_name)
+            try:
+                self.settings.save()
+            except Exception:
+                pass
+            apply_theme(QApplication.instance(), self.settings.theme)
+            self._update_ribbon_state()
+            self.status_label.setText(f'主题已切换: {theme_name}')
+            return True
+        except Exception as exc:                      # noqa: BLE001
+            QMessageBox.warning(self, '主题切换失败', str(exc))
+            return False
+
+    def _design_current_table(self):
+        """打开当前对象树选中表的设计器（AUTO_INCREMENT 回显/编辑）。"""
+        item = self.object_tree.tree.currentItem()
+        meta = {}
+        table = ''
+        while item is not None:
+            data = item.data(0, Qt.UserRole)
+            if data and data[0] == 'table':
+                table = data[1]
+                meta = item.data(0, Qt.UserRole + 1) or {}
+                break
+            item = item.parent()
+        if not table:
+            QMessageBox.information(self, '提示', '请先在左侧选择一个表')
+            return None
+        conn = self.object_tree.connections.get(meta.get('conn')) or \
+            self._get_current_conn()
+        if conn is None:
+            QMessageBox.warning(self, '提示', '请先选择一个连接')
+            return None
+        dlg = TableDesigner(conn, self, table_name=table)
+        if dlg.exec() == TableDesigner.Accepted:
+            self.object_tree.refresh_all()
+            self._update_ribbon_state()
+        return dlg
 
     # ==================== 表设计器 ====================
 
