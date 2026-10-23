@@ -593,3 +593,12 @@ pip install lightdb
 git clone https://github.com/lightdb/studio.git
 cd studio
 pip install -e ".[all]"
+
+### 近期交付（beta.44–60，2026-10-22/23）
+
+- **P6 安装包**：Inno Setup/WiX 脚本 + uild_installer.py（工具缺失显式 SKIP）+ erify_release.py 发布校验
+- **AUTO_INCREMENT**：真实自增（省略/NULL/多行分配、显式推进、重启保持、并发唯一）、崩溃持久化（区间预留 .autoinc，硬杀不复用）、表设计器 UI + 编辑保存/去自增
+- **AI SQL 助手**：自然语言建表/存储过程生成（parser 校验、预览、二次确认、不兼容显式提示）+ 7 条离线示例库
+- **SSH 隧道**：paramiko 可选依赖，连接/SQL 经隧道，未安装显式降级
+- **本地等价 CI**：scripts/local_ci.ps1（PowerShell 5.1 可用）——compileall/GUI smoke/全量 pytest+JUnit/benchmark/packaging；本机实测 1433 passed / 0 failed
+- CI 改用 self-hosted runner（D:\actions-runner-lightdb）并限制 tag 不触发、concurrency 取消旧 run，节省 Actions 额度
