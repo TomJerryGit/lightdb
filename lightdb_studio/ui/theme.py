@@ -9,6 +9,9 @@ DESIGN_TOKENS = {
     'radius': {'sm': 3, 'md': 5, 'lg': 7},
     'font_size': {'xs': 11, 'sm': 12, 'base': 13, 'lg': 15},
     'icon_size': {'toolbar': 18, 'ribbon': 30, 'menu': 16},
+    # task-52：内置 SVG 图标 token（本地优先，按主题色着色）
+    'icon': {'asset_dir': 'assets/icons', 'size': 24, 'stroke': 1.8,
+             'theme_adaptive': True},
     'ribbon_button': {'min_width': 60, 'min_height': 58},
 }
 
@@ -336,7 +339,7 @@ DARK_THEME = Theme('dark', {
     'scrollbar': '#424242', 'scrollbar_hover': '#4e4e4e',
     'ribbon_bg': '#2b2b2b', 'ribbon_hover': '#37373d',
     'ribbon_text': '#d4d4d4', 'border_soft': '#4a4a4a',
-    'focus_ring': '#4daafc',
+    'focus_ring': '#4daafc', 'icon': '#d4d4d4',
 })
 
 LIGHT_THEME = Theme('light', {
@@ -351,7 +354,7 @@ LIGHT_THEME = Theme('light', {
     'scrollbar': '#c0c0c0', 'scrollbar_hover': '#a0a0a0',
     'ribbon_bg': '#eef1f5', 'ribbon_hover': '#e0e6ee',
     'ribbon_text': '#2c2c2c', 'border_soft': '#cdd3da',
-    'focus_ring': '#0078d4',
+    'focus_ring': '#0078d4', 'icon': '#2c2c2c',
 })
 
 HC_THEME = Theme('highcontrast', {
@@ -366,7 +369,7 @@ HC_THEME = Theme('highcontrast', {
     'scrollbar': '#ffff00', 'scrollbar_hover': '#ffff66',
     'ribbon_bg': '#1a1a1a', 'ribbon_hover': '#333333',
     'ribbon_text': '#ffffff', 'border_soft': '#ffff00',
-    'focus_ring': '#ffff00',
+    'focus_ring': '#ffff00', 'icon': '#ffffff',
 })
 
 
@@ -400,6 +403,20 @@ def theme_tokens(theme_name='dark'):
 
 def theme_qss(theme_name='dark'):
     return THEMES.get(theme_name, DARK_THEME).qss()
+
+
+def icon_color(theme_name=None):
+    """task-52：图标着色 token；未指定时跟随 QApplication 当前主题。"""
+    if not theme_name:
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            theme_name = getattr(app, '_lightdb_theme_name', 'dark') \
+                if app is not None else 'dark'
+        except Exception:
+            theme_name = 'dark'
+    theme = THEMES.get(theme_name, DARK_THEME)
+    return theme.colors.get('icon') or theme.colors.get('fg')
 
 
 def apply_theme(app, theme_name: str):

@@ -822,64 +822,109 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._show_about)
         m_help.addAction(a)
 
+        self._decorate_menu_icons()
+
+    def _decorate_menu_icons(self):
+        """task-52：主要菜单动作也使用内置 SVG 图标（本地优先）。"""
+        try:
+            from PySide6.QtWidgets import QMenu
+            from .toolbar import make_icon
+            from .theme import icon_color
+            mapping = [
+                ('新建连接', 'new_connection'),
+                ('设计表', 'design_table'),
+                ('新建表', 'new_table'),
+                ('新建查询', 'new_query'),
+                ('执行', 'execute'),
+                ('EXPLAIN', 'explain'),
+                ('导入', 'import'),
+                ('导出', 'export'),
+                ('备份', 'backup'),
+                ('AI SQL', 'ai'),
+                ('设置', 'settings'),
+                ('刷新对象', 'refresh'),
+            ]
+            color = icon_color()
+            menus = [self.menuBar()] + [
+                m for m in self.menuBar().findChildren(QMenu)]
+            for menu in menus:
+                for act in menu.actions():
+                    if act.isSeparator():
+                        continue
+                    text = act.text()
+                    for needle, local_name in mapping:
+                        if needle in text:
+                            act.setIcon(make_icon(
+                                '', 'new', color=color,
+                                local_name=local_name))
+                            break
+        except Exception:
+            pass
+
     def _build_toolbar(self):
         """N1：Ribbon 分组大图标工具栏（保留现有动作 + 显式禁用态）。"""
         from .toolbar import RibbonActionSpec, RibbonBar
         specs = [
             RibbonActionSpec(
                 'new_connection', i18n.t('action.new_connection'), '新建连接',
-                self._new_connection, 'mdi.plug', 'connect', '连接'),
+                self._new_connection, 'mdi.plug', 'connect', '连接',
+                local_icon='new_connection'),
             RibbonActionSpec(
                 'edit_connection', '编辑连接', '编辑连接',
                 self._edit_current_connection, 'mdi.connection', 'edit',
-                '连接', needs_connection=True),
+                '连接', needs_connection=True, local_icon='edit_connection'),
             RibbonActionSpec(
                 'refresh_tree', i18n.t('toolbar.refresh'), '刷新对象树',
-                self._refresh_tree, 'mdi.refresh', 'refresh', '连接'),
+                self._refresh_tree, 'mdi.refresh', 'refresh', '连接',
+                local_icon='refresh'),
             RibbonActionSpec(
                 'new_table', i18n.t('toolbar.new_table'), '新建表',
-                self._new_table_designer, 'mdi.table-plus', 'table', '表'),
+                self._new_table_designer, 'mdi.table-plus', 'table', '表',
+                local_icon='new_table'),
             RibbonActionSpec(
                 'edit_data', i18n.t('toolbar.edit_data'), '编辑数据',
                 self._edit_current_table, 'mdi.table-edit', 'edit', '表',
-                needs_connection=True),
+                needs_connection=True, local_icon='edit_data'),
             RibbonActionSpec(
                 'design_table', '设计表', '设计表',
                 self._design_current_table, 'mdi.table-cog', 'design', '表',
-                needs_connection=True),
+                needs_connection=True, local_icon='design_table'),
             RibbonActionSpec(
                 'import_data', i18n.t('toolbar.import'), '导入数据',
                 self._import_current_table, 'mdi.import', 'import', '表',
-                needs_connection=True),
+                needs_connection=True, local_icon='import'),
             RibbonActionSpec(
                 'export_data', i18n.t('toolbar.export'), '导出结果',
                 self._export_current_result, 'mdi.export', 'export', '表',
-                needs_connection=True),
+                needs_connection=True, local_icon='export'),
             RibbonActionSpec(
                 'backup', '备份/快照', '备份',
                 self._open_snapshot, 'mdi.backup-restore', 'backup', '表',
-                needs_connection=True),
+                needs_connection=True, local_icon='backup'),
             RibbonActionSpec(
                 'toggle_panels', '显示/隐藏工具面板', '面板',
-                self._toggle_right_dock, 'mdi.view-dashboard', 'view', '视图'),
+                self._toggle_right_dock, 'mdi.view-dashboard', 'view', '视图',
+                local_icon='panel'),
             RibbonActionSpec(
                 'new_query', i18n.t('toolbar.query'), '新建查询',
                 lambda: self._add_new_query_tab(True), 'mdi.file-document-plus',
-                'query', '查询'),
+                'query', '查询', local_icon='new_query'),
             RibbonActionSpec(
                 'execute', i18n.t('toolbar.execute'), '执行',
                 self._exec_current, 'mdi.play', 'run', '查询',
-                needs_connection=True),
+                needs_connection=True, local_icon='execute'),
             RibbonActionSpec(
                 'explain', i18n.t('toolbar.explain'), 'EXPLAIN',
                 self._exec_explain, 'mdi.chart-timeline', 'explain', '查询',
-                needs_connection=True),
+                needs_connection=True, local_icon='explain'),
             RibbonActionSpec(
                 'ai_assistant', 'AI SQL 助手', 'AI 助手',
-                self._open_ai_sql_dialog, 'mdi.robot', 'ai', '工具'),
+                self._open_ai_sql_dialog, 'mdi.robot', 'ai', '工具',
+                local_icon='ai'),
             RibbonActionSpec(
                 'settings', '设置', '设置',
-                self._open_settings, 'mdi.cog', 'tool', '工具'),
+                self._open_settings, 'mdi.cog', 'tool', '工具',
+                local_icon='settings'),
         ]
         tb = RibbonBar(specs, self)
         self.addToolBar(tb)
@@ -1947,6 +1992,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             apply_theme(QApplication.instance(), self.settings.theme)
+            ribbon = getattr(self, 'ribbon', None)
+            if ribbon is not None:
+                ribbon.refresh_icons()
             self._update_ribbon_state()
             self.status_label.setText(f'主题已切换: {theme_name}')
             return True
@@ -2530,6 +2578,9 @@ class MainWindow(QMainWindow):
             from PySide6.QtWidgets import QApplication
             from .theme import apply_theme
             apply_theme(QApplication.instance(), self.settings.theme)
+            ribbon = getattr(self, 'ribbon', None)
+            if ribbon is not None:
+                ribbon.refresh_icons()
         except Exception:
             pass
 
