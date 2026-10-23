@@ -1,4 +1,4 @@
-#requires -Version 7
+#requires -Version 5.1
 <#
 .SYNOPSIS
     LightDB 本地 CI（GitHub Actions 不可用/额度耗尽时的等价验证）。
