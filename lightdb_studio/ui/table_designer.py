@@ -452,12 +452,8 @@ class TableDesigner(QDialog):
             if col['unique'] != old['unique']:
                 return [], ('本引擎不支持通过 ALTER 修改唯一约束（ADD/DROP '
                             'INDEX/UNIQUE 变体未实现），请手工处理')
-            if old['auto_increment'] and not col['auto_increment']:
-                # 实测：本引擎 MODIFY 省略 AUTO_INCREMENT 会静默保留自增；
-                # 预检拒绝，避免“看起来成功但自增还在”的假保存。
-                return [], ('本引擎的 ALTER MODIFY 无法移除 AUTO_INCREMENT'
-                            '（实测会静默保留）；预检拒绝，未发送任何 SQL。'
-                            '请重建表/手工处理')
+            # task-50：引擎已支持 MODIFY 省略 AUTO_INCREMENT 真正移除自增；
+            # 目标状态由 validate_columns 校验，正常生成不含 AUTO_INCREMENT 的 MODIFY。
             changed = any(col[k] != old[k] for k in (
                 'type', 'length', 'notnull', 'default', 'auto_increment'))
             if changed:

@@ -120,12 +120,15 @@ def test_alter_add_remove_auto_increment(home):
         assert error == ''
         assert statements == [
             'ALTER TABLE `t` MODIFY COLUMN `id` INT NOT NULL AUTO_INCREMENT;']
-        # 模拟原表已有自增 → 试图去掉：引擎会静默保留 → 预检拒绝
+        # 模拟原表已有自增 → 取消勾选：生成不含 AUTO_INCREMENT 的 MODIFY
+        # （engine task-49 已支持真实移除；不再是预检拒绝）
         dlg.original_columns[0]['auto_increment'] = True
         dlg.original_auto_start = 10
         change_col(dlg, 0, auto=False)
         statements, error = dlg.build_alter_statements()
-        assert statements == [] and '无法移除' in error
+        assert error == ''
+        assert statements == [
+            'ALTER TABLE `t` MODIFY COLUMN `id` INT NOT NULL;']
         # 设置起始号（仅当显式修改；此时原表已非自增 → 重新开启自增）
         dlg.original_columns[0]['auto_increment'] = False
         change_col(dlg, 0, auto=True)
@@ -343,32 +346,75 @@ def test_real_engine_alter_save_roundtrip(home, tmp_path, monkeypatch):
             assert int(row[idx]) == 100
             _cols, create = conn.query('SHOW CREATE TABLE alter_ai')
             assert 'AUTO_INCREMENT=100' in create[0][1]
-            # 4) 去自增：本引擎 MODIFY 会静默保留 AUTO_INCREMENT → 预检拒绝
+            # 4) 去自增：engine task-49 已支持真实移除 → 生成不含 AUTO_INCREMENT 的 MODIFY
             change_col(dlg, 0, auto=False)
             statements, error = dlg.build_alter_statements()
-            assert statements == [] and '无法移除' in error
-            assert dlg._on_accept() is False
-            assert dlg.last_error and '无法移除' in dlg.last_error
+            assert error == ''
+            assert statements == [
+                'ALTER TABLE `alter_ai` MODIFY COLUMN `id` INT NOT NULL;']
+            assert dlg._on_accept() is True
+            _cols, create = conn.query('SHOW CREATE TABLE alter_ai')
+            assert 'AUTO_INCREMENT' not in create[0][1].upper()
+            _cols, full = conn.query('SHOW FULL COLUMNS FROM alter_ai')
+            extra_idx = [str(c).lower() for c in _cols].index('extra')
+            by = {r[0]: r for r in full}
+            assert by['id'][extra_idx] == ''
+            cols, status = conn.query('SHOW TABLE STATUS')
+            idx = [str(c).lower() for c in cols].index('auto_increment')
+            row = [r for r in status if str(r[0]) == 'alter_ai'][0]
+            assert row[idx] is None
+            # 省略 id 插入 → 引擎显式 1048
+            n, err = conn.execute(
+                "INSERT INTO alter_ai (name, email) VALUES ('b', 'b@x')")
+            assert err and '1048' in str(err)
+            # 5) 加回自增：继续可用且不复用旧号
+            change_col(dlg, 0, auto=True)
+            statements, error = dlg.build_alter_statements()
+            assert error == ''
+            assert statements == [
+                'ALTER TABLE `alter_ai` MODIFY COLUMN `id` INT NOT NULL AUTO_INCREMENT;']
+            assert dlg._on_accept() is True
             _cols, create = conn.query('SHOW CREATE TABLE alter_ai')
             assert 'AUTO_INCREMENT' in create[0][1].upper()
-            # 对话框保留；新开一个回显对话框验证失败路径（引擎真实错误）
-            dlg2 = TableDesigner(conn, table_name='alter_ai')
+            assert conn.execute(
+                "INSERT INTO alter_ai (name, email) VALUES ('c', 'c@x')")[1] is None
+            _cols, rows = conn.query('SELECT id FROM alter_ai ORDER BY id')
+            new_id = rows[-1][0]
+            assert new_id not in (1, 2), rows
+            # 再显式设置起始号 → 从 500 开始
+            dlg.set_auto_start(500)
+            statements, error = dlg.build_alter_statements()
+            assert error == ''
+            assert 'ALTER TABLE `alter_ai` AUTO_INCREMENT = 500;' in statements
+            assert dlg._on_accept() is True
+            assert conn.execute(
+                "INSERT INTO alter_ai (name, email) VALUES ('d', 'd@x')")[1] is None
+            _cols, rows = conn.query('SELECT id FROM alter_ai ORDER BY id')
+            assert rows[-1][0] == 500, rows
+            # 6) 真实 1138：历史 NULL 行 + 目标 NOT NULL → 错误显式、对话框保留
+            assert conn.execute(
+                'CREATE TABLE hist (id INT AUTO_INCREMENT PRIMARY KEY, '
+                'val VARCHAR(10))')[1] is None
+            assert conn.execute(
+                "INSERT INTO hist (val) VALUES (NULL)")[1] is None
+            dlg3 = TableDesigner(conn, table_name='hist')
             try:
-                change_col(dlg2, 0, ctype='VARCHAR', length='10')
+                change_col(dlg3, 0, auto=False)
+                change_col(dlg3, 1, nn=True)
                 critical = []
                 monkeypatch.setattr(QMessageBox, 'critical',
                                     staticmethod(lambda *a, **k:
                                                  critical.append(a[2])))
-                # id 仍自增 + 改为非整数 → 预检拒绝（不发送 SQL）
-                assert dlg2._on_accept() is False
-                assert dlg2.last_error
+                assert dlg3._on_accept() is False
+                assert '1138' in dlg3.last_error
+                assert critical and '1138' in critical[0]
                 from PySide6.QtWidgets import QDialog
-                assert dlg2.result() != QDialog.Accepted
+                assert dlg3.result() != QDialog.Accepted
             finally:
-                dlg2.close()
+                dlg3.close()
         finally:
             dlg.close()
-        assert len(asked) == 3
+        assert len(asked) >= 6
     finally:
         conn.close()
         for res in (srv, db):
