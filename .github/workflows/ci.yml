@@ -47,7 +47,7 @@ jobs:
         run: python -m pytest tests/test_gui_smoke_ci.py -q -p no:cacheprovider
 
       - name: Full test suite (JUnit gate; raw pytest exit logged)
-        shell: pwsh
+        shell: powershell
         env:
           # 测试全绿后 Qt/原生库在解释器退出阶段可能 fail-fast（0xC0000409）；
           # conftest 在 pytest 收尾后按 exitstatus os._exit，绕过问题析构路径。
@@ -76,7 +76,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Benchmark gate (quick)
-        shell: pwsh
+        shell: powershell
         run: |
           python -m benchmarks.run --suite quick --gate > bench.log 2>&1
           $code = $LASTEXITCODE
@@ -89,7 +89,7 @@ jobs:
       - name: GUI perf budget (hard ceiling; target = WARN only)
         env:
           QT_QPA_PLATFORM: offscreen
-        shell: pwsh
+        shell: powershell
         run: |
           python scripts/gui_perf_budget.py > gui_perf.log 2>&1
           $code = $LASTEXITCODE
@@ -100,7 +100,7 @@ jobs:
           }
 
       - name: Packaging check (wheel must contain engine + entry points)
-        shell: pwsh
+        shell: powershell
         run: |
           python scripts/check_packaging.py > packaging.log 2>&1
           $code = $LASTEXITCODE
