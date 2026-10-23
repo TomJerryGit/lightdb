@@ -15,7 +15,7 @@ jobs:
   test:
     # 项目主要在 Windows 上开发（文件锁、socket.share、msvcrt 等路径），
     # 因此 CI 用 windows-latest；Linux 兼容性另有 roadmap 项。
-    runs-on: windows-latest
+    runs-on: [self-hosted, windows, lightdb-local]
     timeout-minutes: 60
     env:
       # GitHub Windows runner 控制台不是 UTF-8（cp1252），测试/注解输出里含中文
