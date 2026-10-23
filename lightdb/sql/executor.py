@@ -710,6 +710,14 @@ class Executor:
                     attach(self.audit)
             except Exception as e:               # pragma: no cover - 防御
                 logger.warn(f"审计日志惰性初始化失败: {e}")
+                self.__dict__.setdefault('_audit_fallback', [])
+                self._audit_fallback.append({
+                    'ts': '', 'user': str((session or {}).get('user') or ''),
+                    'cmd': str(parsed.get('command') or ''),
+                    'sql': str(parsed.get('source_sql') or ''),
+                    'success': not (isinstance(result, dict)
+                                    and result.get('type') == 'error'),
+                    'elapsed': elapsed})
                 return
         try:
             ok = not (isinstance(result, dict)
