@@ -28,6 +28,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import tempfile
 import shutil
 import statistics
 import subprocess
@@ -43,7 +44,9 @@ COLS = [{'name': 'id', 'type': 'INT', 'primary': True},
         {'name': 'v', 'type': 'INT'}]
 
 #: 默认数据目录（在 benchmarks/ 下，不进版本库，跑完即删）
-DEFAULT_DATA_DIR = os.path.join(HERE, 'data_bench')
+DEFAULT_DATA_DIR = (os.environ.get('LIGHTDB_BENCH_DATA_DIR')
+                    or os.path.join(tempfile.gettempdir(),
+                                    'lightdb_bench_data'))
 
 #: 多值 INSERT 的默认"每条语句行数"（与历史脚本一致）
 BATCH = 500
