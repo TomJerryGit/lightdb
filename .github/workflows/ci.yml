@@ -78,7 +78,7 @@ jobs:
       - name: Benchmark gate (quick)
         shell: powershell
         run: |
-          python -m benchmarks.run --suite quick --gate > bench.log 2>&1
+          python -m benchmarks.run --suite quick --gate *> bench.log
           $code = $LASTEXITCODE
           Get-Content bench.log -Tail 100
           if ($code -ne 0) {
@@ -91,7 +91,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         shell: powershell
         run: |
-          python scripts/gui_perf_budget.py > gui_perf.log 2>&1
+          python scripts/gui_perf_budget.py *> gui_perf.log
           $code = $LASTEXITCODE
           Get-Content gui_perf.log -Tail 80
           if ($code -ne 0) {
@@ -102,7 +102,7 @@ jobs:
       - name: Packaging check (wheel must contain engine + entry points)
         shell: powershell
         run: |
-          python scripts/check_packaging.py > packaging.log 2>&1
+          python scripts/check_packaging.py *> packaging.log
           $code = $LASTEXITCODE
           Get-Content packaging.log -Tail 100
           if ($code -ne 0) {
