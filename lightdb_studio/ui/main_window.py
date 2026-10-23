@@ -1192,7 +1192,7 @@ class MainWindow(QMainWindow):
         if conn is None:
             QMessageBox.warning(self, '提示', '请先选择一个连接')
             return None
-        dlg = TableDesigner(conn, self)
+        dlg = TableDesigner(conn, self, table_name=table)
         if dlg.exec() == TableDesigner.Accepted:
             self.object_tree.refresh_all()
         return dlg
