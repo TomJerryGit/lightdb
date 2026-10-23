@@ -29,6 +29,8 @@ class _Env:
         from lightdb.sql.parser import parser
 
         shutil.rmtree(DATA_DIR, ignore_errors=True)
+        # CI 顺序下显式钉住审计级别，避免外部环境变量影响（默认 DML 不含/含 DDL 的差异）
+        os.environ['LIGHTDB_AUDIT_LEVEL'] = 'ALL'
         self.db = Database(DATA_DIR)
         self.ex = Executor(self.db)
         self.parser = parser
