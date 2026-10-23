@@ -11,7 +11,7 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QComboBox, QPushButton, QLineEdit, QCheckBox, QLabel, QMessageBox,
-    QDialogButtonBox, QTextEdit, QAbstractItemView, QWidget
+    QDialogButtonBox, QTextEdit, QAbstractItemView, QWidget, QSpinBox
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -51,6 +51,9 @@ class TableDesigner(QDialog):
         self.is_edit = bool(self.edit_table)
         self.last_error = ''
         self.last_validation_error = ''
+        self.original_columns = []
+        self.original_auto_start = None
+        self.last_alter_statements = []
         self.setWindowTitle(
             f"编辑表 - {self.edit_table}" if self.is_edit else "新建表 - 表设计器")
         self.resize(1000, 780)
@@ -110,6 +113,22 @@ class TableDesigner(QDialog):
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet('color: #d7ba7d;')
         layout.addWidget(self.info_label)
+
+        # task-48：编辑模式可显式设置 AUTO_INCREMENT 起始号（仅当用户修改才生成）
+        self.auto_start_bar = QWidget()
+        auto_start_layout = QHBoxLayout(self.auto_start_bar)
+        auto_start_layout.setContentsMargins(0, 0, 0, 0)
+        auto_start_layout.addWidget(QLabel('AUTO_INCREMENT 起始值:'))
+        self.auto_start_spin = QSpinBox()
+        self.auto_start_spin.setRange(1, 2147483647)
+        self.auto_start_spin.setValue(1)
+        self.auto_start_spin.setToolTip(
+            '仅在编辑已有表时可用；修改后生成 ALTER TABLE ... AUTO_INCREMENT=n')
+        auto_start_layout.addWidget(self.auto_start_spin)
+        auto_start_layout.addStretch()
+        self.auto_start_bar.setVisible(False)
+        layout.addWidget(self.auto_start_bar)
+
         self.show_create_view = QTextEdit()
         self.show_create_view.setReadOnly(True)
         self.show_create_view.setFont(QFont("Consolas", 9))
@@ -119,8 +138,9 @@ class TableDesigner(QDialog):
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText(
-            "创建表" if not self.is_edit else "关闭（仅回显）")
+        self.save_btn = buttons.button(QDialogButtonBox.Ok)
+        self.save_btn.setText(
+            "创建表" if not self.is_edit else "💾 保存修改（ALTER）")
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
@@ -318,6 +338,18 @@ class TableDesigner(QDialog):
         return build_create_table(table_name, cols)
 
     def _preview_sql(self):
+        if self.is_edit:
+            statements, error = self.build_alter_statements()
+            self.last_validation_error = error
+            if error:
+                self.sql_preview.setPlainText('-- ' + error)
+                self.info_label.setText(error)
+                self.info_label.setStyleSheet('color: #f48771;')
+            else:
+                self.sql_preview.setPlainText('\n'.join(statements))
+                self.info_label.setText('待执行 ALTER（保存前会二次确认）')
+                self.info_label.setStyleSheet('color: #d7ba7d;')
+            return
         sql = self._generate_sql()
         if sql:
             self.sql_preview.setPlainText(sql)
@@ -370,8 +402,90 @@ class TableDesigner(QDialog):
                 '' if col.get('default') is None else str(
                     col.get('default'))))
         self._refresh_auto_states()
+        self.original_columns = self._normalize_columns(
+            self._collect_columns())
+        self.auto_start_bar.setVisible(True)
         self._load_table_info()
         return True
+
+    @staticmethod
+    def _normalize_columns(columns):
+        out = []
+        for c in columns or []:
+            out.append({
+                'name': str(c.get('name') or ''),
+                'type': str(c.get('type') or '').upper(),
+                'length': str(c.get('length') or ''),
+                'primary': bool(c.get('primary')),
+                'notnull': bool(c.get('notnull')),
+                'unique': bool(c.get('unique')),
+                'auto_increment': bool(c.get('auto_increment')),
+                'default': '' if c.get('default') is None else str(
+                    c.get('default')),
+            })
+        return out
+
+    # ---------- task-48：编辑已有表 → 最小 ALTER ----------
+
+    def build_alter_statements(self, columns=None, auto_start=None):
+        """生成最小 ALTER TABLE；返回 (statements, error)。不执行。"""
+        if not self.is_edit:
+            return [], '仅编辑已有表时支持 ALTER'
+        edited = self._normalize_columns(
+            columns if columns is not None else self._collect_columns())
+        ok, error = self.validate_columns(edited)
+        if not ok:
+            return [], error
+        original = {c['name']: c for c in self.original_columns}
+        edited_map = {c['name']: c for c in edited}
+        added = [n for n in edited_map if n not in original]
+        removed = [n for n in original if n not in edited_map]
+        if added or removed:
+            return [], ('编辑模式不支持添加/删除列（预检拒绝）：'
+                        f'新增 {added}，删除 {removed}')
+        statements = []
+        for name, col in edited_map.items():
+            old = original[name]
+            if col['primary'] != old['primary']:
+                return [], ('本引擎不支持通过 ALTER 修改主键（ADD/DROP PRIMARY '
+                            'KEY 变体未实现），请在 SQL 中手工处理')
+            if col['unique'] != old['unique']:
+                return [], ('本引擎不支持通过 ALTER 修改唯一约束（ADD/DROP '
+                            'INDEX/UNIQUE 变体未实现），请手工处理')
+            if old['auto_increment'] and not col['auto_increment']:
+                # 实测：本引擎 MODIFY 省略 AUTO_INCREMENT 会静默保留自增；
+                # 预检拒绝，避免“看起来成功但自增还在”的假保存。
+                return [], ('本引擎的 ALTER MODIFY 无法移除 AUTO_INCREMENT'
+                            '（实测会静默保留）；预检拒绝，未发送任何 SQL。'
+                            '请重建表/手工处理')
+            changed = any(col[k] != old[k] for k in (
+                'type', 'length', 'notnull', 'default', 'auto_increment'))
+            if changed:
+                statements.append(self._modify_column_sql(col))
+        # 起始号：仅当用户显式修改（spin 与加载值不同）时生成
+        start = int(self.auto_start_spin.value()
+                    if auto_start is None else auto_start)
+        has_auto = any(c['auto_increment'] for c in edited)
+        if self.original_auto_start is not None and \
+                start != int(self.original_auto_start):
+            if not has_auto:
+                return [], ('当前表没有 AUTO_INCREMENT 列，无法设置起始值')
+            statements.append(
+                f"ALTER TABLE `{self.edit_table}` AUTO_INCREMENT = {start};")
+        if not statements:
+            return [], '没有可保存的修改'
+        return statements, ''
+
+    def _modify_column_sql(self, col):
+        type_sql = col['type'] + (
+            f"({col['length']})" if col['length'] else '')
+        parts = [f"MODIFY COLUMN `{col['name']}` {type_sql}"]
+        parts.append('NOT NULL' if col['notnull'] else 'NULL')
+        if col['default'] != '':
+            parts.append(f"DEFAULT {col['default']}")
+        if col['auto_increment']:
+            parts.append('AUTO_INCREMENT')
+        return f"ALTER TABLE `{self.edit_table}` " + ' '.join(parts) + ';'
 
     def _load_table_info(self):
         """SHOW CREATE / SHOW TABLE STATUS.Auto_increment（失败显式）。"""
@@ -400,6 +514,13 @@ class TableDesigner(QDialog):
                         value = row[idx]
                         lines.append(
                             f'SHOW TABLE STATUS.Auto_increment = {value}')
+                        self.auto_start_bar.setVisible(True)
+                        try:
+                            start = int(value)
+                        except (TypeError, ValueError):
+                            start = 1
+                        self.auto_start_spin.setValue(max(1, start))
+                        self.original_auto_start = start
                         break
                 else:
                     lines.append('SHOW TABLE STATUS：未找到该表')
@@ -414,13 +535,7 @@ class TableDesigner(QDialog):
 
     def _on_accept(self):
         if self.is_edit:
-            # 不做假成功：编辑回显不静默生成 ALTER
-            QMessageBox.information(
-                self, '编辑模式',
-                '当前仅回显已有表结构（含 AUTO_INCREMENT）与 SHOW CREATE/'
-                'Auto_increment 信息；自动保存 ALTER 尚未开放，'
-                '请使用 SQL 执行修改。')
-            return
+            return self._save_alter()
         sql = self._generate_sql()
         if not sql:
             QMessageBox.warning(
@@ -440,6 +555,57 @@ class TableDesigner(QDialog):
         self.last_error = ''
         QMessageBox.information(self, "成功", "表已创建")
         self.accept()
+
+    def _save_alter(self):
+        statements, error = self.build_alter_statements()
+        self.last_alter_statements = list(statements)
+        self.sql_preview.setPlainText('\n'.join(statements))
+        self.last_validation_error = error
+        if error:
+            self.last_error = error
+            if error == '没有可保存的修改':
+                # 兼容回显语义：不改结构时只提示，不执行任何 SQL
+                QMessageBox.information(
+                    self, '编辑模式',
+                    '没有可保存的修改；当前显示 SHOW CREATE / '
+                    'Auto_increment 回显信息。')
+                return False
+            QMessageBox.warning(self, '无法保存修改', error)
+            return False
+        preview = '\n'.join(statements)
+        ret = QMessageBox.question(
+            self, '确认执行 ALTER',
+            '即将在目标表上执行以下 ALTER（请确认已备份）：\n\n'
+            + preview[:1800] + '\n\n是否继续？',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            self.last_error = '用户取消'
+            return False
+        for sql in statements:
+            try:
+                _n, err = self.conn.execute(sql)
+            except Exception as exc:                  # noqa: BLE001
+                self.last_error = str(exc)
+                QMessageBox.critical(self, 'ALTER 失败', f'引擎错误: {exc}')
+                return False
+            if err:
+                self.last_error = str(err)
+                QMessageBox.critical(self, 'ALTER 失败', str(err))
+                return False
+        self.last_error = ''
+        # 执行成功后刷新 SHOW CREATE / Auto_increment（对象树由主窗口在
+        # accept 后刷新；失败路径不会 accept，对话框保留）
+        self.load_existing_table(self.edit_table)
+        QMessageBox.information(
+            self, '保存成功',
+            f'已执行 {len(statements)} 条 ALTER；SHOW CREATE/自增信息已刷新。')
+        self.accept()
+        return True
+
+    def set_auto_start(self, value):
+        """测试辅助：设置 AUTO_INCREMENT 起始值。"""
+        self.auto_start_spin.setValue(int(value))
+        return self.auto_start_spin.value()
 
     # ---------- 测试/外部辅助 ----------
 
