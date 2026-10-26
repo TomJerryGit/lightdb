@@ -53,9 +53,10 @@ jobs:
           # conftest 在 pytest 收尾后按 exitstatus os._exit，绕过问题析构路径。
           LIGHTDB_PYTEST_HARD_EXIT: "1"
         run: |
-          python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml
+          python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml *> pytest-console.log
           $raw = $LASTEXITCODE
           Write-Host "pytest raw exit code: $raw"
+          Get-Content pytest-console.log -Tail 120 -ErrorAction SilentlyContinue
           python scripts/check_junit.py pytest-results.xml
           $gate = $LASTEXITCODE
           if ($gate -ne 0) { exit $gate }
@@ -72,7 +73,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pytest-results
-          path: pytest-results.xml
+          path: |
+            pytest-results.xml
+            pytest-console.log
           if-no-files-found: warn
 
       - name: Benchmark gate (quick)
