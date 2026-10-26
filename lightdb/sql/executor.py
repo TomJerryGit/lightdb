@@ -3534,21 +3534,39 @@ class Executor:
                     return t
             return ''
 
+        num_types = ('int', 'bigint', 'smallint', 'tinyint', 'mediumint',
+                     'decimal', 'numeric', 'float', 'double', 'real')
+        str_types = ('char', 'varchar', 'text', 'tinytext', 'mediumtext',
+                     'longtext', 'enum', 'set')
+        time_types = ('date', 'datetime', 'timestamp', 'time', 'year')
+
+        def col_type(name):
+            for c in (getattr(tbl, 'cols', None) or []):
+                if c.get('name') == name:
+                    return str(c.get('type') or '').split('(')[0].strip().lower()
+            return ''
+
         def lit_ok(name, lit):
-            # MySQL 下 BETWEEN 1.5 AND 3.5 对 INT 列按数值比较（id=2,3），
-            # 而下推后的 >= / <= 若把 1.5 强转成整数会得到错误结果；
-            # 仅当字面量与列类型安全匹配时才下推，否则保留原 BETWEEN 求值。
+            # 只有在"字面量与列类型同类、比较语义与 BETWEEN 一致"时才下推；
+            # 否则保留原 BETWEEN 求值路径（含不兼容类型显式报错）。
             ctype = col_type(name)
-            if ctype in int_types:
-                v = lit.get('value')
-                if isinstance(v, bool) or isinstance(v, float):
+            v = lit.get('value')
+            if v is None:
+                return False
+            is_num = isinstance(v, (int, float)) and not isinstance(v, bool)
+            is_str = isinstance(v, str)
+            if ctype in num_types:
+                if not is_num:
                     return False
-                if isinstance(v, str):
-                    try:
-                        int(v)
-                    except ValueError:
-                        return False
-            return True
+                if ctype in ('int', 'bigint', 'smallint', 'tinyint',
+                             'mediumint') and isinstance(v, float):
+                    return False
+                return True
+            if ctype in str_types:
+                return is_str
+            if ctype in time_types:
+                return is_str
+            return False
 
         def conv(node):
             if not isinstance(node, dict):
