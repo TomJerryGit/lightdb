@@ -27,6 +27,7 @@ INTEGER_TYPES = {'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT'}
 
 COL_NAME, COL_TYPE, COL_LENGTH, COL_PK, COL_NN, COL_UNIQUE, COL_AUTO, \
     COL_DEFAULT = 0, 1, 2, 3, 4, 5, 6, 7
+COL_POSITION = 8   # task-54：编辑已有表时新增列位置（末尾/FIRST/AFTER x）
 
 
 def _split_type(full_type):
@@ -54,6 +55,8 @@ class TableDesigner(QDialog):
         self.original_columns = []
         self.original_auto_start = None
         self.last_alter_statements = []
+        self.last_execution_results = []
+        self.last_failure_index = None
         self.setWindowTitle(
             f"编辑表 - {self.edit_table}" if self.is_edit else "新建表 - 表设计器")
         self.resize(1000, 780)
@@ -75,12 +78,13 @@ class TableDesigner(QDialog):
         layout.addLayout(top)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
+        self.table.setColumnCount(9)
         self.table.setHorizontalHeaderLabels([
-            '列名', '类型', '长度', '主键', '非空', '唯一', '自增', '默认值'])
+            '列名', '类型', '长度', '主键', '非空', '唯一', '自增', '默认值',
+            '位置'])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        widths = [150, 110, 70, 55, 55, 55, 55, 140]
+        widths = [150, 110, 70, 55, 55, 55, 55, 140, 130]
         for i, width in enumerate(widths):
             self.table.setColumnWidth(i, width)
         layout.addWidget(self.table, 1)
@@ -181,7 +185,76 @@ class TableDesigner(QDialog):
             cb.toggled.connect(self._refresh_auto_states)
             self.table.setCellWidget(r, col, w)
         self.table.setItem(r, COL_DEFAULT, QTableWidgetItem(""))
+        pos = QComboBox()
+        pos.addItems(['末尾', 'FIRST'])
+        pos.setToolTip('新增列位置：末尾 / FIRST / AFTER 已有列')
+        self.table.setCellWidget(r, COL_POSITION, pos)
         self._refresh_auto_states()
+        self.table.setColumnHidden(COL_POSITION, not self.is_edit)
+        self._rebuild_position_options()
+
+    def _position_combo(self, r):
+        w = self.table.cellWidget(r, COL_POSITION)
+        if w is None:
+            return None
+        if isinstance(w, QComboBox):
+            return w
+        return w.findChild(QComboBox)
+
+    def _position_value(self, r):
+        combo = self._position_combo(r)
+        if combo is None or not combo.isEnabled():
+            return '末尾'
+        value = combo.currentText().strip()
+        return '' if value in ('—', '') else value
+
+    def set_column_position(self, row, value):
+        """测试/外部辅助：设置新增列位置（末尾/FIRST/AFTER 列名）。"""
+        combo = self._position_combo(row)
+        if combo is None:
+            return None
+        value = str(value or '末尾')
+        if value not in [combo.itemText(i) for i in range(combo.count())]:
+            combo.addItem(value if value.startswith('AFTER ') else
+                          (f'AFTER {value}' if value not in ('末尾', 'FIRST')
+                           else value))
+        combo.setCurrentText(value)
+        return combo.currentText()
+
+    def _rebuild_position_options(self):
+        """刷新位置候选：existing 列禁用显示 —，新增列可选末尾/FIRST/AFTER。"""
+        name_set = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, COL_NAME)
+            name = item.text().strip() if item else ''
+            if name:
+                name_set.append(name)
+        original_names = {c['name'] for c in self.original_columns} \
+            if self.is_edit else set()
+        for r in range(self.table.rowCount()):
+            combo = self._position_combo(r)
+            if combo is None:
+                continue
+            item = self.table.item(r, COL_NAME)
+            name = item.text().strip() if item else ''
+            previous = combo.currentText() if combo.isEnabled() else ''
+            combo.blockSignals(True)
+            combo.clear()
+            if self.is_edit and name in original_names:
+                combo.addItem('—')
+                combo.setEnabled(False)
+            else:
+                combo.addItem('末尾')
+                combo.addItem('FIRST')
+                for other in name_set:
+                    if other != name:
+                        combo.addItem(f'AFTER {other}')
+                combo.setEnabled(True)
+                if previous and previous != '—':
+                    idx = combo.findText(previous)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
 
     def _checkbox(self, r, col):
         w = self.table.cellWidget(r, col)
@@ -198,6 +271,7 @@ class TableDesigner(QDialog):
         for r in rows:
             self.table.removeRow(r)
         self._refresh_auto_states()
+        self._rebuild_position_options()
 
     def _move_column(self, delta):
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
@@ -301,6 +375,7 @@ class TableDesigner(QDialog):
                 'name': name, 'type': ctype, 'length': length,
                 'primary': pk, 'notnull': nn, 'unique': unique,
                 'auto_increment': ai, 'default': default,
+                'position': self._position_value(r),
             })
         return cols
 
@@ -404,6 +479,7 @@ class TableDesigner(QDialog):
         self._refresh_auto_states()
         self.original_columns = self._normalize_columns(
             self._collect_columns())
+        self._rebuild_position_options()
         self.auto_start_bar.setVisible(True)
         self._load_table_info()
         return True
@@ -422,29 +498,71 @@ class TableDesigner(QDialog):
                 'auto_increment': bool(c.get('auto_increment')),
                 'default': '' if c.get('default') is None else str(
                     c.get('default')),
+                'position': str(c.get('position') or '末尾'),
             })
         return out
 
     # ---------- task-48：编辑已有表 → 最小 ALTER ----------
 
     def build_alter_statements(self, columns=None, auto_start=None):
-        """生成最小 ALTER TABLE；返回 (statements, error)。不执行。"""
+        """生成最小、顺序安全的 ALTER 列表；返回 (statements, error)。不执行。
+
+        task-54：支持编辑已有表 ADD COLUMN / DROP COLUMN。
+        顺序：DROP（先释放索引/名称）→ 现有列 MODIFY → ADD（按最终行顺序，
+        位置子句仅对新增列生效）。兼容旧快照 API：显式传入 `columns` 时
+        不做增删列（旧测试/只读校验用途）；真实 UI 保存走 `columns=None`。
+        """
         if not self.is_edit:
             return [], '仅编辑已有表时支持 ALTER'
         edited = self._normalize_columns(
             columns if columns is not None else self._collect_columns())
-        ok, error = self.validate_columns(edited)
+        ok, error = (True, '') if not edited else self.validate_columns(edited)
         if not ok:
             return [], error
         original = {c['name']: c for c in self.original_columns}
         edited_map = {c['name']: c for c in edited}
-        added = [n for n in edited_map if n not in original]
+        added = [c['name'] for c in edited if c['name'] not in original]
         removed = [n for n in original if n not in edited_map]
-        if added or removed:
+        # 兼容边界：显式 columns 快照仅供只读校验；UI 使用实时行（columns=None）
+        if columns is not None and (added or removed):
             return [], ('编辑模式不支持添加/删除列（预检拒绝）：'
                         f'新增 {added}，删除 {removed}')
+        final_names = [c['name'] for c in edited]
+        added_set = set(added)
+        removed_set = set(removed)
+        # 新增列引擎能力预检（engine task-53）
+        for name in added:
+            col = edited_map[name]
+            if col['primary']:
+                return [], ('本引擎 ADD COLUMN 不支持 PRIMARY KEY（会报 '
+                            'Multiple primary key / ADD PRIMARY KEY 未实现）；'
+                            '请改用唯一键 UNIQUE')
+            if col['auto_increment']:
+                if not is_integer_type(col['type']):
+                    return [], f'新增自增列 {name} 必须是整数类型'
+                if not col['unique']:
+                    return [], ('新增 AUTO_INCREMENT 列必须勾选“唯一”（引擎 '
+                                'ADD COLUMN 要求自增列为键，且不支持 ADD '
+                                'PRIMARY KEY）')
+            position = (col.get('position') or '末尾').strip()
+            anchor = self._position_anchor(position)
+            if anchor:
+                if anchor in removed_set:
+                    return [], f'新增列 {name} 的位置锚点列 {anchor} 将被删除'
+                if anchor not in final_names:
+                    return [], f'新增列 {name} 的位置锚点列 {anchor} 不存在'
+                if anchor == name:
+                    return [], f'新增列 {name} 不能 AFTER 自身'
         statements = []
-        for name, col in edited_map.items():
+        # 1) DROP COLUMN（先删，保证后续索引/名称空间安全）
+        for name in removed:
+            statements.append(
+                f"ALTER TABLE `{self.edit_table}` DROP COLUMN `{name}`;")
+        # 2) 现有列的 MODIFY（类型/长度/NULL/DEFAULT/自增）
+        for col in edited:
+            name = col['name']
+            if name in added_set:
+                continue
             old = original[name]
             if col['primary'] != old['primary']:
                 return [], ('本引擎不支持通过 ALTER 修改主键（ADD/DROP PRIMARY '
@@ -458,6 +576,10 @@ class TableDesigner(QDialog):
                 'type', 'length', 'notnull', 'default', 'auto_increment'))
             if changed:
                 statements.append(self._modify_column_sql(col))
+        # 3) ADD COLUMN（按最终行顺序，自左向右/追加，位置子句保持稳定）
+        for col in edited:
+            if col['name'] in added_set:
+                statements.append(self._add_column_sql(col))
         # 起始号：仅当用户显式修改（spin 与加载值不同）时生成
         start = int(self.auto_start_spin.value()
                     if auto_start is None else auto_start)
@@ -471,6 +593,45 @@ class TableDesigner(QDialog):
         if not statements:
             return [], '没有可保存的修改'
         return statements, ''
+
+    @staticmethod
+    def _position_anchor(position):
+        """把 UI 位置值转成锚点列名：FIRST/末尾返回 None，AFTER x 返回 x。"""
+        value = str(position or '').strip()
+        if not value or value in ('末尾', 'FIRST', '—'):
+            return None
+        for prefix in ('AFTER ', 'AFTER:'):
+            if value.upper().startswith(prefix):
+                return value[len(prefix):].strip().strip('`')
+        if value.upper().startswith('AFTER'):
+            return value[5:].strip().strip('`')
+        return value.strip('`')
+
+    def _position_clause(self, position):
+        anchor = self._position_anchor(position)
+        if anchor:
+            return f'AFTER `{anchor}`'
+        if str(position or '').strip().upper() == 'FIRST':
+            return 'FIRST'
+        return ''
+
+    def _add_column_sql(self, col):
+        """生成单条 ADD COLUMN；位置支持 FIRST/AFTER。"""
+        type_sql = col['type'] + (
+            f"({col['length']})" if col['length'] else '')
+        parts = [f"ADD COLUMN `{col['name']}` {type_sql}"]
+        parts.append('NOT NULL' if (col['notnull'] or col['auto_increment'])
+                     else 'NULL')
+        if col['default'] != '':
+            parts.append(f"DEFAULT {col['default']}")
+        if col['unique']:
+            parts.append('UNIQUE')
+        if col['auto_increment']:
+            parts.append('AUTO_INCREMENT')
+        clause = self._position_clause(col.get('position'))
+        if clause:
+            parts.append(clause)
+        return f"ALTER TABLE `{self.edit_table}` " + ' '.join(parts) + ';'
 
     def _modify_column_sql(self, col):
         type_sql = col['type'] + (
@@ -555,6 +716,8 @@ class TableDesigner(QDialog):
     def _save_alter(self):
         statements, error = self.build_alter_statements()
         self.last_alter_statements = list(statements)
+        self.last_execution_results = []
+        self.last_failure_index = None
         self.sql_preview.setPlainText('\n'.join(statements))
         self.last_validation_error = error
         if error:
@@ -569,32 +732,46 @@ class TableDesigner(QDialog):
             QMessageBox.warning(self, '无法保存修改', error)
             return False
         preview = '\n'.join(statements)
+        has_drop = any(' DROP COLUMN ' in s.upper() for s in statements)
+        warning = ''
+        if has_drop:
+            warning = ('\n⚠ 包含 DROP COLUMN：删除列不可逆，现有数据将丢失！'
+                       '\n如列被索引/主键/CHECK 引用，引擎会拒绝并返回真实错误。')
         ret = QMessageBox.question(
             self, '确认执行 ALTER',
             '即将在目标表上执行以下 ALTER（请确认已备份）：\n\n'
-            + preview[:1800] + '\n\n是否继续？',
+            + preview[:1800] + warning + '\n\n是否继续？',
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ret != QMessageBox.Yes:
             self.last_error = '用户取消'
             return False
-        for sql in statements:
+        total = len(statements)
+        for idx, sql in enumerate(statements):
+            result = {'sql': sql, 'ok': False, 'error': None}
             try:
                 _n, err = self.conn.execute(sql)
             except Exception as exc:                  # noqa: BLE001
-                self.last_error = str(exc)
-                QMessageBox.critical(self, 'ALTER 失败', f'引擎错误: {exc}')
-                return False
+                err = exc
             if err:
                 self.last_error = str(err)
-                QMessageBox.critical(self, 'ALTER 失败', str(err))
+                result['error'] = str(err)
+                self.last_execution_results.append(result)
+                self.last_failure_index = idx
+                QMessageBox.critical(
+                    self, 'ALTER 失败',
+                    f'第 {idx + 1}/{total} 条失败（已执行 {idx} 条，'
+                    f'剩余 {total - idx - 1} 条未执行）：\n\n'
+                    f'{sql}\n\n引擎真实错误：\n{err}')
                 return False
+            result['ok'] = True
+            self.last_execution_results.append(result)
         self.last_error = ''
         # 执行成功后刷新 SHOW CREATE / Auto_increment（对象树由主窗口在
         # accept 后刷新；失败路径不会 accept，对话框保留）
         self.load_existing_table(self.edit_table)
         QMessageBox.information(
             self, '保存成功',
-            f'已执行 {len(statements)} 条 ALTER；SHOW CREATE/自增信息已刷新。')
+            f'已执行 {total} 条 ALTER；SHOW CREATE/列回显/表状态已刷新。')
         self.accept()
         return True
 
