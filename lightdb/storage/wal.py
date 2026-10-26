@@ -1,61 +1,49 @@
 """
-预写日志 (WAL) - 修复版
+预写日志 (WAL) - 命名多段轮转版
 
-修复历史:
-- 第二批: find_committed_transactions 按顺序扫描
-- 第二批: read_all 加缓存
-- 第二批: truncate 保持 LSN 单调
-- 第三批: 增加 checkpoint / compact
-- 事务原子性批次:
-  * `log()` 之后由调用方调用 `flush_to_os()`，落实 **log-before-data**
-    （WAL 记录先于页修改进入 OS，进程被硬杀也不会出现"页改了、日志没了"）。
-  * **log() 现在默认就把记录 flush 到 OS**（不做 fsync，成本约 0.05ms），
-    这样所有调用方天然满足 log-before-data，不需要各自记得调用
-    flush_to_os()；`sync=True`（COMMIT/ABORT）再补 fsync，是掉电级持久化点。
-  * 新增 `analyze()`：一次扫描给出 [已提交操作] 与 [loser 事务操作]，
-    供崩溃恢复做 redo + undo（loser undo 依赖 UPDATE/DELETE 记录里的旧行镜像）。
-  * **autocommit 记录视为隐式提交**：`txn_id == 0`（executor 没有显式
-    事务时传 0）以及 Table 为 autocommit 语句分配的合成高位事务号
-    （`>= SYNTHETIC_TXN_FLOOR`，区间与 mvcc.ReadView 的判定一致）都没有
-    COMMIT 记录，必须按已提交重放。旧实现把 0 号直接 continue 丢掉，
-    合成号又会被判成 loser，结果是**autocommit 写入一重启就整表消失**。
+段文件布局（每张表一组）：
+    <table>.wal                 ← **活动段**（当前追加写；兼容旧路径/测试）
+    <table>-wal-000001.log      ← 已轮转的归档段（按序号递增）
 
-checkpoint 机制说明:
-- checkpoint() 记录一个安全 LSN
-- compact_before(lsn) 删除该 LSN 之前的已提交记录
-- 使用前提: 调用方需保证 lsn 之前的事务都已提交/回滚，且不再需要恢复
+* 活动段超过 `segment_bytes`（默认 256 KB，可用
+  `LIGHTDB_WAL_SEGMENT_BYTES` 或 `Table.wal_segment_bytes` 配置）后，
+  自动把活动段改名为 `-wal-NNNNNN.log` 归档，并开新活动段继续写；
+  LSN 跨段单调。
+* checkpoint（`Table._retire_wal` → `WAL.truncate`）先把活动段轮转为归档，
+  再只保留最近 K 段（`LIGHTDB_WAL_KEEP_SEGMENTS` / `Table.wal_keep_segments`，
+  默认 0 = 兼容旧的"checkpoint 后 WAL 清空"语义），更旧的段安全删除。
+  之后活动段为空，归档总量 <= K * (segment_bytes + 单条记录上限)。
+* 启动时按归档段序号 + 活动段的顺序读取全部记录再做 redo/undo，
+  因此**跨段崩溃恢复**成立；恢复成功后才轮转/退休 WAL（失败保留原样重试）。
+* `size_bytes()`/`record_count()` 返回**全部段**的真实合计（活动段 + 归档），
+  这样 Table 的 WAL 阈值/有界性判定覆盖整个 WAL，而不会在轮转后重置为 0；
+  需要单看活动段时用 `active_size_bytes()`。
 
-WAL 有界（轮转）批次:
-- 新增 **体积/条数计量** (`size_bytes()` / `record_count()` /
-  `needs_checkpoint()`)，供 Table 侧按阈值触发 checkpoint。
-  计量不依赖每次 `os.path.getsize()`（每条语句一次 syscall），
-  而是在 `log()` 里累加写入字节数；`__init__` 扫已有文件时一并初始化，
-  `truncate()` / `compact_before()` 重算。
-- `truncate()` 现在**先把重写落到 OS 并 fsync**，再重开追加句柄：
-  checkpoint 的语义是"数据页已经 fsync，日志可以退休"，
-  截断动作本身必须真的落盘，否则掉电后可能读回半截日志。
-  LSN 仍然单调（`_base_lsn = self.lsn`），恢复侧不会因为轮转而
-  把新记录当成旧记录。
-
-已知限制:
-- 只保证"进程崩溃不丢"（flush 到 OS）与"COMMIT 后掉电不丢"（fsync）。
-  未提交事务的页若被提前刷盘，靠恢复阶段的 loser-undo 撤销，
-  但该 undo 需要 WAL 记录里的旧行镜像（UPDATE/DELETE 已带 old/old_loc）。
-- 无 checkpoint/LSN 页头联动，恢复是"日志全量重放 + 幂等覆盖"。
+写路径持久性语义与旧版一致：
+- `log()` 写入 Python 缓冲；`flush_to_os()` 交给 OS（进程硬杀不丢）；
+- `commit()`/`abort()` fsync（掉电级持久化点）；autocommit 语句用
+  `commit_async()` / `commit_autocommit()`（flush 到 OS，不 fsync）；
+- 恢复是"日志全量重放 + 幂等覆盖"，loser 用 UPDATE/DELETE 的旧行镜像 undo。
 """
+import glob
 import json
 import os
+import re
 import struct
 import threading
 
 # 合成 autocommit 事务号下界（必须与 storage/mvcc.py 的 ReadView 判定一致）。
-# Table 给 autocommit 语句分配的事务号从 0xFFFFFFFF 往下取（行头 xmin/xmax
-# 是 uint32，不能为负）；这类事务号没有 COMMIT 记录，恢复时必须按
-# "隐式提交" 处理，否则 autocommit 写入会在重启时被当成 loser 撤销掉。
 try:
     from .mvcc import SYNTHETIC_TXN_FLOOR
 except Exception:  # pragma: no cover - 防御性回退
     SYNTHETIC_TXN_FLOOR = 0xF0000000
+
+#: 默认段大小（字节）：可用环境变量/Table 类属性覆盖
+WAL_SEGMENT_BYTES_DEFAULT = 256 * 1024
+WAL_SEGMENT_BYTES_ENV = 'LIGHTDB_WAL_SEGMENT_BYTES'
+#: checkpoint 后默认保留的最近归档段数（0 = 兼容旧语义：全部退休）
+WAL_KEEP_SEGMENTS_DEFAULT = 0
+WAL_KEEP_SEGMENTS_ENV = 'LIGHTDB_WAL_KEEP_SEGMENTS'
 
 
 def is_implicit_commit_tid(txn_id: int) -> bool:
@@ -78,9 +66,7 @@ def fix_loser_undo_image(data: dict) -> bool:
     Table 写 WAL 时把 "旧行镜像" 存成了 **带删除标记的版本**
     （old_b = encode(old, xmin, xmax=txn_id)）。恢复阶段把这份字节
     原样写回页，行头就永久带着 xmax=txn_id —— 于是**事务前就已经
-    提交、本来必须保留的旧行在恢复后彻底读不出来**
-    （实测: 未提交事务 update/delete 过的行在重启后整行消失，
-     连 select 都返回空表）。
+    提交、本来必须保留的旧行在恢复后彻底读不出来**。
 
     正确的前像应当是 xmax = 0（事务前该行是活的）。这里按 old 值 +
     原 xmin 重建镜像；如果 Table 侧哪天改对了（xmax 本来就是 0），
@@ -146,10 +132,21 @@ class WALRecord:
         return cls(o['lsn'], o['txn_id'], o['type'], o['data'])
 
 
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 class WAL:
 
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, path: str, segment_bytes: int = None,
+                 keep_segments: int = None):
+        self.path = str(path)
         self.lock = threading.RLock()
         self.lsn = 0
         self._base_lsn = 0
@@ -157,32 +154,162 @@ class WAL:
         # checkpoint 状态
         self._checkpoint_lsn = 0
 
-        # 体积/条数计量（避免每条语句都 getsize；见文件头说明）
+        # 段配置：显式参数 > 环境变量 > 默认值
+        self.segment_bytes = int(
+            segment_bytes if segment_bytes is not None
+            else _env_int(WAL_SEGMENT_BYTES_ENV, WAL_SEGMENT_BYTES_DEFAULT))
+        self.keep_segments = int(
+            keep_segments if keep_segments is not None
+            else _env_int(WAL_KEEP_SEGMENTS_ENV, WAL_KEEP_SEGMENTS_DEFAULT))
+        if self.segment_bytes <= 0:
+            self.segment_bytes = 0       # 0 = 不轮转
+        if self.keep_segments < 0:
+            self.keep_segments = 0
+
+        # 归档段（按序号升序）：[(seq, path)]
+        self._segments = []
+        base = self.path[:-4] if self.path.lower().endswith('.wal') \
+            else self.path
+        self._prefix = base
+        self._seq = 0
+
+        # 体积/条数计量（**全部段合计**；见文件头说明）
         self._size = 0
         self._records = 0
+        self._active_size = 0
 
-        # 扫描已有 WAL
-        if os.path.exists(path):
+        self._load_existing_segments()
+        self.f = open(self.path, 'a', encoding='utf-8', newline='')
+
+    # ==================== 段管理 ====================
+
+    def _archive_pattern(self) -> str:
+        return f"{self._prefix}-wal-*.log"
+
+    def _archive_path(self, seq: int) -> str:
+        return f"{self._prefix}-wal-{seq:06d}.log"
+
+    def _discover_segments(self):
+        """扫描磁盘上的归档段，返回 [(seq, path)]（按 seq 升序）"""
+        found = []
+        for p in glob.glob(self._archive_pattern()):
+            m = re.search(r'-wal-(\d+)\.log$', p)
+            if not m:
+                continue
+            try:
+                found.append((int(m.group(1)), p))
+            except (TypeError, ValueError):
+                continue
+        found.sort(key=lambda x: x[0])
+        # 同一序号出现多个（异常手工拷贝）：保留序号最大的，忽略重复
+        dedup = {}
+        for seq, p in found:
+            dedup[seq] = p
+        return sorted(dedup.items())
+
+    @staticmethod
+    def _read_file_records(path: str):
+        out = []
+        try:
             with open(path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        rec = WALRecord.from_json(line)
-                        if rec.lsn > self.lsn:
-                            self.lsn = rec.lsn
-                        self._records += 1
-                        self._size += len(line) + 1
+                        out.append(WALRecord.from_json(line))
                     except Exception:
-                        pass
+                        continue
+        except FileNotFoundError:
+            return out
+        return out
 
+    def _load_existing_segments(self):
+        """启动扫描：归档段（序号序）+ 活动段，LSN 取全部最大值
+
+        恢复侧稍后调用 `read_all()`/`analyze()` 时再完整读一遍内容；
+        这里只统计段大小/条数以保持检查点阈值语义（含跨段合计）。
+        """
+        self._segments = self._discover_segments()
+        if self._segments:
+            self._seq = max(s for s, _p in self._segments)
+        self._size = 0
+        self._records = 0
+        for _seq, p in self._segments:
+            try:
+                self._size += os.path.getsize(p)
+            except OSError:
+                pass
+        for p in [p for _s, p in self._segments] + [self.path]:
+            for rec in self._read_file_records(p):
+                self._records += 1
+                if rec.lsn > self.lsn:
+                    self.lsn = rec.lsn
+        self._active_size = self._file_size(self.path)
         self._base_lsn = self.lsn
-        self.f = open(path, 'a', encoding='utf-8')
 
-        # 增量读取缓存
-        self._cached_records = []
-        self._cached_offset = 0
+    @staticmethod
+    def _file_size(path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    def _rotate_locked(self):
+        """把当前活动段改名为归档段，并开新的空活动段（调用方持锁）"""
+        active_size = self._file_size(self.path)
+        if active_size <= 0:
+            # 空活动段：无需归档
+            self._active_size = 0
+            return 0
+        try:
+            self.f.flush()
+            self.f.close()
+        except Exception:
+            pass
+        self._seq += 1
+        dst = self._archive_path(self._seq)
+        try:
+            os.replace(self.path, dst)
+        except OSError:
+            # 改不了名（被占用等）：保持原文件继续写，避免丢日志
+            self.f = open(self.path, 'a', encoding='utf-8', newline='')
+            self._active_size = active_size
+            return 0
+        self._segments.append((self._seq, dst))
+        self.f = open(self.path, 'w', encoding='utf-8', newline='')
+        self._size += 0                    # 总量不变（改名不改变字节数）
+        self._active_size = 0
+        return self._seq
+
+    def _prune_segments_locked(self):
+        """只保留最近 `keep_segments` 个归档段，删除更旧的（调用方持锁）"""
+        if self.keep_segments < 0:
+            self.keep_segments = 0
+        keep = int(self.keep_segments)
+        if len(self._segments) <= keep:
+            return 0
+        drop = self._segments[:len(self._segments) - keep] \
+            if keep > 0 else list(self._segments)
+        removed = 0
+        for seq, p in drop:
+            try:
+                sz = self._file_size(p)
+                os.unlink(p)
+                self._size = max(0, self._size - sz)
+                removed += 1
+            except OSError:
+                pass
+        self._segments = self._segments[len(drop):]
+        return removed
+
+    def _scan_all_records(self):
+        """按段序读取全部记录（归档段升序 + 活动段）"""
+        records = []
+        for _seq, p in list(self._segments):
+            records.extend(self._read_file_records(p))
+        records.extend(self._read_file_records(self.path))
+        return records
 
     # ==================== 写 ====================
 
@@ -191,20 +318,23 @@ class WAL:
         """
         追加一条 WAL 记录（写入 Python 缓冲，不做 syscall）。
 
+        活动段超过配置大小后自动轮转（改名归档 + 新活动段），LSN 继续单调。
         持久化点由调用方把控：
         - `commit()` / `abort()` → fsync（显式事务的持久化点）
         - `commit_async()`       → flush 到 OS（autocommit 语句）
         - `flush_to_os()`        → 交调用方在"改页之前"显式调用
-
-        注意 sync=True 仍然会立即 flush+fsync，保留给需要单条
-        持久化的调用方。
         """
         with self.lock:
+            if (self.segment_bytes and self._active_size
+                    and self._active_size >= self.segment_bytes):
+                self._rotate_locked()
             self.lsn += 1
             rec = WALRecord(self.lsn, txn_id, rtype, data)
             line = rec.to_json()
             self.f.write(line + '\n')
-            self._size += len(line) + 1
+            n = len(line) + 1
+            self._active_size += n
+            self._size += n
             self._records += 1
             if sync:
                 self._flush_locked()
@@ -218,14 +348,6 @@ class WAL:
         """
         autocommit 语句的隐式提交记录：先把数据记录交给 OS，再追加
         COMMIT，全程不 fsync。
-
-        为什么可以：这条 COMMIT 的作用是让崩溃恢复的 analyze() 认出
-        "这是一个已提交的隐式事务"；flush 到 OS 后进程被硬杀照样
-        读得回来。真正的 fsync 留给显式 COMMIT、abort() 和
-        Table.flush()/close()。
-
-        为什么必须分开：每条 autocommit INSERT 都 fsync 一次，
-        3000 行插入在 Windows 上实测要 200s+（14 rows/s）。
         """
         with self.lock:
             try:
@@ -238,20 +360,7 @@ class WAL:
         self.log(txn_id, 'ABORT', {}, sync=True)
 
     def commit_autocommit(self, txn_id: int):
-        """语句级 autocommit 提交：数据 + COMMIT 记录都交给 OS（**不 fsync**）
-
-        与 `commit_async` 的差别只有一处：COMMIT 记录本身也 flush 到 OS。
-        `commit_async` 把 COMMIT 留在 Python 缓冲里（靠下一条语句的
-        `flush_to_os` 顺带带出去），对"逐行 autocommit"没有影响；但语句级
-        COMMIT 是**整条语句**的判定点 —— 一条 500 行的多值 INSERT 若被硬杀
-        时 COMMIT 还在 Python 缓冲里，恢复会把这几百行已提交的行当 loser
-        全部撤销。因此这里在写 COMMIT 之后再 flush 一次。
-
-        持久性档位与逐行 autocommit 完全一致（Stage 2.1 的既有设计）:
-        进程被硬杀不丢（数据在 OS 缓冲里），掉电可能丢最后几条；
-        真正的掉电级持久化点仍然只有显式 COMMIT（`commit` / fsync）、
-        checkpoint 与 close。
-        """
+        """语句级 autocommit 提交：数据 + COMMIT 都 flush 到 OS（不 fsync）"""
         with self.lock:
             try:
                 self.f.flush()
@@ -290,46 +399,14 @@ class WAL:
     # ==================== 读 ====================
 
     def read_all(self):
-        """读取所有记录（带缓存）"""
+        """读取全部记录：归档段（序号序）+ 活动段"""
         with self.lock:
-            if not os.path.exists(self.path):
-                return list(self._cached_records)
-
-            try:
-                cur_size = os.path.getsize(self.path)
-            except OSError:
-                return list(self._cached_records)
-
-            if cur_size < self._cached_offset:
-                # 文件被截断/重写
-                self._cached_records = []
-                self._cached_offset = 0
-
-            if cur_size == self._cached_offset:
-                return list(self._cached_records)
-
-            with open(self.path, 'r', encoding='utf-8') as f:
-                f.seek(self._cached_offset)
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = WALRecord.from_json(line)
-                        self._cached_records.append(rec)
-                    except Exception:
-                        pass
-                self._cached_offset = f.tell()
-
-            return list(self._cached_records)
+            return self._scan_all_records()
 
     def read_from_lsn(self, lsn: int, limit: int = None):
-        """
-        读取 lsn >= 指定值的记录（增量读，用于 PITR）
-        """
-        records = self.read_all()
+        """读取 lsn >= 指定值的记录（增量读，用于 PITR；跨段同样适用）"""
         result = []
-        for r in records:
+        for r in self.read_all():
             if r.lsn >= lsn:
                 result.append(r)
                 if limit and len(result) >= limit:
@@ -338,14 +415,9 @@ class WAL:
 
     def find_committed_transactions(self):
         """
-        返回 [(txn_id, [ops]), ...]
-        ops 是 COMMIT 之前的 INSERT/UPDATE/DELETE 记录。
+        返回 [(txn_id, [ops]), ...]；跨段合并后按 LSN 分类。
 
-        修复: txn_id == 0 与合成 autocommit 事务号不再被丢弃。
-        它们是 autocommit（executor 的 INSERT/UPDATE/DELETE 在没有
-        显式事务时传 txn_id=0；Table 则分配合成高位号），不会写
-        COMMIT 记录，因此按 "隐式提交" 处理；否则 autocommit 写入
-        崩溃后永远无法重放。
+        `txn_id == 0` 与合成 autocommit 事务号按"隐式提交"处理。
         """
         records = self.read_all()
         by_txn = {}
@@ -359,7 +431,6 @@ class WAL:
             if not ops:
                 continue
             if is_implicit_commit_tid(tid):
-                # autocommit: 每条记录自身即已提交
                 committed.append((tid, ops))
                 continue
 
@@ -387,16 +458,7 @@ class WAL:
     def analyze(self):
         """
         崩溃恢复用的一次性分析，返回 (committed_ops, loser_ops)。
-
-        - committed_ops: 需要 **redo** 的操作，元素 (lsn, txn_id, type, data)，
-          按 LSN 升序。包含 COMMIT 之前的记录，以及 autocommit 记录
-          （txn_id == 0 或合成高位事务号 → 隐式提交）。
-        - loser_ops: 需要 **undo** 的操作（有数据记录但没有 COMMIT，
-          或 ABORT 在 COMMIT 之前），按 LSN 升序返回；
-          调用方必须**倒序**应用撤销，才能正确回退同一行的多次修改。
-
-        已知限制: 本方法只做"日志级"分类，不区分页是否已经落盘；
-        redo/undo 由 Table 侧的幂等实现保证可重复执行。
+        跨全部段收集记录后按事务分类，再按 LSN 排序。
         """
         records = self.read_all()
         by_txn = {}
@@ -430,9 +492,6 @@ class WAL:
                     for r in recs[:commit_idx]
                     if r.type in ('INSERT', 'UPDATE', 'DELETE'))
             else:
-                # loser: 未提交（或已 ABORT）。撤销是幂等的，
-                # 即使进程内已经回滚过、这里重复撤销也不会出错。
-                # 交给恢复层之前先修好旧行镜像（见 fix_loser_undo_image）。
                 for r in ops:
                     if r.type in ('UPDATE', 'DELETE'):
                         fix_loser_undo_image(r.data)
@@ -445,87 +504,70 @@ class WAL:
     # ==================== checkpoint / compact ====================
 
     def checkpoint(self) -> int:
-        """
-        记录当前 LSN 作为安全点，返回该 LSN。
-        调用方需保证：此 LSN 之前的事务都已提交/回滚。
-        """
+        """记录当前 LSN 作为安全点，返回该 LSN"""
         with self.lock:
             self._checkpoint_lsn = self.lsn
             return self._checkpoint_lsn
 
     def compact_before(self, lsn: int) -> int:
-        """
-        删除 lsn 之前的记录。
-        - 只保留 lsn >= 目标值的记录
-        - 返回被删除的记录数
-        - 注意：调用方需确保这些记录不再需要恢复
-        """
+        """删除 lsn 之前的记录（跨段合并后重写活动段，归档段删除）"""
         with self.lock:
-            # 关闭当前文件句柄
+            records = self._scan_all_records()
+            kept = [r for r in records if r.lsn >= lsn]
+            removed = len(records) - len(kept)
             try:
                 self.f.flush()
                 self.f.close()
             except Exception:
                 pass
-
-            # 读全部记录
-            records = []
-            if os.path.exists(self.path):
-                with open(self.path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            records.append(WALRecord.from_json(line))
-                        except Exception:
-                            pass
-
-            # 过滤
-            kept = [r for r in records if r.lsn >= lsn]
-            removed = len(records) - len(kept)
-
-            # 重写文件
-            with open(self.path, 'w', encoding='utf-8') as f:
+            for _seq, p in list(self._segments):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            self._segments = []
+            with open(self.path, 'w', encoding='utf-8', newline='') as f:
                 for r in kept:
                     f.write(r.to_json() + '\n')
-
-            # 重开
-            self.f = open(self.path, 'a', encoding='utf-8')
-
-            # 重置缓存
-            self._cached_records = list(kept)
-            self._cached_offset = os.path.getsize(self.path)
+                f.flush()
+            self.f = open(self.path, 'a', encoding='utf-8', newline='')
+            self._active_size = self._file_size(self.path)
+            self._size = self._active_size
             self._records = len(kept)
-            self._size = self._cached_offset
-
-            # 更新 base_lsn
             if kept:
                 self._base_lsn = kept[0].lsn - 1
-
             return removed
 
     # ==================== 维护 ====================
 
     def size_bytes(self) -> int:
-        """当前 WAL 段落的字节数（估算，用于阈值触发；见文件头说明）"""
+        """**全部段**的字节数合计（活动段 + 归档段；用于 WAL 有界性判定）"""
         with self.lock:
             return self._size
 
     def record_count(self) -> int:
-        """当前 WAL 段落的记录条数"""
+        """**全部段**的记录条数合计"""
         with self.lock:
             return self._records
 
+    def active_size_bytes(self) -> int:
+        """当前活动段的字节数（兼容旧观测；不含归档段）"""
+        with self.lock:
+            return self._active_size
+
+    def segment_files(self):
+        """当前 WAL 段文件列表（归档段升序 + 活动段）"""
+        with self.lock:
+            return [p for _s, p in self._segments] + [self.path]
+
+    def segment_count(self) -> int:
+        with self.lock:
+            return len(self._segments) + (1 if self._file_size(self.path)
+                                          else 0)
+
     def needs_checkpoint(self, max_bytes: int = 0,
                          max_records: int = 0) -> bool:
-        """
-        是否达到 checkpoint 阈值（0 表示该维度不限制）。
-
-        只做判断，不做任何刷盘/截断动作——真正的 checkpoint 语义
-        （"页先 fsync、日志后退休"）由 Table.checkpoint() 负责，
-        它必须持有表锁并确认没有未提交事务。
-        """
+        """是否达到 checkpoint 阈值（0 表示该维度不限制）"""
         with self.lock:
             if max_bytes > 0 and self._size >= max_bytes:
                 return True
@@ -535,40 +577,49 @@ class WAL:
 
     def truncate(self, sync: bool = True):
         """
-        清空 WAL（checkpoint 的第二步）。LSN 保持单调。
+        退休 WAL（checkpoint 的第二步）：活动段轮转为归档 → 只保留最近 K 段。
 
-        ★ 调用前提（由 Table.checkpoint 保证）: WAL 里所有记录对应的
-        数据页**已经 fsync 落盘**，且不存在未提交事务。否则截断就是
-        "日志先于数据退休"，崩溃后无法 redo/undo。
+        调用前提（由 Table.checkpoint 保证）：WAL 里所有记录对应的数据页
+        已经 fsync 落盘、且不存在未提交事务。LSN 保持单调。
 
-        `sync=True`（周期 checkpoint）: 把"段落已退休"这件事本身落盘，
-        保证 WAL 的有界性在掉电后依然成立。
-        `sync=False`（进程收尾）: 数据页已经 fsync，截断丢失只会让下次
-        启动多幂等重放一批记录，不会丢已提交数据；省下一次 fsync。
+        `keep_segments`（K）配置见文件头；K=0 时行为与旧版"截断单文件"完全
+        一致（checkpoint 后 WAL 为空），但归档删除更旧段前先改名，保证
+        删除动作本身是"整段删除"而不是截断到一半。
         """
         with self.lock:
             self._base_lsn = self.lsn
             try:
-                self.f.flush()          # 缓冲交给 OS 后 close（不需要 fsync：
-                self.f.close()          # 这些记录马上要被截断掉）
+                self.f.flush()
+                self.f.close()
             except Exception:
                 pass
-
-            with open(self.path, 'w', encoding='utf-8') as f:
-                f.flush()
-                if sync:
-                    try:
-                        os.fsync(f.fileno())
-                    except Exception:
-                        pass
-
-            self.f = open(self.path, 'a', encoding='utf-8')
-
-            self._cached_records = []
-            self._cached_offset = 0
-            self._size = 0
-            self._records = 0
+            # 1) 先把当前活动段落到归档（若有数据）
+            if self._file_size(self.path) > 0:
+                self._seq += 1
+                dst = self._archive_path(self._seq)
+                try:
+                    os.replace(self.path, dst)
+                    self._segments.append((self._seq, dst))
+                except OSError:
+                    # 改不了名：退化为旧行为，直接清空活动段
+                    open(self.path, 'w', encoding='utf-8',
+                         newline='').close()
+            else:
+                with open(self.path, 'w', encoding='utf-8', newline=''):
+                    pass
+            # 2) 只保留最近 K 段
+            self._prune_segments_locked()
+            self.f = open(self.path, 'a', encoding='utf-8', newline='')
+            self._active_size = 0
+            self._size = sum(self._file_size(p) for _s, p in self._segments)
+            self._records = sum(len(self._read_file_records(p))
+                                for _s, p in self._segments)
             self._checkpoint_lsn = self.lsn
+            if sync:
+                try:
+                    self._flush_locked()
+                except Exception:
+                    pass
 
     def close(self):
         with self.lock:
@@ -577,3 +628,18 @@ class WAL:
                 self.f.close()
             except Exception:
                 pass
+
+    def stats(self) -> dict:
+        """观测用：段数量/活动段/归档段/总量（不编造，直接来自文件）"""
+        with self.lock:
+            return {
+                'active': self.path,
+                'active_bytes': self._active_size,
+                'archives': [p for _s, p in self._segments],
+                'archive_count': len(self._segments),
+                'total_bytes': self._size,
+                'records': self._records,
+                'segment_bytes': self.segment_bytes,
+                'keep_segments': self.keep_segments,
+                'lsn': self.lsn,
+            }

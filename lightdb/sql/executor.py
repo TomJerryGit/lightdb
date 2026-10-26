@@ -2466,6 +2466,14 @@ class Executor:
 
         tbl = self.db.get_table(table)
 
+        # P5.1：把**简单**的 `col BETWEEN low AND high` 下推成
+        # `col >= low AND col <= high`，让二级索引的范围查找生效
+        # （BETWEEN 原来落在 expr_pred 的通用表达式路径上，只能全表扫描）。
+        # 只转换"列 BETWEEN 两个字面量"且列真实存在；NOT/表达式/子查询
+        # 形态原样保留，走原有统一求值路径（正确性优先）。
+        where = self._pushdown_simple_between(where, tbl)
+        p['where'] = where
+
         txn = s.get('txn')
         if txn:
             rv = txn['read_view']
@@ -3496,6 +3504,54 @@ class Executor:
                 if cls._where_has_is_null(c):
                     return True
         return False
+
+    @classmethod
+    def _pushdown_simple_between(cls, where, tbl):
+        """简单 `col BETWEEN low AND high` → `col >= low AND col <= high`
+
+        P5.1：BETWEEN 原本是 expr_pred 表达式谓词，只能走统一求值+全表扫描；
+        对于"列 BETWEEN 两个字面量"这种最常见形态，下推成存储层认识的
+        AND 比较后，二级索引可以真正做范围查找。只在列真实存在时转换；
+        其它形态（NOT BETWEEN / 表达式 / 子查询）原样保留。
+        """
+        if not isinstance(where, dict):
+            return where
+        col_names = None
+
+        def cols_ok(name):
+            nonlocal col_names
+            if col_names is None:
+                col_names = [c.get('name') for c in
+                             (getattr(tbl, 'cols', None) or [])]
+            return name in col_names
+
+        def conv(node):
+            if not isinstance(node, dict):
+                return node
+            if 'and' in node:
+                return {'and': [conv(c) for c in (node.get('and') or [])]}
+            if 'or' in node:
+                return {'or': [conv(c) for c in (node.get('or') or [])]}
+            ep = node.get('expr_pred')
+            if isinstance(ep, dict) and \
+                    str(ep.get('op') or '').upper() == 'BETWEEN':
+                left = ep.get('left') or {}
+                low = ep.get('low') or {}
+                high = ep.get('high') or {}
+                if (left.get('kind') == 'col'
+                        and low.get('kind') == 'lit'
+                        and high.get('kind') == 'lit'
+                        and cols_ok(str(left.get('name') or ''))):
+                    cname = str(left['name'])
+                    return {'and': [
+                        {'column': cname, 'op': '>=',
+                         'value': low.get('value')},
+                        {'column': cname, 'op': '<=',
+                         'value': high.get('value')},
+                    ]}
+            return node
+
+        return conv(where)
 
     @classmethod
     def _where_has_expr_pred(cls, where) -> bool:

@@ -110,6 +110,7 @@
 - 主键复用（DELETE 后重新 INSERT 同一主键）会把新版本挂到墓碑后面，
   于是老快照仍读到被删的旧值 —— 语义上等价于"重插",符合 MVCC。
 """
+import bisect
 import json
 import os
 import re
@@ -333,6 +334,11 @@ class Table:
     wal_checkpoint_seconds = None
     #: P6.2：自增号预留区间大小（None = 取环境变量/默认 1000）
     auto_increment_block = None
+    #: P5.1：WAL 段大小 / checkpoint 后保留的最近归档段数
+    #: （None = 取环境变量 LIGHTDB_WAL_SEGMENT_BYTES /
+    #:  LIGHTDB_WAL_KEEP_SEGMENTS 或 WAL 模块默认值）
+    wal_segment_bytes = None
+    wal_keep_segments = None
 
     def __init__(self, name: str, cols: List[Dict], data_dir: str,
                  lock_manager: LockManager = None,
@@ -384,7 +390,14 @@ class Table:
         self.wal_path = str(self.data_dir / f"{name}.wal")
 
         self.bp = BufferPool(self.heap_path, capacity=500)
-        self.wal = WAL(self.wal_path)
+        # P5.1：WAL 命名多段轮转。段大小 / checkpoint 保留段数可配置：
+        #   Table.wal_segment_bytes / LIGHTDB_WAL_SEGMENT_BYTES
+        #   Table.wal_keep_segments / LIGHTDB_WAL_KEEP_SEGMENTS
+        # None = 由 WAL 读取环境变量/默认值（活动段 <table>.wal，归档段
+        # <table>-wal-NNNNNN.log）。
+        self.wal = WAL(self.wal_path,
+                       segment_bytes=self.wal_segment_bytes,
+                       keep_segments=self.wal_keep_segments)
 
         root_id = self._load_btree_root()
         self.bt = BTree(self.bp, root_page_id=root_id)
@@ -421,6 +434,16 @@ class Table:
 
         # 事务号 -> ReadView（供写路径的可见性判断 + 恢复用）
         self._read_views: Dict[int, Any] = {}
+
+        # P5.1：非唯一二级索引的**真实内存映射**（懒建）：
+        #   `_secondary_maps[name] = {'spec','map': {key: set(pk)}, 'sorted'}`
+        # 写路径只标脏（`_secondary_dirty=True`），下一次可安全使用索引的
+        # 查询时按 `_live_rows()` 重建；有活跃事务/读视图时**安全回退**
+        # 全表扫描（索引映射不承担 MVCC 可见性判断）。
+        self._secondary_maps = None
+        self._secondary_dirty = True
+        self._index_stats = {
+            'lookups': 0, 'fallbacks': 0, 'rebuilds': 0, 'ordered': 0}
 
         # P5：checkpoint 状态（供 SHOW WAL STATUS / 日志观测）。
         # `_last_checkpoint_ts` 在时间阈值判定中使用；`_checkpoint_count`
@@ -532,6 +555,7 @@ class Table:
             out.append(item)
         self._unique_indexes = out
         self._sync_column_unique_indexes()
+        self._secondary_dirty = True
         return self.unique_indexes()
 
     def _sync_column_unique_indexes(self):
@@ -642,6 +666,7 @@ class Table:
             out.append({'name': name, 'columns': columns,
                         'unique': False})
         self._secondary_indexes = out
+        self._secondary_dirty = True
         return self.secondary_indexes()
 
     def secondary_indexes(self):
@@ -1813,6 +1838,7 @@ class Table:
                 page = self.bp.get_page(pid)
                 if page is not None and page.page_type == PAGE_TYPE_HEAP:
                     self._register_space_page(pid)
+            self._secondary_dirty = True
             return {'deleted_versions': dropped}
 
     def index_specs(self):
@@ -1849,15 +1875,18 @@ class Table:
                         'columns': list(spec['columns']),
                         'cardinality': self._unique_cardinality(spec),
                         'index_type': 'UNIQUE-CHECK'})
-        # E2：非唯一索引声明（`CREATE INDEX` / 内联 KEY）：真实存在的
-        # 只有**声明元数据**，查询仍全表扫描 —— Index_type 如实报
-        # `SCAN-ASSIST`，绝不谎称 BTREE；Cardinality 是真实不同值个数。
+        # P5.1：单列非唯一索引现在有真实的**内存映射**（等值/范围/ORDER BY
+        # 加速，重启后按数据重建），因此 Index_type 如实报 BTREE；
+        # 多列索引仍只有声明元数据（planner 回退全表扫描）→ SCAN-ASSIST。
+        # Cardinality 都是真实的不同非 NULL 键值个数（不是估计值）。
         for spec in self._secondary_indexes:
+            cols = list(spec['columns'])
+            accelerated = len(cols) == 1
             out.append({'name': spec['name'], 'unique': False,
-                        'columns': list(spec['columns']),
-                        'cardinality': self._index_cardinality(
-                            spec['columns']),
-                        'index_type': 'SCAN-ASSIST'})
+                        'columns': cols,
+                        'cardinality': self._index_cardinality(cols),
+                        'index_type': 'BTREE' if accelerated
+                        else 'SCAN-ASSIST'})
         return out
 
     def _unique_cardinality(self, spec):
@@ -1896,6 +1925,9 @@ class Table:
         # P6：列定义变化后同步自增列下标/计数键（ADD/DROP COLUMN 等）
         if hasattr(self, '_auto_next'):
             self._sync_auto_columns()
+        # P5.1：结构变化会让二级索引映射失效（列位置/存在性变了）
+        if hasattr(self, '_secondary_dirty'):
+            self._secondary_dirty = True
 
     def _col_idx(self, name: str) -> int:
         for i, c in enumerate(self.cols):
@@ -2163,6 +2195,7 @@ class Table:
             self.mvcc.push_undo(tid, UndoAction(
                 'INSERT', self.name, pk, txn_id=tid,
                 page_id=page_id, slot_id=slot_id))
+        self._secondary_dirty = True
         return 1
 
     def _acquire_row_lock(self, tid, pk):
@@ -2448,6 +2481,8 @@ class Table:
                 undo_act.new_page_id = np
                 undo_act.new_slot_id = ns
             n += 1
+        if n:
+            self._secondary_dirty = True
         return n
 
     def delete(self, where: Optional[Dict],
@@ -2532,6 +2567,8 @@ class Table:
             # 全文索引则要摘掉：被删除的行不应再被 MATCH 命中
             self._unindex_fulltext(pk)
             n += 1
+        if n:
+            self._secondary_dirty = True
         return n
 
     # ==================== 读操作 ====================
@@ -2541,6 +2578,200 @@ class Table:
     # （页上没有的历史版本），重启后靠页上的链。
     # 扫描代价: 单主键等值查找是 O(链长) 次单槽读取（无 vacuum 时
     # 链会随更新次数增长）；全表扫描是 O(索引项数 × 链长)。
+
+    # ==================== P5.1：非唯一二级索引（真实加速） ====================
+    #
+    # 只做**单列**二级索引（`CREATE INDEX idx ON t (col)`）：等值/范围
+    # 走内存映射（key -> set(pk)），ORDER BY col 走按 key 排序的映射。
+    # 映射来源是 `_live_rows()`（当前可见数据）；任何写操作只把映射标脏，
+    # 下一次可安全使用索引的查询时重建 —— 因此不会出现"索引与表数据不一致
+    # 却仍被使用"。有活跃显式事务/读视图时**安全回退**全表扫描：二级索引
+    # 不承担 MVCC 可见性判断（正确性优先）。
+    # 多列索引、OR、LIKE、表达式谓词等一律回退。
+
+    _SECONDARY_INDEX_OPS = frozenset(('=', '<', '>', '<=', '>='))
+
+    def _secondary_usable(self, read_view) -> bool:
+        if not getattr(self, '_secondary_indexes', None):
+            return False
+        if getattr(self, '_read_views', None):
+            return False
+        return True
+
+    def _secondary_spec_for_column(self, name):
+        for spec in (self._secondary_indexes or []):
+            cols = [str(c) for c in (spec.get('columns') or [])]
+            if len(cols) == 1 and cols[0] == name:
+                return spec
+        return None
+
+    def _rebuild_secondary_maps(self):
+        maps = {}
+        for spec in (self._secondary_indexes or []):
+            cols = [str(c) for c in (spec.get('columns') or [])]
+            if len(cols) != 1:
+                continue
+            try:
+                ci = self._col_idx(cols[0])
+            except KeyError:
+                continue
+            m = {}
+            for pk, values in self._live_rows():
+                key = values[ci] if ci < len(values) else None
+                m.setdefault(key, set()).add(pk)
+            maps[str(spec.get('name'))] = {
+                'spec': spec, 'map': m, 'sorted': None}
+        self._secondary_maps = maps
+        self._secondary_dirty = False
+        self._index_stats['rebuilds'] += 1
+        return maps
+
+    def _secondary_entry(self, spec):
+        if self._secondary_dirty or self._secondary_maps is None:
+            self._rebuild_secondary_maps()
+        return (self._secondary_maps or {}).get(str(spec.get('name')))
+
+    @staticmethod
+    def _secondary_sorted_keys(entry):
+        keys = entry.get('sorted')
+        if keys is None:
+            keys = sorted(entry['map'].keys(),
+                          key=lambda v: (v is None, v))
+            entry['sorted'] = keys
+        return keys
+
+    def _secondary_conjuncts(self, where):
+        """展开 AND 链里的单列比较条件（OR/其它形态返回空 = 不可用）"""
+        out = []
+        if not isinstance(where, dict):
+            return out
+        if 'and' in where:
+            for c in where['and']:
+                out.extend(self._secondary_conjuncts(c))
+        elif 'column' in where:
+            out.append(where)
+        return out
+
+    def _secondary_plan(self, where):
+        """选择可用索引：返回 (spec, [conditions]) 或 None"""
+        if not isinstance(where, dict) or 'or' in where:
+            return None
+        groups = {}
+        for cond in self._secondary_conjuncts(where):
+            op = cond.get('op')
+            if op not in self._SECONDARY_INDEX_OPS:
+                continue
+            spec = self._secondary_spec_for_column(cond.get('column'))
+            if spec is None:
+                continue
+            key = str(spec.get('name'))
+            groups.setdefault(key, [spec, []])[1].append(cond)
+        if not groups:
+            return None
+        # 优先有等值条件的索引；否则取第一个范围条件索引
+        for spec, conds in groups.values():
+            if any(c.get('op') == '=' for c in conds):
+                return spec, conds
+        return next(iter(groups.values()))
+
+    def _secondary_candidate_pks(self, spec, conds):
+        entry = self._secondary_entry(spec)
+        if entry is None:
+            return None
+        m = entry['map']
+        col = str((spec.get('columns') or [''])[0])
+        try:
+            ci = self._col_idx(col)
+        except KeyError:
+            return None
+        ctype = self.cols[ci].get('type')
+
+        def conv(v):
+            try:
+                return coerce(v, ctype)
+            except Exception:
+                return v
+
+        eq = [c for c in conds if c.get('op') == '=']
+        if eq:
+            return set(m.get(conv(eq[-1].get('value')), ()))
+        # 范围：合并同一列上的上下界（= 已单独处理）
+        lower = upper = None
+        lower_inc = upper_inc = True
+        for c in conds:
+            v = conv(c.get('value'))
+            op = c.get('op')
+            if v is None:
+                return set()            # 范围比较 NULL 在 SQL 三值逻辑下无行
+            try:
+                if op == '>':
+                    if lower is None or v > lower or \
+                            (v == lower and not lower_inc):
+                        lower, lower_inc = v, False
+                elif op == '>=':
+                    if lower is None or v > lower:
+                        lower, lower_inc = v, True
+                elif op == '<':
+                    if upper is None or v < upper or \
+                            (v == upper and not upper_inc):
+                        upper, upper_inc = v, False
+                elif op == '<=':
+                    if upper is None or v < upper:
+                        upper, upper_inc = v, True
+            except TypeError:                # 类型不可比：安全回退
+                return None
+        keys = [k for k in self._secondary_sorted_keys(entry)
+                if k is not None]
+        lo = 0
+        hi = len(keys)
+        if lower is not None:
+            lo = (bisect.bisect_left(keys, lower) if lower_inc
+                  else bisect.bisect_right(keys, lower))
+        if upper is not None:
+            hi = (bisect.bisect_right(keys, upper) if upper_inc
+                  else bisect.bisect_left(keys, upper))
+        out = set()
+        for k in keys[lo:hi]:
+            out.update(m.get(k, ()))
+        return out
+
+    def _index_ordered_pks(self, order_by, where, limit, read_view):
+        """ORDER BY 单列（该列有二级索引）时的有序主键流；不可用返回 None"""
+        if not order_by or not self._secondary_usable(read_view):
+            return None
+        try:
+            col, desc = order_by[0], bool(order_by[1])
+        except Exception:
+            return None
+        spec = self._secondary_spec_for_column(col)
+        if spec is None:
+            return None
+        entry = self._secondary_entry(spec)
+        if entry is None:
+            return None
+        keys = list(self._secondary_sorted_keys(entry))
+        if desc:
+            keys.reverse()
+        out = []
+        max_n = int(limit) if limit else None
+        for key in keys:
+            for pk in sorted(entry['map'].get(key, ())):
+                v = self._read_version(pk, read_view)
+                if v is None:
+                    continue
+                if where is not None and not self._match(v[0], where):
+                    continue
+                out.append(pk)
+                if max_n is not None and len(out) >= max_n:
+                    self._index_stats['ordered'] += 1
+                    return out
+        self._index_stats['ordered'] += 1
+        return out
+
+    def index_usage_stats(self) -> dict:
+        """P5.1 观测：真实索引使用/回退/重建次数（供测试与基准量化）"""
+        return dict(self._index_stats, secondary_indexes=len(
+            getattr(self, '_secondary_indexes', []) or []))
 
     def _find_pks(self, where: Optional[Dict],
                   read_view=None) -> List:
@@ -2562,6 +2793,23 @@ class Table:
                     return []
                 except Exception:
                     return []
+
+        # P5.1：二级索引等值/范围（安全条件下；结果仍逐行用 _match 复核）
+        if self._secondary_usable(read_view):
+            plan = self._secondary_plan(where)
+            if plan is not None:
+                cand = self._secondary_candidate_pks(plan[0], plan[1])
+                if cand is not None:
+                    self._index_stats['lookups'] += 1
+                    result = []
+                    for pk in sorted(cand):
+                        v = self._read_version(pk, read_view)
+                        if v is not None and self._match(v[0], where):
+                            result.append(pk)
+                    return result
+            self._index_stats['fallbacks'] += 1
+        else:
+            self._index_stats['fallbacks'] += 1
 
         # 全表
         result = []
@@ -2604,18 +2852,32 @@ class Table:
 
     def select(self, columns, where=None, order_by=None,
                limit=None, read_view=None):
-        with self._lock:
-            pks = self._find_pks(where, read_view)
-            rows = []
-            for pk in pks:
-                # _find_pks 已经按可见性挑选过，这里只需取回那一版的行值
-                v = self._read_version(pk, read_view)
-                if v is not None:
-                    rows.append(v[0])
-
         has_agg = any(
             re.match(r'\w+\s*\(', c.strip())
             for c in columns if c != '*')
+        index_ordered = False
+        with self._lock:
+            ordered_pks = None
+            if order_by and not has_agg:
+                # P5.1：ORDER BY 单列（该列有二级索引）→ 按索引键序取行，
+                # 可带 LIMIT 提前停止；有活跃事务/不支持的表达式时回退。
+                ordered_pks = self._index_ordered_pks(
+                    order_by, where, limit, read_view)
+            if ordered_pks is not None:
+                index_ordered = True
+                rows = []
+                for pk in ordered_pks:
+                    v = self._read_version(pk, read_view)
+                    if v is not None:
+                        rows.append(v[0])
+            else:
+                pks = self._find_pks(where, read_view)
+                rows = []
+                for pk in pks:
+                    # _find_pks 已经按可见性挑选过，这里只需取回那一版的行值
+                    v = self._read_version(pk, read_view)
+                    if v is not None:
+                        rows.append(v[0])
 
         if columns == ['*']:
             out_cols = [c['name'] for c in self.cols]
@@ -2630,7 +2892,7 @@ class Table:
                 for r in rows
             ]
 
-        if order_by:
+        if order_by and not index_ordered:
             col, desc = order_by
             try:
                 i = out_cols.index(col)
@@ -2714,6 +2976,7 @@ class Table:
                     restored += 1
             except Exception as e:
                 logger.warn(f"回滚 {act.op} pk={act.pk} 失败: {e}")
+        self._secondary_dirty = True
         return restored
 
     def rollback_statement(self, tid, marks) -> int:
@@ -2750,6 +3013,7 @@ class Table:
             logger.info(
                 f"语句级回滚 {self.name}: 撤销 {restored}/{len(actions)} 条"
                 f"（事务 {tid} 保持打开）")
+            self._secondary_dirty = True
         return restored
 
     def _log_statement_undo_delete(self, tid, act) -> bool:
