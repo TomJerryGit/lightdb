@@ -3525,6 +3525,31 @@ class Executor:
                              (getattr(tbl, 'cols', None) or [])]
             return name in col_names
 
+        int_types = ('int', 'bigint', 'smallint', 'tinyint', 'mediumint')
+
+        def col_type(name):
+            for c in (getattr(tbl, 'cols', None) or []):
+                if c.get('name') == name:
+                    t = str(c.get('type') or '').split('(')[0].strip().lower()
+                    return t
+            return ''
+
+        def lit_ok(name, lit):
+            # MySQL 下 BETWEEN 1.5 AND 3.5 对 INT 列按数值比较（id=2,3），
+            # 而下推后的 >= / <= 若把 1.5 强转成整数会得到错误结果；
+            # 仅当字面量与列类型安全匹配时才下推，否则保留原 BETWEEN 求值。
+            ctype = col_type(name)
+            if ctype in int_types:
+                v = lit.get('value')
+                if isinstance(v, bool) or isinstance(v, float):
+                    return False
+                if isinstance(v, str):
+                    try:
+                        int(v)
+                    except ValueError:
+                        return False
+            return True
+
         def conv(node):
             if not isinstance(node, dict):
                 return node
@@ -3543,6 +3568,8 @@ class Executor:
                         and high.get('kind') == 'lit'
                         and cols_ok(str(left.get('name') or ''))):
                     cname = str(left['name'])
+                    if not (lit_ok(cname, low) and lit_ok(cname, high)):
+                        return node
                     return {'and': [
                         {'column': cname, 'op': '>=',
                          'value': low.get('value')},
