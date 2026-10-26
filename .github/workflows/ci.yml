@@ -53,16 +53,27 @@ jobs:
           # conftest 在 pytest 收尾后按 exitstatus os._exit，绕过问题析构路径。
           LIGHTDB_PYTEST_HARD_EXIT: "1"
         run: |
-          python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml *> pytest-console.log
-          $raw = $LASTEXITCODE
+          $ErrorActionPreference = 'Continue'
+          $raw = 0
+          try {
+            python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml *> pytest-console.log
+            $raw = $LASTEXITCODE
+          } catch {
+            Write-Host "pytest launch failed: $_"
+          }
           Write-Host "pytest raw exit code: $raw"
-          Get-Content pytest-console.log -Tail 120 -ErrorAction SilentlyContinue
-          python scripts/check_junit.py pytest-results.xml
-          $gate = $LASTEXITCODE
+          try { Get-Content pytest-console.log -Tail 120 -ErrorAction SilentlyContinue } catch {}
+          try {
+            python scripts/check_junit.py pytest-results.xml
+            $gate = $LASTEXITCODE
+          } catch {
+            $gate = 1
+          }
           if ($gate -ne 0) { exit $gate }
           if ($raw -ne 0) {
             Write-Host "::warning::pytest exited $raw but JUnit shows 0 failures/errors; gate uses JUnit as the source of truth"
           }
+          exit 0
 
       - name: Annotate failed tests (public check-run annotations)
         if: always()
