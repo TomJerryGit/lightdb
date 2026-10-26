@@ -9,7 +9,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # 曾因 cancel-in-progress 取消正在跑的 job，但 Windows 上 pytest 子进程
+  # 未随之退出，残留进程与新 job 抢同一 workspace 导致 pytest 异常缓慢/超时；
+  # 改为排队执行（同一时间只跑一个，不再产生孤儿 pytest）。
+  cancel-in-progress: false
 
 jobs:
   test:
