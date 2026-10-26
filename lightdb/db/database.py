@@ -925,8 +925,18 @@ class Database:
             raise DdlError(f"Table '{name}' doesn't exist", errno=1146)
         return self.tables[name]
 
-    def alter_add_column(self, name: str, col: dict) -> dict:
-        """`ALTER TABLE t ADD COLUMN c <type> [DEFAULT ..] [NOT NULL]`
+    #: `ADD COLUMN` 接受的列类型（未知类型显式 1064，绝不静默按字符串存）
+    _ADD_COLUMN_TYPES = frozenset((
+        'INT', 'BIGINT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'INTEGER',
+        'VARCHAR', 'CHAR', 'TEXT', 'TINYTEXT', 'MEDIUMTEXT', 'LONGTEXT',
+        'DOUBLE', 'FLOAT', 'REAL', 'DECIMAL', 'NUMERIC', 'FIXED',
+        'BOOLEAN', 'BOOL', 'DATETIME', 'DATE', 'TIME', 'TIMESTAMP', 'JSON',
+    ))
+
+    def alter_add_column(self, name: str, col: dict,
+                         position: dict = None) -> dict:
+        """`ALTER TABLE t ADD [COLUMN] c <类型> [NULL|NOT NULL] [DEFAULT]
+        [UNIQUE] [AUTO_INCREMENT] [FIRST | AFTER col]`
 
         对**已有行**按 MySQL 语义回填：
 
@@ -935,7 +945,13 @@ class Database:
         * 没声明 `DEFAULT` 且允许 NULL → NULL；
         * `NOT NULL` 且没有 `DEFAULT` 且表非空 → **显式报错 1138**
           （MySQL 8.0 严格模式的 `Invalid use of NULL value`），
-          **绝不**静默填 0 / '' / NULL —— 那是"看起来加上了、数据却是编的"。
+          **绝不**静默填 0 / '' / NULL —— 那是"看起来加上了、数据却是编的"；
+        * `FIRST` / `AFTER col` 真正改变列顺序（行载荷按新位置重写，
+          `SHOW CREATE`/`SHOW COLUMNS`/`SELECT *` 顺序一致）；
+        * `AUTO_INCREMENT`：必须是整数且是键（本入口只接受 `UNIQUE`，
+          因为 `ADD PRIMARY KEY` 是独立且仍不支持的变体）。已有行按主键
+          升序回填 1..N（真实、可重放：恢复时按同一规则重算），计数置 N+1
+          并立即持久化；空表从 1 开始。
         """
         tbl = self._get_table_for_ddl(name)
         col = dict(col or {})
@@ -944,61 +960,123 @@ class Database:
             raise DdlError("ADD COLUMN 缺少列名", errno=1064)
         if any(c.get('name') == cname for c in tbl.cols):
             raise DdlError(f"Duplicate column name '{cname}'", errno=1060)
-        if col.get('auto_increment'):
-            # 不给已有行编造自增值：显式拒绝，绝不"加一列但已有行没有号"。
+        base = self._base_type(col.get('type'))
+        if base not in self._ADD_COLUMN_TYPES:
             raise DdlError(
-                "ALTER TABLE ADD COLUMN ... AUTO_INCREMENT 暂不支持"
-                "（已有行的回填语义：MySQL 会按顺序补号，本引擎不做半套）",
-                errno=1235, sqlstate='42000')
+                f"Unknown column type '{col.get('type')}' in ALTER TABLE "
+                f"ADD COLUMN '{cname}'（本引擎不支持该类型，显式拒绝而"
+                f"不是静默按字符串存）", errno=1064, sqlstate='42000')
         if col.get('primary'):
             # MySQL 1068：一张表只能有一个主键。`ADD COLUMN c INT PRIMARY KEY`
             # 在 MySQL 里就是这条错误（不是静默忽略 PRIMARY KEY 子句）。
             raise DdlError("Multiple primary key defined", errno=1068)
+        if col.get('generated'):
+            raise DdlError(
+                f"ADD COLUMN '{cname}' 不支持 GENERATED 生成列"
+                f"（本引擎的生成列只能在 CREATE TABLE 定义）", errno=1235)
+
+        # ---------- 列位置（尾部 / FIRST / AFTER col） ----------
+        old_cols = [dict(c) for c in tbl.cols]
+        insert_at = len(old_cols)
+        pos = position or {}
+        if pos.get('first'):
+            insert_at = 0
+        elif pos.get('after'):
+            after_name = str(pos.get('after') or '')
+            names_old = [c.get('name') for c in old_cols]
+            if after_name not in names_old:
+                raise DdlError(
+                    f"Unknown column '{after_name}' in '{name}'",
+                    errno=1054, sqlstate='42S22')
+            insert_at = names_old.index(after_name) + 1
+
+        # ---------- AUTO_INCREMENT ----------
+        auto = bool(col.get('auto_increment'))
+        auto_next = None
+        auto_old_pk_idx = next(
+            (i for i, c in enumerate(old_cols) if c.get('primary')), 0)
+        if auto:
+            if not Table.is_auto_increment_integer_type(col.get('type')):
+                raise DdlError(
+                    f"Incorrect column specifier for column '{cname}'"
+                    f"（AUTO_INCREMENT 只支持整数类型，声明为 "
+                    f"{col.get('type')!r} 不会生效，因此显式拒绝）",
+                    errno=1063, sqlstate='42000')
+            if any(c.get('auto_increment') for c in tbl.cols):
+                raise DdlError(
+                    "Incorrect table definition; there can be only one auto "
+                    "column and it must be defined as a key", errno=1075,
+                    sqlstate='42000')
+            if not col.get('unique'):
+                raise DdlError(
+                    "Incorrect table definition; there can be only one auto "
+                    "column and it must be defined as a key"
+                    "（本引擎的 ADD COLUMN 不支持 ADD PRIMARY KEY；"
+                    "请声明 UNIQUE 让自增列成为键）",
+                    errno=1075, sqlstate='42000')
+            col['notnull'] = True
+            if tbl.row_count:
+                rank_map = self._auto_rank_map(tbl)
+                for _pid, _sid, values, *_rest in \
+                        tbl.iter_all_row_versions():
+                    pk = values[auto_old_pk_idx] if \
+                        len(values) > auto_old_pk_idx else None
+                    if not isinstance(pk, int) or pk not in rank_map:
+                        raise DdlError(
+                            f"无法为 ADD COLUMN '{cname}' 的 AUTO_INCREMENT "
+                            f"回填确定值：行主键 {pk!r} 不在索引中",
+                            errno=1105)
+                auto_next = len(rank_map) + 1
+            else:
+                auto_next = 1
 
         notnull = bool(col.get('notnull'))
-        if col.get('has_default'):
-            fill = tbl._column_default(col)
-            if fill is None and notnull:
-                raise DdlError(
-                    f"列 '{cname}' 声明了 NOT NULL 但 DEFAULT 是 NULL："
-                    f"定义本身矛盾", errno=1138, sqlstate='22004')
-        elif notnull:
-            if tbl.row_count:
-                raise DdlError(
-                    f"列 '{cname}' 声明了 NOT NULL 却没有 DEFAULT，表 "
-                    f"{name} 中已有 {tbl.row_count} 行：无法确定这些行该"
-                    f"填什么（MySQL 严格模式同样拒绝），本引擎不会静默填 "
-                    f"0/''/NULL。请给出 DEFAULT 或允许 NULL 后重试",
-                    errno=1138, sqlstate='22004')
-            fill = None
-        else:
-            fill = None
-        if fill is not None:
-            try:
-                fill = coerce(fill, col.get('type'))
-            except (ValueError, TypeError) as e:
-                raise DdlError(
-                    f"DEFAULT 取值 {fill!r} 无法转换为 {col.get('type')}: {e}",
-                    errno=1366, sqlstate='22007')
+        fill = None
+        if not auto:
+            if col.get('has_default'):
+                fill = tbl._column_default(col)
+                if fill is None and notnull:
+                    raise DdlError(
+                        f"列 '{cname}' 声明了 NOT NULL 但 DEFAULT 是 NULL："
+                        f"定义本身矛盾", errno=1138, sqlstate='22004')
+            elif notnull:
+                if tbl.row_count:
+                    raise DdlError(
+                        f"列 '{cname}' 声明了 NOT NULL 却没有 DEFAULT，表 "
+                        f"{name} 中已有 {tbl.row_count} 行：无法确定这些行该"
+                        f"填什么（MySQL 严格模式同样拒绝），本引擎不会静默填 "
+                        f"0/''/NULL。请给出 DEFAULT 或允许 NULL 后重试",
+                        errno=1138, sqlstate='22004')
+                fill = None
+            if fill is not None:
+                try:
+                    fill = coerce(fill, col.get('type'))
+                except (ValueError, TypeError) as e:
+                    raise DdlError(
+                        f"DEFAULT 取值 {fill!r} 无法转换为 "
+                        f"{col.get('type')}: {e}",
+                        errno=1366, sqlstate='22007')
 
-        # `ADD COLUMN email ... UNIQUE DEFAULT 'x'`：已有行会全部回填成
-        # 同一个非 NULL 值，唯一性从第一天起就不成立。定义期直接报 1062，
-        # 而不是先把列加上、等到下一次写入才发现"声明没生效"。
-        if col.get('unique') and fill is not None:
-            live = len(tbl._live_rows())
-            if live > 1:
-                raise DdlError(
-                    f"Duplicate entry '{fill}' for key '{cname}'"
-                    f"（ADD COLUMN ... UNIQUE 会把 {live} 行已有数据回填成"
-                    f"同一个非 NULL 值，唯一性无法成立；请改用允许 NULL 的"
-                    f"默认值或先清洗数据）",
-                    errno=1062, sqlstate='23000')
+            # `ADD COLUMN email ... UNIQUE DEFAULT 'x'`：已有行会全部回填成
+            # 同一个非 NULL 值，唯一性从第一天起就不成立。定义期直接报 1062，
+            # 而不是先把列加上、等到下一次写入才发现"声明没生效"。
+            if col.get('unique') and fill is not None:
+                live = len(tbl._live_rows())
+                if live > 1:
+                    raise DdlError(
+                        f"Duplicate entry '{fill}' for key '{cname}'"
+                        f"（ADD COLUMN ... UNIQUE 会把 {live} 行已有数据回填成"
+                        f"同一个非 NULL 值，唯一性无法成立；请改用允许 NULL 的"
+                        f"默认值或先清洗数据）",
+                        errno=1062, sqlstate='23000')
 
-        old_cols = [dict(c) for c in tbl.cols]
-        new_cols = old_cols + [col]
+        new_cols = old_cols[:insert_at] + [col] + old_cols[insert_at:]
         entry = {'op': 'ADD COLUMN', 'table': name,
                  'old_cols': old_cols, 'new_cols': new_cols,
-                 'fill': fill}
+                 'at': insert_at, 'fill': fill,
+                 'column_name': cname,
+                 'auto_increment': auto,
+                 'auto_next': auto_next}
         # ★ 全程持有**表级锁**：`insert/update/delete` 都在这个锁里写行，
         #   因此"检查未提交事务 → 退休 WAL → 改写所有行 → 换列定义"这一段
         #   不会被并发的写入插进来（插进来就会写下一行**旧列数**的数据，
@@ -1012,13 +1090,52 @@ class Database:
             # 做"，一旦先写了 pending 记录，恢复端就会把这条被报错的 DDL 补完。
             self._ddl_retire_wal(tbl, 'ADD COLUMN')
             self._ddl_begin(entry)
+            transform, _ = self._add_column_transform(entry, tbl)
             stats = tbl.rewrite_row_payloads(
-                lambda values: list(values) + [fill],
-                len(old_cols), len(new_cols))
+                transform, len(old_cols), len(new_cols))
             tbl.cols = new_cols
             tbl.refresh_schema_meta()
+            if auto:
+                tbl._auto_next[cname] = int(auto_next)
+                tbl._auto_reserved[cname] = int(auto_next)
+                tbl._persist_auto_reservation(exact=True)
             self._ddl_commit(tbl)
-        return {'rows_backfilled': stats['rows'], 'backfill': fill, **stats}
+        return {'rows_backfilled': stats['rows'], 'backfill': fill,
+                'at': insert_at, 'position': position,
+                'auto_increment': auto, 'auto_next': auto_next, **stats}
+
+    @staticmethod
+    def _auto_rank_map(tbl) -> dict:
+        """自增回填用的确定性映射：主键升序 → 1..N
+
+        B+Tree 键在 ADD COLUMN 期间**不会改变**（只改行载荷/位置），因此
+        崩溃恢复时用同一份映射重放是幂等的；删除过的历史主键也占一个号
+        （允许跳号，但保证可见行取值唯一）。
+        """
+        pks = sorted(int(k) for k, _pid, _sid in tbl.bt.scan()
+                     if isinstance(k, int))
+        return {pk: i + 1 for i, pk in enumerate(pks)}
+
+    def _add_column_transform(self, entry: dict, tbl):
+        """`ADD COLUMN` 的行转换函数（执行路径与崩溃恢复共用同一份）"""
+        at = int(entry.get('at'))
+        fill = entry.get('fill')
+        if entry.get('auto_increment'):
+            rank_map = self._auto_rank_map(tbl)
+            old_cols = entry.get('old_cols') or []
+            pk_idx = next((i for i, c in enumerate(old_cols)
+                           if c.get('primary')), 0)
+
+            def transform_auto(values):
+                pk = values[pk_idx] if len(values) > pk_idx else None
+                try:
+                    value = rank_map[int(pk)]
+                except (TypeError, ValueError, KeyError):
+                    value = 0
+                return list(values)[:at] + [value] + list(values)[at:]
+            return transform_auto, entry.get('auto_next')
+        return (lambda values: list(values)[:at] + [fill]
+                + list(values)[at:]), None
 
     def alter_drop_column(self, name: str, colname: str) -> dict:
         """`ALTER TABLE t DROP COLUMN c`
@@ -1093,7 +1210,9 @@ class Database:
         old_cols = [dict(c) for c in tbl.cols]
         new_cols = [dict(c) for c in tbl.cols if c.get('name') != colname]
         entry = {'op': 'DROP COLUMN', 'table': name, 'at': idx,
+                 'column_name': colname,
                  'old_cols': old_cols, 'new_cols': new_cols}
+        cleared = False
         with tbl._lock:                      # 与 ADD COLUMN 同一套并发边界
             self._ddl_guard(tbl, 'ALTER TABLE ... DROP COLUMN')
             self._ddl_retire_wal(tbl, 'DROP COLUMN')
@@ -1103,8 +1222,28 @@ class Database:
                 len(old_cols), len(new_cols), zero_removed=True)
             tbl.cols = new_cols
             tbl.refresh_schema_meta()
+            # 删除列时清理它在自增计数里的残留条目（例如先 MODIFY 移除
+            # AUTO_INCREMENT 再 DROP 该列）：列都没了，计数条目也不能留。
+            cleared = self._clear_auto_counter(tbl, colname)
             self._ddl_commit(tbl)
-        return {'column': colname, 'rows_rewritten': stats['rows'], **stats}
+        return {'column': colname, 'rows_rewritten': stats['rows'],
+                'auto_increment_cleared': cleared, **stats}
+
+    @staticmethod
+    def _clear_auto_counter(tbl, colname: str) -> bool:
+        """删除列后清掉该列名的自增计数条目（并落盘）；返回是否有残留"""
+        changed = False
+        for attr in ('_auto_next', '_auto_reserved'):
+            mapping = getattr(tbl, attr, None)
+            if isinstance(mapping, dict) and colname in mapping:
+                mapping.pop(colname, None)
+                changed = True
+        if changed:
+            try:
+                tbl._persist_auto_reservation(exact=True)
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"清理自增计数条目失败 {tbl.name}/{colname}: {e}")
+        return changed
 
     # ==================== E2：ALTER MODIFY COLUMN ====================
 
@@ -1623,15 +1762,29 @@ class Database:
             old_cols = entry.get('old_cols') or []
             new_cols = entry.get('new_cols') or []
             if op == 'ADD COLUMN':
-                fill = entry.get('fill')
+                transform, auto_next = self._add_column_transform(entry, tbl)
                 tbl.rewrite_row_payloads(
-                    lambda values: list(values) + [fill],
-                    len(old_cols), len(new_cols))
+                    transform, len(old_cols), len(new_cols))
+                if new_cols:
+                    tbl.cols = new_cols
+                tbl.refresh_schema_meta()
+                if auto_next is not None:
+                    cname = str(entry.get('column_name') or '')
+                    if cname:
+                        tbl._auto_next[cname] = int(auto_next)
+                        tbl._auto_reserved[cname] = int(auto_next)
+                        tbl._persist_auto_reservation(exact=True)
             elif op == 'DROP COLUMN':
                 at = int(entry.get('at'))
                 tbl.rewrite_row_payloads(
                     lambda values: list(values)[:at] + list(values)[at + 1:],
                     len(old_cols), len(new_cols), zero_removed=True)
+                if new_cols:
+                    tbl.cols = new_cols
+                tbl.refresh_schema_meta()
+                cname = str(entry.get('column_name') or '')
+                if cname:
+                    self._clear_auto_counter(tbl, cname)
             elif op == 'MODIFY COLUMN':
                 # 列数不变的类型变更：所有行都重新走一次幂等转换
                 tbl.rewrite_row_payloads(

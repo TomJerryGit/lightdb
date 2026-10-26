@@ -3243,17 +3243,28 @@ class Parser:
                 # 接受它就等于"表里已存在时静默跳过"，本引擎选择显式拒绝。
                 return self._unsupported_alter(
                     table, 'ALTER TABLE ... ADD COLUMN IF NOT EXISTS', sql)
+            position = None
             pm = re.search(r'\s+(FIRST|AFTER\s+[`"]?\w+[`"]?)\s*$',
                            rest, re.IGNORECASE)
             if pm:
-                return self._unsupported_alter(
-                    table, 'ALTER TABLE ... ADD COLUMN ... FIRST/AFTER', sql)
+                pos_text = pm.group(1)
+                rest = rest[:pm.start()].strip()
+                if pos_text.upper() == 'FIRST':
+                    position = {'first': True}
+                else:
+                    after = re.sub(r'^AFTER\s+', '', pos_text,
+                                   flags=re.IGNORECASE).strip().strip('`"')
+                    position = {'after': after}
+                if not rest:
+                    raise SyntaxError(
+                        f"ALTER TABLE ADD COLUMN 缺少列定义: {action[:80]}")
             col = self._column_def(rest)
             if not col:
                 raise SyntaxError(
                     f"ALTER TABLE ADD COLUMN 的列定义无法解析: {rest[:80]}")
             return {'command': 'ALTER TABLE', 'table': table,
-                    'action': 'ADD COLUMN', 'column': col}
+                    'action': 'ADD COLUMN', 'column': col,
+                    'position': position}
 
         # ---- DROP [COLUMN] c ----
         if re.match(r'DROP\b', up):

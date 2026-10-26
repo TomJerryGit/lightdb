@@ -299,7 +299,7 @@ def test_alter_auto_increment_set_and_floor(inproc):
 # ==================== 4. 非法场景：显式 errno ====================
 
 def test_invalid_auto_increment_definitions(inproc):
-    """非整数 1063 / 非键 1075 / 多列 1075 / ADD COLUMN 1235（显式拒绝）"""
+    """非整数 1063 / 非键 1075 / 多列 1075（显式拒绝）"""
     _db, ex, s = inproc
     # 非整数 + 唯一键：不能自增
     r = err(ex, 'CREATE TABLE bad_int (a VARCHAR(10) AUTO_INCREMENT UNIQUE)', s)
@@ -315,8 +315,10 @@ def test_invalid_auto_increment_definitions(inproc):
     assert rows(ex, 'SHOW TABLES', s) == []
 
     ok(ex, 'CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v INT)', s)
+    # task-53 起 ADD COLUMN AUTO_INCREMENT（整数 + UNIQUE 键）已实现；
+    # 但一张表只能有一个自增列，第二列仍显式 1075。
     r = err(ex, 'ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT UNIQUE', s)
-    assert r['code'] == 1235, r
+    assert r['code'] == 1075, r
     # 显式拒绝后表结构没变
     cols = [c['name'] for c in _db.get_table('t').cols]
     assert cols == ['id', 'v'], cols

@@ -1672,21 +1672,37 @@ class Executor:
                          f"{nxt}（实际下一号；SHOW CREATE/STATUS 如实回显）"))
         if action == 'ADD COLUMN':
             col = dict(p['column'])
-            stats = self.db.alter_add_column(table, col)
+            stats = self.db.alter_add_column(
+                table, col, position=p.get('position'))
             n = stats.get('rows_backfilled', 0)
+            pos = stats.get('position') or {}
+            if pos.get('first'):
+                where = ' at FIRST'
+            elif pos.get('after'):
+                where = f" after '{pos['after']}'"
+            else:
+                where = ' at end'
+            auto = ''
+            if stats.get('auto_increment'):
+                auto = (f", AUTO_INCREMENT 回填/下一号="
+                        f"{stats.get('auto_next')}")
             return self._ok(
                 message=(f"Table '{table}' altered: column "
-                         f"'{col['name']}' added, {n} existing row "
+                         f"'{col['name']}' added{where}, {n} existing row "
                          f"version(s) backfilled"
                          + (f" with {stats['backfill']!r}"
-                            if 'backfill' in stats else '')))
+                            if stats.get('backfill') is not None else '')
+                         + auto))
         if action == 'DROP COLUMN':
             cname = p['column']
             stats = self.db.alter_drop_column(table, cname)
+            cleared = ('（已清理该列的自增计数残留）'
+                       if stats.get('auto_increment_cleared') else '')
             return self._ok(
                 message=(f"Table '{table}' altered: column '{cname}' "
                          f"dropped, {stats.get('rows_rewritten', 0)} row "
-                         f"version(s) rewritten (数据已从数据文件清除)"))
+                         f"version(s) rewritten (数据已从数据文件清除)"
+                         + cleared))
         if action == 'RENAME':
             new = p['new_name']
             self.db.rename_table(table, new)
