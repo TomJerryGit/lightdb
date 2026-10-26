@@ -24,6 +24,12 @@ jobs:
       PYTHONIOENCODING: "utf-8"
       PYTHONUNBUFFERED: "1"
     steps:
+      - name: Sync local mirror (self-hosted; keeps checkout offline-capable)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          git --git-dir D:\lightdb_mirror.git fetch D:\lightdb_project "+refs/heads/main:refs/heads/main" "+refs/tags/*:refs/tags/*"
+
       - uses: actions/checkout@v7
 
       - name: Verify system Python (self-hosted)
