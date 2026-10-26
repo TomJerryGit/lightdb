@@ -281,13 +281,14 @@ LightDB-Studio-Setup-{version}.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR
 
 # ==================== 执行与构建 ====================
 
-def run_command(cmd, cwd=None, timeout=900) -> tuple:
+def run_command(cmd, cwd=None, timeout=900, env=None) -> tuple:
     """执行一条命令，返回 (returncode, 合并后的输出尾部)。"""
     try:
         proc = subprocess.run(
             [str(c) for c in cmd], cwd=str(cwd or ROOT),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding='utf-8', errors='replace', timeout=timeout)
+            text=True, encoding='utf-8', errors='replace', timeout=timeout,
+            env=env)
         return proc.returncode, (proc.stdout or '')[-8000:]
     except subprocess.TimeoutExpired:
         return 124, '命令超时（>%ss）: %s' % (timeout, cmd)
@@ -550,9 +551,11 @@ def smoke_install(installer, tool: str = '', workdir=None, timeout: int = 300,
     def step(name, status, detail=''):
         result['steps'].append({'name': name, 'status': status, 'detail': detail})
 
+    install_log = workdir / 'install.log'
     if tool == 'inno':
         install_cmd = [str(installer), '/VERYSILENT', '/SUPPRESSMSGBOXES',
-                       '/NORESTART', '/SP-', '/DIR=%s' % install_dir]
+                       '/NORESTART', '/SP-', '/DIR=%s' % install_dir,
+                       '/LOG=%s' % install_log]
         if no_icons:
             install_cmd.append('/NOICONS')
         uninstall_exe = install_dir / 'unins000.exe'
@@ -561,10 +564,32 @@ def smoke_install(installer, tool: str = '', workdir=None, timeout: int = 300,
                        'INSTALLDIR=%s' % install_dir]
         uninstall_exe = None
 
-    rc, output = run(install_cmd, cwd=workdir, timeout=timeout)
+    # Inno/Windows Installer 需要可写的 %TEMP%；受限会话/沙箱下系统 TEMP
+    # 可能拒绝创建 is-*.tmp（Error 5），这里显式指向 smoke 工作目录。
+    smoke_env = os.environ.copy()
+    smoke_temp = workdir / '_temp'
+    smoke_temp.mkdir(parents=True, exist_ok=True)
+    smoke_env['TEMP'] = str(smoke_temp)
+    smoke_env['TMP'] = str(smoke_temp)
+
+    def _run_installer(cmd):
+        if runner is None:
+            return run_command(cmd, cwd=workdir, timeout=timeout,
+                               env=smoke_env)
+        return run(cmd, cwd=workdir, timeout=timeout)
+
+    rc, output = _run_installer(install_cmd)
     result['install_rc'] = rc
     if rc != 0:
-        step('silent_install', 'FAIL', '安装退出码 %s: %s' % (rc, output[-1000:]))
+        try:
+            log_tail = install_log.read_text(encoding='utf-8',
+                                             errors='replace')[-3000:]
+        except OSError:
+            log_tail = ''
+        detail = '安装退出码 %s: %s' % (rc, output[-1000:])
+        if log_tail:
+            detail += '\n--- install.log ---\n' + log_tail
+        step('silent_install', 'FAIL', detail)
         result.update({'status': 'failed', 'exit_code': 1,
                        'reason': '静默安装失败'})
         return result
