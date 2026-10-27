@@ -124,3 +124,13 @@ EXPLAIN、备份、结构对比、数据分页排序与连接安全字段展示�
 
 证据：`_analysis_tmp/gui_full/p2_ui_check.py` 2/2 PASS，截图 `shots_p2_ui/p2_chart.png`、
 `p2_er.png`、`p2_plugins.png`；`tests/test_p2_ui_features.py` 覆盖静态/API/流式/取消。
+
+## 7. task-66 P3 交互与 i18n（2026-10-27）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| ER 交互 | 已实现 | `er_interaction.js` 纯函数坐标变换；节点拖拽、画布平移、滚轮缩放、适应/重置、点击节点高亮关联边；>30 表显示性能提示（简化渲染）；无外部库/CDN |
+| 图表交互 | 已实现 | hover tooltip（SVG title）、图例显示/隐藏、柱/线切换、空/非数值显式、本地导出 SVG/PNG |
+| i18n | 部分实现（显式清单） | 新增 key 字典（中英，data-i18n/t()）+ 旧页面常见短语运行时翻译 + `LDB_UNTRANSLATED` 显式未翻译清单；旧动态插值/长安全说明/后端 detail 仍未 key 化，见清单，不静默留中文 |
+| 测试 | 已实现 | `tests/test_web_i18n_full.py`：QJSEngine 纯函数单测（缩放锚点/平移/适应/拖拽/关联边）、图表交互静态、i18n key 完整性、语言切换；真浏览器无 Playwright 显式 skip |
+| 证据 | 已实现 | `_analysis_tmp/gui_full/p3_ui_check.py`，截图 `shots_p3_ui/`（ER 拖拽后、图表 tooltip、英文界面） |

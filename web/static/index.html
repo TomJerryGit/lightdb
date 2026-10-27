@@ -102,7 +102,11 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
         <div id="chart-panel" class="panel hidden">
           <h3 data-i18n="chart.title">查询结果图表（本地 SVG，无 CDN）</h3>
           <div id="chart-output" class="chart-output"></div>
+          <div id="chart-legend" class="chart-legend"></div>
           <div class="btn-row">
+            <button id="chart-switch-btn" class="btn-small" data-i18n="chart.switch">切换柱/线</button>
+            <button id="chart-export-svg" class="btn-small" data-i18n="chart.export_svg">导出 SVG</button>
+            <button id="chart-export-png" class="btn-small" data-i18n="chart.export_png">导出 PNG</button>
             <button id="chart-close-btn" class="btn-small" data-i18n="common.close">关闭</button>
           </div>
         </div>
@@ -173,6 +177,10 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           <h3 data-i18n="er.title">ER 图（information_schema）</h3>
           <div class="btn-row">
             <button id="er-refresh-btn" class="btn-small" data-i18n="common.refresh">刷新</button>
+            <button id="er-fit-btn" class="btn-small" data-i18n="er.fit">适应窗口</button>
+            <button id="er-reset-btn" class="btn-small" data-i18n="er.reset">重置</button>
+            <button id="er-zoom-in-btn" class="btn-small">＋</button>
+            <button id="er-zoom-out-btn" class="btn-small">－</button>
           </div>
           <div id="er-status" class="status"></div>
           <div id="er-output" class="er-output"></div>
@@ -192,6 +200,7 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
 </div>
 
 <script src="/static/i18n.js"></script>
+<script src="/static/er_interaction.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

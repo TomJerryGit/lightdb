@@ -15,6 +15,9 @@ let dataOrderBy = '';
 let dataOrderDesc = false;
 let designColumns = [];
 let lastQueryResult = null;
+let erController = null;
+let currentChartKind = 'bar';
+let chartSeriesVisible = true;
 let activeImportJob = '';
 let importPollTimer = null;
 let reportTemplates = [];
@@ -937,6 +940,61 @@ function tr(key, fallback) {
   return (typeof window.t === 'function') ? window.t(key, fallback) : fallback;
 }
 
+function chartTitle(text) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const title = document.createElementNS(NS, 'title');
+  title.textContent = text;
+  return title;
+}
+
+function currentChartSvg() {
+  const out = $id('chart-output');
+  return out ? out.querySelector('svg') : null;
+}
+
+function exportChartSVG() {
+  const svg = currentChartSvg();
+  if (!svg) {
+    setStatus('exec-status', '当前没有可导出的图表', true);
+    return;
+  }
+  const source = new XMLSerializer().serializeToString(svg);
+  const blob = new Blob([source], {type: 'image/svg+xml;charset=utf-8'});
+  downloadBlob(blob, 'chart_' + currentChartKind + '.svg');
+}
+
+function exportChartPNG() {
+  const svg = currentChartSvg();
+  if (!svg) {
+    setStatus('exec-status', '当前没有可导出的图表', true);
+    return;
+  }
+  const source = new XMLSerializer().serializeToString(svg);
+  const blob = new Blob([source], {type: 'image/svg+xml;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 660; canvas.height = 300;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#1e1e1e';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    URL.revokeObjectURL(url);
+    canvas.toBlob(b => downloadBlob(b, 'chart_' + currentChartKind + '.png'),
+                  'image/png');
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    setStatus('exec-status', 'PNG 导出失败（浏览器不支持 SVG 绘制）', true);
+  };
+  img.src = url;
+}
+
+function switchChartKind() {
+  renderChart(currentChartKind === 'bar' ? 'line' : 'bar');
+}
+
 function showChartMessage(message) {
   const out = $id('chart-output');
   $id('chart-panel').classList.remove('hidden');
@@ -946,8 +1004,10 @@ function showChartMessage(message) {
 
 function renderChart(kind) {
   const out = $id('chart-output');
+  currentChartKind = kind;
   $id('chart-panel').classList.remove('hidden');
   clearNode(out);
+  clearNode($id('chart-legend'));
   if (!lastQueryResult || !lastQueryResult.rows ||
       !lastQueryResult.rows.length) {
     showChartMessage(tr('chart.empty', '当前查询结果为空，无法绘图'));
@@ -971,6 +1031,22 @@ function renderChart(kind) {
     label: String(r[0] !== undefined && r[0] !== null ? r[0] : idx + 1),
     value: Number(r[valueIdx]) || 0,
   }));
+  const legend = $id('chart-legend');
+  const item = el('button', 'legend-item' + (chartSeriesVisible ? ' active' : ''),
+    cols[valueIdx]);
+  item.setAttribute('type', 'button');
+  item.onclick = () => {
+    chartSeriesVisible = !chartSeriesVisible;
+    renderChart(currentChartKind);
+  };
+  legend.appendChild(item);
+  if (!chartSeriesVisible) {
+    showChartMessage(tr('chart.legend_hidden',
+      '图例已隐藏该数据系列（点击图例恢复）'));
+    const restored = $id('chart-legend');
+    if (restored && !restored.firstChild) restored.appendChild(item);
+    return;
+  }
   const width = 660, height = 300, padL = 50, padR = 20, padT = 24, padB = 48;
   const maxV = Math.max(...data.map(d => d.value), 0);
   const minV = Math.min(...data.map(d => d.value), 0);
@@ -1009,6 +1085,7 @@ function renderChart(kind) {
       const dot = document.createElementNS(NS, 'circle');
       dot.setAttribute('cx', xFor(i)); dot.setAttribute('cy', yFor(d.value));
       dot.setAttribute('r', '3'); dot.setAttribute('fill', '#4daafc');
+      dot.appendChild(chartTitle(d.label + ' · ' + cols[valueIdx] + ' = ' + d.value));
       svg.appendChild(dot);
     });
   } else {
@@ -1020,6 +1097,7 @@ function renderChart(kind) {
       rect.setAttribute('width', String(barW));
       rect.setAttribute('height', String(Math.abs(yFor(d.value) - yFor(0)) || 1));
       rect.setAttribute('fill', '#4daafc');
+      rect.appendChild(chartTitle(d.label + ' · ' + cols[valueIdx] + ' = ' + d.value));
       svg.appendChild(rect);
     });
   }
@@ -1054,57 +1132,17 @@ async function loadER() {
       setStatus('er-status', tr('er.empty', '当前数据库没有表'), true);
       return;
     }
-    const NS = 'http://www.w3.org/2000/svg';
-    const nodeW = 220, nodeH = 120, gapX = 30, gapY = 40, cols = 3;
-    const rowsN = Math.ceil(data.nodes.length / cols);
-    const width = cols * nodeW + (cols - 1) * gapX + 40;
-    const height = rowsN * nodeH + (rowsN - 1) * gapY + 40;
-    const svg = document.createElementNS(NS, 'svg');
-    svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
-    svg.setAttribute('width', String(width));
-    svg.setAttribute('height', String(height));
-    svg.setAttribute('class', 'er-svg');
-    const positions = {};
-    data.nodes.forEach((n, i) => {
-      const cx = 20 + (i % cols) * (nodeW + gapX);
-      const cy = 20 + Math.floor(i / cols) * (nodeH + gapY);
-      positions[n.name] = {x: cx, y: cy};
-      const rect = document.createElementNS(NS, 'rect');
-      rect.setAttribute('x', String(cx)); rect.setAttribute('y', String(cy));
-      rect.setAttribute('width', String(nodeW));
-      rect.setAttribute('height', String(nodeH));
-      rect.setAttribute('rx', '8'); rect.setAttribute('fill', '#252526');
-      rect.setAttribute('stroke', '#4daafc');
-      svg.appendChild(rect);
-      const title = document.createElementNS(NS, 'text');
-      title.setAttribute('x', String(cx + 10)); title.setAttribute('y', String(cy + 22));
-      title.setAttribute('fill', '#d4d4d4'); title.setAttribute('font-size', '13');
-      title.setAttribute('font-weight', 'bold');
-      title.textContent = n.name;
-      svg.appendChild(title);
-      (n.columns || []).slice(0, 4).forEach((c, j) => {
-        const t = document.createElementNS(NS, 'text');
-        t.setAttribute('x', String(cx + 10)); t.setAttribute('y', String(cy + 42 + j * 17));
-        t.setAttribute('fill', c.key === 'PRI' ? '#d7ba7d' : '#9cdcfe');
-        t.setAttribute('font-size', '11');
-        t.textContent = (c.key === 'PRI' ? 'PK ' : '') + c.name + ' : ' + c.type;
-        svg.appendChild(t);
-      });
-    });
-    (data.edges || []).forEach(edge => {
-      const a = positions[edge.from], b = positions[edge.to];
-      if (!a || !b) return;
-      const line = document.createElementNS(NS, 'line');
-      line.setAttribute('x1', String(a.x + nodeW));
-      line.setAttribute('y1', String(a.y + nodeH / 2));
-      line.setAttribute('x2', String(b.x));
-      line.setAttribute('y2', String(b.y + nodeH / 2));
-      line.setAttribute('stroke', '#d7ba7d');
-      line.setAttribute('stroke-width', '1.5');
-      svg.appendChild(line);
-    });
-    out.appendChild(svg);
-    setStatus('er-status', data.notice || 'ER 图已生成', false);
+    if (!window.ERInteraction) {
+      setStatus('er-status', 'ER 交互模块未加载（er_interaction.js）', true);
+      return;
+    }
+    erController = window.ERInteraction.render(out, data,
+      {width: 980, height: Math.max(420, Math.ceil(data.nodes.length / 3) * 175 + 120)});
+    let status = data.notice || 'ER 图已生成';
+    if (data.nodes.length > 30) {
+      status += `（${data.nodes.length} 张表：已启用简化渲染与大库提示）`;
+    }
+    setStatus('er-status', status, false);
   } catch (e) {
     setStatus('er-status', tr('er.failed', '加载 ER 图失败') + ': ' + e.message, true);
   }
@@ -1261,9 +1299,16 @@ window.addEventListener('DOMContentLoaded', async () => {
   $id('tool-er-btn').onclick = () => switchTool('er');
   $id('tool-plugins-btn').onclick = () => switchTool('plugins');
   $id('er-refresh-btn').onclick = loadER;
+  $id('er-fit-btn').onclick = () => { if (erController) erController.fit(); };
+  $id('er-reset-btn').onclick = () => { if (erController) erController.reset(); };
+  $id('er-zoom-in-btn').onclick = () => { if (erController) erController.zoomIn(); };
+  $id('er-zoom-out-btn').onclick = () => { if (erController) erController.zoomOut(); };
   $id('plugins-refresh-btn').onclick = loadPlugins;
   $id('chart-bar-btn').onclick = () => renderChart('bar');
   $id('chart-line-btn').onclick = () => renderChart('line');
+  $id('chart-switch-btn').onclick = switchChartKind;
+  $id('chart-export-svg').onclick = exportChartSVG;
+  $id('chart-export-png').onclick = exportChartPNG;
   $id('chart-close-btn').onclick = () => {
     $id('chart-panel').classList.add('hidden');
   };
