@@ -361,6 +361,49 @@ class Parser:
         return d
 
     @staticmethod
+    def _parse_status_tail(tail: str) -> Dict:
+        """解析 `SHOW FUNCTION|PROCEDURE STATUS [LIKE 'x'] [WHERE Db='y']`
+
+        返回 `{'like': ..., 'status_where': {'db': 'default', ...}}`；
+        不认识的 WHERE 形态显式 SyntaxError（绝不静默忽略过滤条件）。
+        """
+        rest = str(tail or '').strip().rstrip(';').strip()
+        like = None
+        where = None
+        if not rest:
+            return {'like': None, 'status_where': None}
+        lit = r"(?:'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")"
+        lm = re.search(r'\bLIKE\s+(' + lit + r')', rest, re.IGNORECASE)
+        if lm:
+            like = Parser._like_literal(lm.group(1))
+            rest = (rest[:lm.start()] + rest[lm.end():]).strip()
+        wm = re.match(r'(?is)^WHERE\s+(.+)$', rest)
+        if wm:
+            where = {}
+            for part in re.split(r'(?i)\s+AND\s+', wm.group(1)):
+                part = part.strip()
+                if not part:
+                    continue
+                mm = re.match(
+                    r'[`"]?(\w+)[`"]?\s*=\s*(' + lit + r'|[\w.]+)\s*$',
+                    part, re.IGNORECASE)
+                if not mm:
+                    raise SyntaxError(
+                        f"SHOW ... STATUS 的 WHERE 条件不支持: {part[:80]}"
+                        f"（只支持 列 = 值 的 AND 组合，如 Db='default'）")
+                key = mm.group(1).lower()
+                val = Parser._like_literal(mm.group(2))
+                if val is None and mm.group(2).strip().upper() == 'NULL':
+                    val = None
+                where[key] = val
+            rest = ''
+        if rest.strip():
+            raise SyntaxError(
+                f"SHOW ... STATUS 尾部多余内容: {rest[:80]}"
+                f"（支持 [LIKE '模式'] [WHERE Db='库']）")
+        return {'like': like, 'status_where': where}
+
+    @staticmethod
     def _like_literal(raw):
         """把 `LIKE 'a%'` 的字面量去掉引号（支持 '' 转义）；None 保持 None"""
         if raw is None:
@@ -394,13 +437,15 @@ class Parser:
         show_stmt 标记，见该函数说明），保证网络层按结果集回包。
         """
         m = re.match(
-            r'(?is)^SHOW\s+FULL\s+COLUMNS\s+FROM\s+[`"]?(\w+)[`"]?'
-            r'(?:\s+FROM\s+[`"]?(\w+)[`"]?)?'
+            r'(?is)^SHOW\s+FULL\s+COLUMNS\s+(?:FROM|IN)\s+'
+            r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?'
+            r'(?:\s+(?:FROM|IN)\s+[`"]?(\w+)[`"]?)?'
             r'(?:\s+LIKE\s+(.+?))?\s*;?\s*$', sql)
         if m:
             return self._show_result(
-                'FULL_COLUMNS', table=m.group(1), database=m.group(2),
-                like=self._like_literal(m.group(3)))
+                'FULL_COLUMNS', table=m.group(2),
+                database=m.group(1) or m.group(3),
+                like=self._like_literal(m.group(4)))
 
         # Navicat 10 列表时发：SHOW FULL TABLES WHERE Table_type != 'VIEW'
         m = re.match(
@@ -580,30 +625,42 @@ class Parser:
             return self._show_result('VACUUM', tables=names or None)
 
         # ---- 分区 ----
-        pm = re.match(r'SHOW\s+PARTITIONS\s+FROM\s+[`"]?(\w+)[`"]?\s*$',
-                      sql, re.IGNORECASE)
+        pm = re.match(
+            r'SHOW\s+PARTITIONS\s+(?:FROM|IN)\s+'
+            r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?'
+            r'(?:\s+(?:FROM|IN)\s+[`"]?(\w+)[`"]?)?\s*;?\s*$',
+            sql, re.IGNORECASE)
         if pm:
-            return self._show_result('PARTITIONS', table=pm.group(1))
+            return self._show_result(
+                'PARTITIONS', table=pm.group(2),
+                database=pm.group(1) or pm.group(3))
 
         # ---- SHOW CREATE TABLE（结果集回传；DDL 由 `sql/logical_dump.py`
         #      的 `TableSchema.canonical_ddl` 统一生成，**含 CHECK 约束**）----
-        scm = re.match(r'SHOW\s+CREATE\s+TABLE\s+[`"]?(\w+)[`"]?\s*$',
-                       sql, re.IGNORECASE)
+        scm = re.match(
+            r'SHOW\s+CREATE\s+TABLE\s+'
+            r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?\s*;?\s*$',
+            sql, re.IGNORECASE)
         if scm:
-            return self._show_result('CREATE_TABLE', table=scm.group(1))
+            return self._show_result(
+                'CREATE_TABLE', table=scm.group(2),
+                database=scm.group(1))
 
         # ---- SHOW INDEX / SHOW INDEXES / SHOW KEYS FROM t ----
         #
         # MySQL 三种写法同义（`SHOW INDEX FROM t` / `SHOW INDEXES FROM t` /
-        # `SHOW KEYS FROM t`），都还能跟一个 `FROM db`。
+        # `SHOW KEYS FROM t`），都还能跟一个 `FROM db`，或用 `db.t` 限定。
         # 走 `_show_result` 是因为 `net/server.py` 只在 `command == 'SELECT'`
         # 时才把结果序列化成结果集 —— 否则客户端 `fetchall()` 拿不到东西。
         sim = re.match(
             r'SHOW\s+(?:INDEX|INDEXES|KEYS)\s+(?:FROM|IN)\s+'
-            r'[`"]?(\w+)[`"]?(?:\s+(?:FROM|IN)\s+[`"]?\w+[`"]?)?\s*$',
+            r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?'
+            r'(?:\s+(?:FROM|IN)\s+[`"]?(\w+)[`"]?)?\s*;?\s*$',
             sql, re.IGNORECASE)
         if sim:
-            return self._show_result('INDEX', table=sim.group(1))
+            return self._show_result(
+                'INDEX', table=sim.group(2),
+                database=sim.group(1) or sim.group(3))
 
         # ---- `SHOW TRIGGERS`：触发器的真实定义（F2）----
         #
@@ -678,7 +735,15 @@ class Parser:
                     'if_exists': bool(dfm.group(1))}
         if upper in ('SHOW FUNCTIONS', 'SHOW FUNCTION STATUS') \
                 or re.match(r'SHOW\s+FUNCTION\s+STATUS\b', sql, re.IGNORECASE):
-            return self._show_result('FUNCTIONS')
+            tail = re.sub(r'(?is)^SHOW\s+(?:FUNCTIONS|FUNCTION\s+STATUS)',
+                          '', sql).strip()
+            return self._show_result('FUNCTIONS',
+                                     **self._parse_status_tail(tail))
+        if re.match(r'(?is)^SHOW\s+PROCEDURE\s+STATUS\b', sql):
+            tail = re.sub(r'(?is)^SHOW\s+PROCEDURE\s+STATUS', '',
+                          sql).strip()
+            return self._show_result('PROCEDURES',
+                                     **self._parse_status_tail(tail))
         cm = re.match(r'CALL\s+[`"]?(\w+)[`"]?\s*\((.*)\)\s*$',
                       sql, re.IGNORECASE | re.DOTALL)
         if cm:
@@ -1465,16 +1530,19 @@ class Parser:
             # 的 JOIN 正则会在 ' u JOIN' 处匹配失败，整个 JOIN 被静默丢弃
             main_alias, rest = self._take_alias(rest)
 
-        # JOIN
+        # JOIN：表名同样支持 `` `db`.`tbl` `` 限定（Navicat 数据网格
+        # 会发全限定 JOIN）；库前缀交给执行器 `_normalize_table_refs`。
         joins = []
         while True:
             jm = re.match(
-                r'\s*(INNER|LEFT|RIGHT|CROSS)?\s*(?:OUTER\s+)?JOIN\s+[`"]?(\w+)[`"]?',
+                r'\s*(INNER|LEFT|RIGHT|CROSS)?\s*(?:OUTER\s+)?JOIN\s+'
+                r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?',
                 rest, re.IGNORECASE)
             if not jm:
                 break
             jtype = (jm.group(1) or 'INNER').upper()
-            jtable = jm.group(2)
+            jdb, jname = jm.group(2), jm.group(3)
+            jtable = f"{jdb}.{jname}" if jdb else jname
             rest = rest[jm.end():]
             jalias, rest = self._take_alias(rest)
             on_cond = None
@@ -1711,11 +1779,35 @@ class Parser:
         if len(and_parts) > 1:
             return {'and': [self._where(p) for p in and_parts]}
 
-        # 走到这里说明整段没有顶层 OR/AND：`NOT (...)` 一定是整段形态，
-        # 但前面的括号匹配失败（例如 `NOT (A) 尾随垃圾`），显式报错，
-        # 避免把 `NOT dept = 'Eng'` 之类静默当成别的东西。
-        if not is_pred_not and re.match(r'NOT\b', s, re.IGNORECASE):
-            raise SyntaxError(f"NOT 后面必须是一段括号条件: {s}")
+        # 走到这里说明整段没有顶层 OR/AND。通用 `NOT <predicate>`：
+        # NOT 的优先级高于 AND/OR，所以此刻剩余部分就是**单个谓词**，
+        # 递归解析后整体取反即可：
+        #   NOT ISNULL(PARTITION_NAME) / NOT col IS NULL /
+        #   NOT col = 1 / NOT expr LIKE 'x%' / NOT (a = 1) ...
+        # 三值逻辑（NOT UNKNOWN = UNKNOWN）由执行器 `_eval_3vl` 统一实现。
+        if not is_pred_not:
+            nm = re.match(r'NOT\b\s*(.+)$', s,
+                          re.IGNORECASE | re.DOTALL)
+            if nm and nm.group(1).strip():
+                inner = self._where(nm.group(1).strip())
+                return {'not': inner}
+
+        # ISNULL(x)：Navicat 的分区查询（NOT ISNULL(PARTITION_NAME)）会用到。
+        # 列形态编码成 IS NULL 并带 `is_null` 标记（执行器 3VL 求值据此
+        # 区分 IS NULL 与普通 NULL 比较）；表达式形态编码成 expr_pred。
+        im = re.match(r'ISNULL\s*\(\s*(.+?)\s*\)\s*$',
+                      s, re.IGNORECASE | re.DOTALL)
+        if im:
+            arg = im.group(1).strip()
+            colref = _column_ref_text(arg)
+            if colref is not None:
+                return {'column': colref, 'op': '=', 'value': None,
+                        'is_null': True}
+            expr = parse_scalar_expr(arg)
+            if expr is not None:
+                return {'expr_pred': {'left': expr, 'op': 'ISNULL'}}
+            raise SyntaxError(
+                f"ISNULL(...) 里的参数无法解析: {arg[:60]!r}")
 
         # EXISTS
         em = re.match(
@@ -1762,6 +1854,7 @@ class Parser:
                 'column': zm.group(1),
                 'op': '!=' if zm.group(2) else '=',
                 'value': None,
+                'is_null': True,
             }
 
         bt = self._parse_between_predicate(s)
@@ -3530,13 +3623,14 @@ class Parser:
 
     def _update(self, sql: str) -> Dict:
         m = re.match(
-            r'UPDATE\s+[`"]?(\w+)[`"]?\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$',
+            r'UPDATE\s+(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?'
+            r'\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$',
             sql, re.IGNORECASE | re.DOTALL)
         if not m:
             raise SyntaxError("UPDATE 语法错误")
 
         set_pairs = {}
-        for pair in self._split_top_level(m.group(2)):
+        for pair in self._split_top_level(m.group(3)):
             if '=' not in pair:
                 continue
             k, v = pair.split('=', 1)
@@ -3554,33 +3648,44 @@ class Parser:
                 value = raw
             set_pairs[k.strip().strip('`"')] = value
 
-        where = self._where(m.group(3)) if m.group(3) else None
+        where = self._where(m.group(4)) if m.group(4) else None
         return {
             'command': 'UPDATE',
-            'table': m.group(1),
+            'table': m.group(2),
             'set': set_pairs,
             'where': where,
         }
 
     def _delete(self, sql: str) -> Dict:
         m = re.match(
-            r'DELETE\s+FROM\s+[`"]?(\w+)[`"]?(?:\s+WHERE\s+(.+))?$',
+            r'DELETE\s+FROM\s+(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?'
+            r'(?:\s+WHERE\s+(.+))?$',
             sql, re.IGNORECASE | re.DOTALL)
         if not m:
             raise SyntaxError("DELETE 语法错误")
-        where = self._where(m.group(2)) if m.group(2) else None
+        where = self._where(m.group(3)) if m.group(3) else None
         return {
-            'command': 'DELETE', 'table': m.group(1),
+            'command': 'DELETE', 'table': m.group(2),
             'where': where,
         }
 
     def _show_columns(self, sql: str) -> Dict:
+        """`SHOW [FULL] COLUMNS FROM tbl [FROM db] [LIKE 'x']` / `DESC`
+
+        表名支持 `` `db`.`tbl` `` 限定形态、`FROM tbl FROM db` 变体
+        （Navicat 数据网格/表设计器都会发）。
+        """
         m = re.search(
-            r'(?:FROM|DESCRIBE|DESC)\s+[`"]?(\w+)[`"]?',
-            sql, re.IGNORECASE)
+            r'(?:FROM|DESCRIBE|DESC)\s+'
+            r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?'
+            r'(?:\s+(?:FROM|IN)\s+[`"]?(\w+)[`"]?)?'
+            r'(?:\s+LIKE\s+(.+?))?\s*;?\s*$',
+            sql, re.IGNORECASE | re.DOTALL)
         if not m:
             raise SyntaxError("SHOW COLUMNS 语法错误")
-        return {'command': 'SHOW COLUMNS', 'table': m.group(1)}
+        return {'command': 'SHOW COLUMNS', 'table': m.group(2),
+                'database': m.group(1) or m.group(3),
+                'like': self._like_literal(m.group(4))}
 
     def _join_condition(self, s: str) -> Optional[Dict]:
         """解析 JOIN ON 条件（标准语义：ON = 连接后的过滤条件）
@@ -5076,6 +5181,9 @@ def eval_expr_predicate(pred, resolve, agg_values=None, position='',
     op = str(pred.get('op') or '').upper()
     left = eval_expr_node(pred.get('left'), resolve, agg_values, position,
                           funcs)
+    # ISNULL(expr) / IS NOT NULL(expr)：结果恒为 TRUE/FALSE（不会 UNKNOWN）
+    if op in ('ISNULL', 'IS NOT NULL'):
+        return left is None if op == 'ISNULL' else left is not None
     if op in ('BETWEEN', 'NOT BETWEEN'):
         low = eval_expr_node(pred.get('low'), resolve, agg_values, position,
                              funcs)

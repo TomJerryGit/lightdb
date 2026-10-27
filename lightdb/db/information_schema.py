@@ -32,7 +32,60 @@ class InformationSchema:
             return self._columns()
         if t == 'SCHEMATA':
             return self._schemata()
+        if t == 'PARTITIONS':
+            return self._partitions()
         return [], []
+
+    #: MySQL 5.7/8.0 `information_schema.PARTITIONS` 的列（顺序照官方文档）
+    PARTITIONS_COLUMNS = (
+        'TABLE_CATALOG', 'TABLE_SCHEMA', 'TABLE_NAME', 'PARTITION_NAME',
+        'SUBPARTITION_NAME', 'PARTITION_ORDINAL_POSITION',
+        'PARTITION_METHOD', 'PARTITION_EXPRESSION',
+        'PARTITION_DESCRIPTION', 'TABLE_ROWS', 'AVG_ROW_LENGTH',
+        'DATA_LENGTH', 'MAX_DATA_LENGTH', 'INDEX_LENGTH', 'DATA_FREE',
+        'CREATE_TIME', 'UPDATE_TIME', 'CHECK_TIME', 'CHECKSUM',
+        'PARTITION_COMMENT', 'NODEGROUP', 'TABLESPACE_NAME')
+
+    def _partitions(self):
+        """分区元数据（Navicat 打开表时查它；`NOT ISNULL(PARTITION_NAME)`）
+
+        * 分区表：每个分区一行（名称/类型/表达式/描述来自真实
+          `Table._partition` + parser 分区定义）；
+        * 非分区表：MySQL 同样返回**一行**、分区字段为 NULL（Navicat 的
+          `NOT ISNULL(PARTITION_NAME)` 因此会过滤掉它们），不是"没有行"。
+        不编造 TABLE_ROWS / 数据长度：本引擎分区是逻辑路由（数据仍在同一
+        `.dat`），无法给出每分区真实字节数 → 这些列报 NULL。
+        """
+        cols = list(self.PARTITIONS_COLUMNS)
+        rows = []
+        for tname, tbl in self.db.tables.items():
+            spec = getattr(tbl, '_partition_spec', None) or {}
+            mgr = getattr(tbl, '_partition', None)
+            plist = getattr(mgr, 'partitions', None) if mgr is not None else None
+            if spec and plist:
+                ptype = str(spec.get('type', '')).upper()
+                expr = spec.get('col')
+                for ordinal, part in enumerate(plist, 1):
+                    desc = None
+                    value = getattr(part, 'value', None)
+                    if ptype == 'RANGE' and isinstance(value, tuple):
+                        lo, hi = value
+                        desc = 'MAXVALUE' if hi is None else str(hi)
+                    elif ptype == 'LIST' and isinstance(value, (list, tuple)):
+                        desc = ','.join(str(v) for v in value)
+                    elif value is not None:
+                        desc = str(value)
+                    rows.append((
+                        'def', self.db.name, tname, getattr(part, 'name', None),
+                        None, ordinal, ptype, expr, desc,
+                        None, None, None, None, None, None,
+                        None, None, None, None, '', None, None))
+            else:
+                rows.append((
+                    'def', self.db.name, tname, None, None, None, None,
+                    None, None, None, None, None, None, None, None,
+                    None, None, None, None, '', None, None))
+        return cols, rows
     
     def _tables(self):
         cols = ['TABLE_CATALOG', 'TABLE_SCHEMA', 'TABLE_NAME', 'TABLE_TYPE',

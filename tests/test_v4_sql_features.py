@@ -1006,16 +1006,16 @@ def test_correlated_nested_and_multitable():
 
 
 def test_not_condition():
-    """WHERE NOT ( ... )：整体取反，可与 AND/OR 组合、可嵌套
+    """WHERE NOT <predicate>：通用取反，可与 AND/OR 组合、可嵌套
 
-    实现方式：
-    * 解析器在顶层 AND/OR 切分之前处理 `NOT (...)`（要求配对括号正好在
-      末尾，因此 AND 比 NOT 结合得更紧），产出 {'not': <子树>}；
-    * 执行器 `_normalize_where` 用德摩根律把 NOT 推到叶子：比较条件翻转
-      运算符（`=`↔`!=`、`<`↔`>=` …），NOT-AND/OR 互换，这样存储层的
-      _match 拿到的永远是它能认识的形态（NOT 本身它不认，会 KeyError）；
-    * LIKE 这类没有取反运算符的形态打 negate 标记，由执行器自己的三值
-      求值器过滤（`NOT (NULL LIKE ...)` 仍为 UNKNOWN，不能放行）。
+    实现方式（task-56 起）：
+    * 解析器在顶层 AND/OR 切分之后处理 `NOT <predicate>`，产出
+      {'not': <谓词子树>}；`NOT ( ... )`、`NOT col IS NULL`、
+      `NOT ISNULL(col)`、`NOT col = 1`、`NOT expr LIKE ...` 统一形态；
+    * 执行器 `_normalize_where` **保留** not 节点（不再做会丢三值的
+      德摩根改写），`_base_rows_and_cols` 取全部行后用
+      `_eval_condition`/`_eval_3vl` 做完整三值求值：NOT UNKNOWN 仍是
+      UNKNOWN（NULL 行不会被 NOT 放行）。
 
     数据：emp 8 行，Eng 3（1/2/3）、Sales 2（4/5）、HR 3（6/7/8）
     """
@@ -1061,10 +1061,13 @@ def test_not_condition():
                       "o.user_id = u.id))")
         assert [r[0] for r in rows] == [3], rows
 
-        # ⑧ 错误语法仍显式报错（`NOT 列 = 值` 不是合法 SQL 谓词）
+        # ⑧ 无括号的 `NOT col = 值` 也合法（task-56 通用 NOT 谓词），
+        #    结果与 `NOT (col = 值)` 一致；真正残缺的 NOT 仍显式报错。
+        _, rows = e.q("SELECT id FROM emp WHERE NOT dept = 'Eng'")
+        assert sorted(r[0] for r in rows) == [4, 5, 6, 7, 8], rows
         import pytest
         with pytest.raises(SyntaxError):
-            e.parser.parse("SELECT id FROM emp WHERE NOT dept = 'Eng'")
+            e.parser.parse("SELECT id FROM emp WHERE NOT")
 
 
 def test_is_null_and_is_not_null():

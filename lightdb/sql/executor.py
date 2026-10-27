@@ -538,7 +538,50 @@ class Executor:
         validate_group_by(
             p, strict=resolve_strict_group_by(self.strict_group_by))
 
+    def _normalize_table_refs(self, parsed: Dict) -> Dict:
+        """把 `db.table` / `` `db`.`table` `` 归一成引擎内的真实表名
+
+        Navicat 10 会用限定名（数据网格、SHOW 元数据）：
+        `default.users` 直接交给 `Database.get_table` 会报
+        `Table 'default.users' doesn't exist`（复现的错误里甚至出现
+        `default.default`）。本引擎只有单库（+ information_schema），因此：
+          * `information_schema.X` 保留前缀（虚拟库分支要用）；
+          * 其它已知库前缀剥掉，只留表名；
+          * 未知库前缀原样保留（让错误信息如实指出是哪个库/表不存在）。
+        """
+        if not isinstance(parsed, dict):
+            return parsed
+        known = {'default', 'information_schema'}
+        try:
+            known |= {str(n).lower() for n in self.db.database_names()}
+        except Exception:
+            pass
+
+        def norm(name):
+            if not isinstance(name, str):
+                return name
+            raw = name.strip()
+            if '.' not in raw:
+                return raw
+            parts = [p.strip().strip('`"') for p in raw.split('.')]
+            if len(parts) != 2:
+                return raw
+            db, tbl = parts
+            dbl = db.lower()
+            if dbl == 'information_schema':
+                return f'information_schema.{tbl}'
+            if dbl in known:
+                return tbl
+            return raw
+
+        parsed['table'] = norm(parsed.get('table'))
+        for j in (parsed.get('joins') or []):
+            if isinstance(j, dict):
+                j['table'] = norm(j.get('table'))
+        return parsed
+
     def execute(self, parsed: Dict, session: Dict) -> Dict:
+        parsed = self._normalize_table_refs(parsed)
         start = time.time()
         # 记录"当前会话"：投影列表里的标量子查询需要把折叠后的子查询
         # 重新交给 self.execute 执行（复用事务读视图 / CTE 关系）。
@@ -2395,15 +2438,12 @@ class Executor:
         # information_schema
         if table.lower().startswith('information_schema.'):
             _, name = table.split('.', 1)
-            cols, rows = self.info_schema.query(name)
-            return self._rs(cols, rows)
-        # 裸 `TABLES` / `COLUMNS` / `SCHEMATA`：只有在真实表里不存在时才
-        # 当成 information_schema 的虚拟表，避免遮蔽用户自己的同名表
-        # （原实现无条件优先虚拟表，与 `TABLES` 同名的真实表就查不到了）。
-        if (table.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA')
+            return self._info_schema_result(name, p)
+        # 裸 `TABLES` / `COLUMNS` / `SCHEMATA` / `PARTITIONS`：只有在真实表里
+        # 不存在时才当成 information_schema 的虚拟表，避免遮蔽用户同名表。
+        if (table.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA', 'PARTITIONS')
                 and table not in self.db.tables):
-            cols, rows = self.info_schema.query(table)
-            return self._rs(cols, rows)
+            return self._info_schema_result(table, p)
 
         # E3：视图 —— 与 CTE 同一条「物化后查询」路径：
         #   1) 执行视图定义查询，得到 (cols, rows)；
@@ -2601,6 +2641,41 @@ class Executor:
                 rows = rows[:int(p['limit'])]
 
         return self._rs(cols, rows)
+
+    def _info_schema_result(self, table, p):
+        """执行 `SELECT ... FROM information_schema.<table>` 的通用包装
+
+        Navicat 的 PARTITIONS 查询带真实过滤条件
+        （`TABLE_SCHEMA=... AND NOT ISNULL(PARTITION_NAME)`）：虚拟表结果
+        必须像真实表一样应用 WHERE / 简单投影 / ORDER BY / LIMIT，
+        否则过滤条件被静默忽略会返回误导性行集。
+        """
+        cols, rows = self.info_schema.query(table)
+        where = p.get('where')
+        if isinstance(where, dict):
+            cols_list = list(cols)
+            rows = [r for r in rows
+                    if self._eval_condition(list(r), cols_list, where)]
+        ob = normalize_order_by(p.get('order_by')) if p.get('order_by') else []
+        if len(ob) == 1:
+            col, desc = ob[0]
+            if col in cols:
+                i = cols.index(col)
+                rows = sorted(rows, key=lambda r: (r[i] is None, r[i]),
+                              reverse=bool(desc))
+        off = int(p.get('offset') or 0)
+        if off:
+            rows = rows[off:]
+        if p.get('limit') is not None:
+            rows = rows[:int(p['limit'])]
+        cols_in = p.get('columns') or ['*']
+        if cols_in != ['*']:
+            names = [str(c).strip().strip('`"') for c in cols_in]
+            if names and all(n in cols for n in names):
+                idxs = [cols.index(n) for n in names]
+                cols = [cols[i] for i in idxs]
+                rows = [tuple(r[i] for i in idxs) for r in rows]
+        return self._rs(list(cols), list(rows))
 
     # ==================== 并行 COUNT ====================
 
@@ -3258,6 +3333,19 @@ class Executor:
                 if self._eval_condition(r, cols, target) is False:
                     kept.append(r)
             return cols, kept
+        # NOT 子树（可能嵌套在 AND/OR 里，且可能含 UNKNOWN）：统一取全部行
+        # 后按三值逻辑过滤。`_normalize_where` 现在保留 not 节点（不再做会
+        # 丢三值的德摩根改写），存储层 `_match` 不认 `{'not':...}` →
+        # 只要条件树里**任意位置**出现 NOT，就必须由执行器接管。
+        if isinstance(where, dict) and self._where_has_not(where):
+            if isinstance(src, _CTERelation):
+                cols = list(src.col_names)
+                rows = [list(r) for r in src.rows]
+            else:
+                cols, rows = src.select(['*'], None, None, None, read_view)
+                cols, rows = list(cols), [list(r) for r in rows]
+            return cols, [r for r in rows
+                          if self._eval_condition(r, cols, where) is True]
         # 表达式谓词（函数 / 算术，`WHERE LOWER(name) = 'alice'`、
         # `WHERE salary * 2 > 230`）：存储层 `_match` 认不出这种节点
         # （KeyError('column')），因此取全部行后用统一求值器逐行过滤。
@@ -3378,8 +3466,11 @@ class Executor:
         if not isinstance(where, dict):
             return where
         if isinstance(where.get('not'), dict):
-            return self._negate_condition(
-                self._normalize_where(where['not'], strip))
+            # NOT 子树**不**在这里做德摩根改写：`NOT (A OR B)` 里若有
+            # UNKNOWN，按存储层比较取反会得到错误结果（NOT UNKNOWN 必须
+            # 仍是 UNKNOWN）。保留 not 节点，交给 `_base_rows_and_cols`
+            # 取全部行后用 `_eval_condition`/`_eval_3vl` 做真正的三值求值。
+            return {'not': self._normalize_where(where['not'], strip)}
         if 'and' in where:
             return {'and': [self._normalize_where(c, strip)
                             for c in where['and']]}
@@ -3413,10 +3504,15 @@ class Executor:
         if 'column' in where and op in cls._NOT_OP:
             # `NOT (c IS NULL)` 即 `c IS NOT NULL`：value=None 保持不变，
             # 只翻转运算符（=' -> '!=、'!=' -> '='），NULL 语义自动对齐
-            return {'column': where.get('column'),
-                    'op': cls._NOT_OP[op],
-                    'value': val,
-                    'value_column': where.get('value_column', False)}
+            negated = {'column': where.get('column'),
+                       'op': cls._NOT_OP[op],
+                       'value': val,
+                       'value_column': where.get('value_column', False)}
+            if where.get('is_null'):
+                # 保留 IS NULL 标记：否则 `NOT ISNULL(c)` 翻成普通 NULL
+                # 比较后会被三值逻辑判成 UNKNOWN（应为 IS NOT NULL）
+                negated['is_null'] = True
+            return negated
         if 'agg' in where and op in cls._NOT_OP:
             return {'agg': where.get('agg'), 'op': cls._NOT_OP[op],
                     'value': val}
@@ -4078,6 +4174,64 @@ class Executor:
 
     # ==================== 条件求值（统一路径） ====================
 
+    def _eval_3vl(self, row, cols, where, agg_values=None):
+        """SQL 三值逻辑求值（True / False / None=UNKNOWN），供 NOT 子树使用
+
+        `_eval_condition` 的普通路径把 NULL 比较当 False（存储层同样如此，
+        对"直接过滤"是等价的）；但 NOT 取反时必须区分 FALSE 与 UNKNOWN，
+        否则 `NOT (col > 5)` 在 col 为 NULL 时会把行错误地留下。
+        本函数对 and/or/not/negate/expr_pred/普通列比较/IS NULL 做完整的
+        三值组合；无法识别的叶子回退到 `_eval_condition`（布尔）。
+        """
+        if where is None or not isinstance(where, dict):
+            return True
+        if 'not' in where and isinstance(where['not'], dict):
+            inner = self._eval_3vl(row, cols, where['not'], agg_values)
+            return None if inner is None else (not inner)
+        if isinstance(where.get('negate'), dict):
+            inner = self._eval_3vl(row, cols, where['negate'], agg_values)
+            return None if inner is None else (not inner)
+        if 'and' in where:
+            vals = [self._eval_3vl(row, cols, c, agg_values)
+                    for c in (where.get('and') or [])]
+            if any(v is False for v in vals):
+                return False
+            if any(v is None for v in vals):
+                return None
+            return True
+        if 'or' in where:
+            vals = [self._eval_3vl(row, cols, c, agg_values)
+                    for c in (where.get('or') or [])]
+            if any(v is True for v in vals):
+                return True
+            if any(v is None for v in vals):
+                return None
+            return False
+        if isinstance(where.get('expr_pred'), dict):
+            return self._eval_condition(row, cols, where, agg_values)
+        col = where.get('column')
+        if isinstance(col, str):
+            if where.get('is_null'):
+                i = self._col_index_of(cols, col)
+                if i < 0:
+                    return self._eval_condition(row, cols, where, agg_values)
+                value = row[i] if i < len(row) else None
+                if where.get('op') == '!=':
+                    return value is not None
+                return value is None
+            op = where.get('op')
+            if op in ('=', '!=', '<', '>', '<=', '>=', 'LIKE'):
+                i = self._col_index_of(cols, col)
+                if i < 0:
+                    return self._eval_condition(row, cols, where, agg_values)
+                value = row[i] if i < len(row) else None
+                right = where.get('value')
+                if value is None or right is None:
+                    return None
+                return bool(self._eval_condition(row, cols, where,
+                                                 agg_values))
+        return self._eval_condition(row, cols, where, agg_values)
+
     def _eval_condition(self, row, cols, where, agg_values=None):
         """统一路径上的 WHERE/HAVING 条件求值
 
@@ -4089,10 +4243,14 @@ class Executor:
         if not isinstance(where, dict):
             return True
 
-        # NOT (...)：整体取反（可嵌套，可与 AND/OR 组合）
+        # NOT (...)：SQL 三值逻辑取反（NOT UNKNOWN = UNKNOWN）。
+        # 这里不能简单 `not bool`：`NOT (col > 5)` 在 col 为 NULL 时
+        # 应当是 UNKNOWN（该行被过滤），而不是 TRUE。
         if 'not' in where and isinstance(where['not'], dict):
-            return not self._eval_condition(
-                row, cols, where['not'], agg_values)
+            inner = self._eval_3vl(row, cols, where['not'], agg_values)
+            if inner is None:
+                return None
+            return not inner
 
         # `{'negate': ...}`：`_normalize_where` 对「存储层没有取反运算符」的
         # 形态（例如 `NOT (name LIKE 'A%')`）打的标记。**必须在这里就地展开**：
@@ -4101,7 +4259,7 @@ class Executor:
         # 整个 NOT 条件（例如 `WHERE NOT (name LIKE 'A%') AND LOWER(dept)='eng'`）。
         # 三值逻辑：NOT UNKNOWN 仍是 UNKNOWN（None）。
         if isinstance(where.get('negate'), dict):
-            inner = self._eval_condition(row, cols, where['negate'], agg_values)
+            inner = self._eval_3vl(row, cols, where['negate'], agg_values)
             if inner is None:
                 return None
             return not inner
@@ -4236,10 +4394,18 @@ class Executor:
                     raise ValueError(f"列 '{r}' 不存在（WHERE 里的列引用）")
             else:
                 r = row[j] if j < len(row) else None
-        if l is None:
-            return op == '=' and r is None
-        if r is None:
-            return op == '!='
+        # IS [NOT] NULL（解析器带 `is_null` 标记，与普通 NULL 比较区分）：
+        # 结果恒为 TRUE/FALSE，不会 UNKNOWN。
+        if where.get('is_null'):
+            if op == '=':
+                return l is None
+            if op == '!=':
+                return l is not None
+        if l is None or r is None:
+            # SQL 三值逻辑：比较运算含 NULL → UNKNOWN。
+            # WHERE 过滤按"不通过"处理；NOT/negate 子树由 `_eval_3vl`
+            # 区分 UNKNOWN 与 FALSE（`NOT (NULL 比较)` 不能放行）。
+            return None
         try:
             if isinstance(l, (int, float)) and isinstance(r, str):
                 r = float(r) if '.' in r else int(r)
@@ -7234,6 +7400,17 @@ class Executor:
     def _exec_show_stmt(self, p, s):
         """show_stmt 标记 → 具体 handler（见 parser._show_result）"""
         kind = str(p.get('show_stmt') or '').lower()
+        # `SHOW ... FROM db`：本引擎单库；未知库名显式 1049，而不是
+        # 静默忽略库限定去查默认库（那会在客户端切错库时给出错答案）。
+        db_arg = p.get('database')
+        if db_arg:
+            known = {'default', 'information_schema'}
+            try:
+                known |= {str(n).lower() for n in self.db.database_names()}
+            except Exception:
+                pass
+            if str(db_arg).strip().strip('`"').lower() not in known:
+                return self._err(1049, f"Unknown database '{db_arg}'")
         handler = getattr(self, f'_show_{kind}', None)
         if handler is None:
             return self._err(1064, f"不支持的 SHOW 语句: {p.get('show_stmt')}")
@@ -8683,17 +8860,28 @@ class Executor:
     def _show_functions(self, p, s):
         """`SHOW FUNCTIONS` / `SHOW FUNCTION STATUS` —— 真实注册表快照
 
-        列名沿用 MySQL `SHOW FUNCTION STATUS`（首列是 Name，这样
-        `lightdb_studio` 的 `[r[0] for r in rows]` 拿到的是函数名）。
+        支持 Navicat 备份页形态：`[LIKE 'x'] [WHERE Db='库']`
+        （也可用 Name=... 过滤）。列名沿用现有 MySQL 兼容清单。
         """
         mgr = self._stored
         funcs = (getattr(mgr, 'functions', {}) if mgr is not None else {})
+        label = getattr(self.db, 'name', 'default') or 'default'
+        where = p.get('status_where') or {}
+        db_filter = where.get('db')
+        name_filter = where.get('name')
         cols = ['Name', 'Db', 'Type', 'Return_type', 'Parameters',
                 'Definer', 'Modified', 'Created', 'Security_type', 'Comment',
                 'character_set_client', 'collation_connection',
                 'Database Collation']
         rows = []
         for fname in sorted(funcs):
+            if not self._like_match(fname, p.get('like')):
+                continue
+            if name_filter is not None and fname != str(name_filter):
+                continue
+            if db_filter is not None and \
+                    str(db_filter).lower() not in ('default', label.lower()):
+                continue
             fn = funcs[fname]
             params = ', '.join(
                 f"{prm.get('name')} {prm.get('type')}"
@@ -8701,8 +8889,47 @@ class Executor:
             created = time.strftime(
                 '%Y-%m-%d %H:%M:%S',
                 time.localtime(getattr(fn, 'created_at', time.time())))
-            rows.append((fname, 'default', 'FUNCTION', fn.return_type,
+            rows.append((fname, label, 'FUNCTION', fn.return_type,
                          params, 'root@localhost', created, created,
+                         'DEFINER', '', 'utf8mb4', 'utf8mb4_general_ci',
+                         'utf8mb4_general_ci'))
+        return self._rs(cols, rows)
+
+    def _show_procedures(self, p, s):
+        """`SHOW PROCEDURE STATUS [LIKE 'x'] [WHERE Db='库']` —— 真实快照
+
+        Navicat 备份页/对象加载会先发这条（原来 1064）。列形状与
+        `SHOW FUNCTION STATUS` 保持一致（Name 在首列，Type=PROCEDURE），
+        过滤条件真实生效；本引擎单库，Db 如实报当前库名。
+        """
+        mgr = self._stored
+        procs = (getattr(mgr, 'procedures', {}) if mgr is not None else {})
+        label = getattr(self.db, 'name', 'default') or 'default'
+        where = p.get('status_where') or {}
+        db_filter = where.get('db')
+        name_filter = where.get('name')
+        cols = ['Name', 'Db', 'Type', 'Return_type', 'Parameters',
+                'Definer', 'Modified', 'Created', 'Security_type', 'Comment',
+                'character_set_client', 'collation_connection',
+                'Database Collation']
+        rows = []
+        for pname in sorted(procs):
+            if not self._like_match(pname, p.get('like')):
+                continue
+            if name_filter is not None and pname != str(name_filter):
+                continue
+            if db_filter is not None and \
+                    str(db_filter).lower() not in ('default', label.lower()):
+                continue
+            proc = procs[pname]
+            params = ', '.join(
+                f"{prm.get('name')} {prm.get('type')}"
+                for prm in (getattr(proc, 'params', None) or []))
+            created = time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                time.localtime(getattr(proc, 'created_at', time.time())))
+            rows.append((pname, label, 'PROCEDURE', None, params,
+                         'root@localhost', created, created,
                          'DEFINER', '', 'utf8mb4', 'utf8mb4_general_ci',
                          'utf8mb4_general_ci'))
         return self._rs(cols, rows)
@@ -10076,7 +10303,17 @@ class Executor:
         Type（保留长度/精度）、Default（真实默认值或 NULL）、Extra（没有
         对应概念就留空，**不**由主键推断）三者与 `information_schema`
         共用 `db/database.py::describe_columns`，不会再各写一份。
+        支持 `[FROM|IN] db` 与 `LIKE` 过滤（Navicat 数据网格/设计器）。
         """
+        db_arg = p.get('database')
+        if db_arg:
+            known = {'default', 'information_schema'}
+            try:
+                known |= {str(n).lower() for n in self.db.database_names()}
+            except Exception:
+                pass
+            if str(db_arg).strip().strip('`"').lower() not in known:
+                return self._err(1049, f"Unknown database '{db_arg}'")
         tbl = self.db.get_table(p['table'])
         cols = ['Field', 'Type', 'Null', 'Key',
                 'Default', 'Extra']
@@ -10084,6 +10321,7 @@ class Executor:
             (c['name'], c['type'], c['null'], c['key'],
              c['default'], c['extra'])
             for c in describe_columns(tbl)
+            if self._like_match(c['name'], p.get('like'))
         ]
         return self._rs(cols, rows)
 
@@ -10117,8 +10355,15 @@ class Executor:
         if pattern is None:
             return True
         import re as _re
-        rx = ('^' + _re.escape(str(pattern))
-              .replace(r'\%', '.*').replace(r'\_', '.') + '$')
+        parts = []
+        for ch in str(pattern):
+            if ch == '%':
+                parts.append('.*')
+            elif ch == '_':
+                parts.append('.')
+            else:
+                parts.append(_re.escape(ch))
+        rx = '^' + ''.join(parts) + '$'
         return bool(_re.match(rx, str(value), _re.IGNORECASE | _re.DOTALL))
 
     def _show_table_status(self, p, s):

@@ -1636,15 +1636,30 @@ class MySQLHandler(socketserver.BaseRequestHandler):
 
     def _show_columns(self, sql: str):
         import re
+        # Navicat 10：`SHOW COLUMNS FROM `db`.`tbl`` / `... FROM tbl FROM db`
+        # / `DESC `db`.`tbl`` 都会发。旧正则只抓 `(\w+)`，于是把库名
+        # `default` 当成表名 → 1146 "Table 'default.default' doesn't exist"。
         m = re.search(
-            r'(?:FROM|DESC(?:RIBE)?)\s+[`"]?(\w+)[`"]?',
-            sql, re.IGNORECASE)
+            r'(?:FROM|DESC(?:RIBE)?)\s+'
+            r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?'
+            r'(?:\s+(?:FROM|IN)\s+[`"]?(\w+)[`"]?)?'
+            r'(?:\s+LIKE\s+(.+?))?\s*;?\s*$',
+            sql, re.IGNORECASE | re.DOTALL)
         if not m:
             self._send_packet(mp.make_err_packet(
                 1064, "42000", "Syntax error"))
             return
 
-        table_name = m.group(1)
+        table_name = m.group(2)
+        db_name = m.group(1) or m.group(3)
+        like_raw = (m.group(4) or '').strip()
+        if db_name:
+            resolved, err = self._resolve_database(db_name)
+            if err is not None:
+                self._send_packet(err)
+                return
+        else:
+            resolved = self.database or 'default'
         # 权限先于存在性判断：否则无权限账户能靠 1146/1142 的差异探测
         # "这个表存不存在"（MySQL 对无权限的表同样先报 1142）。
         access_err = self._access_error_packet(
@@ -1655,21 +1670,26 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         if table_name not in self.db.tables:
             self._send_packet(mp.make_err_packet(
                 1146, "42S02",
-                f"Table '{self.database}.{table_name}' "
-                f"doesn't exist"))
+                f"Table '{resolved}.{table_name}' doesn't exist"))
             return
 
         table = self.db.tables[table_name]
-        # 列元数据来自**真实列定义**（与 information_schema / 进程内执行器
-        # 共用 db/database.py::describe_columns）：
-        #   Type   保留长度/精度（VARCHAR(20) / DECIMAL(10,2)）
-        #   Default 真实默认值，没声明就是 NULL
-        #   Extra  本引擎没有 auto_increment / on update → 恒为 ''
-        # 旧实现把 Default 写死 None、把 Extra 由主键伪造成 auto_increment。
+        # LIKE 过滤：`SHOW COLUMNS ... LIKE 'x%'`（Navicat 元数据刷新会带）
+        like = None
+        if like_raw:
+            like = like_raw.strip().strip("'\"")
+
+        def _name_match(name):
+            if like is None:
+                return True
+            pattern = '^' + like.replace('%', '.*').replace('_', '.') + '$'
+            return bool(re.match(pattern, str(name)))
+
         rows = [
             (c['name'], c['type'], c['null'], c['key'],
              c['default'], c['extra'])
             for c in describe_columns(table)
+            if _name_match(c['name'])
         ]
 
         self._send_resultset([
