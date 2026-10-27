@@ -2435,13 +2435,17 @@ class Executor:
                 return self._select_from_subquery(p, s, sub)
             return self._err(1105, "暂不支持 FROM 子查询")
 
-        # information_schema
+        # information_schema（物化元数据 + WHERE/投影/聚合/排序/分页）
         if table.lower().startswith('information_schema.'):
             _, name = table.split('.', 1)
-            return self._info_schema_result(name, p)
-        # 裸 `TABLES` / `COLUMNS` / `SCHEMATA` / `PARTITIONS`：只有在真实表里
-        # 不存在时才当成 information_schema 的虚拟表，避免遮蔽用户同名表。
-        if (table.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA', 'PARTITIONS')
+            if name.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA', 'PARTITIONS',
+                                'EVENTS', 'TRIGGERS', 'ROUTINES'):
+                return self._info_schema_result(name, p)
+            return self._err(1146, f"Table '{table}' doesn't exist")
+        # 裸 `TABLES` / `COLUMNS` / `SCHEMATA` / `PARTITIONS` / EVENTS /
+        # TRIGGERS / ROUTINES：只有在真实表里不存在时才当成虚拟表。
+        if (table.upper() in ('TABLES', 'COLUMNS', 'SCHEMATA', 'PARTITIONS',
+                              'EVENTS', 'TRIGGERS', 'ROUTINES')
                 and table not in self.db.tables):
             return self._info_schema_result(table, p)
 
@@ -2669,6 +2673,39 @@ class Executor:
         if p.get('limit') is not None:
             rows = rows[:int(p['limit'])]
         cols_in = p.get('columns') or ['*']
+        # 聚合投影：Navicat/客户端会用 `SELECT COUNT(*) FROM
+        # information_schema.EVENTS` 探测对象数量；虚拟表也必须像真实表
+        # 一样给出 0，而不是"零列零行"这种不可解释的结果。
+        if len(cols_in) == 1:
+            agg = re.fullmatch(
+                r'\s*(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(\*|[A-Za-z_]\w*)\s*\)\s*',
+                str(cols_in[0]), re.IGNORECASE)
+            if agg:
+                fn = agg.group(1).upper()
+                arg = agg.group(2)
+                if arg == '*' or fn == 'COUNT':
+                    if arg == '*':
+                        vals = [1 for _ in rows]
+                    else:
+                        ci = cols.index(arg) if arg in cols else -1
+                        vals = [r[ci] for r in rows
+                                if ci >= 0 and r[ci] is not None]
+                    out = len(vals)
+                else:
+                    ci = cols.index(arg) if arg in cols else -1
+                    nums = [r[ci] for r in rows
+                            if ci >= 0 and r[ci] is not None]
+                    if not nums:
+                        out = None
+                    elif fn == 'SUM':
+                        out = sum(nums)
+                    elif fn == 'AVG':
+                        out = sum(nums) / len(nums)
+                    elif fn == 'MIN':
+                        out = min(nums)
+                    else:
+                        out = max(nums)
+                return self._rs([str(cols_in[0]).strip()], [(out,)])
         if cols_in != ['*']:
             names = [str(c).strip().strip('`"') for c in cols_in]
             if names and all(n in cols for n in names):

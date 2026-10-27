@@ -1708,6 +1708,51 @@ class Parser:
 
     # ==================== WHERE ====================
 
+    @staticmethod
+    def _strip_binary_prefix(s: str) -> str:
+        """剥离 MySQL `BINARY <expr>` 一元前缀（引号外、大小写不敏感）
+
+        MySQL：`BINARY expr` 返回二进制字符串，比较按**字节**、大小写敏感。
+        本引擎默认 `utf8mb4_bin`（Python 码点比较）本来就是大小写敏感，
+        因此剥离前缀不改变既有比较语义，只是让 Navicat 生成的
+        `WHERE BINARY EVENT_SCHEMA='default'` 能解析。
+        支持比较两侧 / AND/OR/NOT 组合；字符串字面量里的 "BINARY" 不动。
+        """
+        out = []
+        i, n = 0, len(s)
+        quote = None
+        while i < n:
+            ch = s[i]
+            if quote is not None:
+                out.append(ch)
+                if ch == quote:
+                    if i + 1 < n and s[i + 1] == quote:
+                        out.append(s[i + 1])
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if ch in ("'", '"', '`'):
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+            head = s[i:i + 6]
+            if head.upper() == 'BINARY' and (
+                    i == 0 or not (s[i - 1].isalnum() or s[i - 1] in '_`')):
+                j = i + 6
+                if j < n and s[j].isspace():
+                    k = j
+                    while k < n and s[k].isspace():
+                        k += 1
+                    if k < n and (s[k].isalnum() or s[k] in "_`'\"("):
+                        i = k          # 跳过 `BINARY `，保留操作数
+                        continue
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
     def _where(self, s: str) -> Dict:
         """解析 WHERE / HAVING 条件，产出 and/or/比较 条件树
 
@@ -1727,6 +1772,10 @@ class Parser:
         不会被外层拆开，所以这里不需要再动切分逻辑。
         """
         s = s.strip()
+        # Navicat 备份/对象树：`WHERE BINARY EVENT_SCHEMA='default'`。
+        # BINARY 是 MySQL 一元前缀（按字节比较）；本引擎字符串比较本就是
+        # 大小写敏感，剥离前缀即可（详见 `_strip_binary_prefix`）。
+        s = self._strip_binary_prefix(s)
         # JSON 路径语法糖（`data->'$.k'`）必须在括号/AND-OR 切分之前改写：
         # 否则 `->` 里的 `>` 会被 `_split_top_level_comparison` 当成比较运算符，
         # 整段条件解析失败（原实现直接报「WHERE 条件错误」）。

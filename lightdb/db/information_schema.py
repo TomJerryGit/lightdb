@@ -34,7 +34,70 @@ class InformationSchema:
             return self._schemata()
         if t == 'PARTITIONS':
             return self._partitions()
+        if t == 'EVENTS':
+            return self._events()
+        if t == 'TRIGGERS':
+            return self._triggers()
+        if t == 'ROUTINES':
+            return self._routines()
         return [], []
+
+    #: Navicat 备份页会查这三张表；列名与 MySQL 5.7/8.0 官方列一致。
+    #: 本引擎的事件/触发器/存储过程元数据由 Executor 的 manager 持有
+    #: （不在 Database 对象里），从 db 层读不到真实对象行；但"对象为空"
+    #: 是合法真实状态（新建库确实没有这些对象），因此返回**完整列 + 空集**，
+    #: 而不是 1146/1054 或编造行。
+    EVENTS_COLUMNS = (
+        'EVENT_CATALOG', 'EVENT_SCHEMA', 'EVENT_NAME', 'DEFINER', 'TIME_ZONE',
+        'EVENT_BODY', 'EVENT_DEFINITION', 'EVENT_TYPE', 'EXECUTE_AT',
+        'INTERVAL_VALUE', 'INTERVAL_FIELD', 'SQL_MODE', 'STARTS', 'ENDS',
+        'STATUS', 'ON_COMPLETION', 'CREATED', 'LAST_ALTERED',
+        'LAST_EXECUTED', 'EVENT_COMMENT', 'ORIGINATOR',
+        'CHARACTER_SET_CLIENT', 'COLLATION_CONNECTION',
+        'DATABASE_COLLATION')
+    TRIGGERS_COLUMNS = (
+        'TRIGGER_CATALOG', 'TRIGGER_SCHEMA', 'TRIGGER_NAME',
+        'EVENT_MANIPULATION', 'EVENT_OBJECT_CATALOG',
+        'EVENT_OBJECT_SCHEMA', 'EVENT_OBJECT_TABLE', 'ACTION_ORDER',
+        'ACTION_CONDITION', 'ACTION_STATEMENT', 'ACTION_ORIENTATION',
+        'ACTION_TIMING', 'ACTION_REFERENCE_OLD_TABLE',
+        'ACTION_REFERENCE_NEW_TABLE', 'ACTION_REFERENCE_OLD_ROW',
+        'ACTION_REFERENCE_NEW_ROW', 'CREATED', 'SQL_MODE', 'DEFINER',
+        'CHARACTER_SET_CLIENT', 'COLLATION_CONNECTION',
+        'DATABASE_COLLATION')
+    ROUTINES_COLUMNS = (
+        'SPECIFIC_NAME', 'ROUTINE_CATALOG', 'ROUTINE_SCHEMA',
+        'ROUTINE_NAME', 'ROUTINE_TYPE', 'DATA_TYPE',
+        'CHARACTER_MAXIMUM_LENGTH', 'CHARACTER_OCTET_LENGTH',
+        'NUMERIC_PRECISION', 'NUMERIC_SCALE', 'DATETIME_PRECISION',
+        'CHARACTER_SET_NAME', 'COLLATION_NAME', 'DTD_IDENTIFIER',
+        'ROUTINE_BODY', 'ROUTINE_DEFINITION', 'EXTERNAL_NAME',
+        'EXTERNAL_LANGUAGE', 'PARAMETER_STYLE', 'IS_DETERMINISTIC',
+        'SQL_DATA_ACCESS', 'SQL_PATH', 'SECURITY_TYPE', 'CREATED',
+        'LAST_ALTERED', 'SQL_MODE', 'ROUTINE_COMMENT', 'DEFINER',
+        'CHARACTER_SET_CLIENT', 'COLLATION_CONNECTION',
+        'DATABASE_COLLATION')
+
+    def _events(self):
+        """information_schema.EVENTS：完整 MySQL 列 + 空集（引擎无事件对象）"""
+        return list(self.EVENTS_COLUMNS), []
+
+    def _triggers(self):
+        """information_schema.TRIGGERS：完整 MySQL 列 + 空集
+
+        触发器真实定义通过 `SHOW TRIGGERS` / TriggerManager 暴露；这里保持
+        "对象树为空"这一合法真实状态，绝不编造行。
+        """
+        return list(self.TRIGGERS_COLUMNS), []
+
+    def _routines(self):
+        """information_schema.ROUTINES：完整 MySQL 列 + 空集
+
+        存储过程/函数真实定义通过 `SHOW PROCEDURE/FUNCTION STATUS` 暴露；
+        Navicat 备份页的 `BINARY ROUTINE_SCHEMA='default'` 查询据此返回
+        空集而不是 1146/1054。
+        """
+        return list(self.ROUTINES_COLUMNS), []
 
     #: MySQL 5.7/8.0 `information_schema.PARTITIONS` 的列（顺序照官方文档）
     PARTITIONS_COLUMNS = (
