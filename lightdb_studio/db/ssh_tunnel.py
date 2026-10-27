@@ -73,6 +73,8 @@ class SshTunnel:
         self._accept_thread = None
         self._stop = threading.Event()
         self._handlers = []
+        # task-61：后台转发线程的错误不能静默；显式记录供调用方/测试检查
+        self.forward_errors = []
 
     # ---------- 生命周期 ----------
 
@@ -171,8 +173,13 @@ class SshTunnel:
                     if not data:
                         break
                     client_sock.sendall(data)
-        except Exception:
-            pass
+        except Exception as exc:                      # noqa: BLE001
+            # 无法把异常抛回前台线程，但绝不静默：记录为显式转发错误
+            try:
+                self.forward_errors.append(
+                    SSHTunnelError(f'SSH direct-tcpip 转发失败: {exc}'))
+            except Exception:
+                pass
         finally:
             try:
                 if channel is not None:
@@ -210,6 +217,10 @@ class SshTunnel:
 
     def is_active(self):
         return bool(self._listener is not None and self._transport is not None)
+
+    def last_forward_error(self):
+        """最近一次 direct-tcpip 转发错误（无则 None）；显式失败证据。"""
+        return str(self.forward_errors[-1]) if self.forward_errors else None
 
     def __enter__(self):
         return self.start()
