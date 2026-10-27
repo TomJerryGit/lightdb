@@ -499,6 +499,18 @@ class Parser:
             # P5：WAL / checkpoint 真实状态（扩展语句；MySQL 无此语句）
             return self._show_result('WAL_STATUS')
 
+        # ---- task-58：SHOW CREATE PROCEDURE / FUNCTION / TRIGGER / EVENT ----
+        # Navicat 备份页会逐对象取 SHOW CREATE；名称支持反引号与 `db.name`
+        # 限定（库名交执行器校验：未知库 1049、未知对象 1305/1360）。
+        scr = re.match(
+            r'(?is)^SHOW\s+CREATE\s+'
+            r'(PROCEDURE|FUNCTION|TRIGGER|EVENT)\s+'
+            r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?\s*;?\s*$', sql)
+        if scr:
+            return self._show_result(
+                'CREATE_' + scr.group(1).upper(), table=scr.group(3),
+                database=scr.group(2))
+
         if re.match(r'(?is)^SHOW\s+CREATE\s+VIEW\b', sql):
             # E3：视图已实现 → 结果集（View/Create View/charset/collation）。
             vm = re.match(

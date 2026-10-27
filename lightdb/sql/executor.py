@@ -8978,6 +8978,143 @@ class Executor:
         'collation_connection', 'Database Collation',
     )
 
+    # ==================== task-58：SHOW CREATE 例程/触发器/事件 ====================
+    #
+    # Navicat 备份页对每个存储对象执行 `SHOW CREATE PROCEDURE/FUNCTION ...`。
+    # 内容来自真实持久化的 `_stored.json`（参数/返回类型/过程体），重建的
+    # DDL 交给本引擎自己的 CREATE 解析器可再次执行（测试验证往返），不是
+    # 编造的固定文本。事件对象引擎未提供对象列表 API 时显式 1360，不 1064。
+    _ROUTINE_SQL_MODE = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES'
+    _ROUTINE_CLIENT_CHARSET = 'utf8mb4'
+    _ROUTINE_CONN_COLLATION = 'utf8mb4_general_ci'
+
+    @classmethod
+    def _routine_params_ddl(cls, params) -> str:
+        parts = []
+        for prm in (params or []):
+            mode = str(prm.get('mode') or 'IN').upper()
+            name = str(prm.get('name') or '').strip().strip('`"')
+            typ = str(prm.get('type') or 'VARCHAR').strip()
+            # 参数名**不**加反引号：本引擎 `parse_params` 不会剥反引号，
+            # 若这里输出 `` `x` ``，重建后的参数名会变成 "`x`" 与过程体里
+            # 的 x 不匹配（实测 CALL 报变量未定义）。裸名可被本引擎再次
+            # 解析且与真实参数名一致。
+            if name:
+                parts.append(f"{mode} {name} {typ}")
+        return ', '.join(parts)
+
+    def _show_create_procedure(self, p, s):
+        """`SHOW CREATE PROCEDURE name`（MySQL 6 列）"""
+        name = str(p.get('table') or '')
+        proc = (self._stored.get_procedure(name)
+                if self._stored is not None else None)
+        if proc is None:
+            return self._err(
+                1305, f"PROCEDURE {name} does not exist",
+                sqlstate='42000')
+        real_name = str(getattr(proc, 'name', name))
+        body = str(getattr(proc, 'body', '') or '')
+        params = self._routine_params_ddl(getattr(proc, 'params', None))
+        ddl = (f"CREATE PROCEDURE `{real_name}`({params})\n{body}")
+        cols = ['Procedure', 'sql_mode', 'Create Procedure',
+                'character_set_client', 'collation_connection',
+                'Database Collation']
+        return self._rs(cols, [(real_name, self._ROUTINE_SQL_MODE, ddl,
+                                self._ROUTINE_CLIENT_CHARSET,
+                                self._ROUTINE_CONN_COLLATION,
+                                self._ROUTINE_CONN_COLLATION)])
+
+    def _show_create_function(self, p, s):
+        """`SHOW CREATE FUNCTION name`（MySQL 6 列）"""
+        name = str(p.get('table') or '')
+        fn = (self._stored.get_function(name)
+              if self._stored is not None else None)
+        if fn is None:
+            return self._err(
+                1305, f"FUNCTION {name} does not exist", sqlstate='42000')
+        real_name = str(getattr(fn, 'name', name))
+        body = str(getattr(fn, 'body', '') or '')
+        params = self._routine_params_ddl(getattr(fn, 'params', None))
+        ret = str(getattr(fn, 'return_type', '') or 'INT')
+        ddl = (f"CREATE FUNCTION `{real_name}`({params}) "
+               f"RETURNS {ret}\n{body}")
+        cols = ['Function', 'sql_mode', 'Create Function',
+                'character_set_client', 'collation_connection',
+                'Database Collation']
+        return self._rs(cols, [(real_name, self._ROUTINE_SQL_MODE, ddl,
+                                self._ROUTINE_CLIENT_CHARSET,
+                                self._ROUTINE_CONN_COLLATION,
+                                self._ROUTINE_CONN_COLLATION)])
+
+    def _show_create_trigger(self, p, s):
+        """`SHOW CREATE TRIGGER name` —— 真实触发器定义（7 列）
+
+        本引擎触发器定义由 `TriggerManager` 持久化；找得到就如实重建 DDL，
+        找不到按 MySQL 报 1360「Trigger does not exist」（不是 1064）。
+        """
+        name = str(p.get('table') or '')
+        trig = None
+        mgr = getattr(self, '_trigger_mgr', None)
+        if mgr is not None:
+            try:
+                for t in mgr.list_all():
+                    if str(getattr(t, 'name', '')).lower() == name.lower():
+                        trig = t
+                        break
+            except Exception:
+                trig = None
+        if trig is None:
+            return self._err(1360, f"Trigger '{name}' does not exist",
+                             sqlstate='HY000')
+        real_name = str(getattr(trig, 'name', name))
+        table = str(getattr(trig, 'table', '') or '')
+        timing = str(getattr(trig, 'timing', 'BEFORE') or 'BEFORE')
+        event = str(getattr(trig, 'event', 'INSERT') or 'INSERT')
+        body = str(getattr(trig, 'body', '') or '')
+        ddl = (f"CREATE DEFINER=`root`@`localhost` TRIGGER `{real_name}` "
+               f"{timing} {event} ON `{table}` FOR EACH ROW {body}")
+        cols = ['Trigger', 'sql_mode', 'SQL Original Statement',
+                'character_set_client', 'collation_connection',
+                'Database Collation', 'Created']
+        created = time.strftime(
+            '%Y-%m-%d %H:%M:%S',
+            time.localtime(getattr(trig, 'created_at', time.time())))
+        return self._rs(cols, [(real_name, self._ROUTINE_SQL_MODE, ddl,
+                                self._ROUTINE_CLIENT_CHARSET,
+                                self._ROUTINE_CONN_COLLATION,
+                                self._ROUTINE_CONN_COLLATION, created)])
+
+    def _show_create_event(self, p, s):
+        """`SHOW CREATE EVENT name`（真实事件对象来自 EventScheduler）
+
+        事件对象由 `EventScheduler.events` 持有（与建事件同一份内存注册表）。
+        找不到/调度器未启动时显式 1360，绝不返回 1064 或编造行。
+        """
+        name = str(p.get('table') or '')
+        sched = getattr(self, '_event_scheduler', None)
+        ev = None
+        events = getattr(sched, 'events', None) if sched is not None else None
+        if isinstance(events, dict):
+            key = next((k for k in events
+                        if str(k).lower() == name.lower()), None)
+            ev = events.get(key) if key is not None else None
+        if ev is None:
+            return self._err(1360, f"Event '{name}' does not exist",
+                             sqlstate='HY000')
+        real_name = str(getattr(ev, 'name', name))
+        body = str(getattr(ev, 'body', '') or '')
+        secs = getattr(ev, 'schedule_seconds', None)
+        when = (f"EVERY {int(secs)} SECOND" if secs
+                else "EVERY 1 SECOND")
+        ddl = f"CREATE EVENT `{real_name}` ON SCHEDULE {when} DO {body}"
+        cols = ['Event', 'sql_mode', 'time_zone', 'Create Event',
+                'character_set_client', 'collation_connection',
+                'Database Collation']
+        return self._rs(cols, [(real_name, self._ROUTINE_SQL_MODE, 'SYSTEM',
+                                ddl, self._ROUTINE_CLIENT_CHARSET,
+                                self._ROUTINE_CONN_COLLATION,
+                                self._ROUTINE_CONN_COLLATION)])
+
     def _show_triggers(self, p, s):
         """`SHOW TRIGGERS`（F2）—— 触发器的**真实**定义快照
 
