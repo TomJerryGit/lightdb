@@ -244,6 +244,11 @@ class TableSchema:
     #: 本引擎没有独立唯一索引结构，唯一性由写入路径检查强制；这里把它
     #: 原样写回 DDL，恢复后仍然强制（`SHOW INDEX` 报 UNIQUE-CHECK）。
     unique_indexes: list = field(default_factory=list)  # [{'name','columns'}]
+    #: 内部行键（物理 B+Tree 键）列名。`DROP PRIMARY KEY` 后列上没有用户
+    #: 声明的 PRIMARY KEY，但引擎仍需要一个行键扫描/备份；它**不**会写进
+    #: SHOW CREATE / dump 的 DDL（否则等于凭空恢复出一条主键约束），只用于
+    #: 校验"这张表有可用的内部键，备份不会按 NULL/重复键扫描"。
+    row_key: str = None
 
     @property
     def col_names(self):
@@ -311,7 +316,11 @@ class TableSchema:
                 #   `normalize_type` 仍然在**解析/比对**侧使用（`parse_create_table`
                 #   与 `verify_restore`），因此本改动不会让比对口径漂移。
                 'type': str(c.get('type') or ''),
-                'primary': bool(c.get('primary')),
+                # 内部行键（第一列隐式主键）不是用户声明的 PRIMARY KEY：
+                # SHOW CREATE / 逻辑 dump 不能把它写出来，否则备份恢复后
+                # 会凭空多出一条主键约束（DROP PRIMARY KEY 后也是如此）。
+                'primary': (bool(c.get('primary'))
+                            and not c.get('implicit_pk')),
                 'unique': bool(c.get('unique')),
                 'notnull': bool(c.get('notnull')),
                 'has_default': bool(c.get('has_default')),
@@ -339,8 +348,9 @@ class TableSchema:
                 continue
             uq.append({'name': str(spec.get('name') or uq_cols[0]),
                        'columns': uq_cols})
+        row_key = next((c['name'] for c in cols if c.get('primary')), None)
         schema = cls(name=name, columns=columns, table_checks=table_checks,
-                     unique_indexes=uq)
+                     unique_indexes=uq, row_key=row_key)
         # 用与 `Database.create_table` 完全相同的一份命名规则补全自动名：
         # 否则"dump 里的匿名约束"与"恢复后引擎自动命名的约束"名字对不上，
         # 恢复校验会把一次正确恢复误判成失败。
@@ -476,7 +486,7 @@ class TableSchema:
                     raise BackupError(
                         f"表 {self.name} 的 UNIQUE 索引 {spec.get('name')!r} "
                         f"引用了不存在的列 {cn!r}，无法导出")
-        if not any(c.get('primary') for c in self.columns):
+        if not any(c.get('primary') for c in self.columns) and not self.row_key:
             raise BackupError(f"表 {self.name} 没有主键，无法按主键扫描备份")
 
 
@@ -788,9 +798,16 @@ def parse_create_table(stmt: str) -> TableSchema:
                 f"表 {name} 的表级 PRIMARY KEY 引用了不存在的列 {target!r}")
         hit[0]['primary'] = True
 
+    # 没有显式 PRIMARY KEY 的 DDL（例如源表执行过 DROP PRIMARY KEY）仍可
+    # 恢复：引擎会为第一列建立内部行键；dump 侧用同一列作为行键扫描，
+    # 但**不会**把 PRIMARY KEY 写回 DDL（否则恢复后会凭空多一条约束）。
+    if not any(c.get('primary') for c in columns) and columns:
+        row_key = columns[0]['name']
+    else:
+        row_key = next((c['name'] for c in columns if c.get('primary')), None)
     schema = TableSchema(name=name, columns=columns,
                          table_checks=table_checks,
-                         unique_indexes=table_unique)
+                         unique_indexes=table_unique, row_key=row_key)
     # 匿名约束按与 `Database.create_table` 相同的规则补名，再自检支持面
     _assign_check_names(schema)
     schema.assert_supported()

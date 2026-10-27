@@ -3372,6 +3372,51 @@ class Parser:
             return {'command': 'ALTER TABLE', 'table': table,
                     'action': 'AUTO_INCREMENT', 'value': int(aim.group(1))}
 
+        # ---- task-62：ADD/DROP PRIMARY KEY、ADD UNIQUE、DROP INDEX ----
+        # 这些动作从"明确不支持列表"里移出，解析成结构化 AST 交由执行器
+        # 校验（列存在/重复值/已有主键/自增依赖等语义见 db/database.py）。
+        apm = re.match(
+            r'ADD\s+(?:CONSTRAINT\s+[`"]?\w+[`"]?\s+)?PRIMARY\s+KEY\s*\(',
+            action, re.IGNORECASE | re.DOTALL)
+        if apm:
+            inner, end = self._extract_paren(action, apm.end() - 1)
+            cols = self._parse_key_columns(inner, 'PRIMARY KEY')
+            tail = action[end + 1:].strip()
+            if tail:
+                raise SyntaxError(
+                    f"ALTER TABLE ADD PRIMARY KEY 尾部有多余内容 "
+                    f"{tail[:80]!r}")
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'ADD PRIMARY KEY', 'columns': cols}
+
+        aum = re.match(
+            r'ADD\s+(?:CONSTRAINT\s+[`"]?(\w+)[`"]?\s+)?UNIQUE'
+            r'(?:\s+(?:INDEX|KEY))?(?:\s+[`"]?(\w+)[`"]?)?\s*\(',
+            action, re.IGNORECASE | re.DOTALL)
+        if aum:
+            inner, end = self._extract_paren(action, aum.end() - 1)
+            cols = self._parse_key_columns(inner, 'UNIQUE')
+            tail = action[end + 1:].strip()
+            if tail:
+                raise SyntaxError(
+                    f"ALTER TABLE ADD UNIQUE 尾部有多余内容 {tail[:80]!r}")
+            name = aum.group(2) or aum.group(1)
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'ADD UNIQUE', 'name': name,
+                    'columns': cols}
+
+        dpm = re.fullmatch(r'DROP\s+PRIMARY\s+KEY', action.strip(),
+                           re.IGNORECASE)
+        if dpm:
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'DROP PRIMARY KEY'}
+
+        dim = re.fullmatch(r'DROP\s+INDEX\s+[`"]?(\w+)[`"]?\s*', action,
+                           re.IGNORECASE)
+        if dim:
+            return {'command': 'ALTER TABLE', 'table': table,
+                    'action': 'DROP INDEX', 'name': dim.group(1)}
+
         # ---- 明确不支持的变体（先判前缀，避免被 ADD/DROP 抢先匹配）----
         for prefix, label in sorted(self._ALTER_UNSUPPORTED_ACTIONS,
                                     key=lambda kv: -len(kv[0])):

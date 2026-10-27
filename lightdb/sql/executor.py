@@ -1713,6 +1713,36 @@ class Executor:
             return self._ok(
                 message=(f"Table '{table}' altered: AUTO_INCREMENT set to "
                          f"{nxt}（实际下一号；SHOW CREATE/STATUS 如实回显）"))
+        if action == 'ADD PRIMARY KEY':
+            stats = self.db.alter_add_primary_key(
+                table, p.get('columns') or [])
+            return self._ok(
+                message=(f"Table '{table}' altered: PRIMARY KEY ("
+                         f"{', '.join(stats.get('columns') or [])}) added"
+                         f"（{stats.get('rows', 0)} 行已校验唯一/NOT NULL"
+                         + ("，主键 B+Tree 已按新列重建"
+                            if stats.get('rekeyed') else '')
+                         + '；SHOW CREATE/COLUMNS/INDEX 同步）'))
+        if action == 'DROP PRIMARY KEY':
+            stats = self.db.alter_drop_primary_key(table)
+            return self._ok(
+                message=(f"Table '{table}' altered: PRIMARY KEY dropped"
+                         f"（列 '{stats.get('column')}' 保留 NOT NULL；"
+                         f"物理行键继续由该列支撑，可再 ADD PRIMARY KEY）"))
+        if action == 'ADD UNIQUE':
+            stats = self.db.alter_add_unique(
+                table, p.get('name'), p.get('columns') or [])
+            return self._ok(
+                message=(f"Table '{table}' altered: UNIQUE INDEX "
+                         f"'{stats.get('name')}' added ("
+                         f"{', '.join(stats.get('columns') or [])}"
+                         f"；已有数据唯一性已校验，SHOW INDEX/SHOW CREATE 同步"))
+        if action == 'DROP INDEX':
+            stats = self.db.drop_index(table, p.get('name'))
+            kind = 'UNIQUE INDEX' if stats.get('unique') else 'INDEX'
+            return self._ok(
+                message=(f"Table '{table}' altered: {kind} "
+                         f"'{stats.get('dropped')}' dropped"))
         if action == 'ADD COLUMN':
             col = dict(p['column'])
             stats = self.db.alter_add_column(

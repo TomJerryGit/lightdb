@@ -76,7 +76,7 @@ def column_key(col: dict) -> str:
     `UNIQUE KEY (列)` 覆盖到的列由 `describe_columns` 补 `UNI`
     （那需要表的上下文，单列字典看不到）。
     """
-    if col.get('primary'):
+    if col.get('primary') and not col.get('implicit_pk'):
         return 'PRI'
     if col.get('unique'):
         return 'UNI'
@@ -1602,6 +1602,189 @@ class Database:
         raise DdlError(
             f"Can't DROP '{name}'; check that column/key exists",
             errno=1091, sqlstate='42000')
+
+    # ==================== P2/task-62：ALTER 主键 / 唯一约束 ====================
+
+    @staticmethod
+    def _primary_type_base(col: dict) -> str:
+        return str(col.get('type') or '').strip().upper().split('(')[0]
+
+    @staticmethod
+    def _explicit_primary_cols(tbl) -> List[dict]:
+        """用户**显式声明**的主键列（排除第一列内部行键的隐式标记）"""
+        return [c for c in tbl.cols
+                if c.get('primary') and not c.get('implicit_pk')]
+
+    @staticmethod
+    def _auto_increment_cols(tbl) -> List[str]:
+        return [c['name'] for c in tbl.cols if c.get('auto_increment')]
+
+    def _rekey_primary_key(self, tbl, new_idx: int, new_col: dict):
+        """把物理主键 B+Tree 从旧列重建到 `new_col`（行数据载荷不变）
+
+        只在 `new_col` 的所有活行值都非 NULL、唯一、可转成主键类型后调用。
+        新建一棵 B+Tree，把每个主键映射到该行**当前可见版本**的页/槽位；
+        旧树页变成不可达孤儿页（不参与扫描，COMPACT 可回收）。写入新根
+        指针前先 flush 所有脏页，避免"根已落盘、叶子没落盘"的不可达索引。
+        """
+        from ..storage.btree import BTree
+        rows = tbl._visible_pks(None)
+        new_bt = BTree(tbl.bp, root_page_id=None)
+        seen = set()
+        for _oldpk, values, _xmin, _xmax, pid, sid in rows:
+            raw = values[new_idx] if new_idx < len(values) else None
+            key = coerce(raw, new_col['type'])
+            ikey = int(key)
+            if ikey in seen:
+                raise DdlError(
+                    f"Duplicate entry '{raw}' for key 'PRIMARY'",
+                    errno=1062, sqlstate='23000')
+            seen.add(ikey)
+            new_bt.insert(ikey, pid, sid)
+        tbl.bp.flush()
+        tbl.bt = new_bt
+        tbl._save_btree_root(new_bt.root_page_id, sync=True)
+        tbl.pk_idx = new_idx
+        tbl.pk_col = new_col['name']
+        tbl.pk_type = new_col['type']
+        tbl._next_pk = tbl._calc_next_pk()
+        tbl._secondary_dirty = True
+
+    def alter_add_primary_key(self, name: str, columns: List[str]) -> dict:
+        """`ALTER TABLE t ADD PRIMARY KEY (col)`（单列；MySQL 语义）
+
+        * 已有显式主键 → 1068 `Multiple primary key defined`；
+        * 列不存在 → 1072；类型不是主键兼容类型 → 1064；
+        * 目标列已有 NULL 值 → 1138 `Invalid use of NULL value`；
+        * 已有重复值 → 1062 `Duplicate entry ... for key 'PRIMARY'`；
+        * AUTO_INCREMENT 列存在且目标不是该列 → 1075（自增列必须是键）；
+        * 成功：主键 B+Tree 真实重键（目标列与旧内部行键不同列时）、
+          `cols` 的主键/NOT NULL 标记与 `_meta.json` 原子更新，
+          `SHOW CREATE` / `SHOW COLUMNS Key` / `SHOW INDEX` 同步。
+        """
+        tbl = self._get_table_for_ddl(name)
+        cols = [str(c).strip().strip('`"') for c in (columns or [])]
+        cols = [c for c in cols if c]
+        if len(cols) != 1:
+            raise DdlError(
+                f"ALTER TABLE {name} ADD PRIMARY KEY 只支持单列主键"
+                f"（本引擎主键 B+Tree 只支持单列；收到 {cols}）",
+                errno=1235, sqlstate='42000')
+        target = cols[0]
+        names = [c['name'] for c in tbl.cols]
+        if target not in names:
+            raise DdlError(
+                f"Key column '{target}' doesn't exist in table '{name}'",
+                errno=1072, sqlstate='42022')
+        if self._explicit_primary_cols(tbl):
+            raise DdlError("Multiple primary key defined", errno=1068,
+                           sqlstate='42000')
+        idx = names.index(target)
+        col = tbl.cols[idx]
+        base = self._primary_type_base(col)
+        if base not in self._PK_COMPATIBLE_TYPES:
+            raise DdlError(
+                f"列 '{target}' 的类型 {col.get('type')} 不能作为主键"
+                f"（主键 B+Tree 键只支持整数类型）", errno=1064)
+        autos = self._auto_increment_cols(tbl)
+        if autos and target not in autos:
+            raise DdlError(
+                f"Incorrect table definition; there can be only one auto "
+                f"column and it must be defined as a key（AUTO_INCREMENT "
+                f"列 {', '.join(autos)} 必须先成为键；显式错误，不静默"
+                f"把自增列变成非键列）", errno=1075, sqlstate='42000')
+        with tbl._lock:
+            self._ddl_guard(tbl, 'ALTER TABLE ... ADD PRIMARY KEY')
+            seen = {}
+            for pk, values in tbl._live_rows():
+                raw = values[idx] if idx < len(values) else None
+                if raw is None:
+                    raise DdlError(
+                        f"Invalid use of NULL value（列 '{target}' 在行 "
+                        f"pk={pk} 上是 NULL，MySQL 不允许把含 NULL 的列"
+                        f"加为主键）", errno=1138, sqlstate='22004')
+                try:
+                    key = coerce(raw, col['type'])
+                except Exception:
+                    raise DdlError(
+                        f"Incorrect integer value: '{raw}' for column "
+                        f"'{target}' at row pk={pk}", errno=1366,
+                        sqlstate='HY000')
+                if key in seen:
+                    raise DdlError(
+                        f"Duplicate entry '{raw}' for key 'PRIMARY'",
+                        errno=1062, sqlstate='23000')
+                seen[key] = pk
+            same_col = (target == getattr(tbl, 'pk_col', None))
+            if not same_col:
+                # 结构变化涉及行键重写：先退休 WAL，避免恢复时用旧主键
+                # 重放这些行；随后重建 B+Tree 并同步元数据。
+                self._ddl_retire_wal(tbl, 'ADD PRIMARY KEY')
+                self._rekey_primary_key(tbl, idx, col)
+            new_cols = [dict(c) for c in tbl.cols]
+            for c in new_cols:
+                c['primary'] = False
+                c['implicit_pk'] = False
+            new_cols[idx]['primary'] = True
+            new_cols[idx]['implicit_pk'] = False
+            new_cols[idx]['notnull'] = True
+            tbl.cols = new_cols
+            tbl.refresh_schema_meta()
+            self.save_meta()
+        return {'columns': [target], 'rows': len(seen),
+                'rekeyed': not same_col}
+
+    def alter_drop_primary_key(self, name: str) -> dict:
+        """`ALTER TABLE t DROP PRIMARY KEY`
+
+        * 没有显式主键 → 1091（MySQL：`Can't DROP 'PRIMARY'`）；
+        * 存在 AUTO_INCREMENT 列 → 1075（自增列必须保持为键；显式拒绝，
+          不会留下"自增列不再是键"的坏定义）；
+        * 成功：约束从元数据移除（列保留 NOT NULL），物理行键继续由该列
+          作为内部隐式键支撑（本引擎每张表都需要一个行键），因此数据与
+          索引始终一致；随后可再 `ADD PRIMARY KEY` 恢复显式约束。
+        """
+        tbl = self._get_table_for_ddl(name)
+        explicit = self._explicit_primary_cols(tbl)
+        if not explicit:
+            raise DdlError(
+                f"Can't DROP 'PRIMARY'; check that column/key exists",
+                errno=1091, sqlstate='42000')
+        autos = self._auto_increment_cols(tbl)
+        if autos:
+            raise DdlError(
+                f"Incorrect table definition; there can be only one auto "
+                f"column and it must be defined as a key（AUTO_INCREMENT 列 "
+                f"{', '.join(autos)} 依赖主键，不能 DROP PRIMARY KEY；"
+                f"请先移除 AUTO_INCREMENT 或保留主键）", errno=1075,
+                sqlstate='42000')
+        pkcol = explicit[0]['name']
+        with tbl._lock:
+            self._ddl_guard(tbl, 'ALTER TABLE ... DROP PRIMARY KEY')
+            new_cols = [dict(c) for c in tbl.cols]
+            for c in new_cols:
+                if c.get('name') == pkcol:
+                    c['implicit_pk'] = True
+                    c['notnull'] = True
+            tbl.cols = new_cols
+            tbl.refresh_schema_meta()
+            self.save_meta()
+        return {'dropped': 'PRIMARY', 'column': pkcol}
+
+    def alter_add_unique(self, name: str, index_name, columns) -> dict:
+        """`ALTER TABLE t ADD UNIQUE [INDEX|KEY] [name] (cols)`
+
+        —— 复用 `CREATE UNIQUE INDEX` 的**真实强制**路径：定义期校验
+        列/重名，已有数据重复 → 1062；非唯一索引/唯一索引共用同一份
+        `_meta.json` 持久化与写入期唯一性检查。
+        """
+        cols = [str(c).strip().strip('`"') for c in (columns or [])]
+        cols = [c for c in cols if c]
+        if not cols:
+            raise DdlError(
+                f"ALTER TABLE {name} ADD UNIQUE 缺少列清单", errno=1064)
+        idx = str(index_name).strip() if index_name else cols[0]
+        return self.create_index(name, idx, cols, unique=True)
 
     def set_auto_increment(self, name: str, value: int) -> int:
         """`ALTER TABLE t AUTO_INCREMENT = n`：设置下一号并持久化

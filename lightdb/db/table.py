@@ -1864,7 +1864,8 @@ class Table:
         多行）。
         """
         out = []
-        pk_cols = [c['name'] for c in self.cols if c.get('primary')]
+        pk_cols = [c['name'] for c in self.cols
+                   if c.get('primary') and not c.get('implicit_pk')]
         if pk_cols:
             out.append({'name': 'PRIMARY', 'unique': True,
                         'columns': pk_cols,
