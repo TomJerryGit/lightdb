@@ -206,13 +206,23 @@ def test_view_missing_base_and_cycles_are_explicit(inproc):
     assert r['code'] == 1050, r
 
 
-def test_view_join_is_explicitly_unsupported(inproc):
+def test_view_join_is_supported(inproc):
+    """task-59：视图 JOIN 已支持（不再是显式 1105）
+
+    `FROM view JOIN table ON ...` 物化视图后做 Hash/嵌套循环 JOIN，结果与
+    等价手写基表 SQL 一致；不支持的 RIGHT/FULL 等形态仍在其它用例显式 1105。
+    """
     _db, ex, s = inproc
     ok(ex, 'CREATE TABLE a (id INT PRIMARY KEY)', s)
     ok(ex, 'CREATE TABLE b (id INT PRIMARY KEY)', s)
+    ok(ex, "INSERT INTO a VALUES (1), (2), (3)", s)
+    ok(ex, "INSERT INTO b VALUES (1), (3), (4)", s)
     ok(ex, 'CREATE VIEW va AS SELECT id FROM a', s)
-    r = err(ex, 'SELECT * FROM va JOIN b ON va.id = b.id', s)
-    assert r['code'] == 1105 and '视图' in r['message'], r
+    r = ok(ex, 'SELECT * FROM va JOIN b ON va.id = b.id', s)
+    assert sorted(tuple(x) for x in r['rows']) == [(1, 1), (3, 3)], r
+    hand = ok(ex, 'SELECT a.id, b.id FROM a JOIN b ON a.id = b.id', s)
+    assert sorted(tuple(x) for x in r['rows']) == \
+        sorted(tuple(x) for x in hand['rows'])
 
 
 def test_view_persists_after_restart(inproc):

@@ -1824,6 +1824,198 @@ class Executor:
                 stack.extend(graph.get(cur, []))
         return False
 
+    def _view_session_rv(self, s):
+        """取当前会话/语句的读视图（表物化与视图展开共用）"""
+        txn = (s or {}).get('txn') if isinstance(s, dict) else None
+        if isinstance(txn, dict):
+            return txn.get('read_view')
+        rv = getattr(self, '_active_read_view', None)
+        return rv
+
+    def _materialize_view_relation(self, view_name, alias, s):
+        """把视图定义执行成内存关系：返回 (qualified_cols, rows, err)
+
+        qualified_cols 形如 ``<alias>.<列>``（join/别名场景需要区分同名列）；
+        视图不存在 1146、循环/过深 1356、定义错误 1064、执行错误透传。
+        """
+        view = self.db.get_view(view_name)
+        if view is None:
+            return None, None, self._err(
+                1146, f"View '{view_name}' doesn't exist",
+                sqlstate='42S02')
+        stack = getattr(self, '_view_expansion_stack', None)
+        if stack is None:
+            stack = []
+            self._view_expansion_stack = stack
+        key = str(view_name).lower()
+        if key in stack:
+            return None, None, self._err(
+                1356,
+                f"View '{view_name}' 循环依赖（展开时检测到递归引用）",
+                sqlstate='HY000')
+        if len(stack) >= 16:
+            return None, None, self._err(
+                1356, "视图嵌套层数超过 16（疑似循环依赖）",
+                sqlstate='HY000')
+        from .parser import parser as _parser
+        stack.append(key)
+        try:
+            try:
+                inner = _parser.parse(view['sql'])
+            except Exception as e:
+                return None, None, self._err(
+                    1064, f"View '{view_name}' 定义无法解析: {e}")
+            if not isinstance(inner, dict):
+                return None, None, self._err(
+                    1064, f"View '{view_name}' 定义不是可执行查询")
+            res = self.execute(inner, s)
+        finally:
+            stack.pop()
+        if not isinstance(res, dict) or res.get('type') == 'error':
+            return None, None, (res if isinstance(res, dict)
+                                else self._err(1105,
+                                               f"View '{view_name}' 执行失败"))
+        cols = list(res.get('columns') or [])
+        rows = [list(r) for r in (res.get('rows') or [])]
+        if view.get('columns'):
+            if len(view['columns']) != len(cols):
+                return None, None, self._err(
+                    1356,
+                    f"View '{view_name}' 的列别名数量 "
+                    f"({len(view['columns'])}) 与查询列数 ({len(cols)}) 不一致",
+                    sqlstate='HY000')
+            cols = list(view['columns'])
+        qalias = alias or view_name
+        return [f"{qalias}.{c}" for c in cols], rows, None
+
+    def _materialize_table_relation(self, table_name, alias, s):
+        """把真实表读成内存关系（JOIN 视图时需要物化另一侧）"""
+        if table_name not in self.db.tables:
+            return None, None, self._err(
+                1146, f"Table '{table_name}' doesn't exist",
+                sqlstate='42S02')
+        tbl = self.db.tables[table_name]
+        try:
+            cols, rows = tbl.select(['*'], None, None, None,
+                                    read_view=self._view_session_rv(s))
+        except Exception as e:
+            return None, None, self._err(
+                getattr(e, 'errno', None) or 1105, str(e))
+        qalias = alias or table_name
+        return ([f"{qalias}.{c}" for c in cols],
+                [list(r) for r in rows], None)
+
+    def _materialize_source(self, name, alias, s):
+        if self.db.get_view(name) is not None:
+            return self._materialize_view_relation(name, alias, s)
+        return self._materialize_table_relation(name, alias, s)
+
+    def _select_join_with_views(self, p, s):
+        """`FROM view|table [alias] JOIN view|table ...`：物化后内存 JOIN
+
+        采用「物化 → 等值 Hash Join / 非等值嵌套循环 → 复用统一 SELECT
+        路径」：参与 JOIN 的视图与基表都先物化成内存关系。支持
+        INNER / LEFT [OUTER] / CROSS JOIN；RIGHT/FULL JOIN、重复别名、
+        WHERE 含子查询等无法无歧义处理的形态显式 1105（不静默错答）。
+        """
+        main_name = p.get('table')
+        joins = p.get('joins') or []
+        main_alias = p.get('table_alias')
+        cols, rows, e = self._materialize_source(main_name, main_alias, s)
+        if e is not None:
+            return e
+        used_aliases = {str((main_alias or main_name)).lower()}
+        for j in joins:
+            jtype = str(j.get('type') or 'INNER').upper()
+            if jtype not in ('INNER', 'LEFT', 'LEFT OUTER', 'CROSS'):
+                return self._err(
+                    1105,
+                    f"视图 JOIN 暂不支持 {jtype} JOIN（显式错误，不静默"
+                    f"返回错误结果）；请改用 INNER/LEFT JOIN 或子查询")
+            jname = j.get('table')
+            jalias = j.get('alias') or jname
+            if str(jalias).lower() in used_aliases:
+                return self._err(
+                    1105,
+                    f"视图 JOIN 的别名 '{jalias}' 重复（同一来源被引用两次"
+                    f"时必须使用不同别名；显式错误，不静默把列绑错）")
+            used_aliases.add(str(jalias).lower())
+            jcols, jrows, e = self._materialize_source(jname, jalias, s)
+            if e is not None:
+                return e
+            on = j.get('on') or {}
+            cond = on.get('filter') if isinstance(on, dict) else None
+            left_key = on.get('left') if isinstance(on, dict) else None
+            right_key = on.get('right') if isinstance(on, dict) else None
+            new_cols = list(cols) + list(jcols)
+            new_rows = []
+            # ---- 等值连接走 Hash Join（O(N+M)）；非等值 ON 才嵌套循环。
+            # 大数据量视图 JOIN（2000×5000）嵌套循环实测要 20s+，必须走
+            # 哈希桶；parser 只在 ON 恰为「两列等值」时给 left/right。
+            hash_join = False
+            li = ri = -1
+            if jtype in ('INNER', 'LEFT', 'LEFT OUTER') and cond is not None \
+                    and isinstance(left_key, str) and isinstance(right_key, str):
+                try:
+                    li = cols.index(left_key)
+                    ri = jcols.index(right_key)
+                    hash_join = True
+                except ValueError:
+                    hash_join = False
+            if hash_join:
+                buckets = {}
+                for jr in jrows:
+                    buckets.setdefault(jr[ri], []).append(jr)
+                is_left = jtype in ('LEFT', 'LEFT OUTER')
+                for r in rows:
+                    matched = False
+                    for jr in buckets.get(r[li], ()):
+                        new_rows.append(list(r) + list(jr))
+                        matched = True
+                    if is_left and not matched:
+                        new_rows.append(list(r) + [None] * len(jcols))
+            elif jtype in ('INNER', 'CROSS') or cond is None:
+                for r in rows:
+                    for jr in jrows:
+                        cand = list(r) + list(jr)
+                        if cond is None or \
+                                self._eval_condition(cand, new_cols, cond):
+                            new_rows.append(cand)
+            else:                                 # LEFT [OUTER] JOIN
+                for r in rows:
+                    matched = False
+                    for jr in jrows:
+                        cand = list(r) + list(jr)
+                        if self._eval_condition(cand, new_cols, cond):
+                            new_rows.append(cand)
+                            matched = True
+                    if not matched:
+                        new_rows.append(list(r) + [None] * len(jcols))
+            cols, rows = new_cols, new_rows
+        rel = _CTERelation(str(main_name), list(cols), rows)
+        p2 = dict(p)
+        p2['joins'] = []
+        p2['table_alias'] = None
+        # 外层 WHERE 在**连接后的关系**上求值：这里必须先求（而不是交给
+        # `_select_advanced`），因为后者会剥掉列限定名，`a.dept`/`b.dept`
+        # 同名时会被误判为「列 dept 歧义」；直接用完整限定列名求值即可。
+        where = p2.get('where')
+        if where:
+            if self._contains_subquery(where):
+                return self._err(
+                    1105, "视图 JOIN 的 WHERE 子查询暂不支持（显式错误，"
+                          "不静默返回错误结果）；请改写成手写基表 JOIN "
+                          "或先物化子查询")
+            try:
+                rows = [r for r in rows
+                        if self._eval_condition(r, cols, where) is True]
+            except Exception as e:
+                return self._err(
+                    1105, f"视图 JOIN 的外层 WHERE 求值失败: {e}")
+            rel = _CTERelation(str(main_name), list(cols), rows)
+            p2['where'] = None
+        return self._select_advanced(p2, rel, session=s)
+
     def _select_from_view(self, p, s, view_name):
         """`SELECT ... FROM view ...`：物化视图查询 + 复用外层查询路径
 
@@ -1834,10 +2026,9 @@ class Executor:
         * `SELECT ... FROM view JOIN ...` 暂不支持 → 显式 1105（不静默错答）。
         """
         if p.get('joins'):
-            return self._err(
-                1105,
-                f"从视图 '{view_name}' JOIN 其他表暂不支持（显式错误，"
-                f"不静默返回错误结果）；请改写成子查询或直接查基表")
+            # task-59：视图 JOIN —— 物化视图/表后做内存 JOIN，再复用统一
+            # SELECT 路径（WHERE/GROUP BY/HAVING/ORDER BY/LIMIT 全支持）。
+            return self._select_join_with_views(p, s)
         view = self.db.get_view(view_name)
         if view is None:
             return self._err(1146, f"View '{view_name}' doesn't exist",
@@ -2471,9 +2662,12 @@ class Executor:
             return self._err(1062, self._ambiguous_outer_ref_message(
                 amb, table, p.get('table_alias')))
 
-        # 有 JOIN → 用计划执行器
+        # 有 JOIN → 用计划执行器；JOIN 目标含视图时必须先物化视图
         joins = p.get('joins') or []
         if joins:
+            if any(self.db.get_view(str(j.get('table')) or '') is not None
+                   for j in joins):
+                return self._select_join_with_views(p, s)
             return self._exec_join_query(p, s)
 
         # 单表
@@ -2631,9 +2825,10 @@ class Executor:
 
         cols, rows = tbl.select(
             p['columns'], where,
-            # 存储层只认单键 `(列, desc)`；走到这里时 `_order_by_needs_eval`
-            # 已经保证「最多一个键、且键就是投影输出列名」。
-            (ob_keys[0] if ob_keys else None),
+            # task-59：存储层现在支持多键 ORDER BY（内存稳定排序；若键
+            # 与二级索引列前缀一致则直接按索引序取行 + LIMIT 提前停止）。
+            # 走到这里时 `_order_by_needs_eval` 已保证所有键都是投影列。
+            ob_keys,
             # 存储层只认 limit；OFFSET 靠多取 offset 行再切片实现
             (int(p['limit']) + int(p.get('offset') or 0))
             if p.get('limit') is not None else None,
@@ -3839,8 +4034,6 @@ class Executor:
         keys = normalize_order_by(order_by)
         if not keys:
             return False
-        if len(keys) > 1:
-            return True
         out_names = (cls._projection_output_names(columns)
                      if columns is not None else None)
         if out_names is None:
@@ -3858,7 +4051,7 @@ class Executor:
                 if out_names is None:
                     return False
                 if t in out_names or t.strip('`"') in out_names:
-                    return False
+                    continue
                 return True
             # 非纯列名：表达式（或认不出的形态）一律走统一路径
             return True

@@ -1875,18 +1875,16 @@ class Table:
                         'columns': list(spec['columns']),
                         'cardinality': self._unique_cardinality(spec),
                         'index_type': 'UNIQUE-CHECK'})
-        # P5.1：单列非唯一索引现在有真实的**内存映射**（等值/范围/ORDER BY
-        # 加速，重启后按数据重建），因此 Index_type 如实报 BTREE；
-        # 多列索引仍只有声明元数据（planner 回退全表扫描）→ SCAN-ASSIST。
-        # Cardinality 都是真实的不同非 NULL 键值个数（不是估计值）。
+        # P5.1/task-59：单列与多列非唯一索引都有真实的**内存映射**
+        # （多列按最左前缀等值/范围/ORDER BY 加速，重启后按数据重建），
+        # 因此 Index_type 如实报 BTREE；Cardinality 是真实的不同非 NULL
+        # 键值个数（多列按整组元组计，不是估计值）。
         for spec in self._secondary_indexes:
             cols = list(spec['columns'])
-            accelerated = len(cols) == 1
             out.append({'name': spec['name'], 'unique': False,
                         'columns': cols,
                         'cardinality': self._index_cardinality(cols),
-                        'index_type': 'BTREE' if accelerated
-                        else 'SCAN-ASSIST'})
+                        'index_type': 'BTREE'})
         return out
 
     def _unique_cardinality(self, spec):
@@ -2598,29 +2596,43 @@ class Table:
             return False
         return True
 
-    def _secondary_spec_for_column(self, name):
+    def _secondary_specs_for_column(self, name):
+        out = []
         for spec in (self._secondary_indexes or []):
             cols = [str(c) for c in (spec.get('columns') or [])]
-            if len(cols) == 1 and cols[0] == name:
+            if name in cols:
+                out.append(spec)
+        return out
+
+    def _secondary_spec_for_column(self, name):
+        """以 `name` 为**首列**的二级索引（ORDER BY 前缀匹配用）"""
+        for spec in (self._secondary_indexes or []):
+            cols = [str(c) for c in (spec.get('columns') or [])]
+            if cols and cols[0] == name:
                 return spec
         return None
 
     def _rebuild_secondary_maps(self):
+        """重建二级索引映射：每个长度 k 一份「前 k 列元组 -> pk 集合」"""
         maps = {}
         for spec in (self._secondary_indexes or []):
             cols = [str(c) for c in (spec.get('columns') or [])]
-            if len(cols) != 1:
+            if not cols:
                 continue
             try:
-                ci = self._col_idx(cols[0])
+                cis = [self._col_idx(c) for c in cols]
             except KeyError:
                 continue
-            m = {}
+            n = len(cols)
+            by_len = [None] + [{} for _ in range(n)]
             for pk, values in self._live_rows():
-                key = values[ci] if ci < len(values) else None
-                m.setdefault(key, set()).add(pk)
+                vals = [values[ci] if ci < len(values) else None
+                        for ci in cis]
+                for k in range(1, n + 1):
+                    by_len[k].setdefault(tuple(vals[:k]), set()).add(pk)
             maps[str(spec.get('name'))] = {
-                'spec': spec, 'map': m, 'sorted': None}
+                'spec': spec, 'maps': by_len,
+                'sorted': [None] * (n + 1)}
         self._secondary_maps = maps
         self._secondary_dirty = False
         self._index_stats['rebuilds'] += 1
@@ -2632,12 +2644,16 @@ class Table:
         return (self._secondary_maps or {}).get(str(spec.get('name')))
 
     @staticmethod
-    def _secondary_sorted_keys(entry):
-        keys = entry.get('sorted')
+    def _secondary_key_order(key):
+        """元组键的 NULL-last 排序键（逐列 `(is_none, value)`）"""
+        return tuple((v is None, v) for v in key)
+
+    def _secondary_sorted_keys(self, entry, prefix_len):
+        keys = entry['sorted'][prefix_len]
         if keys is None:
-            keys = sorted(entry['map'].keys(),
-                          key=lambda v: (v is None, v))
-            entry['sorted'] = keys
+            keys = sorted(entry['maps'][prefix_len].keys(),
+                          key=self._secondary_key_order)
+            entry['sorted'][prefix_len] = keys
         return keys
 
     def _secondary_conjuncts(self, where):
@@ -2653,56 +2669,89 @@ class Table:
         return out
 
     def _secondary_plan(self, where):
-        """选择可用索引：返回 (spec, [conditions]) 或 None"""
+        """选择可用索引：返回 (spec, {列下标: [条件]}) 或 None
+
+        对多列索引按最左前缀评分：连续等值列越多越优先；下一列的范围
+        条件同样可用。非最左前缀（跳过首列）不参与评分 → 安全回退。
+        """
         if not isinstance(where, dict) or 'or' in where:
             return None
-        groups = {}
-        for cond in self._secondary_conjuncts(where):
-            op = cond.get('op')
-            if op not in self._SECONDARY_INDEX_OPS:
-                continue
-            spec = self._secondary_spec_for_column(cond.get('column'))
-            if spec is None:
-                continue
-            key = str(spec.get('name'))
-            groups.setdefault(key, [spec, []])[1].append(cond)
-        if not groups:
+        conj = self._secondary_conjuncts(where)
+        if not conj:
             return None
-        # 优先有等值条件的索引；否则取第一个范围条件索引
-        for spec, conds in groups.values():
-            if any(c.get('op') == '=' for c in conds):
-                return spec, conds
-        return next(iter(groups.values()))
+        best = None
+        for spec in (self._secondary_indexes or []):
+            cols = [str(c) for c in (spec.get('columns') or [])]
+            if not cols:
+                continue
+            by_idx = {}
+            for cond in conj:
+                if cond.get('op') not in self._SECONDARY_INDEX_OPS:
+                    continue
+                cname = cond.get('column')
+                if cname not in cols:
+                    continue
+                by_idx.setdefault(cols.index(cname), []).append(cond)
+            if not by_idx or 0 not in by_idx:
+                continue            # 最左前缀不满足：该索引不可用
+            prefix = 0
+            for i in range(len(cols)):
+                if any(c.get('op') == '=' for c in by_idx.get(i, ())):
+                    prefix = i + 1
+                else:
+                    break
+            next_range = any(c.get('op') != '='
+                             for c in by_idx.get(prefix, ()))
+            if prefix == 0 and not next_range:
+                continue
+            score = (prefix, len(cols))
+            if best is None or score > best[0]:
+                best = (score, spec, by_idx)
+        if best is None:
+            return None
+        return best[1], best[2]
 
-    def _secondary_candidate_pks(self, spec, conds):
+    def _secondary_candidate_pks(self, spec, by_idx):
         entry = self._secondary_entry(spec)
         if entry is None:
             return None
-        m = entry['map']
-        col = str((spec.get('columns') or [''])[0])
-        try:
-            ci = self._col_idx(col)
-        except KeyError:
-            return None
-        ctype = self.cols[ci].get('type')
-
-        def conv(v):
+        cols = [str(c) for c in (spec.get('columns') or [])]
+        n = len(cols)
+        ctypes = []
+        for c in cols:
             try:
-                return coerce(v, ctype)
+                ctypes.append(self.cols[self._col_idx(c)].get('type'))
+            except KeyError:
+                return None
+
+        def conv(v, i):
+            try:
+                return coerce(v, ctypes[i])
             except Exception:
                 return v
 
-        eq = [c for c in conds if c.get('op') == '=']
-        if eq:
-            return set(m.get(conv(eq[-1].get('value')), ()))
-        # 范围：合并同一列上的上下界（= 已单独处理）
+        eq_vals = []
+        for i in range(n):
+            eqs = [c for c in by_idx.get(i, ()) if c.get('op') == '=']
+            if not eqs:
+                break
+            eq_vals.append(conv(eqs[-1].get('value'), i))
+        prefix = len(eq_vals)
+        if prefix >= n:
+            return set(entry['maps'][n].get(tuple(eq_vals), ()))
+        range_conds = [c for c in by_idx.get(prefix, ())
+                       if c.get('op') in ('<', '>', '<=', '>=')]
+        if not range_conds:
+            if prefix == 0:
+                return None
+            return set(entry['maps'][prefix].get(tuple(eq_vals), ()))
         lower = upper = None
         lower_inc = upper_inc = True
-        for c in conds:
-            v = conv(c.get('value'))
+        for c in range_conds:
+            v = conv(c.get('value'), prefix)
             op = c.get('op')
             if v is None:
-                return set()            # 范围比较 NULL 在 SQL 三值逻辑下无行
+                return set()
             try:
                 if op == '>':
                     if lower is None or v > lower or \
@@ -2718,44 +2767,72 @@ class Table:
                 elif op == '<=':
                     if upper is None or v < upper:
                         upper, upper_inc = v, True
-            except TypeError:                # 类型不可比：安全回退
+            except TypeError:
                 return None
-        keys = [k for k in self._secondary_sorted_keys(entry)
-                if k is not None]
+        fixed = tuple(eq_vals)
+        keys = [k for k in self._secondary_sorted_keys(entry, prefix + 1)
+                if k[:prefix] == fixed and k[prefix] is not None]
+        vals = [k[prefix] for k in keys]
         lo = 0
-        hi = len(keys)
+        hi = len(vals)
         if lower is not None:
-            lo = (bisect.bisect_left(keys, lower) if lower_inc
-                  else bisect.bisect_right(keys, lower))
+            lo = (bisect.bisect_left(vals, lower) if lower_inc
+                  else bisect.bisect_right(vals, lower))
         if upper is not None:
-            hi = (bisect.bisect_right(keys, upper) if upper_inc
-                  else bisect.bisect_left(keys, upper))
+            hi = (bisect.bisect_right(vals, upper) if upper_inc
+                  else bisect.bisect_left(vals, upper))
         out = set()
+        full_map = entry['maps'][prefix + 1]
         for k in keys[lo:hi]:
-            out.update(m.get(k, ()))
+            out.update(full_map.get(k, ()))
         return out
 
+    def _normalize_order_keys(self, order_by):
+        """把 `(col, desc)` / `[(col, desc), ...]` 归一成键列表"""
+        if not order_by:
+            return []
+        if isinstance(order_by, (list, tuple)) and order_by \
+                and isinstance(order_by[0], (list, tuple)):
+            return [(str(c), bool(d)) for c, d in order_by]
+        if isinstance(order_by, (list, tuple)) and len(order_by) >= 2:
+            return [(str(order_by[0]), bool(order_by[1]))]
+        return []
+
     def _index_ordered_pks(self, order_by, where, limit, read_view):
-        """ORDER BY 单列（该列有二级索引）时的有序主键流；不可用返回 None"""
-        if not order_by or not self._secondary_usable(read_view):
+        """ORDER BY 与某个二级索引列前缀一致时的有序主键流；否则 None
+
+        只支持**所有键同向**（全 ASC/全 DESC）且键序列是索引列前缀；
+        混合方向/非前缀 → 安全回退（由调用方内存排序）。
+        """
+        ob = self._normalize_order_keys(order_by)
+        if not ob or not self._secondary_usable(read_view):
             return None
-        try:
-            col, desc = order_by[0], bool(order_by[1])
-        except Exception:
+        dirs = {d for _c, d in ob}
+        if len(dirs) != 1:
             return None
-        spec = self._secondary_spec_for_column(col)
+        desc = dirs.pop()
+        spec = None
+        for cand in (self._secondary_indexes or []):
+            cols = [str(c) for c in (cand.get('columns') or [])]
+            if len(cols) >= len(ob) and \
+                    [c for c, _d in ob] == cols[:len(ob)]:
+                if spec is None or len(cols) > len(
+                        spec.get('columns') or []):
+                    spec = cand
         if spec is None:
             return None
         entry = self._secondary_entry(spec)
         if entry is None:
             return None
-        keys = list(self._secondary_sorted_keys(entry))
+        k = len(ob)
+        keys = list(self._secondary_sorted_keys(entry, k))
         if desc:
             keys.reverse()
+        full_map = entry['maps'][k]
         out = []
         max_n = int(limit) if limit else None
         for key in keys:
-            for pk in sorted(entry['map'].get(key, ())):
+            for pk in sorted(full_map.get(key, ())):
                 v = self._read_version(pk, read_view)
                 if v is None:
                     continue
@@ -2855,14 +2932,15 @@ class Table:
         has_agg = any(
             re.match(r'\w+\s*\(', c.strip())
             for c in columns if c != '*')
+        ob = self._normalize_order_keys(order_by)
         index_ordered = False
         with self._lock:
             ordered_pks = None
-            if order_by and not has_agg:
-                # P5.1：ORDER BY 单列（该列有二级索引）→ 按索引键序取行，
-                # 可带 LIMIT 提前停止；有活跃事务/不支持的表达式时回退。
+            if ob and not has_agg:
+                # P5.1：ORDER BY 与二级索引列前缀一致 → 按索引键序取行，
+                # 可带 LIMIT 提前停止；有活跃事务/不支持形态时回退。
                 ordered_pks = self._index_ordered_pks(
-                    order_by, where, limit, read_view)
+                    ob, where, limit, read_view)
             if ordered_pks is not None:
                 index_ordered = True
                 rows = []
@@ -2892,15 +2970,17 @@ class Table:
                 for r in rows
             ]
 
-        if order_by and not index_ordered:
-            col, desc = order_by
-            try:
-                i = out_cols.index(col)
+        if ob and not index_ordered:
+            # 多键排序：从最后一个键往前做**稳定排序**（与统一路径的
+            # NULL 语义一致：ASC 时 NULL 最后、DESC 时 NULL 最前）。
+            for col, desc in reversed(ob):
+                try:
+                    i = out_cols.index(col)
+                except ValueError:
+                    continue
                 out_rows.sort(
                     key=lambda r: (r[i] is None, r[i]),
-                    reverse=desc)
-            except Exception:
-                pass
+                    reverse=bool(desc))
 
         if limit:
             out_rows = out_rows[:limit]

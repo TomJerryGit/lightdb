@@ -228,8 +228,9 @@ def test_composite_primary_key_is_explicit_1064(tmp_path, decl):
 # ==================== 5. 不支持的索引形态：显式 1064 ====================
 
 UNSUPPORTED_DECLS = [
-    # E2 起非唯一 KEY/INDEX 声明被接受（持久化成 SCAN-ASSIST 声明元数据，
-    # 见 tests/test_mysql_compat_e2.py）；仍不支持的形态如下：
+    # E2/task-59 起非唯一 KEY/INDEX 声明被接受为真实二级索引（等值/范围/
+    # 最左前缀加速，SHOW INDEX 报 BTREE，见 test_perf_deepening.py /
+    # test_view_join_and_multi_index.py）；仍不支持的形态如下：
     ('FULLTEXT KEY ft (body)', 'FULLTEXT'),
     ('FULLTEXT (body)', 'FULLTEXT'),
     ('SPATIAL KEY sp (body)', 'SPATIAL'),

@@ -10,10 +10,10 @@
 二、二级索引（`lightdb/db/table.py`）
     * 单列非唯一索引的真实内存映射：等值 / 范围 / ORDER BY col LIMIT
       加速，结果与全表扫描逐行一致；写后标脏、查询时重建，崩溃/重启后
-      按数据重建；有活跃事务或不支持的表达式（OR/LIKE/表达式/多列索引）
-      安全回退全表扫描。
-    * `SHOW INDEX`：单列索引 Index_type=BTREE、多列仍 SCAN-ASSIST；
-      Cardinality 是真实不同非 NULL 键值个数。
+      按数据重建；有活跃事务或不支持的表达式（OR/LIKE/表达式/非最左
+      前缀）安全回退全表扫描。
+    * `SHOW INDEX`：单列/多列索引 Index_type=BTREE（task-59 起多列按
+      最左前缀加速）；Cardinality 是真实不同非 NULL 键值个数。
     * 量化（本机 10k 行，见 send_message 报告）：点查 ~40x、范围 ~10x、
       ORDER BY LIMIT ~219x。
 三、量化（tests 内不跑重基准，只锁定语义与上界；数字由 probe/harness 产出）。
@@ -533,7 +533,7 @@ def test_show_index_metadata_real_and_type(tmp_path):
         assert by['idx_region']['Index_type'] == 'BTREE'
         # 多列索引：真实不同 (region,val) 非 NULL 组合数 = 7*3=21
         assert by['idx_multi']['Cardinality'] == 21, by['idx_multi']
-        assert by['idx_multi']['Index_type'] == 'SCAN-ASSIST'
+        assert by['idx_multi']['Index_type'] == 'BTREE'
         # 全部 NULL 的列：真实基数 0，而不是编造一个数字
         _ok(ex, 'CREATE INDEX idx_note ON m (note)')
         idx2 = _ok(ex, 'SHOW INDEX FROM m')
@@ -542,6 +542,6 @@ def test_show_index_metadata_real_and_type(tmp_path):
                     if r[cols2.index('Key_name')] == 'idx_note')
         assert note[cols2.index('Cardinality')] == 0, (cols2, note)
         print(f"\n    SHOW INDEX：单列 BTREE/Cardinality=7、"
-              f"多列 SCAN-ASSIST/Cardinality=21、NULL 列=0（真实值）")
+              f"多列 BTREE/Cardinality=21、NULL 列=0（真实值）")
     finally:
         db.shutdown()

@@ -13,8 +13,8 @@
    主键/唯一/CHECK/注释保持；SHOW CREATE 反映新类型。
 3. **CREATE [UNIQUE] INDEX / DROP INDEX**：独立语句 + 建表内联共用持久化；
    重名 1061 / 未知列 1072 / 同索引重复列 1060 / 不存在索引 1091；
-   SHOW INDEX/SHOW CREATE 如实反映（单列非唯一索引 Index_type=BTREE 且真实
-   加速等值/范围查询；多列索引仍 SCAN-ASSIST）；UNIQUE 冲突 1062
+   SHOW INDEX/SHOW CREATE 如实反映（单列/多列非唯一索引 Index_type=BTREE，
+   多列按最左前缀真实加速等值/范围/ORDER BY 查询）；UNIQUE 冲突 1062
    （含建索引时已有数据冲突）。
 4. **SHOW GRANTS [FOR user]**：基于真实授权数据；不存在用户 1141；
    CURRENT_USER 可用（权限体系已有，E2 补协议/边界测试）。

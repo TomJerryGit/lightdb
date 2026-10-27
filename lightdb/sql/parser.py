@@ -1547,7 +1547,7 @@ class Parser:
         joins = []
         while True:
             jm = re.match(
-                r'\s*(INNER|LEFT|RIGHT|CROSS)?\s*(?:OUTER\s+)?JOIN\s+'
+                r'\s*(INNER|LEFT|RIGHT|FULL|CROSS)?\s*(?:OUTER\s+)?JOIN\s+'
                 r'(?:[`"]?(\w+)[`"]?\s*\.\s*)?[`"]?(\w+)[`"]?',
                 rest, re.IGNORECASE)
             if not jm:
