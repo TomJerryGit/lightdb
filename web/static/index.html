@@ -41,6 +41,10 @@
     <header>
       <div class="logo">🔌 LightDB Studio</div>
       <div class="user-info">
+        <select id="lang-select" class="btn-small" aria-label="语言 / Language">
+          <option value="zh">中文</option>
+          <option value="en">English</option>
+        </select>
         <span id="user-label"></span>
         <button id="logout-btn" class="btn-small">退出</button>
       </div>
@@ -76,6 +80,8 @@
             <button id="import-btn" class="btn-small" data-action="import-csv">⬆ 导入 CSV</button>
             <button id="backup-btn" class="btn-small" data-action="backup">💾 备份</button>
             <button id="sync-btn" class="btn-small" data-action="schema-compare">⇄ 结构对比</button>
+            <button id="chart-bar-btn" class="btn-small" data-action="chart-bar" data-i18n="chart.bar">📊 柱状图</button>
+            <button id="chart-line-btn" class="btn-small" data-action="chart-line" data-i18n="chart.line">📈 折线图</button>
             <input id="import-file-input" type="file" accept=".csv,text/csv" class="hidden-input">
           </div>
           <textarea id="sql-editor" placeholder="-- 输入 SQL
@@ -88,7 +94,17 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           <button id="data-next-btn" class="btn-small">下一页</button>
           <span id="data-page-info" class="status"></span>
           <button id="export-table-btn" class="btn-small">导出 CSV</button>
+          <button id="export-stream-btn" class="btn-small" data-i18n="stream.export">流式导出</button>
           <button id="data-close-btn" class="btn-small">关闭数据页</button>
+        </div>
+        <div id="import-progress" class="status"></div>
+        <button id="cancel-import-btn" class="btn-small hidden">取消导入</button>
+        <div id="chart-panel" class="panel hidden">
+          <h3 data-i18n="chart.title">查询结果图表（本地 SVG，无 CDN）</h3>
+          <div id="chart-output" class="chart-output"></div>
+          <div class="btn-row">
+            <button id="chart-close-btn" class="btn-small" data-i18n="common.close">关闭</button>
+          </div>
         </div>
         <div id="design-panel" class="panel hidden">
           <h3>表设计器（列 / AUTO_INCREMENT / 索引）</h3>
@@ -113,6 +129,8 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           <button id="tool-history-btn" class="tab-btn active" data-tool="history">历史</button>
           <button id="tool-reports-btn" class="tab-btn" data-tool="reports">报表模板</button>
           <button id="tool-quality-btn" class="tab-btn" data-tool="quality">数据质量</button>
+          <button id="tool-er-btn" class="tab-btn" data-tool="er" data-i18n="er.tab">ER 图</button>
+          <button id="tool-plugins-btn" class="tab-btn" data-tool="plugins" data-i18n="plugins.tab">插件</button>
         </div>
 
         <div id="history-section" class="tool-section">
@@ -150,11 +168,30 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           <div id="quality-summary" class="result-info"></div>
           <div id="quality-issues" class="result-table"></div>
         </div>
+
+        <div id="er-section" class="tool-section hidden">
+          <h3 data-i18n="er.title">ER 图（information_schema）</h3>
+          <div class="btn-row">
+            <button id="er-refresh-btn" class="btn-small" data-i18n="common.refresh">刷新</button>
+          </div>
+          <div id="er-status" class="status"></div>
+          <div id="er-output" class="er-output"></div>
+        </div>
+
+        <div id="plugins-section" class="tool-section hidden">
+          <h3 data-i18n="plugins.title">已加载插件</h3>
+          <div class="btn-row">
+            <button id="plugins-refresh-btn" class="btn-small" data-i18n="common.refresh">刷新</button>
+          </div>
+          <div id="plugins-status" class="status"></div>
+          <div id="plugins-table" class="result-table"></div>
+        </div>
       </aside>
     </div>
   </div>
 </div>
 
+<script src="/static/i18n.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

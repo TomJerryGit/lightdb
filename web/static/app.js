@@ -14,6 +14,9 @@ let dataTotal = 0;
 let dataOrderBy = '';
 let dataOrderDesc = false;
 let designColumns = [];
+let lastQueryResult = null;
+let activeImportJob = '';
+let importPollTimer = null;
 let reportTemplates = [];
 let selectedReport = '';
 
@@ -315,6 +318,7 @@ async function loadTableData(table, db, offset) {
     const data = await api('/databases/' + encodeURIComponent(db) +
       '/tables/' + encodeURIComponent(table) + '/data' + q);
     renderTable(data.columns || [], data.rows || []);
+    lastQueryResult = {columns: data.columns || [], rows: data.rows || []};
     dataTotal = data.total === null || data.total === undefined
       ? (data.rows || []).length : data.total;
     $id('table-controls').classList.remove('hidden');
@@ -489,20 +493,19 @@ async function onImportFile(ev) {
   try {
     const text = await file.text();
     const data = await api('/databases/' + encodeURIComponent(currentDB) +
-      '/tables/' + encodeURIComponent(currentTable) + '/import' +
+      '/tables/' + encodeURIComponent(currentTable) + '/import/start' +
       connQuery(''), {
       method: 'POST',
       body: JSON.stringify({csv: text, has_header: true}),
     });
-    setStatus('exec-status',
-      `导入完成：成功 ${data.inserted} 行，失败 ${data.failed} 行`, !data.ok);
-    if (data.errors && data.errors.length) {
-      $id('result-table').appendChild(
-        el('div', 'result-error', JSON.stringify(data.errors.slice(0, 5))));
-    }
-    if (currentTable) await loadTableData(currentTable, currentDB, 0);
+    activeImportJob = data.job_id;
+    $id('cancel-import-btn').classList.remove('hidden');
+    setStatus('import-progress',
+      `导入任务已启动：0/${data.total}`, false);
+    stopImportPolling();
+    importPollTimer = setInterval(() => pollImportJob(activeImportJob), 500);
   } catch (e) {
-    setStatus('exec-status', '导入失败: ' + e.message, true);
+    setStatus('exec-status', '导入启动失败: ' + e.message, true);
   }
 }
 
@@ -584,6 +587,7 @@ async function runQuery() {
       return;
     }
     if (data.columns && data.columns.length) {
+      lastQueryResult = {columns: data.columns, rows: data.rows || []};
       renderTable(data.columns, data.rows);
       $id('result-info').textContent =
         `返回 ${data.row_count} 行 · ${data.elapsed_ms.toFixed(1)} ms`;
@@ -683,13 +687,15 @@ async function loadHistory() {
 // ==================== 报表模板 ====================
 
 function switchTool(tool) {
-  ['history', 'reports', 'quality'].forEach(name => {
+  ['history', 'reports', 'quality', 'er', 'plugins'].forEach(name => {
     const btn = $id('tool-' + name + '-btn');
     if (btn) btn.classList.toggle('active', name === tool);
     const section = $id(name + '-section');
     if (section) section.classList.toggle('hidden', name !== tool);
   });
   if (tool === 'reports') loadReportTemplates();
+  if (tool === 'er') loadER();
+  if (tool === 'plugins') loadPlugins();
 }
 
 function selectedTemplate() {
@@ -925,7 +931,281 @@ function renderQualityIssues(issues) {
   target.appendChild(table);
 }
 
-// ==================== 初始化 ====================
+// ==================== task-63：图表 / ER / 插件 / 流式 ====================
+
+function tr(key, fallback) {
+  return (typeof window.t === 'function') ? window.t(key, fallback) : fallback;
+}
+
+function showChartMessage(message) {
+  const out = $id('chart-output');
+  $id('chart-panel').classList.remove('hidden');
+  clearNode(out);
+  out.appendChild(el('div', 'result-error', message));
+}
+
+function renderChart(kind) {
+  const out = $id('chart-output');
+  $id('chart-panel').classList.remove('hidden');
+  clearNode(out);
+  if (!lastQueryResult || !lastQueryResult.rows ||
+      !lastQueryResult.rows.length) {
+    showChartMessage(tr('chart.empty', '当前查询结果为空，无法绘图'));
+    return;
+  }
+  const cols = lastQueryResult.columns || [];
+  const rows = lastQueryResult.rows || [];
+  let valueIdx = -1;
+  for (let i = 0; i < cols.length; i += 1) {
+    if (rows.some(r => typeof r[i] === 'number' && isFinite(r[i]))) {
+      valueIdx = i;
+      break;
+    }
+  }
+  if (valueIdx < 0) {
+    showChartMessage(tr('chart.no_numeric',
+      '当前结果没有数值列，无法绘图（柱状/折线需要数值列）'));
+    return;
+  }
+  const data = rows.slice(0, 30).map((r, idx) => ({
+    label: String(r[0] !== undefined && r[0] !== null ? r[0] : idx + 1),
+    value: Number(r[valueIdx]) || 0,
+  }));
+  const width = 660, height = 300, padL = 50, padR = 20, padT = 24, padB = 48;
+  const maxV = Math.max(...data.map(d => d.value), 0);
+  const minV = Math.min(...data.map(d => d.value), 0);
+  const span = (maxV - minV) || 1;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  svg.setAttribute('width', String(width));
+  svg.setAttribute('height', String(height));
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', cols[valueIdx] + ' ' + kind + ' chart');
+  const yFor = v => padT + plotH - ((v - minV) / span) * plotH;
+  const xFor = i => padL + (data.length <= 1 ? plotW / 2 :
+    (i / (data.length - 1)) * plotW);
+  const axis = document.createElementNS(NS, 'line');
+  axis.setAttribute('x1', padL); axis.setAttribute('y1', padT + plotH);
+  axis.setAttribute('x2', padL + plotW); axis.setAttribute('y2', padT + plotH);
+  axis.setAttribute('stroke', '#888'); axis.setAttribute('stroke-width', '1');
+  svg.appendChild(axis);
+  const yLabel = document.createElementNS(NS, 'text');
+  yLabel.setAttribute('x', 8); yLabel.setAttribute('y', padT + 8);
+  yLabel.setAttribute('fill', '#9cdcfe'); yLabel.setAttribute('font-size', '11');
+  yLabel.textContent = cols[valueIdx] + ' (max ' + maxV + ')';
+  svg.appendChild(yLabel);
+  if (kind === 'line') {
+    const points = data.map((d, i) => xFor(i) + ',' + yFor(d.value)).join(' ');
+    const line = document.createElementNS(NS, 'polyline');
+    line.setAttribute('points', points);
+    line.setAttribute('fill', 'none');
+    line.setAttribute('stroke', '#4daafc');
+    line.setAttribute('stroke-width', '2.5');
+    svg.appendChild(line);
+    data.forEach((d, i) => {
+      const dot = document.createElementNS(NS, 'circle');
+      dot.setAttribute('cx', xFor(i)); dot.setAttribute('cy', yFor(d.value));
+      dot.setAttribute('r', '3'); dot.setAttribute('fill', '#4daafc');
+      svg.appendChild(dot);
+    });
+  } else {
+    const barW = Math.max(4, plotW / data.length * 0.6);
+    data.forEach((d, i) => {
+      const rect = document.createElementNS(NS, 'rect');
+      rect.setAttribute('x', String(xFor(i) - barW / 2));
+      rect.setAttribute('y', String(Math.min(yFor(d.value), yFor(0))));
+      rect.setAttribute('width', String(barW));
+      rect.setAttribute('height', String(Math.abs(yFor(d.value) - yFor(0)) || 1));
+      rect.setAttribute('fill', '#4daafc');
+      svg.appendChild(rect);
+    });
+  }
+  data.forEach((d, i) => {
+    if (data.length > 12 && i % 2 !== 0 && i !== data.length - 1) return;
+    const tx = document.createElementNS(NS, 'text');
+    tx.setAttribute('x', String(xFor(i)));
+    tx.setAttribute('y', String(padT + plotH + 18));
+    tx.setAttribute('text-anchor', 'middle');
+    tx.setAttribute('fill', '#b0b0b0');
+    tx.setAttribute('font-size', '10');
+    tx.textContent = d.label.slice(0, 12);
+    svg.appendChild(tx);
+  });
+  out.appendChild(svg);
+  out.appendChild(el('div', 'status', tr('chart.rendered', '图表已生成（本地 SVG）')));
+  setStatus('exec-status', tr('chart.rendered', '图表已生成（本地 SVG）'), false);
+}
+
+async function loadER() {
+  const out = $id('er-output');
+  clearNode(out);
+  setStatus('er-status', '加载中...', false);
+  if (!currentDB) {
+    setStatus('er-status', tr('er.no_conn', '请先选择数据库'), true);
+    return;
+  }
+  try {
+    const data = await api('/databases/' + encodeURIComponent(currentDB) +
+      '/er' + connQuery(''));
+    if (!data.nodes || !data.nodes.length) {
+      setStatus('er-status', tr('er.empty', '当前数据库没有表'), true);
+      return;
+    }
+    const NS = 'http://www.w3.org/2000/svg';
+    const nodeW = 220, nodeH = 120, gapX = 30, gapY = 40, cols = 3;
+    const rowsN = Math.ceil(data.nodes.length / cols);
+    const width = cols * nodeW + (cols - 1) * gapX + 40;
+    const height = rowsN * nodeH + (rowsN - 1) * gapY + 40;
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+    svg.setAttribute('width', String(width));
+    svg.setAttribute('height', String(height));
+    svg.setAttribute('class', 'er-svg');
+    const positions = {};
+    data.nodes.forEach((n, i) => {
+      const cx = 20 + (i % cols) * (nodeW + gapX);
+      const cy = 20 + Math.floor(i / cols) * (nodeH + gapY);
+      positions[n.name] = {x: cx, y: cy};
+      const rect = document.createElementNS(NS, 'rect');
+      rect.setAttribute('x', String(cx)); rect.setAttribute('y', String(cy));
+      rect.setAttribute('width', String(nodeW));
+      rect.setAttribute('height', String(nodeH));
+      rect.setAttribute('rx', '8'); rect.setAttribute('fill', '#252526');
+      rect.setAttribute('stroke', '#4daafc');
+      svg.appendChild(rect);
+      const title = document.createElementNS(NS, 'text');
+      title.setAttribute('x', String(cx + 10)); title.setAttribute('y', String(cy + 22));
+      title.setAttribute('fill', '#d4d4d4'); title.setAttribute('font-size', '13');
+      title.setAttribute('font-weight', 'bold');
+      title.textContent = n.name;
+      svg.appendChild(title);
+      (n.columns || []).slice(0, 4).forEach((c, j) => {
+        const t = document.createElementNS(NS, 'text');
+        t.setAttribute('x', String(cx + 10)); t.setAttribute('y', String(cy + 42 + j * 17));
+        t.setAttribute('fill', c.key === 'PRI' ? '#d7ba7d' : '#9cdcfe');
+        t.setAttribute('font-size', '11');
+        t.textContent = (c.key === 'PRI' ? 'PK ' : '') + c.name + ' : ' + c.type;
+        svg.appendChild(t);
+      });
+    });
+    (data.edges || []).forEach(edge => {
+      const a = positions[edge.from], b = positions[edge.to];
+      if (!a || !b) return;
+      const line = document.createElementNS(NS, 'line');
+      line.setAttribute('x1', String(a.x + nodeW));
+      line.setAttribute('y1', String(a.y + nodeH / 2));
+      line.setAttribute('x2', String(b.x));
+      line.setAttribute('y2', String(b.y + nodeH / 2));
+      line.setAttribute('stroke', '#d7ba7d');
+      line.setAttribute('stroke-width', '1.5');
+      svg.appendChild(line);
+    });
+    out.appendChild(svg);
+    setStatus('er-status', data.notice || 'ER 图已生成', false);
+  } catch (e) {
+    setStatus('er-status', tr('er.failed', '加载 ER 图失败') + ': ' + e.message, true);
+  }
+}
+
+async function loadPlugins() {
+  const target = $id('plugins-table');
+  clearNode(target);
+  setStatus('plugins-status', '加载中...', false);
+  try {
+    const data = await api('/plugins');
+    const plugins = data.plugins || [];
+    if (!plugins.length) {
+      setStatus('plugins-status',
+        data.notice || tr('plugins.empty', '插件目录为空：未发现已加载插件'), false);
+      return;
+    }
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['插件名', '版本', '状态', '错误'].forEach(h => hr.appendChild(el('th', '', h)));
+    thead.appendChild(hr); table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    plugins.forEach(p => {
+      const row = document.createElement('tr');
+      row.appendChild(el('td', '', p.name || p.key || ''));
+      row.appendChild(el('td', '', p.version || ''));
+      row.appendChild(el('td', 'level-' + (p.status === 'failed' ? 'error' : 'info'),
+        p.status || ''));
+      row.appendChild(el('td', '', p.error || ''));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody); target.appendChild(table);
+    setStatus('plugins-status',
+      data.warnings && data.warnings.length ? data.warnings.join('; ') : '已加载',
+      false);
+  } catch (e) {
+    setStatus('plugins-status', tr('plugins.failed', '加载插件失败') + ': ' + e.message, true);
+  }
+}
+
+async function exportStreaming() {
+  if (!currentTable || !currentDB) {
+    setStatus('exec-status', '请先加载表数据', true);
+    return;
+  }
+  const btn = $id('export-stream-btn');
+  if (!setBusy(btn, true, tr('stream.processing', '流式导出中...'))) return;
+  try {
+    const res = await apiBlob('/databases/' + encodeURIComponent(currentDB) +
+      '/tables/' + encodeURIComponent(currentTable) + '/export/stream' +
+      connQuery(''));
+    downloadBlob(res.blob, res.filename || (currentTable + '.csv'));
+    setStatus('exec-status', tr('stream.done', '流式 CSV 导出完成'), false);
+  } catch (e) {
+    setStatus('exec-status', '流式导出失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+function stopImportPolling() {
+  if (importPollTimer) {
+    clearInterval(importPollTimer);
+    importPollTimer = null;
+  }
+}
+
+async function pollImportJob(jobId) {
+  try {
+    const data = await api('/import/jobs/' + encodeURIComponent(jobId));
+    setStatus('import-progress',
+      `导入进度 ${data.progress}%（${data.processed}/${data.total}，` +
+      `失败 ${data.failed}）`, data.status === 'failed');
+    if (['completed', 'completed_with_errors', 'cancelled', 'failed']
+        .includes(data.status)) {
+      stopImportPolling();
+      activeImportJob = '';
+      $id('cancel-import-btn').classList.add('hidden');
+      setStatus('import-progress',
+        `导入结束：${data.status}，成功 ${data.inserted}，失败 ${data.failed}`,
+        data.status !== 'completed');
+      if (currentTable) await loadTableData(currentTable, currentDB, 0);
+    }
+  } catch (e) {
+    stopImportPolling();
+    setStatus('import-progress', '导入任务查询失败: ' + e.message, true);
+  }
+}
+
+async function cancelImport() {
+  if (!activeImportJob) return;
+  try {
+    const data = await api('/import/jobs/' + encodeURIComponent(activeImportJob) +
+      '/cancel', {method: 'POST'});
+    setStatus('import-progress', data.ok ? '取消请求已发送' : data.error, !data.ok);
+  } catch (e) {
+    setStatus('import-progress', '取消失败: ' + e.message, true);
+  }
+}
+
 
 window.addEventListener('DOMContentLoaded', async () => {
   $id('login-btn').onclick = doLogin;
@@ -978,6 +1258,19 @@ window.addEventListener('DOMContentLoaded', async () => {
   $id('tool-history-btn').onclick = () => switchTool('history');
   $id('tool-reports-btn').onclick = () => switchTool('reports');
   $id('tool-quality-btn').onclick = () => switchTool('quality');
+  $id('tool-er-btn').onclick = () => switchTool('er');
+  $id('tool-plugins-btn').onclick = () => switchTool('plugins');
+  $id('er-refresh-btn').onclick = loadER;
+  $id('plugins-refresh-btn').onclick = loadPlugins;
+  $id('chart-bar-btn').onclick = () => renderChart('bar');
+  $id('chart-line-btn').onclick = () => renderChart('line');
+  $id('chart-close-btn').onclick = () => {
+    $id('chart-panel').classList.add('hidden');
+  };
+  $id('export-stream-btn').onclick = exportStreaming;
+  $id('cancel-import-btn').onclick = cancelImport;
+  $id('lang-select').onchange = e => window.setLang(e.target.value);
+  if (typeof window.applyI18n === 'function') window.applyI18n();
   $id('report-refresh-btn').onclick = loadReportTemplates;
   $id('report-save-btn').onclick = saveReportTemplate;
   $id('report-preview-btn').onclick = () => {

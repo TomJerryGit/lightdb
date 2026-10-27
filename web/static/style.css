@@ -608,3 +608,38 @@ header {
   font-size: 11px;
   padding: 6px;
 }
+
+/* task-63：图表 / ER / 插件 / 流式导入 */
+.chart-output,
+.er-output {
+  overflow: auto;
+  max-height: 420px;
+  padding: 6px;
+}
+
+.chart-output svg,
+.er-output svg {
+  max-width: 100%;
+  background: transparent;
+}
+
+#plugins-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+#plugins-table td,
+#plugins-table th {
+  padding: 4px 6px;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.25);
+  text-align: left;
+  font-size: 12px;
+}
+
+#er-section h3,
+#plugins-section h3,
+#chart-panel h3 {
+  margin: 6px 8px;
+  font-size: 13px;
+  color: #9cdcfe;
+}

@@ -101,7 +101,7 @@ EXPLAIN、备份、结构对比、数据分页排序与连接安全字段展示�
 | P1 | 备份入口 | 已实现（partial） | `POST /api/v1/backup` 生成逻辑 SQL 备份（不伪造二进制快照） |
 | P1 | 结构同步入口 | 已实现（partial） | `GET /api/v1/schema/compare` 只读对比；不做自动写入 |
 | P1 | 连接 SSH/SSL 字段状态展示 | 已实现 | `GET /api/v1/connections` 返回 `ssh/ssl` 状态与 has_ca/has_key；口令/私钥不回显 |
-| P2 | 图表/ER、二进制快照恢复、插件、i18n、大文件流式进度/取消 | 未做 | 依赖桌面 Qt/文件系统或需独立流式设计；明确不伪造 |
+| P2 | 图表/ER、二进制快照恢复、插件、i18n、大文件流式进度/取消 | 部分实现（task-63） | 已补：查询结果柱状/折线（本地 SVG）、基础 ER 图（information_schema，无 FK 显式说明）、插件面板（真实 PluginManager）、轻量 i18n（中英新增文案）、CSV 分块流式导出 + 异步导入进度/取消；仍缺二进制快照恢复、完整旧文案 i18n、大文件导入流式分块 |
 
 前端入口：查询工具栏新增「表数据 / 设计表 / EXPLAIN / 导出结果 / 导入 CSV /
 备份 / 结构对比」；对象树下方连接 SSH/SSL 状态；数据页含分页、排序、导出；
@@ -110,3 +110,17 @@ EXPLAIN、备份、结构对比、数据分页排序与连接安全字段展示�
 测试：`tests/test_web_parity_gaps.py`（10 passed + 1 真浏览器显式 skip；含 fake
 核心 API 契约与真实 in-process LightDB 引擎设计器/分页/导出/EXPLAIN/备份 roundtrip）；
 回归 `tests/test_web_*.py` 全绿（51 passed, 1 skipped）。
+
+## 6. task-63 P2 UI 增强（2026-10-27）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| 查询结果图表 | 已实现 | 纯前端本地 SVG（无 CDN）；柱状/折线；空结果与非数值列显式提示 |
+| 基础 ER 图 | 已实现（基础） | `GET /api/v1/databases/{db}/er` 读 information_schema 表/列；外键用 KEY_COLUMN_USAGE，引擎不支持时显式说明；SVG 只读，无拖拽/缩放 |
+| 插件面板 | 已实现 | Web `GET /api/v1/plugins` 用真实 PluginManager（名称/版本/status/error，空目录 notice）；Studio 已有 PluginPanel |
+| i18n | 部分实现 | 审计结论：原 Web UI 无 i18n 框架、旧文案硬编码中文；新增 `static/i18n.js` 原生字典 + data-i18n，覆盖图表/ER/插件/流式新增文案（中英），旧文案未全量迁移，如实记录 |
+| 大文件流式导出 | 已实现 | `GET .../export/stream?chunk_size=` 分块 `StreamingResponse`，不一次性拼内存 |
+| 异步导入进度/取消 | 已实现 | `POST .../import/start` → job_id；`GET /import/jobs/{id}` 进度/逐行错误；`POST .../cancel`；TestClient 验证 |
+
+证据：`_analysis_tmp/gui_full/p2_ui_check.py` 2/2 PASS，截图 `shots_p2_ui/p2_chart.png`、
+`p2_er.png`、`p2_plugins.png`；`tests/test_p2_ui_features.py` 覆盖静态/API/流式/取消。

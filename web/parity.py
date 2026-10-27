@@ -6,11 +6,13 @@
 import csv
 import io
 import re
+import threading
 import time
+import uuid
 from typing import Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import api
@@ -663,3 +665,291 @@ async def schema_compare(source_db: str, target_db: str,
         raise
     except Exception as exc:                      # noqa: BLE001
         raise _err(400, f'结构对比失败: {exc}', 'schema_compare_failed')
+
+
+# ==================== task-63：ER 图 / 插件面板 / 流式导入导出 ====================
+
+@router.get('/databases/{db}/er')
+async def er_diagram(db: str,
+                     connection: Optional[str] = None,
+                     payload: dict = Depends(verify_token)):
+    """基于 information_schema 的真实表/列/外键元数据生成 ER 图数据。"""
+    db = api._ident(db, '数据库名')
+    conn = _conn_for(db, connection, payload)
+    notices = []
+    table_source = 'information_schema'
+    try:
+        _cols, rows = conn.query(
+            'SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES '
+            'WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME', (db,))
+        tables = [str(r[0]) for r in (rows or [])]
+    except Exception as exc:                      # noqa: BLE001
+        table_source = 'show_tables_fallback'
+        notices.append(f'information_schema.TABLES 不可用，退回 SHOW TABLES: {exc}')
+        try:
+            tables = [api._ident(t, '表名') for t in (conn.get_tables() or [])]
+        except Exception as exc2:                 # noqa: BLE001
+            raise _err(400, f'读取表失败: {exc2}', 'er_tables_failed')
+    nodes = []
+    for table in tables:
+        table = api._ident(table, '表名')
+        columns = []
+        try:
+            _c, crows = conn.query(
+                'SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY '
+                'FROM information_schema.COLUMNS '
+                'WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s '
+                'ORDER BY ORDINAL_POSITION', (db, table))
+            for r in crows or []:
+                columns.append({'name': str(r[0]),
+                                'type': str(r[1]) if len(r) > 1 else '',
+                                'key': str(r[2]) if len(r) > 2 else ''})
+        except Exception:
+            try:
+                columns = [{'name': str(c.get('name')),
+                            'type': str(c.get('type') or ''),
+                            'key': str(c.get('key') or '')}
+                           for c in (conn.get_columns(table) or [])]
+            except Exception:
+                columns = []
+        nodes.append({'name': table, 'columns': columns})
+    edges = []
+    fk_supported = True
+    try:
+        _c, fkrows = conn.query(
+            'SELECT TABLE_NAME, COLUMN_NAME, CONSTRAINT_NAME, '
+            'REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME '
+            'FROM information_schema.KEY_COLUMN_USAGE '
+            'WHERE TABLE_SCHEMA = %s AND REFERENCED_TABLE_NAME IS NOT NULL',
+            (db,))
+        for r in fkrows or []:
+            edges.append({
+                'from': str(r[0]), 'column': str(r[1]),
+                'constraint': str(r[2]) if len(r) > 2 else '',
+                'to': str(r[3]), 'ref_column': str(r[4]) if len(r) > 4 else '',
+            })
+    except Exception as exc:                      # noqa: BLE001
+        fk_supported = False
+        notices.append(
+            '当前引擎 information_schema 不提供外键元数据 '
+            f'(KEY_COLUMN_USAGE): {str(exc).splitlines()[-1] if str(exc) else exc}')
+    if not edges:
+        notices.append('无外键关系（当前库没有可展示的 FOREIGN KEY 约束）')
+    return {'ok': True, 'database': db, 'table_source': table_source,
+            'nodes': nodes, 'edges': edges,
+            'foreign_keys_supported': fk_supported,
+            'notice': '；'.join(notices) if notices else ''}
+
+
+def _plugin_manager():
+    """惰性创建真实 PluginManager；插件加载失败在列表 error/status 中显式。"""
+    from .server import app_state
+    mgr = app_state.get('plugin_manager')
+    if mgr is None:
+        from lightdb_studio.core.plugin_manager import PluginManager
+        from lightdb_studio.plugins import get_plugin_dir
+        mgr = PluginManager(str(get_plugin_dir()),
+                            app_context={'source': 'web'})
+        mgr.load_all()
+        app_state['plugin_manager'] = mgr
+    return mgr
+
+
+@router.get('/plugins')
+async def list_plugins(payload: dict = Depends(verify_token)):
+    """真实已加载插件（名称/版本/状态/错误）；不伪造插件。"""
+    try:
+        mgr = _plugin_manager()
+        infos = mgr.get_all()
+        plugins = []
+        for info in infos:
+            d = info.to_dict()
+            d['loaded'] = bool(getattr(info, 'loaded', False))
+            plugins.append(d)
+        return {'ok': True, 'plugins': plugins, 'count': len(plugins),
+                'warnings': list(getattr(mgr, 'warnings', [])[-5:]),
+                'notice': '' if plugins else '插件目录为空：未发现已加载插件'}
+    except Exception as exc:                      # noqa: BLE001
+        raise _err(500, f'插件加载失败: {exc}', 'plugins_load_failed')
+
+
+@router.get('/databases/{db}/tables/{table}/export/stream')
+async def export_table_stream(
+        db: str, table: str,
+        limit: int = Query(100000, ge=1, le=1000000),
+        chunk_size: int = Query(500, ge=1, le=5000),
+        connection: Optional[str] = None,
+        payload: dict = Depends(verify_token)):
+    """task-63：分块流式 CSV 导出（不一次性拼大表到内存）。"""
+    db = api._ident(db, '数据库名')
+    table = api._ident(table, '表名')
+    conn = _conn_for(db, connection, payload)
+    try:
+        cols = [str(c.get('name')) for c in (conn.get_columns(table) or [])]
+    except Exception as exc:                      # noqa: BLE001
+        raise _err(400, f'读取列失败: {exc}', 'stream_export_failed')
+    if not cols:
+        raise _err(404, f'表不存在: {table}', 'table_not_found')
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(cols)
+        yield '\ufeff' + buf.getvalue()
+        offset = 0
+        exported = 0
+        while exported < limit:
+            n = min(chunk_size, limit - exported)
+            try:
+                _c, rows = conn.query(
+                    f'SELECT * FROM `{table}` LIMIT {n} OFFSET {offset}')
+            except Exception as exc:              # noqa: BLE001
+                yield f'\n-- STREAM ERROR: {exc}\n'
+                return
+            if not rows:
+                break
+            out = io.StringIO()
+            w = csv.writer(out)
+            for row in rows:
+                w.writerow(['' if v is None else v for v in row])
+            yield out.getvalue()
+            exported += len(rows)
+            offset += len(rows)
+            if len(rows) < n:
+                break
+
+    headers = {
+        'Content-Disposition':
+            f"attachment; filename*=UTF-8''{table}.csv",
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+        'X-Content-Type-Options': 'nosniff',
+    }
+    return StreamingResponse(generate(),
+                             media_type='text/csv; charset=utf-8',
+                             headers=headers)
+
+
+_IMPORT_JOBS = {}
+_IMPORT_LOCK = threading.Lock()
+
+
+def _job_snapshot(job):
+    with _IMPORT_LOCK:
+        return {k: v for k, v in job.items()
+                if k not in ('cancel_event', 'conn', 'sql')}
+
+
+@router.post('/databases/{db}/tables/{table}/import/start')
+async def start_import_job(
+        db: str, table: str, req: CsvImportRequest,
+        connection: Optional[str] = None,
+        payload: dict = Depends(require_permission('write'))):
+    """异步 CSV 导入任务：返回 job_id；轮询进度 / 取消。"""
+    db = api._ident(db, '数据库名')
+    table = api._ident(table, '表名')
+    if not req.csv or not req.csv.strip():
+        raise _err(400, 'CSV 内容为空', 'empty_import')
+    conn = _conn_for(db, connection, payload)
+    try:
+        table_cols = [str(c.get('name'))
+                      for c in (conn.get_columns(table) or [])]
+    except Exception as exc:                      # noqa: BLE001
+        raise _err(400, f'读取列失败: {exc}', 'import_read_failed')
+    if not table_cols:
+        raise _err(404, f'表不存在: {table}', 'table_not_found')
+    try:
+        parsed = [r for r in csv.reader(io.StringIO(req.csv))
+                  if any(str(x).strip() for x in r)]
+    except csv.Error as exc:
+        raise _err(400, f'CSV 解析失败: {exc}', 'invalid_csv')
+    if not parsed:
+        raise _err(400, 'CSV 没有数据', 'empty_import')
+    if req.has_header:
+        header = [str(x).strip() for x in parsed[0]]
+        for name in header:
+            if name not in table_cols:
+                raise _err(400, f'CSV 表头列不存在: {name}',
+                           'invalid_csv_header')
+        data_rows = parsed[1:]
+        insert_cols = header
+    else:
+        data_rows = parsed
+        insert_cols = table_cols[:len(data_rows[0])]
+    if not data_rows:
+        raise _err(400, 'CSV 没有数据行', 'empty_import')
+    cols_sql = ', '.join(f'`{api._ident(c, "列名")}`' for c in insert_cols)
+    placeholders = ', '.join(['%s'] * len(insert_cols))
+    sql = f'INSERT INTO `{table}` ({cols_sql}) VALUES ({placeholders})'
+    job_id = uuid.uuid4().hex
+    job = {'id': job_id, 'table': table, 'status': 'running',
+           'total': len(data_rows), 'processed': 0, 'inserted': 0,
+           'failed': 0, 'errors': [], 'cancel_event': threading.Event(),
+           'conn': conn, 'sql': sql}
+    with _IMPORT_LOCK:
+        _IMPORT_JOBS[job_id] = job
+
+    def worker():
+        try:
+            for i, row in enumerate(data_rows, 1):
+                if job['cancel_event'].is_set():
+                    job['status'] = 'cancelled'
+                    return
+                if len(row) != len(insert_cols):
+                    job['failed'] += 1
+                    job['errors'].append({'row': i, 'error': '列数不一致'})
+                else:
+                    try:
+                        n, err = conn.execute(sql, tuple(row))
+                    except Exception as exc:      # noqa: BLE001
+                        n, err = 0, str(exc)
+                    if err:
+                        job['failed'] += 1
+                        if len(job['errors']) < 50:
+                            job['errors'].append({'row': i,
+                                                  'error': str(err)})
+                    else:
+                        job['inserted'] += int(n or 0) if n else 1
+                job['processed'] = i
+            job['status'] = 'completed_with_errors' if job['failed'] \
+                else 'completed'
+        except Exception as exc:                  # noqa: BLE001
+            job['status'] = 'failed'
+            job['errors'].append({'row': 0, 'error': str(exc)})
+        finally:
+            job['cancel_event'].set()
+
+    threading.Thread(target=worker, daemon=True,
+                     name='web-csv-import').start()
+    return {'ok': True, 'job_id': job_id, 'status': 'running',
+            'total': len(data_rows)}
+
+
+@router.get('/import/jobs/{job_id}')
+async def import_job_status(job_id: str,
+                            payload: dict = Depends(verify_token)):
+    with _IMPORT_LOCK:
+        job = _IMPORT_JOBS.get(job_id)
+    if job is None:
+        raise _err(404, f'导入任务不存在: {job_id}', 'import_job_not_found')
+    snap = _job_snapshot(job)
+    snap['progress'] = (round(snap['processed'] / snap['total'] * 100, 1)
+                        if snap.get('total') else 100.0)
+    return {'ok': True, **snap}
+
+
+@router.post('/import/jobs/{job_id}/cancel')
+async def cancel_import_job(job_id: str,
+                            payload: dict = Depends(
+                                require_permission('write'))):
+    with _IMPORT_LOCK:
+        job = _IMPORT_JOBS.get(job_id)
+    if job is None:
+        raise _err(404, f'导入任务不存在: {job_id}', 'import_job_not_found')
+    if job['status'] in ('completed', 'completed_with_errors',
+                         'cancelled', 'failed'):
+        return {'ok': False, 'status': job['status'],
+                'error': '任务已结束，无法取消'}
+    job['cancel_event'].set()
+    job['status'] = 'cancelling'
+    return {'ok': True, 'status': 'cancelling', 'job_id': job_id}
