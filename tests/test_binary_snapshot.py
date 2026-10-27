@@ -1,14 +1,17 @@
-"""P2：二进制一致性快照备份/恢复 的测试。
+"""P2/P3：二进制一致性快照备份/恢复 的测试。
 
 覆盖：
 * manifest 字段完整（版本/表/行数/SHA256/大小/时间/文件清单）且文件哈希正确；
 * 快照 -> 删除数据目录 -> 恢复 -> 逐表行数/关键值/SHOW CREATE/自增下一号/WAL=0 一致；
 * 损坏 manifest / SHA256 不符 / 版本不兼容 -> 显式失败，且**不触碰目标目录**；
-* 服务在监听时默认拒绝（真实 MySQLServer 实测），`--force` 显式覆盖并告警；
-* 单表快照 -> 恢复到全新目录（只含该表）；
-* 目标目录非空：默认拒绝，--force 把旧目录改名保留；
-* 10k 行耗时默认量化；100k 行量化由 `LIGHTDB_SNAPSHOT_100K=1` 显式开启
-  （本机引擎写入速度受负载影响，默认跑会拖慢全套；实测数字见 docs/SNAPSHOT_BACKUP.md）。
+* 跨版本策略：同 schema/format 的版本差异默认拒绝，`allow_version_mismatch`
+  放行并 WARNING；格式不兼容即使放行也显式失败；
+* 在线热备（quiesce）：真实 MySQLServer + 并发 pymysql 写客户端下，
+  进程内写锁快照点一致（无半提交、WAL=0）、快照后写入不丢；跨进程
+  suspend 后端管道（monkeypatch 模拟）与失败显式报错；10k 行阻塞/总时长量化；
+* 服务在监听时离线快照默认拒绝（真实 MySQLServer 实测），`--force` 告警覆盖；
+* 单表快照 -> 恢复到全新目录（只含该表）；目标非空保护；
+* 10k/100k 离线快照耗时量化（100k 由 `LIGHTDB_SNAPSHOT_100K=1` 显式开启）。
 
 运行：python -m pytest tests/test_binary_snapshot.py -q
 """
@@ -411,3 +414,302 @@ def test_snapshot_restore_100k_rows_timing(tmp_path, capsys):
     assert rreport['verification']['tables_verified'] == 1
     assert rreport['verification']['wal_zero'] is True
     assert t_snap < 300 and t_restore < 300
+
+
+# ==================== P3：跨版本兼容策略（两条路径） ====================
+
+def test_allow_version_mismatch_compatible_format_warns(tmp_path):
+    """同 schema/format 的跨版本：默认拒绝，显式 --allow-version-mismatch
+    放行并 WARNING，恢复后自检仍通过。"""
+    _, snap = _fresh_snapshot(tmp_path)
+    manifest_path = snap / S.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['lightdb_version'] = '9.9.9-forged'
+    manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+    target = tmp_path / 'target'
+
+    with pytest.raises(S.VersionMismatchError):
+        S.restore_snapshot(snap, target, check_servers=False, quiet=True)
+    assert not target.exists()
+
+    report = S.restore_snapshot(
+        snap, target, check_servers=False, quiet=True,
+        allow_version_mismatch=True, version=S.lightdb_version())
+    assert report['verified'] is True
+    vc = report['version_check']
+    assert vc['format_compatible'] is True
+    assert vc['mismatch_allowed'] is True
+    assert vc['warnings'], '放行跨版本必须记录 WARNING'
+    assert any('WARNING' in w for w in report['warnings'])
+
+
+def test_allow_version_mismatch_never_bypasses_incompatible_format(tmp_path):
+    """格式不兼容（format_version/schema）即使 --allow-version-mismatch
+    也必须显式失败，且不触碰目标目录。"""
+    _, snap = _fresh_snapshot(tmp_path)
+    manifest_path = snap / S.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['format_version'] = 999                      # 伪造不兼容格式
+    manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+    target = tmp_path / 'target'
+    with pytest.raises(S.ManifestError):
+        S.restore_snapshot(snap, target, check_servers=False, quiet=True,
+                           allow_version_mismatch=True)
+    assert not target.exists()
+
+
+# ==================== P3：在线热备 quiesce ====================
+
+def _root_password(data_dir) -> str:
+    p = Path(data_dir) / 'root.password'
+    return p.read_text(encoding='utf-8').strip() if p.is_file() else ''
+
+
+def _start_inprocess_server(data_dir):
+    """真实 MySQLServer（进程内线程）+ 同一 Database 实例（供 online live_db）。"""
+    from lightdb.config import Config
+    from lightdb.db.database import Database
+    from lightdb.net.server import MySQLServer
+    from lightdb.sql.executor import Executor
+
+    db = Database(str(data_dir))
+    cfg = Config()
+    cfg.host, cfg.port = '127.0.0.1', 0
+    srv = MySQLServer(cfg, db, Executor(db))
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if S.find_running_servers([port]):
+            return db, srv, port
+        time.sleep(0.02)
+    raise AssertionError('真实 MySQLServer 未在 5s 内开始监听')
+
+
+def test_online_inprocess_quiesce_consistent_under_concurrent_writers(tmp_path,
+                                                                      capsys):
+    """真实 server + 并发写客户端：quiesce 窗口内拷贝得到"快照点一致"的数据：
+    同一语句写入的成对行不会只出现一半；WAL=0；快照后写入不丢。"""
+    pymysql = pytest.importorskip('pymysql')
+    from lightdb.db.database import Database
+
+    data = tmp_path / 'data'
+    base = Database(str(data))
+    base.create_table('pairs', [
+        {'name': 'id', 'type': 'INT', 'primary': True},
+        {'name': 'tag', 'type': 'INT'},
+        {'name': 'seq', 'type': 'INT'},
+    ])
+    base.shutdown()
+
+    db, srv, port = _start_inprocess_server(data)
+    password = _root_password(data)
+    snap = tmp_path / 'snap'
+    stop = threading.Event()
+    commits = [0, 0]
+    errors = []
+
+    def writer(tag):
+        try:
+            conn = pymysql.connect(host='127.0.0.1', port=port, user='root',
+                                   password=password, autocommit=True,
+                                   connect_timeout=5)
+            cur = conn.cursor()
+            base = tag * 100_000_000
+            seq = 1
+            while not stop.is_set():
+                cur.execute(
+                    'INSERT INTO pairs VALUES (%s,%s,%s),(%s,%s,%s)',
+                    (base + 2 * seq, tag, seq,
+                     base + 2 * seq + 1, tag, seq))
+                commits[tag - 1] += 1
+                seq += 1
+            conn.close()
+        except Exception as exc:                     # noqa: BLE001
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=writer, args=(t,), daemon=True)
+               for t in (1, 2)]
+    for t in threads:
+        t.start()
+    try:
+        time.sleep(0.6)
+        report = S.create_snapshot(
+            data, snap, online=True, live_db=db, server_ports=[port],
+            quiet=True, quiesce_wait=10.0)
+        online = report['online']
+        assert online['enabled'] is True
+        assert online['backend'] == 'in-process-write-lock'
+        assert online['blocked_window_s'] >= 0.0
+        assert report['wal_zero'] is True
+        snap_rows_manifest = report['row_total']
+        assert snap_rows_manifest % 2 == 0 and snap_rows_manifest > 0, \
+            '快照必须落在成对行的语句边界上（无半提交）'
+
+        time.sleep(0.3)                    # 快照后继续写
+        stop.set()
+        for t in threads:
+            t.join(5)
+        assert not errors, errors
+        assert all(t.is_alive() is False for t in threads)
+
+        # 恢复快照 -> 校验成对行完整
+        restored = tmp_path / 'restored'
+        rreport = S.restore_snapshot(snap, restored, check_servers=False,
+                                     quiet=True)
+        assert rreport['verification']['wal_zero'] is True
+        db2, ex = _open(restored)
+        try:
+            rows = _rows(ex, 'SELECT id, tag, seq FROM pairs ORDER BY id')
+            assert len(rows) == snap_rows_manifest
+            by_pair = {}
+            for _id, tag, seq in rows:
+                by_pair[(tag, seq)] = by_pair.get((tag, seq), 0) + 1
+            assert all(v == 2 for v in by_pair.values()), \
+                '存在半提交：某条语句只写了一行'
+            assert len({tag for _id, tag, _seq in rows}) >= 1
+        finally:
+            db2.shutdown()
+
+        # 快照后写入未丢：最终 live 行数 == 2 * 总提交数，且多于快照行数
+        total_commits = sum(commits)
+        conn = pymysql.connect(host='127.0.0.1', port=port, user='root',
+                               password=password, autocommit=True,
+                               connect_timeout=5)
+        try:
+            cur = conn.cursor()
+            cur.execute('SELECT COUNT(*) FROM pairs')
+            live_rows = cur.fetchone()[0]
+        finally:
+            conn.close()
+        assert live_rows == 2 * total_commits, (live_rows, total_commits)
+        assert live_rows > snap_rows_manifest, '快照后应继续有写入'
+        with capsys.disabled():
+            print('\n[online in-process] 快照 %d 行（%d 事务）/ 最终 %d 行'
+                  '（%d 事务）；阻塞窗口 %.4fs（checkpoint %.4fs + 拷贝 '
+                  '%.4fs）；总耗时 %.2fs'
+                  % (snap_rows_manifest, snap_rows_manifest // 2, live_rows,
+                     total_commits, online['blocked_window_s'],
+                     online['checkpoint_s'], online['copy_s'],
+                     report['duration_s']))
+    finally:
+        stop.set()
+        srv.shutdown()
+        srv.server_close()
+        db.shutdown()
+
+
+def test_online_process_suspend_backend_simulated(tmp_path, monkeypatch):
+    """跨进程 suspend 后端的管道验证：suspend/resume 由 monkeypatch 模拟
+    （本沙箱禁止真实 PROCESS_SUSPEND_RESUME），服务空闲时拷贝应一致。"""
+    data = tmp_path / 'data'
+    _make_db(data)
+    db, srv, port = _start_inprocess_server(data)
+    calls = {'suspend': [], 'resume': []}
+
+    def fake_suspend(pid, timeout=10.0):
+        calls['suspend'].append(pid)
+        return {'pid': pid, 'backend': 'process-suspend', 'suspended': True}
+
+    def fake_resume(pid):
+        calls['resume'].append(pid)
+        return True
+
+    monkeypatch.setattr(S, 'suspend_process', fake_suspend)
+    monkeypatch.setattr(S, 'resume_process', fake_resume)
+    snap = tmp_path / 'snap'
+    try:
+        report = S.create_snapshot(
+            data, snap, online=True, server_pid=os.getpid(),
+            check_servers=False, quiet=True)
+        online = report['online']
+        assert online['backend'] == 'process-suspend'
+        assert online['recovered_on_copy'] is True
+        assert online['resume_ok'] is True
+        assert calls['suspend'] and calls['resume']
+        assert report['row_total'] == 10
+        assert report['wal_zero'] is True
+        # 副本已 WAL 恢复 + checkpoint，可正常恢复
+        restored = tmp_path / 'restored'
+        S.restore_snapshot(snap, restored, check_servers=False, quiet=True)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        db.shutdown()
+
+
+def test_online_quiesce_failure_is_explicit(tmp_path, monkeypatch):
+    """quiesce 后端失败必须显式 OnlineQuiesceError，不产出快照。"""
+    data = tmp_path / 'data'
+    _make_db(data)
+    db, srv, port = _start_inprocess_server(data)
+    snap = tmp_path / 'snap'
+
+    def failing_suspend(pid, timeout=10.0):
+        raise S.OnlineQuiesceError('模拟沙箱拒绝 PROCESS_SUSPEND_RESUME')
+
+    monkeypatch.setattr(S, 'suspend_process', failing_suspend)
+    try:
+        with pytest.raises(S.OnlineQuiesceError):
+            S.create_snapshot(data, snap, online=True, server_pid=os.getpid(),
+                              check_servers=False, quiet=True)
+        assert not (snap / S.MANIFEST_NAME).exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        db.shutdown()
+
+
+def test_online_requires_locatable_server(tmp_path):
+    """在线模式定位不到服务进程 -> 显式失败（不静默降级为不一致拷贝）。"""
+    data = tmp_path / 'data'
+    _make_db(data)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        with pytest.raises(S.OnlineQuiesceError):
+            S.create_snapshot(data, tmp_path / 'snap', online=True,
+                              server_ports=[port], check_servers=False,
+                              quiet=True)
+    finally:
+        listener.close()
+
+
+def test_online_10k_rows_blocking_quantified(tmp_path, capsys):
+    """10k 行在线热备：量化 quiesce 阻塞窗口与总时长（真实 server，进程内写锁）。"""
+    data = tmp_path / 'data'
+    t0 = time.perf_counter()
+    _make_big_db(data, 10_000)
+    t_create = time.perf_counter() - t0
+    db, srv, port = _start_inprocess_server(data)
+    snap = tmp_path / 'snap'
+    try:
+        t0 = time.perf_counter()
+        report = S.create_snapshot(
+            data, snap, online=True, live_db=db, server_ports=[port],
+            quiet=True)
+        t_total = time.perf_counter() - t0
+        online = report['online']
+        assert report['row_total'] == 10_000
+        assert online['backend'] == 'in-process-write-lock'
+        assert report['wal_zero'] is True
+        assert online['blocked_window_s'] >= 0.0
+        restored = tmp_path / 'restored'
+        S.restore_snapshot(snap, restored, check_servers=False, quiet=True)
+        with capsys.disabled():
+            print('\n[online 10k] 建库 %.2fs / 阻塞窗口 %.4fs'
+                  '（checkpoint %.4fs + 拷贝 %.4fs，锁等待 %.4fs）'
+                  ' / 快照+后处理 %.2fs / 总数 %.2fs'
+                  % (t_create, online['blocked_window_s'],
+                     online['checkpoint_s'], online['copy_s'],
+                     online['lock_wait_s'], report['duration_s'],
+                     report['duration_s'] + t_create))
+        assert online['blocked_window_s'] < 300
+        assert report['duration_s'] < 300
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        db.shutdown()
+

@@ -9,7 +9,11 @@
     # 只看快照内容，不恢复
     python scripts/snapshot_restore.py --snapshot snap --list
 
-    # 校验失败/版本不兼容会显式失败（不静默返回成功）
+    # 校验失败/版本不兼容会显式失败（不静默返回成功）；跨版本策略：
+    #   * 快照 schema/format_version 不兼容 → 无条件失败（--allow-version-mismatch
+    #     也不放行）；
+    #   * 仅 lightdb 版本不同（同格式）→ 默认失败，--allow-version-mismatch 放行
+    #     并输出 WARNING（恢复后仍逐表自检）。
     python scripts/snapshot_restore.py --snapshot snap --data-dir target \
         --allow-version-mismatch
 

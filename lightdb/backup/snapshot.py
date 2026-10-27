@@ -17,11 +17,30 @@
   且 WAL 归零；失败显式报错（不静默返回"成功"）。
 * **单表快照**：`table=<name>` 只拷该表文件 + 过滤后的 `_meta.json`，
   可恢复到全新数据目录（只含该表）。
+* **在线热备（quiesce）**：`online=True` 时在拷贝窗口内阻断写入：
+  * 进程内模式（`live_db=<server 的 Database 实例>`）：按表名排序获取
+    所有目标表的 `Table._lock`（写锁）→ `db.checkpoint()`（WAL 落盘）
+    → 拷贝文件 → 释放锁；窗口内服务写入被阻塞，释放后继续。
+  * 跨进程模式（`server_pid=...` / 自动探测监听端口）：用 OS 级
+    `Process.suspend()` 冻结服务进程 → 原样拷贝（crash-consistent 镜像）
+    → 恢复进程 → 在**快照副本**上做 WAL 恢复 + checkpoint，得到 WAL=0 的
+    确定恢复点。冻结窗口只含拷贝，不含哈希/恢复。
+  * 两种模式都在 manifest 的 `online` 段记录阻塞窗口、checkpoint、拷贝耗时。
+
+兼容策略（跨版本）
+------------------
+* 快照格式（`schema` + `format_version`）不兼容 → 无条件 `ManifestError`，
+  即使传 `--allow-version-mismatch` 也不放行；
+* 仅 lightdb 版本不同（同格式）→ 默认拒绝；显式
+  `--allow-version-mismatch` 允许并写入 WARNING（报告
+  `version_check.warnings`），恢复后照常逐表自检。
 
 边界（详见 docs/SNAPSHOT_BACKUP.md）
 -----------------------------------
-* 运行中服务的写事务没有被冻结：`--force` 只保证"我们自己的 checkpoint 后
-  文件拷贝一致"，不能保证与并发写入的实时性——生产环境请先停服务。
+* 离线 `--force` 不冻结服务：只保证"本工具 checkpoint 后文件一致"，不能
+  保证与并发写入的实时性——生产环境优先 `--online` 或停机。
+* 跨进程 online 依赖操作系统进程暂停权限；受限沙箱/无权限时显式失败
+  （`OnlineQuiesceError`），不会假装 quiesce 成功。
 * 端口检测只覆盖显式传入/默认 8888；自定义端口的服务请用
   `--server-port` 告知，否则可能漏检。
 * 数据目录里除数据文件外的文件（审计日志、备份目录等）不进入快照。
@@ -77,6 +96,10 @@ class VersionMismatchError(SnapshotError):
 
 class SnapshotIntegrityError(SnapshotError):
     """快照文件缺失/大小不符/SHA256 不匹配，或恢复后自检不一致。"""
+
+
+class OnlineQuiesceError(SnapshotError):
+    """在线快照无法建立/完成 quiesce 窗口（无进程、被沙箱拒绝、锁超时等）。"""
 
 
 # ==================== 基础工具 ====================
@@ -176,6 +199,138 @@ def _refuse_if_running(server_ports, force: bool, warnings: list,
     return running
 
 
+# ==================== 在线热备（quiesce）后端 ====================
+
+def detect_server_pid(server_ports=None) -> "int | None":
+    """用 psutil 找监听给定端口的进程 PID（找不到/无权限时返回 None）。"""
+    try:
+        import psutil
+    except Exception:                                # pragma: no cover
+        return None
+    ports = set(int(p) for p in (server_ports or DEFAULT_SERVER_PORTS))
+    env_port = os.environ.get('LIGHTDB_PORT')
+    if env_port and server_ports is None:
+        try:
+            ports.add(int(env_port))
+        except ValueError:
+            pass
+    try:
+        conns = psutil.net_connections(kind='tcp')
+    except Exception:                                # pragma: no cover
+        return None
+    for conn in conns:
+        try:
+            if conn.status != psutil.CONN_LISTEN or not conn.laddr:
+                continue
+            if conn.laddr.port in ports and conn.pid and conn.pid != os.getpid():
+                return int(conn.pid)
+        except Exception:                            # pragma: no cover
+            continue
+    return None
+
+
+def suspend_process(pid: int, timeout: float = 10.0) -> dict:
+    """OS 级暂停一个进程（跨进程 online quiesce 后端）。
+
+    受限沙箱/令牌可能禁止 PROCESS_SUSPEND_RESUME —— 此时抛
+    `OnlineQuiesceError` 显式失败，绝不假装暂停成功。
+    """
+    if int(pid) == os.getpid():
+        raise OnlineQuiesceError('拒绝暂停当前进程自身')
+    try:
+        import psutil
+    except Exception as exc:                         # pragma: no cover
+        raise OnlineQuiesceError(f'缺少 psutil，无法做进程级 quiesce: {exc}')
+    try:
+        proc = psutil.Process(int(pid))
+    except Exception as exc:                         # noqa: BLE001
+        raise OnlineQuiesceError(f'找不到服务进程 pid={pid}: {exc}') from exc
+    try:
+        proc.suspend()
+    except Exception as exc:                         # noqa: BLE001
+        raise OnlineQuiesceError(
+            f'暂停服务进程 pid={pid} 失败（{type(exc).__name__}: {exc}）；'
+            f'受限沙箱可能禁止 PROCESS_SUSPEND_RESUME。可改用进程内 live_db '
+            f'方式，或停止服务后做离线快照（--force 属不安全兜底）'
+        ) from exc
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if proc.status() == psutil.STATUS_STOPPED:
+                break
+        except Exception:                            # pragma: no cover
+            break
+        time.sleep(0.01)
+    return {'pid': int(pid), 'backend': 'process-suspend', 'suspended': True}
+
+
+def resume_process(pid: int) -> bool:
+    """恢复被 suspend_process 暂停的进程；返回是否成功。"""
+    try:
+        import psutil
+        psutil.Process(int(pid)).resume()
+        return True
+    except Exception:                                # pragma: no cover
+        return False
+
+
+def _copy_raw_files(data_dir: Path, tables, data_out: Path) -> list:
+    """把选中的物理文件原样拷贝到快照 data/（不做哈希，尽量缩短阻塞窗口）。"""
+    names = _selected_files(data_dir, tables)
+    for name in names:
+        shutil.copy2(data_dir / name, data_out / name)
+    return names
+
+
+def _read_tables_from_meta(data_dir: Path) -> list:
+    """不打开数据库、直接读 `_meta.json` 拿表名（跨进程 online 用）。"""
+    try:
+        meta = json.loads((data_dir / '_meta.json').read_text(encoding='utf-8'))
+    except Exception as exc:                         # noqa: BLE001
+        raise SnapshotError(f'读取 _meta.json 失败: {exc}') from exc
+    return sorted((meta.get('tables') or {}).keys())
+
+
+class _TableLocks:
+    """进程内 quiesce：按名字排序获取所有目标表的 `Table._lock`（写锁）。"""
+
+    def __init__(self, live_db, tables, quiesce_wait: float = 10.0):
+        self.live_db = live_db
+        self.tables = sorted(tables)
+        self.timeout = float(quiesce_wait)
+        self.locks = []
+        self.wait_s = 0.0
+
+    def __enter__(self):
+        t0 = time.perf_counter()
+        try:
+            for name in self.tables:
+                lock = self.live_db.get_table(name)._lock
+                if not lock.acquire(timeout=self.timeout):
+                    raise OnlineQuiesceError(
+                        f'等待表 {name} 的写锁超时（{self.timeout:.1f}s）：'
+                        f'有长事务/DDL 正在执行，无法建立 quiesce 窗口')
+                self.locks.append(lock)
+        except BaseException:
+            self.release()
+            raise
+        finally:
+            self.wait_s = time.perf_counter() - t0
+        return self
+
+    def release(self):
+        while self.locks:
+            lock = self.locks.pop()
+            try:
+                lock.release()
+            except RuntimeError:                     # pragma: no cover
+                pass
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
 # ==================== manifest ====================
 
 def _result_rows(result, what: str) -> list:
@@ -271,24 +426,47 @@ def read_manifest(snapshot_dir) -> dict:
 
 def validate_manifest(manifest: dict, version: str = None,
                       allow_version_mismatch: bool = False) -> dict:
-    """校验版本兼容性（默认要求 lightdb 版本精确一致）。"""
+    """跨版本兼容校验。
+
+    策略：
+    * **格式不兼容**（`schema` / `format_version`）由 `read_manifest` 直接
+      `ManifestError` —— 即使 `--allow-version-mismatch` 也不放行；
+    * **仅 lightdb 版本不同**（同格式）：默认拒绝；显式
+      `allow_version_mismatch=True` 时放行并返回 WARNING（报告链路上抛出），
+      恢复后仍必须通过逐表自检。
+    """
     expected = str(version or lightdb_version())
     snap_ver = str(manifest.get('lightdb_version') or '')
-    if snap_ver != expected and not allow_version_mismatch:
-        raise VersionMismatchError(
-            f'快照的 lightdb 版本 {snap_ver!r} 与当前版本 {expected!r} 不兼容'
-            f'（物理页/元数据格式可能变化）；确认可兼容时加 '
-            f'--allow-version-mismatch')
+    warnings = []
+    mismatch = snap_ver != expected
+    if mismatch:
+        if not allow_version_mismatch:
+            raise VersionMismatchError(
+                f'快照的 lightdb 版本 {snap_ver!r} 与当前版本 {expected!r} 不一致'
+                f'（物理页/元数据格式可能变化）；确认格式兼容时可加 '
+                f'--allow-version-mismatch（仅放行**格式兼容**的版本差异）')
+        warnings.append(
+            f'WARNING: 快照 lightdb 版本 {snap_ver!r} != 当前 {expected!r}；'
+            f'已由 --allow-version-mismatch 显式放行（schema/format 兼容），'
+            f'恢复后会逐表自检；若物理格式实际不兼容会在打开时显式报错')
     return {'expected_version': expected, 'snapshot_version': snap_ver,
-            'mismatch_allowed': bool(allow_version_mismatch and snap_ver != expected)}
+            'format_compatible': True, 'mismatch_allowed': bool(mismatch),
+            'warnings': warnings}
 
 
 # ==================== 备份 ====================
 
 def create_snapshot(data_dir, out_dir, *, table: str = None, force: bool = False,
                     server_ports=None, check_servers: bool = True,
-                    version: str = None, quiet: bool = False) -> dict:
-    """创建一致性二进制快照；返回报告 dict（含 manifest 与耗时）。"""
+                    version: str = None, quiet: bool = False,
+                    online: bool = False, live_db=None, server_pid: int = None,
+                    quiesce_wait: float = 10.0) -> dict:
+    """创建一致性二进制快照；返回报告 dict（含 manifest 与耗时）。
+
+    `online=True` 时走在线热备（quiesce）：
+    * `live_db` 给出服务端同一个 `Database` 实例 → 进程内写锁 quiesce；
+    * 否则用 `server_pid` / 自动探测监听端口 → 跨进程 OS 级 suspend quiesce。
+    """
     warnings = []
     t_start = time.perf_counter()
     data_dir = Path(data_dir).resolve()
@@ -297,7 +475,7 @@ def create_snapshot(data_dir, out_dir, *, table: str = None, force: bool = False
         raise SnapshotError(f'数据目录不存在: {data_dir}')
     if out_dir == data_dir or data_dir in out_dir.parents:
         raise SnapshotError('快照输出目录不能位于数据目录内部')
-    if check_servers:
+    if check_servers and not online:
         _refuse_if_running(server_ports, force, warnings, '快照')
 
     # 输出目录：非空目录默认拒绝（避免覆盖旧快照），--force 时清空
@@ -310,6 +488,13 @@ def create_snapshot(data_dir, out_dir, *, table: str = None, force: bool = False
     out_dir.mkdir(parents=True, exist_ok=True)
     data_out = out_dir / DATA_SUBDIR
     data_out.mkdir(parents=True, exist_ok=True)
+
+    if online:
+        return _create_online_snapshot(
+            data_dir, out_dir, data_out, table=table, live_db=live_db,
+            server_pid=server_pid, server_ports=server_ports,
+            warnings=warnings, t_start=t_start, quiet=quiet,
+            quiesce_wait=quiesce_wait)
 
     from lightdb.db.database import Database
     from lightdb.sql.executor import Executor
@@ -428,6 +613,8 @@ def create_snapshot(data_dir, out_dir, *, table: str = None, force: bool = False
         'total_files': len(file_records),
         'total_bytes': total_bytes,
         'users': users_meta,
+        'online': {'enabled': False, 'backend': None,
+                   'note': '离线快照：无 quiesce 窗口'},
         'warnings': warnings,
         'limitations': [
             '运行中服务不会被冻结：--force 仅保证本工具 checkpoint 后文件一致，'
@@ -454,6 +641,7 @@ def create_snapshot(data_dir, out_dir, *, table: str = None, force: bool = False
         'total_files': manifest['total_files'],
         'total_bytes': total_bytes,
         'wal_zero': True,
+        'online': manifest['online'],
         'warnings': warnings,
         'duration_s': duration,
     }
@@ -461,6 +649,291 @@ def create_snapshot(data_dir, out_dir, *, table: str = None, force: bool = False
         print('[snapshot] 完成: %s（%d 表 / %d 行 / %d 文件 / %.1f KB / %.2fs）'
               % (out_dir, manifest['tables_count'], manifest['row_total'],
                  manifest['total_files'], total_bytes / 1024.0, duration))
+        for w in warnings:
+            print('[snapshot] ' + w)
+    return report
+
+
+# ==================== 在线热备（quiesce）主流程 ====================
+
+def _finalize_online_copy(data_out: Path, table):
+    """在**快照副本**上做 WAL 恢复 + checkpoint + 采集元数据。
+
+    * 进程内写锁模式：拷贝时 WAL 已为 0，这里只是采集 + 幂等 checkpoint；
+    * 跨进程 suspend 模式：拷贝的是 crash-consistent 镜像，这里先用引擎
+      WAL 恢复（redo 已提交 / undo 未提交）→ checkpoint 截断 WAL →
+      得到 WAL=0 的确定恢复点，再采集行数/SHOW CREATE/样本/自增。
+    返回 (manifest_tables, users_meta, CheckpointDump)。
+    """
+    from lightdb.db.database import Database
+    from lightdb.sql.executor import Executor
+
+    if table is not None:
+        meta_path = data_out / '_meta.json'
+        try:
+            meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        except Exception as exc:                     # noqa: BLE001
+            raise SnapshotError(f'读取快照副本 _meta.json 失败: {exc}') from exc
+        meta['tables'] = {table: meta['tables'][table]}
+        meta['views'] = {}
+        meta['pending_ddl'] = None
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n',
+                             encoding='utf-8')
+
+    try:
+        db = Database(str(data_out))
+    except Exception as exc:                         # noqa: BLE001
+        raise SnapshotIntegrityError(
+            f'在线快照副本无法被引擎打开（WAL 恢复失败/镜像不一致）: {exc}') from exc
+    manifest_tables = []
+    try:
+        checked = db.checkpoint(force=False)
+        executor = Executor(db)
+        for tname in sorted(db.tables.keys()):
+            manifest_tables.append(_collect_table_info(db, executor, tname))
+        users_meta = list((getattr(db, 'users', {}) or {}).keys())
+    finally:
+        db.shutdown()
+    if not manifest_tables:
+        raise SnapshotError('在线快照副本里没有任何表')
+    wal_after = {}
+    for tinfo in manifest_tables:
+        p = data_out / f'{tinfo["name"]}.wal'
+        wal_after[tinfo['name']] = p.stat().st_size if p.is_file() else 0
+    non_zero = {t: n for t, n in wal_after.items() if n}
+    if non_zero:
+        raise SnapshotIntegrityError(
+            f'在线快照副本最终的 WAL 非零（一致性未达成）: {non_zero}')
+    return manifest_tables, users_meta, {'tables_checked': int(checked),
+                                         'wal_after_bytes': wal_after}
+
+
+def _build_online_manifest(data_dir: Path, data_out: Path, table,
+                           manifest_tables, users_meta, checkpoint_info,
+                           online_info, warnings) -> tuple:
+    """组装在线快照 manifest（结构同离线，额外带 `online` 段）。"""
+    names = _selected_files(data_out, [t['name'] for t in manifest_tables])
+    file_records = []
+    for name in names:
+        p = data_out / name
+        file_records.append({
+            'name': name,
+            'path': f'{DATA_SUBDIR}/{name}',
+            'size': p.stat().st_size,
+            'sha256': sha256_file(p),
+        })
+    for tinfo in manifest_tables:
+        tinfo['files'] = [r['name'] for r in file_records
+                          if _belongs_to_table(r['name'], tinfo['name'])]
+        if not tinfo['files']:
+            raise SnapshotError(f'表 {tinfo["name"]} 没有任何落盘文件（异常）')
+    total_bytes = sum(r['size'] for r in file_records)
+    checkpoint_info.setdefault(
+        'strategy', 'quiesce 窗口内 checkpoint（WAL 落盘/截断）后文件拷贝；'
+                    '跨进程模式在副本上 WAL 恢复+checkpoint')
+    manifest = {
+        'schema': SCHEMA,
+        'format_version': FORMAT_VERSION,
+        'lightdb_version': lightdb_version(),
+        'created_at': _datetime.datetime.now().astimezone().isoformat(
+            timespec='seconds'),
+        'source': {
+            'data_dir': str(data_dir),
+            'host': platform.node(),
+            'platform': platform.platform(),
+            'python': platform.python_version(),
+        },
+        'mode': 'single_table' if table is not None else 'full',
+        'table_filter': table,
+        'checkpoint': dict(checkpoint_info),
+        'online': dict(online_info),
+        'tables': manifest_tables,
+        'tables_count': len(manifest_tables),
+        'row_total': sum(t['row_count'] for t in manifest_tables),
+        'files': file_records,
+        'total_files': len(file_records),
+        'total_bytes': total_bytes,
+        'users': users_meta,
+        'warnings': warnings,
+        'limitations': [
+            '在线快照以 quiesce 窗口换取一致性：窗口内写入阻塞，窗口时长见 '
+            'online.blocked_window_s；窗口过长会影响客户端时延。',
+            '跨进程 suspend 模式是"冻结服务进程 + 拷贝 crash-consistent 镜像"'
+            '（随后在副本上 WAL 恢复），不依赖服务端 checkpoint 接口；'
+            '需要 OS 进程暂停权限。',
+            '数据目录中的审计日志/备份等非数据文件不进入快照。',
+        ],
+    }
+    return manifest, file_records, total_bytes
+
+
+def _create_online_snapshot(data_dir: Path, out_dir: Path, data_out: Path, *,
+                            table, live_db, server_pid, server_ports,
+                            warnings, t_start, quiet,
+                            quiesce_wait: float) -> dict:
+    from lightdb.db.database import Database      # noqa: F401 (保证引擎可用)
+    from lightdb.sql.executor import Executor     # noqa: F401
+
+    if live_db is not None:
+        live_dir = Path(getattr(live_db, 'data_dir', '') or '').resolve()
+        if live_dir != data_dir:
+            raise SnapshotError(
+                f'live_db 的数据目录 {live_dir} 与 --data-dir {data_dir} 不一致')
+        all_tables = sorted(live_db.tables.keys())
+    else:
+        all_tables = _read_tables_from_meta(data_dir)
+    if table is not None:
+        if table not in all_tables:
+            raise SnapshotError(f'表不存在: {table!r}（现有: {all_tables}）')
+        targets = [table]
+    else:
+        targets = all_tables
+    if not targets:
+        raise SnapshotError('数据目录里没有任何表，拒绝生成空快照')
+
+    online_info = {
+        'enabled': True,
+        'backend': None,
+        'quiesced_pid': None,
+        'blocked_window_s': 0.0,
+        'checkpoint_s': 0.0,
+        'copy_s': 0.0,
+        'lock_wait_s': 0.0,
+        'suspend_s': 0.0,
+        'resume_ok': None,
+        'recovered_on_copy': False,
+        'wal_bytes_before_checkpoint': {},
+    }
+
+    if live_db is not None:
+        # ---------- 进程内写锁 quiesce ----------
+        online_info['backend'] = 'in-process-write-lock'
+        online_info['quiesced_pid'] = os.getpid()
+        online_info['server_running'] = True
+        deadline = time.time() + max(0.1, float(quiesce_wait))
+        last_err = ''
+        succeeded = False
+        while time.time() < deadline:
+            locks = _TableLocks(live_db, targets, quiesce_wait)
+            locks.__enter__()
+            try:
+                online_info['lock_wait_s'] = locks.wait_s
+                pending = [t for t in targets
+                           if getattr(live_db.get_table(t), '_read_views', None)]
+                if pending:
+                    last_err = f'表 {pending} 上存在未提交事务'
+                    continue
+                t_mark = time.perf_counter()
+                online_info['wal_bytes_before_checkpoint'] = {
+                    t: ((data_dir / f'{t}.wal').stat().st_size
+                        if (data_dir / f'{t}.wal').is_file() else 0)
+                    for t in targets}
+                checked = live_db.checkpoint(force=False)
+                if int(checked) < len(targets):
+                    last_err = (f'仅 {checked}/{len(targets)} 张表 checkpoint '
+                                f'成功（存在未提交事务？）')
+                    continue
+                online_info['checkpoint_s'] = time.perf_counter() - t_mark
+                wal_after = {}
+                for t in targets:
+                    p = data_dir / f'{t}.wal'
+                    wal_after[t] = p.stat().st_size if p.is_file() else 0
+                non_zero = {t: n for t, n in wal_after.items() if n}
+                if non_zero:
+                    last_err = f'写锁窗口内 checkpoint 后 WAL 仍非零: {non_zero}'
+                    continue
+                t_copy = time.perf_counter()
+                _copy_raw_files(data_dir, targets, data_out)
+                online_info['copy_s'] = time.perf_counter() - t_copy
+                online_info['blocked_window_s'] = time.perf_counter() - t_mark
+                online_info['wal_after_bytes'] = wal_after
+                succeeded = True
+            finally:
+                locks.release()
+        if not succeeded:
+            raise OnlineQuiesceError(
+                f'未能在 {quiesce_wait:.1f}s 内建立一致的进程内 quiesce 窗口：'
+                f'{last_err}（等待事务结束后重试，或停机做离线快照）')
+    else:
+        # ---------- 跨进程 OS 级 suspend quiesce ----------
+        pid = server_pid or detect_server_pid(server_ports)
+        if pid is None:
+            raise OnlineQuiesceError(
+                '在线快照需要能定位服务进程：请用 --server-pid 指定，或改用'
+                '进程内 live_db=... 方式（引擎没有跨进程 SQL quiesce 协议）')
+        online_info['backend'] = 'process-suspend'
+        online_info['quiesced_pid'] = int(pid)
+        online_info['server_running'] = True
+        t0 = time.perf_counter()
+        suspend_process(pid)
+        online_info['suspend_s'] = time.perf_counter() - t0
+        try:
+            t_copy = time.perf_counter()
+            _copy_raw_files(data_dir, targets, data_out)
+            online_info['copy_s'] = time.perf_counter() - t_copy
+        finally:
+            resumed = resume_process(pid)
+            online_info['resume_ok'] = bool(resumed)
+            online_info['blocked_window_s'] = time.perf_counter() - t0
+        if not resumed:
+            raise OnlineQuiesceError(
+                f'严重: 恢复服务进程 pid={pid} 失败，请手工 resume'
+                f'（psutil.Process({pid}).resume()）')
+        online_info['recovered_on_copy'] = True
+        online_info['wal_bytes_before_checkpoint'] = {
+            t: ((data_out / f'{t}.wal').stat().st_size
+                if (data_out / f'{t}.wal').is_file() else 0)
+            for t in targets}
+
+    # ---------- 副本后处理：WAL 恢复/checkpoint + 采集 + 哈希 ----------
+    online_info['blocked_window_s'] = round(online_info['blocked_window_s'], 4)
+    manifest_tables, users_meta, cp = _finalize_online_copy(data_out, table)
+    checkpoint_info = {
+        'tables_checked': cp['tables_checked'],
+        'tables_total': len(targets),
+        'wal_after_bytes': cp['wal_after_bytes'],
+        'all_wal_zero': True,
+        'online': True,
+        'strategy': ('quiesce 窗口内 Table.checkpoint()（脏页 fsync + BTree 根 '
+                     'fsync + WAL truncate）→ 文件拷贝 → 释放写锁/恢复进程；'
+                     '跨进程模式在快照副本上再做 WAL 恢复 + checkpoint'),
+    }
+    if live_db is not None:
+        checkpoint_info['wal_before_bytes'] = \
+            online_info.get('wal_bytes_before_checkpoint') or {}
+    manifest, file_records, total_bytes = _build_online_manifest(
+        data_dir, data_out, table, manifest_tables, users_meta,
+        checkpoint_info, online_info, warnings)
+    _write_manifest(out_dir, manifest)
+    duration = time.perf_counter() - t_start
+    report = {
+        'status': 'ok',
+        'action': 'snapshot',
+        'snapshot_dir': str(out_dir),
+        'manifest_path': str(out_dir / MANIFEST_NAME),
+        'lightdb_version': manifest['lightdb_version'],
+        'mode': manifest['mode'],
+        'table_filter': table,
+        'tables': [{'name': t['name'], 'row_count': t['row_count'],
+                    'files': t['files']} for t in manifest_tables],
+        'tables_count': manifest['tables_count'],
+        'row_total': manifest['row_total'],
+        'total_files': manifest['total_files'],
+        'total_bytes': total_bytes,
+        'wal_zero': True,
+        'online': online_info,
+        'warnings': warnings,
+        'duration_s': duration,
+    }
+    if not quiet:
+        print('[snapshot] 在线快照完成: %s（%d 表 / %d 行 / %.1f KB）'
+              % (out_dir, manifest['tables_count'], manifest['row_total'],
+                 total_bytes / 1024.0))
+        print('[snapshot] quiesce 后端=%s 阻塞窗口=%.3fs（checkpoint %.3fs + '
+              '拷贝 %.3fs，锁等待 %.3fs）总耗时 %.2fs'
+              % (online_info['backend'], online_info['blocked_window_s'],
+                 online_info['checkpoint_s'], online_info['copy_s'],
+                 online_info['lock_wait_s'], duration))
         for w in warnings:
             print('[snapshot] ' + w)
     return report
@@ -597,6 +1070,7 @@ def restore_snapshot(snapshot_dir, target_data_dir, *, force: bool = False,
     manifest = read_manifest(snapshot_dir)
     version_check = validate_manifest(manifest, version,
                                       allow_version_mismatch)
+    warnings.extend(version_check.get('warnings') or [])
     if check_servers:
         _refuse_if_running(server_ports, force, warnings, '恢复')
     if target == snapshot_dir or snapshot_dir in target.parents or \
@@ -697,6 +1171,7 @@ def describe_snapshot(snapshot_dir) -> dict:
         'created_at': manifest.get('created_at'),
         'mode': manifest.get('mode'),
         'table_filter': manifest.get('table_filter'),
+        'online': manifest.get('online'),
         'tables': [{'name': t['name'], 'row_count': t['row_count']}
                    for t in manifest.get('tables') or []],
         'tables_count': manifest.get('tables_count'),
