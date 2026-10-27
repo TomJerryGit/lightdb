@@ -7,6 +7,13 @@ const API = '/api/v1';
 let token = localStorage.getItem('lightdb_token') || '';
 let currentConn = '';
 let currentDB = '';
+let currentTable = '';
+let connectionsCache = [];
+let dataOffset = 0;
+let dataTotal = 0;
+let dataOrderBy = '';
+let dataOrderDesc = false;
+let designColumns = [];
 let reportTemplates = [];
 let selectedReport = '';
 
@@ -190,6 +197,8 @@ async function loadConnections() {
       opt.textContent = `${c.name} (${c.host}:${c.port})`;
       sel.appendChild(opt);
     });
+    renderConnDetail(data || []);
+    connectionsCache = data || [];
   } catch (e) {
     setStatus('exec-status', '加载连接失败: ' + e.message, true);
   }
@@ -197,6 +206,7 @@ async function loadConnections() {
 
 async function onConnChange() {
   currentConn = $id('conn-select').value;
+  renderConnDetail(connectionsCache);
   if (!currentConn) {
     clearNode($id('object-tree'));
     return;
@@ -257,9 +267,291 @@ async function toggleDatabase(elNode, db) {
 
 function selectTable(table, db) {
   currentDB = db;
+  currentTable = table;
+  dataOffset = 0;
   $id('sql-editor').value =
     `SELECT * FROM \`${table}\` LIMIT 100;`;
   runQuery();
+}
+
+// ==================== 表数据 / 分页排序 ====================
+
+function connQuery(extra) {
+  const parts = [];
+  if (currentConn) parts.push('connection=' + encodeURIComponent(currentConn));
+  if (extra) parts.push(extra);
+  return parts.length ? '?' + parts.join('&') : '';
+}
+
+function renderConnDetail(connections) {
+  const box = $id('conn-detail');
+  if (!box) return;
+  clearNode(box);
+  if (!connections || !connections.length) return;
+  const c = connections.find(x => x.name === currentConn) || connections[0];
+  const ssh = c.ssh || {status: 'disabled'};
+  const ssl = c.ssl || {status: 'disabled'};
+  box.appendChild(el('div', 'conn-line',
+    `SSH: ${ssh.status}${ssh.enabled ? ' · ' + (ssh.host || '') + ':' + (ssh.port || '') : ''}`));
+  box.appendChild(el('div', 'conn-line',
+    `SSL: ${ssl.status}${ssl.enabled ? ' · CA ' + (ssl.has_ca ? '已配置' : '未配置') : ''}`));
+}
+
+async function loadTableData(table, db, offset) {
+  if (!table || !db) {
+    setStatus('exec-status', '请先在对象树选择表', true);
+    return;
+  }
+  currentTable = table;
+  currentDB = db;
+  dataOffset = Math.max(0, offset || 0);
+  const order = dataOrderBy
+    ? '&order_by=' + encodeURIComponent(dataOrderBy) +
+      '&order_desc=' + (dataOrderDesc ? 'true' : 'false')
+    : '';
+  setStatus('exec-status', '加载表数据...', false);
+  try {
+    const q = connQuery('limit=100&offset=' + dataOffset + order);
+    const data = await api('/databases/' + encodeURIComponent(db) +
+      '/tables/' + encodeURIComponent(table) + '/data' + q);
+    renderTable(data.columns || [], data.rows || []);
+    dataTotal = data.total === null || data.total === undefined
+      ? (data.rows || []).length : data.total;
+    $id('table-controls').classList.remove('hidden');
+    $id('table-current').textContent = `表 ${db}.${table}`;
+    $id('data-page-info').textContent =
+      `第 ${Math.floor(dataOffset / 100) + 1} 页 · 共 ${dataTotal} 行`;
+    $id('data-prev-btn').disabled = dataOffset <= 0;
+    $id('data-next-btn').disabled = dataOffset + 100 >= dataTotal;
+    const sortSel = $id('sort-column-select');
+    clearNode(sortSel);
+    const first = el('option', '', '默认排序');
+    first.value = '';
+    sortSel.appendChild(first);
+    (data.columns || []).forEach(c => {
+      const o = el('option', '', String(c));
+      o.value = String(c);
+      sortSel.appendChild(o);
+    });
+    setStatus('exec-status', '表数据已加载', false);
+  } catch (e) {
+    setStatus('exec-status', '加载失败: ' + e.message, true);
+    clearNode($id('result-table'));
+    $id('result-table').appendChild(el('div', 'result-error', e.message));
+  }
+}
+
+function onSortColumnChange() {
+  dataOrderBy = $id('sort-column-select').value;
+  dataOrderDesc = false;
+  loadTableData(currentTable, currentDB, 0);
+}
+
+async function explainCurrent() {
+  const sql = $id('sql-editor').value.trim();
+  if (!sql) { setStatus('exec-status', '请输入 SQL', true); return; }
+  const btn = $id('explain-btn');
+  if (!setBusy(btn, true, 'EXPLAIN...')) return;
+  try {
+    const data = await api('/explain', {
+      method: 'POST',
+      body: JSON.stringify({sql: sql, connection: currentConn,
+                            database: currentDB}),
+    });
+    renderTable(data.columns, data.rows);
+    $id('result-info').textContent = `EXPLAIN 返回 ${data.row_count} 行`;
+    setStatus('exec-status', 'EXPLAIN 完成', false);
+  } catch (e) {
+    setStatus('exec-status', 'EXPLAIN 失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function exportCurrentQuery() {
+  const sql = $id('sql-editor').value.trim();
+  if (!sql) { setStatus('exec-status', '请输入 SQL', true); return; }
+  const btn = $id('export-query-btn');
+  if (!setBusy(btn, true, '导出中...')) return;
+  try {
+    const res = await apiBlob('/query/export', {
+      method: 'POST',
+      body: JSON.stringify({sql: sql, connection: currentConn,
+                            database: currentDB, format: 'csv'}),
+    });
+    downloadBlob(res.blob, res.filename || 'query_result.csv');
+    setStatus('exec-status', '查询结果已导出 CSV', false);
+  } catch (e) {
+    setStatus('exec-status', '导出失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function exportCurrentTable() {
+  if (!currentTable || !currentDB) {
+    setStatus('exec-status', '请先加载表数据', true);
+    return;
+  }
+  const btn = $id('export-table-btn');
+  if (!setBusy(btn, true, '导出中...')) return;
+  try {
+    const q = connQuery('');
+    const res = await apiBlob('/databases/' + encodeURIComponent(currentDB) +
+      '/tables/' + encodeURIComponent(currentTable) + '/export?fmt=csv' + q);
+    downloadBlob(res.blob, res.filename || (currentTable + '.csv'));
+    setStatus('exec-status', '表 CSV 已导出', false);
+  } catch (e) {
+    setStatus('exec-status', '导出失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+// ==================== 表设计器 ====================
+
+async function openDesigner() {
+  if (!currentTable || !currentDB) {
+    setStatus('exec-status', '请先在对象树选择表', true);
+    return;
+  }
+  const btn = $id('design-btn');
+  if (!setBusy(btn, true, '读取结构...')) return;
+  try {
+    const data = await api('/databases/' + encodeURIComponent(currentDB) +
+      '/tables/' + encodeURIComponent(currentTable) + '/design' +
+      connQuery(''));
+    designColumns = data.columns || [];
+    $id('design-columns-input').value =
+      JSON.stringify(designColumns, null, 2);
+    $id('design-panel').classList.remove('hidden');
+    $id('design-sql-preview').textContent = '';
+    setStatus('design-status', '已读取列/索引；修改 JSON 后预览或保存', false);
+  } catch (e) {
+    setStatus('exec-status', '读取设计器失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function submitDesign(dryRun) {
+  const btn = $id(dryRun ? 'design-preview-btn' : 'design-save-btn');
+  let columns;
+  try {
+    columns = JSON.parse($id('design-columns-input').value);
+    if (!Array.isArray(columns)) throw new Error('JSON 必须是列数组');
+  } catch (e) {
+    setStatus('design-status', 'JSON 解析失败: ' + e.message, true);
+    return;
+  }
+  if (!dryRun && !window.confirm('保存 ALTER？DROP COLUMN 不可逆，请确认已备份。')) {
+    return;
+  }
+  if (!setBusy(btn, true, dryRun ? '预览中...' : '保存中...')) return;
+  try {
+    const data = await api('/databases/' + encodeURIComponent(currentDB) +
+      '/tables/' + encodeURIComponent(currentTable) + '/design' +
+      connQuery(''), {
+      method: 'POST',
+      body: JSON.stringify({columns: columns, dry_run: dryRun,
+                            connection: currentConn}),
+    });
+    const stmts = data.statements || [];
+    $id('design-sql-preview').textContent = stmts.join('\n') || '（无变更）';
+    setStatus('design-status',
+      dryRun ? `预览 ${stmts.length} 条 ALTER（未执行）`
+             : `已执行 ${data.count} 条 ALTER`, false);
+    if (!dryRun) {
+      await openDesigner();
+      await loadTableData(currentTable, currentDB, 0);
+    }
+  } catch (e) {
+    setStatus('design-status', '保存失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+// ==================== 导入 / 备份 / 结构对比 ====================
+
+function triggerImport() {
+  if (!currentTable || !currentDB) {
+    setStatus('exec-status', '请先在对象树选择表', true);
+    return;
+  }
+  $id('import-file-input').click();
+}
+
+async function onImportFile(ev) {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = '';
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const data = await api('/databases/' + encodeURIComponent(currentDB) +
+      '/tables/' + encodeURIComponent(currentTable) + '/import' +
+      connQuery(''), {
+      method: 'POST',
+      body: JSON.stringify({csv: text, has_header: true}),
+    });
+    setStatus('exec-status',
+      `导入完成：成功 ${data.inserted} 行，失败 ${data.failed} 行`, !data.ok);
+    if (data.errors && data.errors.length) {
+      $id('result-table').appendChild(
+        el('div', 'result-error', JSON.stringify(data.errors.slice(0, 5))));
+    }
+    if (currentTable) await loadTableData(currentTable, currentDB, 0);
+  } catch (e) {
+    setStatus('exec-status', '导入失败: ' + e.message, true);
+  }
+}
+
+async function backupCurrent() {
+  if (!currentDB) {
+    setStatus('exec-status', '请先切换数据库', true);
+    return;
+  }
+  const btn = $id('backup-btn');
+  if (!setBusy(btn, true, '备份中...')) return;
+  try {
+    const res = await apiBlob('/backup', {
+      method: 'POST',
+      body: JSON.stringify({database: currentDB, connection: currentConn}),
+    });
+    downloadBlob(res.blob, res.filename || ('backup_' + currentDB + '.sql'));
+    setStatus('exec-status', '逻辑备份已下载', false);
+  } catch (e) {
+    setStatus('exec-status', '备份失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function compareSchema() {
+  if (!currentDB) {
+    setStatus('exec-status', '请先切换数据库', true);
+    return;
+  }
+  const target = window.prompt('目标数据库名（结构对比，只读）：', currentDB);
+  if (!target) return;
+  const btn = $id('sync-btn');
+  if (!setBusy(btn, true, '对比中...')) return;
+  try {
+    const data = await api('/schema/compare?source_db=' +
+      encodeURIComponent(currentDB) + '&target_db=' +
+      encodeURIComponent(target) + connQuery(''));
+    const s = data.summary || {};
+    setStatus('exec-status',
+      `结构对比：缺少表 ${(s.missing_in_target || []).length}，` +
+      `新增表 ${(s.missing_in_source || []).length}，` +
+      `变化表 ${s.changed_tables || 0}`, false);
+    $id('result-table').appendChild(
+      el('pre', 'sql-preview', JSON.stringify(data.differences || [], null, 2)));
+  } catch (e) {
+    setStatus('exec-status', '结构对比失败: ' + e.message, true);
+  } finally {
+    setBusy(btn, false);
+  }
 }
 
 // ==================== 查询 ====================
@@ -651,6 +943,37 @@ window.addEventListener('DOMContentLoaded', async () => {
     setStatus('exec-status', '', false);
   };
   $id('refresh-obj-btn').onclick = loadConnections;
+  $id('data-btn').onclick = () => {
+    if (!currentTable) {
+      setStatus('exec-status', '请先在对象树选择表', true);
+      return;
+    }
+    loadTableData(currentTable, currentDB, 0);
+  };
+  $id('design-btn').onclick = openDesigner;
+  $id('explain-btn').onclick = explainCurrent;
+  $id('export-query-btn').onclick = exportCurrentQuery;
+  $id('import-btn').onclick = triggerImport;
+  $id('import-file-input').onchange = onImportFile;
+  $id('backup-btn').onclick = backupCurrent;
+  $id('sync-btn').onclick = compareSchema;
+  $id('data-prev-btn').onclick = () =>
+    loadTableData(currentTable, currentDB, Math.max(0, dataOffset - 100));
+  $id('data-next-btn').onclick = () =>
+    loadTableData(currentTable, currentDB, dataOffset + 100);
+  $id('sort-column-select').onchange = onSortColumnChange;
+  $id('export-table-btn').onclick = exportCurrentTable;
+  $id('data-close-btn').onclick = () => {
+    $id('table-controls').classList.add('hidden');
+    clearNode($id('result-table'));
+    $id('result-info').textContent = '就绪';
+  };
+  $id('design-preview-btn').onclick = () => submitDesign(true);
+  $id('design-save-btn').onclick = () => submitDesign(false);
+  $id('design-close-btn').onclick = () => {
+    $id('design-panel').classList.add('hidden');
+    setStatus('design-status', '', false);
+  };
 
   $id('tool-history-btn').onclick = () => switchTool('history');
   $id('tool-reports-btn').onclick = () => switchTool('reports');

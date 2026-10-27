@@ -248,6 +248,7 @@ def create_app(db=None, executor=None, connections: List = None,
     （连接/用户/db/executor），因此多次 ``create_app()``（如测试）互不污染。
     """
     from .api import _session_conns, router
+    from .parity import router as parity_router
 
     app_state['db'] = db
     app_state['executor'] = executor
@@ -276,6 +277,8 @@ def create_app(db=None, executor=None, connections: List = None,
 
     # API 路由
     app.include_router(router)
+    # task-60：Web GUI 对标 P0/P1（设计器/导入导出/EXPLAIN/备份/结构对比）
+    app.include_router(parity_router)
 
     # Prometheus 指标（web/metrics.py 之前是死代码，从未挂载）
     try:

@@ -100,6 +100,9 @@ class ConnectionModel(BaseModel):
     database: str = ""
     charset: str = "utf8mb4"
     ssl: bool = False
+    # task-60：SSH/SSL 高级字段（Web 只展示状态，绝不回显口令/私钥内容）
+    ssh_options: Dict = Field(default_factory=dict)
+    ssl_options: Dict = Field(default_factory=dict)
 
 
 class LoginRequest(BaseModel):
@@ -209,17 +212,39 @@ async def me(payload: dict = Depends(verify_token)):
 
 # ==================== 连接管理 ====================
 
+def _public_connection(c) -> dict:
+    """task-60：连接列表只读展示 SSH/SSL 状态；口令/私钥内容绝不回显。"""
+    ssh = dict(getattr(c, 'ssh_options', None) or {})
+    ssl_opts = dict(getattr(c, 'ssl_options', None) or {})
+    ssh_enabled = bool(ssh.get('enabled'))
+    ssl_enabled = bool(getattr(c, 'ssl', False))
+    return {
+        "name": c.name, "host": c.host, "port": c.port, "user": c.user,
+        "database": c.database,
+        "ssh": {
+            "enabled": ssh_enabled,
+            "status": "enabled" if ssh_enabled else "disabled",
+            "host": ssh.get('host') or None,
+            "port": int(ssh.get('port') or 22) if ssh_enabled else None,
+            "user": ssh.get('user') or None,
+            "credential_set": bool(ssh.get('password')),
+            "has_key": bool(ssh.get('key_path')),
+        },
+        "ssl": {
+            "enabled": ssl_enabled,
+            "status": "enabled" if ssl_enabled else "disabled",
+            "has_ca": bool(ssl_opts.get('ca')),
+            "has_client_cert": bool(ssl_opts.get('cert')),
+            "verify_mode": ssl_opts.get('verify_mode') or None,
+        },
+    }
+
+
 @router.get("/connections")
 async def list_connections(payload: dict = Depends(verify_token)):
     from .server import app_state
     conns = app_state.get('connections', [])
-    return [{
-        "name": c.name,
-        "host": c.host,
-        "port": c.port,
-        "user": c.user,
-        "database": c.database,
-    } for c in conns]
+    return [_public_connection(c) for c in conns]
 
 
 @router.post("/connections")
@@ -275,13 +300,7 @@ async def create_connection(
         "replaced": replaced,
         "persisted": persisted,
         "warning": warning,
-        "connection": {
-            "name": info.name,
-            "host": info.host,
-            "port": info.port,
-            "user": info.user,
-            "database": info.database,
-        },
+        "connection": _public_connection(info),
     }
 
 
@@ -504,11 +523,23 @@ async def get_table_data(
     sql += f" LIMIT {limit} OFFSET {offset}"   # limit/offset 已被 Query 校验为 int
 
     try:
+        total = None
+        try:
+            _tc, trows = conn.query(f"SELECT COUNT(*) FROM `{table}`")
+            if trows:
+                total = int(trows[0][0])
+        except Exception:
+            total = None
         cols, rows = conn.query(sql)
         return {
             "ok": True,
             "columns": cols,
             "rows": [_serialize_row(r) for r in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "order_by": order_by,
+            "order_desc": bool(order_desc),
         }
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -676,12 +707,32 @@ WEB_GUI_PARITY: Dict[str, dict] = {
         'gui': '连接管理 / 对象树', 'web': 'GET/POST /api/v1/connections, '
         'GET /databases*, GET /tables*, POST /connections/test',
         'status': 'partial', 'shared_core': 'lightdb_studio.config.ConnectionInfo',
-        'notes': 'Web 可增改/测试连接与浏览对象；编辑连接对话框是 GUI 专属交互',
+        'notes': 'Web 可增改/测试连接与浏览对象；列表只读展示 SSH/SSL '
+                 '状态（不回显口令）；编辑连接对话框是 GUI 专属交互',
     },
     'object_browser': {
         'gui': '对象浏览器（库/表/列）', 'web': 'GET /databases, /tables, /columns',
         'status': 'full', 'shared_core': 'lightdb_studio.db.connection',
-        'notes': '表行数统计为 Web 补充能力',
+        'notes': '表行数统计、分页/排序数据浏览为 Web 补充能力',
+    },
+    'table_designer': {
+        'gui': '表设计器（列编辑/AUTO_INCREMENT/索引）',
+        'web': 'GET/POST /api/v1/databases/{db}/tables/{table}/design',
+        'status': 'partial', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '预览/保存列增删改、AUTO_INCREMENT、索引增删；主键/唯一变更'
+                 '仍显式拒绝（引擎 ALTER 变体限制）',
+    },
+    'result_paging': {
+        'gui': '数据网格分页/排序',
+        'web': 'GET /databases/{db}/tables/{table}/data?limit&offset&order_by',
+        'status': 'full', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '返回 total/limit/offset/order_by；前端网格分页排序',
+    },
+    'explain': {
+        'gui': 'EXPLAIN 执行计划',
+        'web': 'POST /api/v1/explain',
+        'status': 'full', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '仅 SELECT/WITH；错误显式 400',
     },
     'sql_format': {
         'gui': '编辑器「格式化 SQL」', 'web': 'POST /api/v1/sql/format',
@@ -702,14 +753,17 @@ WEB_GUI_PARITY: Dict[str, dict] = {
         'notes': '参数化 preview/export 复用 ReportEngine；html/csv/xlsx 真实生成',
     },
     'schema_compare': {
-        'gui': 'Schema 对比 / ER 图', 'web': None,
-        'status': 'not_applicable',
-        'notes': '依赖 GUI 交互与 Qt 绘图；Web 后续可做 API 版',
+        'gui': 'Schema 对比 / ER 图',
+        'web': 'GET /api/v1/schema/compare?source_db=&target_db=',
+        'status': 'partial', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '只读结构对比（缺失表/列差异/类型）；Web 不做自动同步写入',
     },
     'snapshot_backup': {
-        'gui': '快照/备份/恢复', 'web': None,
-        'status': 'not_applicable',
-        'notes': '本地文件系统备份属于桌面端能力',
+        'gui': '快照/备份/恢复',
+        'web': 'POST /api/v1/backup',
+        'status': 'partial', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '真实生成逻辑 SQL 备份（SHOW CREATE + INSERT）；不含恢复/'
+                 '二进制快照（桌面端文件系统能力）',
     },
     'data_quality': {
         'gui': '数据质量检查', 'web': 'POST /api/v1/quality/check',
@@ -718,9 +772,12 @@ WEB_GUI_PARITY: Dict[str, dict] = {
         'notes': '复用 DataQualityChecker；Web 当前按单表触发并返回 issues 摘要',
     },
     'import_export': {
-        'gui': 'CSV 导入/导出（进度/取消）', 'web': None,
-        'status': 'not_applicable',
-        'notes': '大文件流式导入导出与进度 UI 为桌面端能力',
+        'gui': 'CSV 导入/导出（进度/取消）',
+        'web': 'GET .../export?fmt=csv|sql; POST .../import; '
+               'POST /api/v1/query/export',
+        'status': 'full', 'shared_core': 'lightdb_studio.db.connection',
+        'notes': '表 CSV/SQL 导出、CSV 导入（显式行错误）、查询结果 CSV/SQL '
+                 '导出；大文件流式进度/取消未做（P2）',
     },
     'plugins': {
         'gui': '插件启用/禁用/菜单注入', 'web': None,

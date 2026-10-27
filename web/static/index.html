@@ -55,6 +55,7 @@
           </select>
           <button id="refresh-obj-btn" class="btn-small">🔄</button>
         </div>
+        <div id="conn-detail" class="conn-detail"></div>
         <div id="object-tree" class="tree"></div>
       </aside>
 
@@ -67,8 +68,38 @@
             <button id="clear-btn" class="btn-small" data-action="clear-editor">清空</button>
             <span id="exec-status" class="status"></span>
           </div>
+          <div class="toolbar parity-toolbar">
+            <button id="data-btn" class="btn-small" data-action="load-table-data">📊 表数据</button>
+            <button id="design-btn" class="btn-small" data-action="design-table">🛠 设计表</button>
+            <button id="explain-btn" class="btn-small" data-action="explain">📈 EXPLAIN</button>
+            <button id="export-query-btn" class="btn-small" data-action="export-query">⬇ 导出结果</button>
+            <button id="import-btn" class="btn-small" data-action="import-csv">⬆ 导入 CSV</button>
+            <button id="backup-btn" class="btn-small" data-action="backup">💾 备份</button>
+            <button id="sync-btn" class="btn-small" data-action="schema-compare">⇄ 结构对比</button>
+            <input id="import-file-input" type="file" accept=".csv,text/csv" class="hidden-input">
+          </div>
           <textarea id="sql-editor" placeholder="-- 输入 SQL
 SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
+        </div>
+        <div id="table-controls" class="table-controls hidden">
+          <span id="table-current" class="result-info"></span>
+          <label>排序 <select id="sort-column-select" class="btn-small"></select></label>
+          <button id="data-prev-btn" class="btn-small">上一页</button>
+          <button id="data-next-btn" class="btn-small">下一页</button>
+          <span id="data-page-info" class="status"></span>
+          <button id="export-table-btn" class="btn-small">导出 CSV</button>
+          <button id="data-close-btn" class="btn-small">关闭数据页</button>
+        </div>
+        <div id="design-panel" class="panel hidden">
+          <h3>表设计器（列 / AUTO_INCREMENT / 索引）</h3>
+          <textarea id="design-columns-input" class="params-input" placeholder="列 JSON（GET design 返回的 columns）"></textarea>
+          <div class="btn-row">
+            <button id="design-preview-btn" class="btn-small" data-action="design-preview">预览 ALTER</button>
+            <button id="design-save-btn" class="btn-small btn-primary" data-action="design-save">保存 ALTER</button>
+            <button id="design-close-btn" class="btn-small">关闭</button>
+          </div>
+          <div id="design-status" class="status"></div>
+          <pre id="design-sql-preview" class="sql-preview"></pre>
         </div>
         <div class="result-area">
           <div id="result-info" class="result-info">就绪</div>

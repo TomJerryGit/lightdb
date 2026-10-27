@@ -551,3 +551,60 @@ header {
 .level-info {
   color: #9cdcfe;
 }
+
+/* task-60：表数据分页/设计器/连接 SSH-SSL 状态 */
+.hidden-input {
+  display: none;
+}
+
+.parity-toolbar {
+  border-top: 1px dashed rgba(127, 127, 127, 0.25);
+  margin-top: 4px;
+  padding-top: 4px;
+}
+
+.table-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.25);
+  flex-wrap: wrap;
+}
+
+.table-controls.hidden {
+  display: none;
+}
+
+.conn-detail {
+  padding: 4px 10px;
+  font-size: 11px;
+  color: #8a8a8a;
+  line-height: 1.5;
+}
+
+.conn-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panel {
+  margin: 8px 10px;
+  padding: 8px;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.06);
+}
+
+.panel.hidden {
+  display: none;
+}
+
+.sql-preview {
+  max-height: 160px;
+  overflow: auto;
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  padding: 6px;
+}
