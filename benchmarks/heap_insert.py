@@ -34,6 +34,7 @@ import statistics
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -53,8 +54,55 @@ BATCH = 500
 
 
 # --------------------------------------------------------------- 环境开关
+#: `prepare_env()` 会临时改写、退出时**按原值/不存在**恢复的进程环境变量。
+#: 不要直接 `os.environ[...] = ...`；统一走 prepare_env() 上下文，
+#: 避免 benchmark 在 pytest 进程内留下 LIGHTDB_AUDIT_LEVEL=NONE 等污染
+#: （全量字母序下会导致后续审计类测试不落盘）。
+BENCH_ENV_KEYS = (
+    'LIGHTDB_AUDIT_LEVEL',
+    'LIGHTDB_LOG_LEVEL',
+    'LIGHTDB_WAL_CHECKPOINT_BYTES',
+    'LIGHTDB_WAL_CHECKPOINT_RECORDS',
+)
+
+
+def snapshot_env(keys=BENCH_ENV_KEYS) -> dict:
+    """保存这些环境变量的当前值；None 表示原本不存在（恢复时要删除）。"""
+    return {key: os.environ.get(key) for key in keys}
+
+
+def restore_env(snapshot: dict) -> None:
+    """把 snapshot_env() 的结果精确恢复（不存在 -> 删除）。"""
+    for key, value in (snapshot or {}).items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _logger_level():
+    try:
+        from lightdb.logger import logger as _lg
+        return _lg.get_level()
+    except Exception:                                # pragma: no cover
+        return None
+
+
+def _restore_logger_level(level) -> None:
+    if level is None:
+        return
+    try:
+        from lightdb.logger import logger as _lg
+        _lg.set_level(level)
+    except Exception:                                # pragma: no cover
+        pass
+
+
 def checkpoint_env(cfg: str):
-    """设置 checkpoint 阈值。cfg='off' 关掉（阈值极大），其它走引擎默认。"""
+    """设置 checkpoint 阈值。cfg='off' 关掉（阈值极大），其它走引擎默认。
+
+    只允许在 `prepare_env()` 上下文内调用（由 ctxmanager 负责恢复原值）。
+    """
     if cfg == 'off':
         os.environ['LIGHTDB_WAL_CHECKPOINT_BYTES'] = str(10 ** 15)
         os.environ['LIGHTDB_WAL_CHECKPOINT_RECORDS'] = '0'
@@ -64,7 +112,7 @@ def checkpoint_env(cfg: str):
 
 
 def quiet_logger(level: str = 'ERROR'):
-    """把全局 logger 压到 ERROR。
+    """把全局 logger 压到 ERROR（由 `prepare_env()` 负责恢复原级别）。
 
     必要性（原作者实测）：`Executor.execute` 在语句耗时 >0.5s 时无条件
     `logger.warn(...)` 并把**整条 AST**（几百行多值 INSERT 是几十 KB）
@@ -78,12 +126,29 @@ def quiet_logger(level: str = 'ERROR'):
         pass
 
 
+@contextmanager
 def prepare_env(cfg: str = 'default', audit: str = 'NONE'):
-    """测量前的统一环境准备（必须在 lightdb 首次使用前调用）"""
-    os.environ['LIGHTDB_AUDIT_LEVEL'] = audit
-    os.environ['LIGHTDB_LOG_LEVEL'] = 'ERROR'
-    checkpoint_env(cfg)
-    quiet_logger()
+    """测量前的统一环境准备上下文：进入时设置，退出（含异常）时精确恢复。
+
+    用法::
+
+        with H.prepare_env(cfg):
+            ... 跑 benchmark ...
+
+    恢复语义：原本不存在的变量会被删除（不是留成空串）；原有值原样写回；
+    全局 logger 级别也一并恢复（避免把后续测试的日志压到 ERROR）。
+    """
+    env_before = snapshot_env()
+    logger_before = _logger_level()
+    try:
+        os.environ['LIGHTDB_AUDIT_LEVEL'] = audit
+        os.environ['LIGHTDB_LOG_LEVEL'] = 'ERROR'
+        checkpoint_env(cfg)
+        quiet_logger()
+        yield env_before
+    finally:
+        restore_env(env_before)
+        _restore_logger_level(logger_before)
 
 
 # --------------------------------------------------------------- 基础工具

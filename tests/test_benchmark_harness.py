@@ -5,7 +5,10 @@
 2. JSON 字段完整：版本/环境/seed/每项 median+best+samples/reference_db/门禁；
 3. 可复现：固定 seed 的数据集与查询计划逐字节一致，换 seed 则不同；
 4. 阈值模拟：合成测量值判定 PASS/FAIL；CLI `--gate --target-scale 1e9`
-   必然未达标 -> 退出码 1（且 JSON 里 gate.passed=False）。
+   必然未达标 -> 退出码 1（且 JSON 里 gate.passed=False）；
+5. **环境变量隔离（task-78）**：`prepare_env`/case/harness 退出（含异常）
+   必须精确恢复 os.environ（原本不存在的键删除、原值写回），避免污染同进程
+   后续测试（根因：全量字母序下 test_production_metrics 审计不落盘）。
 
 运行：
     python -m pytest tests/test_benchmark_harness.py -q
@@ -20,7 +23,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from benchmarks import cases as B                  # noqa: E402
 from benchmarks import competitive_harness as CH  # noqa: E402
+from benchmarks import heap_insert as H           # noqa: E402
 
 REQUIRED_CASES = {
     'insert_rowwise', 'insert_batch', 'insert_batch_speedup',
@@ -251,3 +256,118 @@ def test_cli_rejects_unknown_target_and_bad_suite(tmp_path):
     assert CH.main(['--gate', '--target', 'no_such_target=1',
                     '--scale', '0.01', '--out', str(tmp_path / 'x.json'),
                     '--data-dir', str(tmp_path / 'd'), '--json-only']) == 2
+
+
+# ==================== task-78：benchmark 环境变量泄漏回归 ====================
+
+def _restore_whole_env(snapshot: dict) -> None:
+    os.environ.clear()
+    os.environ.update(snapshot)
+
+
+def test_prepare_env_restores_missing_and_existing_keys(tmp_path):
+    """prepare→teardown 后 env 与之前完全一致；原本不存在的键必须删除。"""
+    before = dict(os.environ)
+    try:
+        # 场景 1：四个键原本都不存在 -> 退出后必须仍不存在
+        for key in H.BENCH_ENV_KEYS:
+            os.environ.pop(key, None)
+        snap_absent = dict(os.environ)
+        with H.prepare_env('default'):
+            assert os.environ['LIGHTDB_AUDIT_LEVEL'] == 'NONE'
+            assert os.environ['LIGHTDB_LOG_LEVEL'] == 'ERROR'
+            assert 'LIGHTDB_WAL_CHECKPOINT_BYTES' not in os.environ
+            assert 'LIGHTDB_WAL_CHECKPOINT_RECORDS' not in os.environ
+        assert dict(os.environ) == snap_absent
+        for key in H.BENCH_ENV_KEYS:
+            assert key not in os.environ, key
+
+        # 场景 2：原有自定义值 + cfg='off' 改写 -> 退出后原值写回
+        os.environ['LIGHTDB_AUDIT_LEVEL'] = 'DML'
+        os.environ['LIGHTDB_LOG_LEVEL'] = 'DEBUG'
+        os.environ['LIGHTDB_WAL_CHECKPOINT_BYTES'] = '123456'
+        os.environ['LIGHTDB_WAL_CHECKPOINT_RECORDS'] = '9'
+        snap_existing = dict(os.environ)
+        with H.prepare_env('off', audit='ALL'):
+            assert os.environ['LIGHTDB_AUDIT_LEVEL'] == 'ALL'
+            assert os.environ['LIGHTDB_WAL_CHECKPOINT_BYTES'] == str(10 ** 15)
+            assert os.environ['LIGHTDB_WAL_CHECKPOINT_RECORDS'] == '0'
+        assert dict(os.environ) == snap_existing
+        assert os.environ['LIGHTDB_AUDIT_LEVEL'] == 'DML'
+        assert os.environ['LIGHTDB_WAL_CHECKPOINT_BYTES'] == '123456'
+    finally:
+        _restore_whole_env(before)
+
+
+def test_prepare_env_restores_on_exception(tmp_path):
+    """异常路径也必须恢复 env（内部 raise 不允许把变量留在进程里）。"""
+    before = dict(os.environ)
+    try:
+        os.environ.pop('LIGHTDB_AUDIT_LEVEL', None)
+        os.environ.pop('LIGHTDB_LOG_LEVEL', None)
+        snap = dict(os.environ)
+        with pytest.raises(RuntimeError, match='boom'):
+            with H.prepare_env('default'):
+                assert os.environ['LIGHTDB_AUDIT_LEVEL'] == 'NONE'
+                raise RuntimeError('boom')
+        assert dict(os.environ) == snap
+        assert 'LIGHTDB_AUDIT_LEVEL' not in os.environ
+        assert 'LIGHTDB_LOG_LEVEL' not in os.environ
+    finally:
+        _restore_whole_env(before)
+
+
+def test_prepare_env_restores_global_logger_level(tmp_path):
+    """prepare_env 顺带恢复全局 logger 级别（不只恢复环境变量）。"""
+    from lightdb.logger import logger
+
+    before = dict(os.environ)
+    level_before = logger.level
+    try:
+        logger.set_level('INFO')
+        level_mid = logger.level
+        with H.prepare_env('default'):
+            assert logger.level != level_mid          # 被压到 ERROR
+        assert logger.level == level_mid              # 退出恢复
+    finally:
+        logger.set_level(level_before)
+        _restore_whole_env(before)
+
+
+def test_case_function_does_not_leak_env(tmp_path):
+    """gate 使用的 case 函数（cases.py 装饰器）跑完不得泄漏 env。"""
+    before = dict(os.environ)
+    try:
+        os.environ.pop('LIGHTDB_AUDIT_LEVEL', None)
+        os.environ.pop('LIGHTDB_LOG_LEVEL', None)
+        snap = dict(os.environ)
+        res = B._case_point_inproc(nrows=120, rounds=1, nq=10,
+                                   data_dir=str(tmp_path / 'case_data'))
+        assert res['metric_median'] > 0
+        assert dict(os.environ) == snap
+        assert 'LIGHTDB_AUDIT_LEVEL' not in os.environ
+    finally:
+        _restore_whole_env(before)
+
+
+def test_run_harness_does_not_leak_env(tmp_path):
+    """进程内跑完整 harness 后 env 与跑之前完全一致（根因回归）。"""
+    before = dict(os.environ)
+    try:
+        os.environ.pop('LIGHTDB_AUDIT_LEVEL', None)
+        os.environ.pop('LIGHTDB_LOG_LEVEL', None)
+        os.environ.pop('LIGHTDB_WAL_CHECKPOINT_BYTES', None)
+        os.environ.pop('LIGHTDB_WAL_CHECKPOINT_RECORDS', None)
+        snap = dict(os.environ)
+        payload, rc = CH.run_harness(
+            suite='quick', scale=0.01,
+            data_dir=str(tmp_path / 'harness_env_data'))
+        assert rc == 0
+        assert payload['suite'] == 'quick'
+        assert dict(os.environ) == snap
+        for key in ('LIGHTDB_AUDIT_LEVEL', 'LIGHTDB_LOG_LEVEL',
+                    'LIGHTDB_WAL_CHECKPOINT_BYTES',
+                    'LIGHTDB_WAL_CHECKPOINT_RECORDS'):
+            assert key not in os.environ, key
+    finally:
+        _restore_whole_env(before)

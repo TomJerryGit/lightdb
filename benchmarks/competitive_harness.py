@@ -916,49 +916,55 @@ def run_harness(suite: str = 'quick', seed: int = DEFAULT_SEED,
     params = _resolve_params(suite, scale)
     params['seed'] = int(seed)
     data_dir = data_dir or os.path.join(DEFAULT_OUT_DIR, 'data')
-    H.prepare_env('default')
     rows = generate_rows(seed, params['rows'])
     scaling_report = None
     attempts = []
-    cases, timings = _perform_measurements(params, rows, data_dir, keep_data)
-    attempts.append({'attempt': 1,
-                     'measurements': _case_measurements(cases)})
+    # 测量期间临时设置审计/日志/WAL checkpoint 环境；退出（含异常/门禁失败）
+    # 必须精确恢复，避免污染同一 pytest 进程里的后续测试（task-78）。
+    with H.prepare_env('default'):
+        cases, timings = _perform_measurements(params, rows, data_dir,
+                                               keep_data)
+        attempts.append({'attempt': 1,
+                         'measurements': _case_measurements(cases)})
 
-    targets = resolve_targets(target_scale, target_overrides, suite=suite)
-    gate_result = None
-    retries_used = 0
-    if gate:
-        gate_result = evaluate_gate(_case_measurements(cases), targets)
-        max_retries = max(0, int(gate_retries))
-        while (not gate_result['passed']) and retries_used < max_retries:
-            retries_used += 1
-            retry_cases, retry_timings = _perform_measurements(
-                params, rows, data_dir, keep_data)
-            cases = _merge_best_cases(cases, retry_cases)
-            timings = _sum_timings(timings, retry_timings)
-            attempts.append({'attempt': retries_used + 1,
-                             'measurements': _case_measurements(retry_cases)})
+        targets = resolve_targets(target_scale, target_overrides, suite=suite)
+        gate_result = None
+        retries_used = 0
+        if gate:
             gate_result = evaluate_gate(_case_measurements(cases), targets)
-        gate_result['retries_requested'] = int(gate_retries)
-        gate_result['retries_used'] = retries_used
-        gate_result['attempts'] = attempts
+            max_retries = max(0, int(gate_retries))
+            while (not gate_result['passed']) and retries_used < max_retries:
+                retries_used += 1
+                retry_cases, retry_timings = _perform_measurements(
+                    params, rows, data_dir, keep_data)
+                cases = _merge_best_cases(cases, retry_cases)
+                timings = _sum_timings(timings, retry_timings)
+                attempts.append({
+                    'attempt': retries_used + 1,
+                    'measurements': _case_measurements(retry_cases)})
+                gate_result = evaluate_gate(_case_measurements(cases),
+                                            targets)
+            gate_result['retries_requested'] = int(gate_retries)
+            gate_result['retries_used'] = retries_used
+            gate_result['attempts'] = attempts
 
-    if scaling:
-        t0 = time.perf_counter()
-        opts = dict(scaling_options or {})
-        scaling_report = SCALING.run_scaling_suite(
-            clients=opts.get('clients'),
-            kinds=opts.get('kinds'),
-            seconds=float(opts.get('seconds', 0.5)),
-            nrows=int(opts.get('nrows') or params['rows']),
-            warmup=float(opts.get('warmup', 0.15)),
-            profile=bool(opts.get('profile', False)),
-            profile_seconds=float(opts.get('profile_seconds', 0.5)),
-            compare_cache=bool(opts.get('compare_cache', True)),
-            out=opts.get('out') or os.path.join(
-                DEFAULT_OUT_DIR, 'concurrency_scaling.json'))
-        timings['scaling'] = time.perf_counter() - t0
-        timings['total'] = float(timings.get('total', 0.0)) + timings['scaling']
+        if scaling:
+            t0 = time.perf_counter()
+            opts = dict(scaling_options or {})
+            scaling_report = SCALING.run_scaling_suite(
+                clients=opts.get('clients'),
+                kinds=opts.get('kinds'),
+                seconds=float(opts.get('seconds', 0.5)),
+                nrows=int(opts.get('nrows') or params['rows']),
+                warmup=float(opts.get('warmup', 0.15)),
+                profile=bool(opts.get('profile', False)),
+                profile_seconds=float(opts.get('profile_seconds', 0.5)),
+                compare_cache=bool(opts.get('compare_cache', True)),
+                out=opts.get('out') or os.path.join(
+                    DEFAULT_OUT_DIR, 'concurrency_scaling.json'))
+            timings['scaling'] = time.perf_counter() - t0
+            timings['total'] = (float(timings.get('total', 0.0))
+                                + timings['scaling'])
 
     reference_db = detect_reference_db(mysql_host, mysql_port)
     payload = build_payload(suite, params, cases, gate_result, reference_db,

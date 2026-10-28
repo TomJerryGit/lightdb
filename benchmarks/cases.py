@@ -112,15 +112,38 @@ def _median(xs):
     return statistics.median(xs)
 
 
+def _scoped_env(fn):
+    """把 case 函数放进 `H.prepare_env()` 上下文（异常路径也精确恢复原 env）。
+
+    每个 case 原先在函数体第一行直接调 `H.prepare_env(...)`，会把
+    LIGHTDB_AUDIT_LEVEL/LIGHTDB_LOG_LEVEL/WAL checkpoint 变量泄漏到进程环境，
+    污染同一进程里的后续测试；改为装饰器后：进入 case 设置、退出（含 raise）
+    恢复原值，原本不存在的键会被删除。
+    """
+    import functools
+    import inspect
+
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        bound = sig.bind_partial(*args, **kwargs)
+        cfg = bound.arguments.get('cfg', 'default')
+        with H.prepare_env(cfg):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 # ==================== 各 case 的测量函数 ====================
 # 统一约定：函数返回一个 result dict（含 `metric_median` 等字段，形状见
 # `heap_insert.summarize`），门禁只读 `metric_median`，其余字段用于事后判读。
 # 崩溃恢复 case 例外：它返回 {'envelope': ..., 'extra_cases': {...}}，
 # 由 `run_case` 拆成 3 条记录（恢复耗时 + 2 条硬判据）。
 
+@_scoped_env
 def _case_insert_rowwise(size=2000, rounds=2, variant='table', cfg='default',
                          data_dir=None):
-    H.prepare_env(cfg)
     dd = data_dir or H.DEFAULT_DATA_DIR
     samples = [H.rowwise_round(size, variant, dd) for _ in range(rounds)]
     out = H.summarize(samples, 'rows_s')
@@ -129,8 +152,8 @@ def _case_insert_rowwise(size=2000, rounds=2, variant='table', cfg='default',
     return out
 
 
+@_scoped_env
 def _case_insert_batch(size=2000, rounds=2, cfg='default', data_dir=None):
-    H.prepare_env(cfg)
     dd = data_dir or H.DEFAULT_DATA_DIR
     samples = [H.batch_round(size, H.BATCH, dd) for _ in range(rounds)]
     out = H.summarize(samples, 'rows_s')
@@ -139,9 +162,9 @@ def _case_insert_batch(size=2000, rounds=2, cfg='default', data_dir=None):
     return out
 
 
+@_scoped_env
 def _case_insert_batch_speedup(size=5000, data_dir=None):
     """同窗交错成对的"多值批量 vs 等价逐行语句"比值（门禁项）"""
-    H.prepare_env('default')
     dd = data_dir or H.DEFAULT_DATA_DIR
     r = H.batch_vs_individual_round(size, H.BATCH, dd)
     return {'metric_median': r['ratio'],
@@ -155,20 +178,21 @@ def _case_insert_batch_speedup(size=5000, data_dir=None):
             'samples': r['pairs']}
 
 
+@_scoped_env
 def _case_point_inproc(nrows=2000, rounds=2, nq=600, data_dir=None):
-    H.prepare_env('default')
     dd = data_dir or H.DEFAULT_DATA_DIR
     samples = [H.point_inproc_round(nrows, nq, dd) for _ in range(rounds)]
     return H.summarize(samples, 'q_s')
 
 
+@_scoped_env
 def _case_point_tcp(nrows=2000, rounds=1, nq=400, port=8977, data_dir=None):
-    H.prepare_env('default')
     dd = data_dir or H.DEFAULT_DATA_DIR
     samples = [H.point_tcp_round(nrows, nq, port, dd) for _ in range(rounds)]
     return H.summarize(samples, 'q_s', warmup_drop=False)
 
 
+@_scoped_env
 def _case_wal_bounded(size=5000, cfg='default', data_dir=None):
     """在**引擎默认 checkpoint 阈值**下写 size 行，报告 WAL 峰值。
 
@@ -179,7 +203,6 @@ def _case_wal_bounded(size=5000, cfg='default', data_dir=None):
     本 case 因为要 stat WAL，**单独测量**（不与吞吐 case 共用结果），
     以免污染吞吐数字。
     """
-    H.prepare_env(cfg)
     dd = data_dir or H.DEFAULT_DATA_DIR
     H.fresh_dir(dd)
     db, tbl = H.new_table(dd)
@@ -215,11 +238,11 @@ def tbl_limit():
         return None
 
 
+@_scoped_env
 def _case_crash_recovery(n_committed=2000, n_uncommitted=50,
                          threshold=256 * 1024, data_dir=None):
     """崩溃恢复：返回包装 dict（envelope），见 `run_case` 的说明"""
     dd = data_dir or H.DEFAULT_DATA_DIR
-    H.prepare_env('default')
     r = H.crash_recovery_round(n_committed, n_uncommitted, threshold, dd)
     res = {'metric_median': r['recover_secs'], 'min': r['recover_secs'],
            'max': r['recover_secs'], 'n_samples': 1,
@@ -240,9 +263,9 @@ def _case_crash_recovery(n_committed=2000, n_uncommitted=50,
     return {'envelope': res, 'extra_cases': integrity}
 
 
+@_scoped_env
 def _case_concurrency(kind='point', clients=1, seconds=3.0, nrows=2000,
                       data_dir=None):
-    H.prepare_env('default')
     dd = data_dir or C.DEFAULT_DATA_DIR
     r = C.concurrency_round(kind, clients, seconds, nrows, 0.5, dd)
     return {'metric_median': r['q_s'], 'min': r['q_s'], 'max': r['q_s'],
@@ -263,6 +286,7 @@ def _olap_tempdir(data_dir):
     return tempfile.mkdtemp(prefix='olap_bench_')
 
 
+@_scoped_env
 def _case_olap_parallel_groupby(size=100_000, rounds=3, data_dir=None):
     """4A.3/4A.5：向量化 GROUP BY 分片线程池加速比（w1 vs w2，同进程成对）。
 
@@ -320,6 +344,7 @@ def _case_olap_parallel_groupby(size=100_000, rounds=3, data_dir=None):
         shutil.rmtree(dd, ignore_errors=True)
 
 
+@_scoped_env
 def _case_olap_dispatch_crosscheck(size=10_000, data_dir=None):
     """4A.2/4A.5：dispatch 开关前后逐行对拍（真实 Executor，不一致行数必须 0）。"""
     import shutil
@@ -376,6 +401,7 @@ def _case_olap_dispatch_crosscheck(size=10_000, data_dir=None):
         shutil.rmtree(dd, ignore_errors=True)
 
 
+@_scoped_env
 def _case_olap_dispatch_agg(size=10_000, data_dir=None):
     """dispatch 开关同 SQL 耗时比（仅报告；当前无收益，不据此启用）。"""
     import shutil
