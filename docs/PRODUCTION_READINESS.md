@@ -21,7 +21,7 @@ config.json，避免与既有配置契约冲突）：
 
 ```bash
 # Windows PowerShell
-$env:LIGHTDB_METRICS_PORT = "9091"      # >0 才启动；0/缺省 = 关闭
+$env:LIGHTDB_METRICS_PORT = "9091"      # >0 固定端口；0 = OS 动态端口；缺省/负数 = 关闭
 $env:LIGHTDB_METRICS_HOST = "127.0.0.1" # 默认回环地址；需要外部抓取时显式改
 python -m lightdb.main --mode single --host 127.0.0.1 --port 8888
 ```

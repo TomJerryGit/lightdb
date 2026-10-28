@@ -146,9 +146,12 @@ class ServerEnv:
         if slow_ms is not None:
             monkeypatch.setenv('LIGHTDB_SLOW_QUERY_MS', str(slow_ms))
         self.metrics_port = None
+        self.metrics_srv = None
         if metrics:
-            self.metrics_port = free_port()
-            monkeypatch.setenv('LIGHTDB_METRICS_PORT', str(self.metrics_port))
+            # ★ 不用固定端口/不去猜空闲端口：让 OS 分配（=0），实际端口从
+            #   MetricsHTTPServer.server_address[1] 读取。避免 9091 或
+            #   "先 bind 再 close" 的 port race 造成 ConnectError flake。
+            monkeypatch.setenv('LIGHTDB_METRICS_PORT', '0')
             monkeypatch.setenv('LIGHTDB_METRICS_HOST', '127.0.0.1')
         self.db_dir = str(tmp_path / 'data')
         self.db = track(Database(self.db_dir))
@@ -158,6 +161,19 @@ class ServerEnv:
         cfg.port = free_port()
         self.cfg = cfg
         self.server = track(MySQLServer(cfg, self.db, self.ex))
+        # 无论由本类设置 =0 还是 caller 显式固定端口，都从真实
+        # server_address[1] 读取实际端口（动态端口尤其不能猜）
+        self.metrics_srv = self.server.metrics_server
+        if self.metrics_srv is not None:
+            self.metrics_port = int(self.metrics_srv.server_address[1])
+            assert self.metrics_port > 0, self.metrics_port
+            assert self.metrics_port == self.metrics_srv.port
+            assert self.server.metrics_url.endswith(
+                f':{self.metrics_port}')
+        else:
+            self.metrics_port = None
+            if metrics:
+                raise AssertionError('动态端口 metrics 未启动')
         self.thread = threading.Thread(
             target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -201,6 +217,32 @@ def run(env_or_ex, sql):
     p = parser.parse(sql)
     assert p is not None, f'解析失败: {sql}'
     return ex.execute(p, {})
+
+
+def tcp_accepts(port: int, timeout: float = 0.5) -> bool:
+    """端口当前是否还能建立 TCP 连接（True=仍被监听）"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(('127.0.0.1', int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def wait_port_closed(port: int, timeout: float = 5.0) -> bool:
+    """等待端口释放（socket 关闭且不再可连接）"""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not tcp_accepts(port, timeout=0.2):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 # ==================== 1. /metrics 真实采集 ====================
@@ -297,11 +339,105 @@ def test_metrics_health_404_405(tmp_path, monkeypatch):
 
 
 def test_metrics_disabled_by_default(tmp_path, monkeypatch):
+    """未设置 LIGHTDB_METRICS_PORT = 默认关闭（不是动态端口）"""
     env = ServerEnv(tmp_path, monkeypatch, metrics=False, slow_ms=None)
     try:
         assert env.server.metrics_url is None
+        assert env.server.metrics_server is None
     finally:
         env.cleanup()
+
+
+def test_metrics_negative_port_disabled(tmp_path, monkeypatch):
+    """负数端口 = 显式关闭（与未设置同义），不创建监听 socket"""
+    env = ServerEnv(tmp_path, monkeypatch, metrics=False, slow_ms=None,
+                    extra_env={'LIGHTDB_METRICS_PORT': '-1'})
+    try:
+        assert env.server.metrics_server is None
+        assert env.server.metrics_url is None
+    finally:
+        env.cleanup()
+
+
+def test_metrics_dynamic_port_exposed_and_released(tmp_path, monkeypatch):
+    """=0 时由 OS 分配真实端口；cleanup 后 socket 关闭、端口释放"""
+    env = ServerEnv(tmp_path, monkeypatch, slow_ms=None)
+    srv = env.metrics_srv
+    real_port = env.metrics_port
+    try:
+        assert srv is not None
+        assert srv.is_running
+        assert tcp_accepts(real_port)
+        assert env.scrape().startswith('# LightDB production metrics')
+    finally:
+        env.cleanup()
+    # teardown 必须 join 线程、close socket、释放端口
+    assert not srv.is_running
+    assert wait_port_closed(real_port), real_port
+    assert not tcp_accepts(real_port)
+
+
+def test_metrics_sequential_instances_no_conflict(tmp_path, monkeypatch):
+    """连续两个实例（动态端口）互不冲突：前一个关闭后端口才释放"""
+    first = ServerEnv(tmp_path / 'one', monkeypatch, slow_ms=None)
+    p1 = first.metrics_port
+    try:
+        assert p1 > 0 and first.scrape()
+    finally:
+        first.cleanup()
+    assert wait_port_closed(p1), p1
+
+    second = ServerEnv(tmp_path / 'two', monkeypatch, slow_ms=None)
+    p2 = second.metrics_port
+    try:
+        assert p2 > 0
+        assert second.scrape()
+        assert second.server.metrics_server.server_address[1] == p2
+    finally:
+        second.cleanup()
+    assert wait_port_closed(p2), p2
+
+
+def test_metrics_two_instances_dynamic_ports_no_conflict(
+        tmp_path, monkeypatch):
+    """两个实例同时运行：各自拿到不同动态端口，关闭一个不影响另一个"""
+    a = ServerEnv(tmp_path / 'a', monkeypatch, slow_ms=None)
+    b = ServerEnv(tmp_path / 'b', monkeypatch, slow_ms=None)
+    pa, pb = a.metrics_port, b.metrics_port
+    try:
+        assert pa > 0 and pb > 0 and pa != pb, (pa, pb)
+        assert a.server.metrics_server.server_address[1] == pa
+        assert b.server.metrics_server.server_address[1] == pb
+        assert a.scrape() and b.scrape()
+        b_srv = b.metrics_srv
+        a.cleanup()
+        assert wait_port_closed(pa), pa
+        # 另一个实例不受影响
+        assert b_srv.is_running
+        assert b.scrape()
+    finally:
+        try:
+            a.cleanup()
+        except Exception:
+            pass
+        b.cleanup()
+    assert wait_port_closed(pb), pb
+
+
+def test_metrics_fixed_port_still_supported(tmp_path, monkeypatch):
+    """>0 时仍使用调用方指定端口（显式固定端口的兼容路径）"""
+    fixed = free_port()
+    env = ServerEnv(tmp_path, monkeypatch, metrics=False, slow_ms=None,
+                    extra_env={'LIGHTDB_METRICS_PORT': str(fixed),
+                               'LIGHTDB_METRICS_HOST': '127.0.0.1'})
+    try:
+        srv = env.server.metrics_server
+        assert srv is not None
+        assert int(srv.server_address[1]) == fixed
+        assert env.scrape().startswith('# LightDB production metrics')
+    finally:
+        env.cleanup()
+    assert wait_port_closed(fixed), fixed
 
 
 def test_metrics_qps_window_real(tmp_path, monkeypatch):
