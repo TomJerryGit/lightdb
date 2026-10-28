@@ -167,17 +167,24 @@ executor.slowlog.rows()       # ts,user,elapsed_ms,cmd,success,errno,sql
 ## 4. 验证
 
 ```bash
-# 新测试（12 例：指标真实计数/端点行为/慢查询阈值与脱敏/审计轮转/崩溃容错）
+# P1-A 新测试（12 例：指标真实计数/端点行为/慢查询阈值与脱敏/审计轮转/崩溃容错）
 python -m pytest tests/test_production_metrics.py -q
 
-# 回归（协议/事务/审计/批量/安全等）
+# P1-B 新测试（12 例连接池复用/超限/排队/断连/长事务/指标/吞吐 + 10 例复制
+# SHOW BINARY LOGS/全量同步/断点续传/幂等/损坏显式/1k 延迟/CLI）
+python -m pytest tests/test_connection_pool.py tests/test_replication_prototype.py -q
+
+# 回归（协议/事务/审计/批量/安全/备份/E3 兼容等）
 python -m pytest tests/test_wire_transaction.py tests/test_batch14.py \
   tests/test_v4_sql_features.py tests/test_batch8.py tests/test_batch15.py \
-  tests/test_type_constraints.py tests/test_phase0_integrity.py -q
+  tests/test_mysql_compat_e3.py tests/test_type_constraints.py \
+  tests/test_phase0_integrity.py -q
 
 # 语法检查（Windows 沙箱下把 pycache 指到可写目录）
 $env:PYTHONPYCACHEPREFIX = "$PWD\tmp_pycache"
-python -m compileall -q lightdb tests/test_production_metrics.py
+python -m compileall -q lightdb tests/test_production_metrics.py \
+  tests/test_connection_pool.py tests/test_replication_prototype.py \
+  scripts/replica_apply.py
 ```
 
 实测（本机，2026-10-28）：`/metrics` 抓取一次约数毫秒；慢查询阈值 0ms 时
@@ -201,3 +208,146 @@ python -m compileall -q lightdb tests/test_production_metrics.py
    开销随文件数增长；快照系统自己的元数据没有暴露（只统计产物大小）；
 6. `lightdb/net/worker.py` / 多进程 worker 侧不启动 `/metrics`（指标在
    Master/单进程侧采集；多进程模式当前仍在生产化排期外）。
+
+---
+
+## 6. 连接池（P1-B / task-71）
+
+### 6.1 实现与语义
+
+`lightdb/net/pool.py::ConnectionPool`，由 `MySQLServer` 在 `__init__` 时创建、
+`process_request` 把已 accept 的连接交给池。**池化的是"连接处理线程"，
+不是会话**：
+
+* 每个连接仍由 `MySQLHandler` 独占一个 worker 线程处理**整个生命周期**；
+  `session`（事务句柄/用户变量/autocommit/当前库）按连接新建 →
+  **会话隔离不变**；
+* 连接结束后 worker 归还池，下一条连接**复用线程**（省线程创建/销毁）；
+* 忙 worker 不会被心跳/超时回收 → **长事务/长查询期间连接一直占用一个
+  worker 与一个准入名额，不会被复用或中途换线程**；
+* 空闲超过 `idle_timeout` 且总数大于 `min_idle` 的 worker 退出（缩容）；
+* 健康检查按 `health_interval` 清理意外退出的 worker 并补足 `min_idle`，
+  `dead_workers` 计数可见；
+* 默认启用；`LIGHTDB_POOL_ENABLED=0` 退回"每连接一线程"旧行为。
+
+### 6.2 配置（环境变量）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LIGHTDB_POOL_ENABLED` | `1` | `0` = 关闭池，退回每连接一线程 |
+| `LIGHTDB_POOL_MAX_WORKERS` | `max_connections` | worker 线程上限 |
+| `LIGHTDB_POOL_MIN_IDLE` | `1` | 常驻空闲 worker 下限 |
+| `LIGHTDB_POOL_IDLE_TIMEOUT` | `60` | 空闲缩容阈值（秒，最小 1） |
+| `LIGHTDB_POOL_OVERFLOW` | `reject` | 超限策略：`reject` 显式 1040 / `queue` 排队 |
+| `LIGHTDB_POOL_QUEUE_TIMEOUT` | `5.0` | queue 模式等待上限（秒） |
+| `LIGHTDB_POOL_QUEUE_SIZE` | `64` | 排队上限（满则拒绝） |
+| `LIGHTDB_POOL_HEALTH_INTERVAL` | `5.0` | 健康检查最小间隔（秒） |
+| `LIGHTDB_POOL_LONG_RUNNING_S` | `30` | "长连接/长事务"统计阈值（秒） |
+
+超限时在**握手前**回 ERR 1040（`Too many connections (pool ...)`），客户端
+（pymysql 等）拿到明确错误码；`queue` 模式在 TCP 已建立后等待，超时同样 1040。
+
+### 6.3 指标
+
+* `/metrics`：`lightdb_pool_workers{state="busy|idle|total"}`、
+  `lightdb_pool_max_workers`、`lightdb_pool_workers_created_total`、
+  `lightdb_pool_assignments_total`、`lightdb_pool_reused_total`、
+  `lightdb_pool_rejected_total`、`lightdb_pool_queue_timeouts_total`、
+  `lightdb_pool_idle_shrinks_total`、`lightdb_pool_dead_workers_total`、
+  `lightdb_pool_jobs_queued`、`lightdb_pool_jobs_pending_accept`、
+  `lightdb_pool_long_running`（附 overflow/min_idle 策略注释）；
+* `SHOW STATUS`：`Pool_workers_total/busy/idle`、`Pool_max_workers`、
+  `Pool_workers_created`、`Pool_assignments`、`Pool_reused`、`Pool_jobs_queued`、
+  `Pool_jobs_pending_accept`、`Pool_queue_waits`、`Pool_queue_timeouts`、
+  `Pool_rejected`、`Pool_idle_shrinks`、`Pool_dead_workers`、
+  `Pool_long_running`、`Pool_overflow_policy`。
+
+### 6.4 量化（本机 2026-10-28，SELECT 1 ×200/客户端，8 worker 池）
+
+| 客户端数 | 总耗时 wall | 吞吐 QPS |
+|---|---|---|
+| 1 | 0.194 s | 1029.0 |
+| 4 | 0.715 s | 1118.4 |
+| 8 | 1.642 s | 974.7 |
+
+诚实解读：wall 时间随客户端数近线性增长、QPS 基本持平 —— 单语句执行路径
+受 GIL/串行会话调度限制，**连接池带来的是线程复用与资源上限（不再每连接
+新建线程、可缩容、可排队/显式拒绝），不是查询并行加速**。短连接场景（反复
+建连/断连）的收益最大。
+
+---
+
+## 7. binlog 复制原型（P1-B / task-71）
+
+### 7.1 链路
+
+```
+主库 binlog 文件（append-only）
+  ├─ SHOW BINARY LOGS            ← 复用既有 E3 实现（2 列 Log_name/File_size；
+  │                                 binlog 未启用 → 1381，不伪造清单）
+  ├─ SHOW MASTER STATUS          ← 当前 File/Position
+  └─ SELECT * FROM __BINLOG_FETCH__ WHERE lsn > N LIMIT k
+        （内部导出：pos/lsn/txn_id/event_type/table_name/data；
+          lsn = 跨 binlog 文件的全局字节偏移，可跨轮转单调续传）
+            ↓  pymysql（真实协议）
+  目标库 Database/Executor（从库/备份节点）
+        ├─ DDL → 目标 Executor 执行（幂等预判）
+        └─ DML → 行镜像直写存储层（不触发目标侧触发器，与 SQL 线程一致）
+            ↓
+  replica_state.json（每批 flush+fsync 一次；原子 tmp+replace）
+```
+
+代码：`lightdb/net/replica_proto.py::ReplicaPrototype`；CLI：
+`scripts/replica_apply.py`。
+
+```bash
+# 一次性追平（无新事件则 0 事件退出；退出码 0/1/2）
+python scripts/replica_apply.py --master-host 127.0.0.1 --master-port 8899 \
+    --target-data-dir /tmp/replica-data
+
+# 持续跟随（Ctrl+C 停止）
+python scripts/replica_apply.py --master-host 127.0.0.1 --master-port 8899 \
+    --target-data-dir /tmp/replica-data --follow --interval 0.2
+
+# 只看主库 binlog 清单/位点（--json 便于脚本消费）
+python scripts/replica_apply.py --master-host 127.0.0.1 --master-port 8899 \
+    --target-data-dir /tmp/replica-data --show-binary-logs --json
+```
+
+### 7.2 幂等 / 断点续传 / 错误显式
+
+* **DML 幂等**：INSERT 主键冲突 → idempotent；UPDATE/DELETE 按主键
+  affected=0 → idempotent；目标缺表/列不匹配 → `ReplicaApplyError`；
+* **DDL 幂等**：CREATE TABLE 目标已存在、DROP TABLE 目标不存在、TRUNCATE、
+  ALTER ADD 列已存在/ALTER DROP 列已不存在 → idempotent；其余错误显式
+  `ReplicaApplyError`（带 pos/lsn/event_type/table 上下文）；
+* **断点续传**：状态含 `{master_file, lsn, seq, applied, idempotent, errors,
+  last_event_type, last_apply_ts}`；每批 apply 完 `flush+fsync` 一次（每事件
+  不 fsync，Windows 上每条 fsync ≈0.2s 会让 1k 事件不可用）；崩溃最多回放
+  最后一批事件，重放按幂等处理；
+* **损坏事件显式**：非 6 列 / payload 非 JSON / 未知 event_type / 主库不可达 /
+  状态文件损坏 / 起始 binlog 已被清理 → 明确异常，**绝不静默跳过**；
+* apply 期间 `suspend_binlog()`：目标库不会把重放事件再写进自己的 binlog。
+
+### 7.3 量化（本机 2026-10-28）
+
+单线程 apply：主库 1001 条事件（1 DDL + 1000 INSERT）apply 耗时 **1.825s**
+（约 **548.5 events/s**；主库写 1000 行耗时 1.042s，含网络往返）。延迟口径
+为"拉取→应用完成"的处理延迟；**不伪造** MySQL `Seconds_Behind_Master`
+（导出接口不含事件时间戳）。
+
+---
+
+## 8. P1-B 原型边界（如实列出）
+
+1. **单主、无自动 failover**：主库不可达直接报错退出；没有选主/切主/多主；
+2. **单线程 apply**：严格按事件顺序串行应用，无并行/无冲突解决；
+3. **schema 必须一致**：DML 按行镜像 + 主键 apply；DDL 按 binlog 原始 SQL
+   重放；不做 schema diff/修复；
+4. **不触发目标侧触发器/外键级联**（行级复制的固有语义）；存储过程/函数
+   副作用不在行镜像里；
+5. **binlog 保留策略**：主库 binlog 被清理/重建后，断点续传拒绝继续
+   （显式检测起始文件是否还在，不猜测位点）；
+6. 复制状态文件在目标数据目录（非集群元数据），不做多副本/高可用；
+7. 连接池的排队发生在已建立 TCP、未握手阶段（客户端会看到握手响应延迟），
+   不是 MySQL 侧的真实"连接代理"；池不替代 `max_connections` 准入。

@@ -30,6 +30,8 @@ from . import mysql_protocol as mp
 # ★ 生产可观测性（task-70）：真实运行期指标 + 内嵌 /metrics 端点
 from .observability import ServerRuntimeMetrics
 from .metrics_server import maybe_start_metrics
+# ★ 生产化 B（task-71）：服务端连接池（worker 线程复用/超限策略/健康检查）
+from .pool import ConnectionPool
 
 
 #: 登录失败后的固定延迟（秒）。它让暴力破解/口令扫描变慢，同时不改变
@@ -1535,6 +1537,32 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             ('Uptime',
              str(int(time.time() - self.server.start_time))),
         ]
+        # ★ task-71：连接池真实指标（与 /metrics 的 lightdb_pool_* 同源）
+        pool = getattr(self.server, 'pool', None)
+        if pool is not None:
+            try:
+                ps = pool.snapshot()
+                rows.extend([
+                    ('Pool_workers_total', str(ps['workers_total'])),
+                    ('Pool_workers_busy', str(ps['workers_busy'])),
+                    ('Pool_workers_idle', str(ps['workers_idle'])),
+                    ('Pool_max_workers', str(ps['max_workers'])),
+                    ('Pool_workers_created', str(ps['workers_created'])),
+                    ('Pool_assignments', str(ps['assignments'])),
+                    ('Pool_reused', str(ps['reused'])),
+                    ('Pool_jobs_queued', str(ps['jobs_queued'])),
+                    ('Pool_jobs_pending_accept',
+                     str(ps['jobs_pending_accept'])),
+                    ('Pool_queue_waits', str(ps['queue_waits'])),
+                    ('Pool_queue_timeouts', str(ps['queue_timeouts'])),
+                    ('Pool_rejected', str(ps['rejected'])),
+                    ('Pool_idle_shrinks', str(ps['idle_shrinks'])),
+                    ('Pool_dead_workers', str(ps['dead_workers'])),
+                    ('Pool_long_running', str(ps['long_running'])),
+                    ('Pool_overflow_policy', str(ps['overflow'])),
+                ])
+            except Exception as e:                # pragma: no cover - 防御
+                rows.append(('Pool_error', str(e)[:120]))
         self._send_resultset(
             [("Variable_name", mp.MYSQL_TYPE_VAR_STRING, 64),
              ("Value", mp.MYSQL_TYPE_VAR_STRING, 1024)],
@@ -2379,8 +2407,74 @@ class MySQLServer(socketserver.ThreadingTCPServer):
             self.metrics_server = None
             self.metrics_url = None
 
+        # ★ task-71：连接池（worker 线程复用）。
+        #   默认启用；`LIGHTDB_POOL_ENABLED=0` 退回"每连接一线程"旧行为。
+        #   池化的是**线程**：每个连接仍独占一个 handler/session（见 pool.py
+        #   模块 docstring 的会话隔离/长事务说明）。
+        self.pool = None
+        try:
+            self.pool = ConnectionPool(self)
+            if not self.pool.enabled:
+                logger.info("连接池已禁用（LIGHTDB_POOL_ENABLED=0）："
+                            "每连接新建线程")
+                self.pool = None
+            else:
+                snap = self.pool.snapshot()
+                logger.info(
+                    f"连接池已启用: max_workers={snap['max_workers']} "
+                    f"min_idle={snap['min_idle']} "
+                    f"idle_timeout={snap['idle_timeout']}s "
+                    f"overflow={snap['overflow']}")
+        except Exception as e:                   # pragma: no cover - 防御
+            logger.warn(f"连接池初始化失败（回退每连接一线程）: {e}")
+            self.pool = None
+
+    # ==================== 连接池接入（task-71） ====================
+
+    def process_request(self, request, client_address):
+        """socketserver 钩子：把已 accept 的连接交给连接池
+
+        池禁用时回退父类实现（每条连接新建线程，保持旧行为）。
+        """
+        pool = getattr(self, 'pool', None)
+        if pool is None:
+            return super().process_request(request, client_address)
+        return pool.submit(request, client_address)
+
+    def _serve_pooled_connection(self, request, client_address):
+        """池化 worker 内处理一条完整连接（父类的 per-connection 流程）"""
+        self.process_request_thread(request, client_address)
+
+    def _pool_reject_connection(self, request, reason: str,
+                                code: int = 1040):
+        """连接池超限/排队超时：握手前显式回 ERR 并关闭
+
+        注意：连接已通过 `verify_request`（准入计数 +1），这里必须走
+        `shutdown_request` 把计数减回去，否则会被误算成"还在服务中"。
+        """
+        logger.warn(f"拒绝连接 {reason}")
+        try:
+            self._reject_connection(request, code, '08004', reason)
+        except Exception:                         # pragma: no cover - 防御
+            pass
+        try:
+            self.shutdown_request(request)
+        except Exception:                         # pragma: no cover - 防御
+            pass
+        try:
+            self.runtime_metrics.on_connection_rejected()
+        except Exception:                         # pragma: no cover - 防御
+            pass
+
     def shutdown(self):
-        """先停指标 HTTP 线程，再走 socketserver 的正常关闭"""
+        """先停连接池/指标 HTTP 线程，再走 socketserver 的正常关闭"""
+        pool = getattr(self, 'pool', None)
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"停止连接池失败: {e}")
+            self.pool = None
         metrics = getattr(self, 'metrics_server', None)
         if metrics is not None:
             try:

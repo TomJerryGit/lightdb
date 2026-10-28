@@ -709,6 +709,56 @@ def render_prometheus(server, prefix: str = None) -> str:
             f'# 备份目录不存在（{backup["dir"] or "(未配置)"}）；'
             f'LIGHTDB_BACKUP_DIR 可指定。以上为 0 表示"未找到产物"，不是采集失败')
 
+    # ---------- 连接池（task-71；真实计数；未启用时 0 + 注释） ----------
+    pool = getattr(server, 'pool', None)
+    _type_line(lines, f'{prefix}_pool_workers', 'gauge',
+               'Connection-pool worker threads by state')
+    if pool is not None:
+        try:
+            ps = pool.snapshot()
+        except Exception as e:                   # pragma: no cover - 防御
+            ps = {}
+            lines.append(f'# 连接池指标读取失败: {e}')
+        for state, key in (('busy', 'workers_busy'),
+                           ('idle', 'workers_idle'),
+                           ('total', 'workers_total')):
+            _metric(lines, f'{prefix}_pool_workers', ps.get(key, 0),
+                    labels={'state': state})
+        for name, key, mtype in (
+                (f'{prefix}_pool_workers_created_total', 'workers_created',
+                 'counter'),
+                (f'{prefix}_pool_assignments_total', 'assignments',
+                 'counter'),
+                (f'{prefix}_pool_reused_total', 'reused', 'counter'),
+                (f'{prefix}_pool_rejected_total', 'rejected', 'counter'),
+                (f'{prefix}_pool_queue_timeouts_total', 'queue_timeouts',
+                 'counter'),
+                (f'{prefix}_pool_idle_shrinks_total', 'idle_shrinks',
+                 'counter'),
+                (f'{prefix}_pool_dead_workers_total', 'dead_workers',
+                 'counter'),
+                (f'{prefix}_pool_jobs_queued', 'jobs_queued', 'gauge'),
+                (f'{prefix}_pool_jobs_pending_accept',
+                 'jobs_pending_accept', 'gauge'),
+                (f'{prefix}_pool_long_running', 'long_running', 'gauge'),
+        ):
+            _type_line(lines, name, mtype, f'Connection pool metric {key}')
+            lines.append(f'{name} {ps.get(key, 0)}')
+        _type_line(lines, f'{prefix}_pool_max_workers', 'gauge',
+                   'Configured pool max worker threads')
+        lines.append(
+            f'{prefix}_pool_max_workers {ps.get("max_workers", 0)}')
+        lines.append(
+            f'# 连接池策略: overflow={ps.get("overflow")} '
+            f'min_idle={ps.get("min_idle")} '
+            f'idle_timeout={ps.get("idle_timeout")}s '
+            f'queue_timeout={ps.get("queue_timeout")}s')
+    else:
+        for state in ('busy', 'idle', 'total'):
+            _metric(lines, f'{prefix}_pool_workers', 0,
+                    labels={'state': state})
+        lines.append('# 连接池未启用（LIGHTDB_POOL_ENABLED=0）：以上为 0')
+
     # ---------- 内存 / 线程 ----------
     try:
         import psutil
@@ -753,4 +803,6 @@ def metrics_snapshot_json(server) -> dict:
         out['connections'] = server.connection_stats()
     except Exception:                            # pragma: no cover - 防御
         pass
+    pool = getattr(server, 'pool', None)
+    out['pool'] = pool.snapshot() if pool is not None else None
     return out
