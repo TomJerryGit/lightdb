@@ -15,7 +15,8 @@ from PySide6.QtGui import QAction, QKeySequence
 DEFAULT_SHORTCUTS = OrderedDict([
     ('new_query', {'label': '新建查询', 'key': 'Ctrl+N',
                    'menu': '新建查询'}),
-    ('run', {'label': '执行', 'key': 'Ctrl+Return', 'menu': '执行'}),
+    ('run', {'label': '执行', 'key': 'Ctrl+Return', 'menu': '执行',
+             'editor': True}),
     ('run_selection', {'label': '执行选中', 'key': 'Ctrl+Shift+Return',
                        'editor': True}),
     ('explain', {'label': 'EXPLAIN', 'key': 'Ctrl+E', 'menu': 'EXPLAIN'}),
@@ -44,6 +45,10 @@ DEFAULT_SHORTCUTS = OrderedDict([
     ('execute_statement', {'label': '执行光标语句', 'key': 'Ctrl+Shift+E',
                            'editor': True}),
     ('completion', {'label': '补全', 'key': 'Ctrl+Space', 'editor': True}),
+    # 编辑器兼容快捷键也纳入默认表/冲突检测（此前是未登记的隐藏 QShortcut）
+    ('run_f5', {'label': '执行 (F5 备选)', 'key': 'F5', 'editor': True}),
+    ('replace_alt', {'label': '查找替换 (Ctrl+R 备选)', 'key': 'Ctrl+R',
+                     'editor': True}),
 ])
 
 DEFAULT_KEYS = {k: v['key'] for k, v in DEFAULT_SHORTCUTS.items()}

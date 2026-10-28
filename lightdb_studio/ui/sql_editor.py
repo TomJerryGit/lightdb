@@ -122,6 +122,9 @@ class SQLEditor(QPlainTextEdit):
         self._setup_completer()
 
         # 快捷键（保持原有执行快捷键不变；G3：保存引用供自定义应用）
+        # task-75：全部 editor QShortcut 使用 WidgetWithChildrenShortcut，
+        # 避免焦点在对象树/主窗口控件时仍触发编辑器动作；F5/Ctrl+R 也登记
+        # 到 _shortcut_refs（纳入默认表/冲突检测/恢复默认）。
         self._shortcut_refs = {
             'run': QShortcut(QKeySequence("Ctrl+Return"), self, self._exec_all),
             'run_selection': QShortcut(
@@ -148,11 +151,16 @@ class SQLEditor(QPlainTextEdit):
             'execute_statement': QShortcut(
                 QKeySequence("Ctrl+Shift+E"), self,
                 self.execute_current_statement),
+            'run_f5': QShortcut(QKeySequence("F5"), self, self._exec_all),
+            'replace_alt': QShortcut(
+                QKeySequence("Ctrl+R"), self,
+                lambda: self.open_find_bar(replace=True)),
         }
-        # Ctrl+R 也打开替换（不进自定义表，保持兼容）
-        QShortcut(QKeySequence("Ctrl+R"), self,
-                  lambda: self.open_find_bar(replace=True))
-        QShortcut(QKeySequence("F5"), self, self._exec_all)
+        for _ref in self._shortcut_refs.values():
+            try:
+                _ref.setContext(Qt.WidgetWithChildrenShortcut)
+            except Exception:
+                pass
         self._build_find_bar()
 
     # ==================== 行号区域 ====================

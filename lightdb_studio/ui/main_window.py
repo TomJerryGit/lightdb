@@ -126,6 +126,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.settings = config.settings
+        # task-75：多窗口生命周期跟踪（子窗口关闭/主窗口关闭都清理）
+        self._extra_windows = []
+        self._shortcut_apply_result = {}
         self.history = QueryHistory()
 
         # ---------- 后台查询状态（P1-1 响应性） ----------
@@ -2375,15 +2378,43 @@ class MainWindow(QMainWindow):
         dlg.exec()
         return dlg
 
+    def _qt_alive(self, widget):
+        try:
+            from shiboken6 import isValid
+            return isValid(widget)
+        except Exception:
+            return widget is not None
+
+    def _prune_extra_windows(self):
+        """移除已销毁子窗口，避免多窗口列表泄漏（task-75）。"""
+        try:
+            self._extra_windows = [
+                w for w in getattr(self, '_extra_windows', [])
+                if w is not None and self._qt_alive(w)]
+        except Exception:
+            self._extra_windows = []
+
     def _new_window(self):
-        """G2-b：独立 MainWindow（关闭互不影响；失败显式，不假成功）。"""
+        """G2-b：独立 MainWindow（关闭互不影响；task-75 生命周期清理）。"""
         try:
             from ..config import AppConfig
             cfg = AppConfig()
             win = MainWindow(cfg)
+            # 共享同一 settings 对象：语言/主题/快捷键在窗口间一致
+            win.settings = self.settings
+            if hasattr(win, 'setAttribute'):
+                win.setAttribute(Qt.WA_DeleteOnClose, True)
+            if hasattr(win, 'destroyed'):
+                win.destroyed.connect(
+                    lambda *_args: self._prune_extra_windows())
             win.show()
-            if not hasattr(self, '_extra_windows'):
-                self._extra_windows = []
+            if hasattr(win, '_apply_settings'):
+                win._apply_settings()
+            if hasattr(win, '_apply_shortcut_settings'):
+                win._apply_shortcut_settings()
+            self._extra_windows = [
+                w for w in getattr(self, '_extra_windows', [])
+                if w is not None and self._qt_alive(w)]
             self._extra_windows.append(win)
             self.status_label.setText('已打开新窗口')
             return win
@@ -2397,6 +2428,15 @@ class MainWindow(QMainWindow):
             from .shortcuts import apply_to_window
             result = apply_to_window(self, getattr(self.settings, 'shortcuts', {}))
             self._shortcut_apply_result = result
+            # task-75：共享 settings 的子窗口同步快捷键（避免窗口间不一致）
+            for win in list(getattr(self, '_extra_windows', [])):
+                try:
+                    if win is self or not self._qt_alive(win):
+                        continue
+                    win.settings = self.settings
+                    win._apply_shortcut_settings()
+                except Exception:
+                    pass
             return result
         except Exception as exc:                      # noqa: BLE001
             self._shortcut_apply_result = {'ok': False, 'error': str(exc)}
@@ -2606,6 +2646,16 @@ class MainWindow(QMainWindow):
                         ed.set_auto_complete(enabled)
         except Exception:
             pass
+
+        # task-75：共享 settings 的子窗口同步快捷键/字体设置
+        for win in list(getattr(self, '_extra_windows', [])):
+            try:
+                if win is self or not self._qt_alive(win):
+                    continue
+                win.settings = self.settings
+                win._apply_shortcut_settings()
+            except Exception:
+                pass
 
     # ==================== 设置 / i18n / 可访问性 ====================
 
@@ -2845,6 +2895,14 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        # task-75：先关闭子窗口（子窗口独立但主窗口关闭时不留下不可达窗口）
+        for win in list(getattr(self, '_extra_windows', [])):
+            try:
+                if win is not None and self._qt_alive(win):
+                    win.close()
+            except Exception:
+                pass
+        self._extra_windows = []
         # P1-1：关闭窗口前取消后台查询并等待 worker 退出，避免 worker
         # 回调访问已销毁的控件（Qt 崩溃）。最多等 3s，超时不阻塞关闭。
         if self._query_busy:
