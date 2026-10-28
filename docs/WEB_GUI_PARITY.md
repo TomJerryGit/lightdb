@@ -134,3 +134,15 @@ EXPLAIN、备份、结构对比、数据分页排序与连接安全字段展示�
 | i18n | 部分实现（显式清单） | 新增 key 字典（中英，data-i18n/t()）+ 旧页面常见短语运行时翻译 + `LDB_UNTRANSLATED` 显式未翻译清单；旧动态插值/长安全说明/后端 detail 仍未 key 化，见清单，不静默留中文 |
 | 测试 | 已实现 | `tests/test_web_i18n_full.py`：QJSEngine 纯函数单测（缩放锚点/平移/适应/拖拽/关联边）、图表交互静态、i18n key 完整性、语言切换；真浏览器无 Playwright 显式 skip |
 | 证据 | 已实现 | `_analysis_tmp/gui_full/p3_ui_check.py`，截图 `shots_p3_ui/`（ER 拖拽后、图表 tooltip、英文界面） |
+
+## 8. task-69 P3+ 收尾（2026-10-28）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| 动态 i18n | 已实现 | `i18n.js` 的 `t(key,null,params)` 支持 `{name}` 参数插值；行数/导入进度/配置对比/ALTER/后端错误等动态状态改用 key+params；登录页安全说明 data-i18n；旧动态前缀由 PHRASES 运行时翻译；`LDB_UNTRANSLATED` 缩至“后端 detail 原文 / 插件自由文本”两项（不可译，显式清单） |
+| ER 大库虚拟化 | 已实现 | >30 表 `groupByPrefix` 前缀分组、`virtualGroupNodes` 按需只渲染组卡片；点击组再渲染该组；拖拽/平移/缩放/适应保留；100 表布局 QJSEngine 实测 **1ms**（<300ms 目标） |
+| CSV multipart 流式上传 | 已实现 | `POST .../import/upload` 分块写临时文件（64KiB），超 `LIGHTDB_WEB_IMPORT_MAX_BYTES` 显式 413；复用 job 进度/取消/逐行错误；任务结束清理临时文件 |
+| 测试 | 已实现 | `tests/test_web_i18n_full.py` 增加动态插值/清单缩减/100 表性能；`tests/test_p2_ui_features.py` 增加 multipart 成功/超限/取消；回归 test_web_* + Studio suites 全绿；compileall |
+| 证据 | 已实现 | `_analysis_tmp/gui_full/p69_check.py` 2/2 PASS，截图 `shots_p69/`（英文动态状态、ER 100 表分组） |
+
+“未翻译”说明：后端异常 detail 为引擎/SQL 原文，作为参数插入不翻译；插件 description/author 为第三方自由文本。除这两类外，页面文案/动态状态均有中英条目或短语映射。

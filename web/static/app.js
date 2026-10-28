@@ -109,12 +109,13 @@ async function api(path, options = {}) {
   const resp = await fetch(API + path, Object.assign({}, options, { headers }));
   if (resp.status === 401) {
     logout();
-    throw new Error('登录已过期，请重新登录');
+    throw new Error(tr('error.login_expired', '登录已过期，请重新登录'));
   }
   let data = null;
   try { data = await resp.json(); } catch (e) { data = null; }
   if (!resp.ok) {
-    const err = new Error(extractDetail(data, 'HTTP ' + resp.status));
+    const err = new Error(backendError(new Error(
+      extractDetail(data, 'HTTP ' + resp.status))));
     err.status = resp.status;
     throw err;
   }
@@ -128,12 +129,13 @@ async function apiBlob(path, options = {}) {
   const resp = await fetch(API + path, Object.assign({}, options, { headers }));
   if (resp.status === 401) {
     logout();
-    throw new Error('登录已过期，请重新登录');
+    throw new Error(tr('error.login_expired', '登录已过期，请重新登录'));
   }
   if (!resp.ok) {
     let data = null;
     try { data = await resp.json(); } catch (e) { data = null; }
-    throw new Error(extractDetail(data, 'HTTP ' + resp.status));
+    throw new Error(backendError(new Error(
+      extractDetail(data, 'HTTP ' + resp.status))));
   }
   const cd = resp.headers.get('Content-Disposition') || '';
   const blob = await resp.blob();
@@ -164,7 +166,8 @@ async function doLogin() {
     localStorage.setItem('lightdb_token', token);
     showMain(data.user);
   } catch (e) {
-    $id('login-error').textContent = '网络错误: ' + e.message;
+    $id('login-error').textContent = trf('error.network', {message: e.message},
+      '网络错误: ' + e.message);
   } finally {
     setBusy(btn, false);
   }
@@ -366,7 +369,8 @@ async function explainCurrent() {
                             database: currentDB}),
     });
     renderTable(data.columns, data.rows);
-    $id('result-info').textContent = `EXPLAIN 返回 ${data.row_count} 行`;
+    $id('result-info').textContent = trf('status.explain_rows',
+      {count: data.row_count}, `EXPLAIN 返回 ${data.row_count} 行`);
     setStatus('exec-status', 'EXPLAIN 完成', false);
   } catch (e) {
     setStatus('exec-status', 'EXPLAIN 失败: ' + e.message, true);
@@ -433,7 +437,8 @@ async function openDesigner() {
       JSON.stringify(designColumns, null, 2);
     $id('design-panel').classList.remove('hidden');
     $id('design-sql-preview').textContent = '';
-    setStatus('design-status', '已读取列/索引；修改 JSON 后预览或保存', false);
+    setStatus('design-status',
+      tr('status.design_read', '已读取列/索引；修改 JSON 后预览或保存'), false);
   } catch (e) {
     setStatus('exec-status', '读取设计器失败: ' + e.message, true);
   } finally {
@@ -466,8 +471,10 @@ async function submitDesign(dryRun) {
     const stmts = data.statements || [];
     $id('design-sql-preview').textContent = stmts.join('\n') || '（无变更）';
     setStatus('design-status',
-      dryRun ? `预览 ${stmts.length} 条 ALTER（未执行）`
-             : `已执行 ${data.count} 条 ALTER`, false);
+      dryRun ? trf('status.alter_preview', {count: stmts.length},
+                   `预览 ${stmts.length} 条 ALTER（未执行）`)
+             : trf('status.alter_executed', {count: data.count},
+                   `已执行 ${data.count} 条 ALTER`), false);
     if (!dryRun) {
       await openDesigner();
       await loadTableData(currentTable, currentDB, 0);
@@ -548,9 +555,13 @@ async function compareSchema() {
       encodeURIComponent(target) + connQuery(''));
     const s = data.summary || {};
     setStatus('exec-status',
-      `结构对比：缺少表 ${(s.missing_in_target || []).length}，` +
-      `新增表 ${(s.missing_in_source || []).length}，` +
-      `变化表 ${s.changed_tables || 0}`, false);
+      trf('status.schema_compare', {
+        missing: (s.missing_in_target || []).length,
+        extra: (s.missing_in_source || []).length,
+        changed: s.changed_tables || 0,
+      }, `结构对比：缺少表 ${(s.missing_in_target || []).length}，` +
+         `新增表 ${(s.missing_in_source || []).length}，` +
+         `变化表 ${s.changed_tables || 0}`), false);
     $id('result-table').appendChild(
       el('pre', 'sql-preview', JSON.stringify(data.differences || [], null, 2)));
   } catch (e) {
@@ -593,12 +604,18 @@ async function runQuery() {
       lastQueryResult = {columns: data.columns, rows: data.rows || []};
       renderTable(data.columns, data.rows);
       $id('result-info').textContent =
-        `返回 ${data.row_count} 行 · ${data.elapsed_ms.toFixed(1)} ms`;
+        trf('status.rows', {count: data.row_count,
+                            elapsed: data.elapsed_ms.toFixed(1)},
+            `返回 ${data.row_count} 行 · ${data.elapsed_ms.toFixed(1)} ms`);
     } else {
       $id('result-info').textContent =
-        `影响 ${data.affected} 行 · ${data.elapsed_ms.toFixed(1)} ms`;
+        trf('status.affected', {count: data.affected,
+                                elapsed: data.elapsed_ms.toFixed(1)},
+            `影响 ${data.affected} 行 · ${data.elapsed_ms.toFixed(1)} ms`);
       $id('result-table').appendChild(
-        el('div', 'result-ok', `✓ 执行成功，影响 ${data.affected} 行`));
+        el('div', 'result-ok',
+           trf('status.exec_ok', {count: data.affected},
+               `✓ 执行成功，影响 ${data.affected} 行`)));
     }
     setStatus('exec-status', '完成', false);
     loadHistory();
@@ -659,7 +676,9 @@ async function formatSQL() {
     });
     $id('sql-editor').value = data.sql;
     setStatus('exec-status',
-      `格式化完成（${data.length_in} → ${data.length_out} 字符）`, false);
+      trf('status.format_done', {before: data.length_in,
+                                 after: data.length_out},
+          `格式化完成（${data.length_in} → ${data.length_out} 字符）`), false);
   } catch (e) {
     setStatus('exec-status', '格式化失败: ' + e.message, true);
   } finally {
@@ -733,7 +752,9 @@ async function loadReportTemplates() {
     reportTemplates = data.templates || [];
     if (selectedReport && !selectedTemplate()) selectedReport = '';
     renderReportList();
-    setStatus('report-status', `已加载 ${reportTemplates.length} 个模板`, false);
+    setStatus('report-status', trf('status.templates_loaded',
+      {count: reportTemplates.length},
+      `已加载 ${reportTemplates.length} 个模板`), false);
   } catch (e) {
     setStatus('report-status', '加载模板失败: ' + e.message, true);
   } finally {
@@ -824,7 +845,9 @@ async function previewReport(name, btn) {
     renderTable(data.columns || [], data.rows || [],
       'report-preview-output');
     setStatus('report-status',
-      `模板「${name}」共 ${data.total} 行，预览 ${data.returned} 行` +
+      trf('status.template_preview', {name: name, total: data.total,
+                                      returned: data.returned},
+          `模板「${name}」共 ${data.total} 行，预览 ${data.returned} 行`) +
       `（上限 ${data.limit || '模板默认'}）`, false);
   } catch (e) {
     setStatus('report-status', '预览失败: ' + e.message, true);
@@ -938,6 +961,22 @@ function renderQualityIssues(issues) {
 
 function tr(key, fallback) {
   return (typeof window.t === 'function') ? window.t(key, fallback) : fallback;
+}
+
+function trf(key, params, fallback) {
+  if (typeof window.t === 'function') {
+    return window.t(key, fallback, params);
+  }
+  let text = fallback !== undefined ? fallback : key;
+  Object.keys(params || {}).forEach(name => {
+    text = String(text).split('{' + name + '}').join(String(params[name]));
+  });
+  return text;
+}
+
+function backendError(e) {
+  return trf('error.backend_detail', {message: e.message},
+    '后端错误: ' + e.message);
 }
 
 function chartTitle(text) {
@@ -1140,7 +1179,8 @@ async function loadER() {
       {width: 980, height: Math.max(420, Math.ceil(data.nodes.length / 3) * 175 + 120)});
     let status = data.notice || 'ER 图已生成';
     if (data.nodes.length > 30) {
-      status += `（${data.nodes.length} 张表：已启用简化渲染与大库提示）`;
+      status += trf('status.er_large', {count: data.nodes.length},
+        `${data.nodes.length} 张表：已启用前缀分组与按需渲染（大库提示）`);
     }
     setStatus('er-status', status, false);
   } catch (e) {
@@ -1214,16 +1254,19 @@ function stopImportPolling() {
 async function pollImportJob(jobId) {
   try {
     const data = await api('/import/jobs/' + encodeURIComponent(jobId));
-    setStatus('import-progress',
-      `导入进度 ${data.progress}%（${data.processed}/${data.total}，` +
-      `失败 ${data.failed}）`, data.status === 'failed');
+    setStatus('import-progress', trf('status.import_progress', {
+      progress: data.progress, processed: data.processed,
+      total: data.total, failed: data.failed,
+    }, `导入进度 ${data.progress}%（${data.processed}/${data.total}，` +
+       `失败 ${data.failed}）`), data.status === 'failed');
     if (['completed', 'completed_with_errors', 'cancelled', 'failed']
         .includes(data.status)) {
       stopImportPolling();
       activeImportJob = '';
       $id('cancel-import-btn').classList.add('hidden');
-      setStatus('import-progress',
-        `导入结束：${data.status}，成功 ${data.inserted}，失败 ${data.failed}`,
+      setStatus('import-progress', trf('status.import_done', {
+        status: data.status, inserted: data.inserted, failed: data.failed,
+      }, `导入结束：${data.status}，成功 ${data.inserted}，失败 ${data.failed}`),
         data.status !== 'completed');
       if (currentTable) await loadTableData(currentTable, currentDB, 0);
     }

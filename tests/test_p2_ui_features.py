@@ -294,3 +294,43 @@ def test_import_job_progress_errors_and_cancel(client, monkeypatch):
     missing = client.get('/api/v1/import/jobs/nope', headers=headers)
     assert missing.status_code == 404
     assert missing.json()['detail']['code'] == 'import_job_not_found'
+
+
+def test_multipart_upload_import_job_and_limit(client, monkeypatch):
+    import web.parity as parity
+    fake = use_fake(monkeypatch)
+    headers = auth(client)
+    csv_bytes = b'name,amount\na,1\nb,2\nc,3'
+    start = client.post(
+        '/api/v1/databases/demo/tables/users/import/upload',
+        files={'file': ('data.csv', csv_bytes, 'text/csv')},
+        data={'has_header': 'true'}, headers=headers)
+    assert start.status_code == 200, start.text
+    assert start.json()['upload_mode'] == 'multipart_stream'
+    job = _wait_job(client, headers, start.json()['job_id'])
+    assert job['status'] == 'completed'
+    assert job['inserted'] == 3
+    monkeypatch.setattr(parity, 'MAX_IMPORT_BYTES', 5)
+    too_big = client.post(
+        '/api/v1/databases/demo/tables/users/import/upload',
+        files={'file': ('big.csv', b'name,amount\na,1', 'text/csv')},
+        data={'has_header': 'true'}, headers=headers)
+    assert too_big.status_code == 413
+    assert too_big.json()['detail']['code'] == 'import_too_large'
+    monkeypatch.setattr(parity, 'MAX_IMPORT_BYTES', 20 * 1024 * 1024)
+    fake.execute_delay = 0.1
+    rows = '\n'.join(f'x{i},{i}' for i in range(20))
+    cancel_start = client.post(
+        '/api/v1/databases/demo/tables/users/import/upload',
+        files={'file': ('cancel.csv', b'name,amount\n' + rows.encode(),
+                        'text/csv')},
+        data={'has_header': 'true'}, headers=headers)
+    jid = cancel_start.json()['job_id']
+    time.sleep(0.1)
+    cancel = client.post('/api/v1/import/jobs/' + jid + '/cancel',
+                         headers=headers)
+    assert cancel.status_code == 200
+    final = _wait_job(client, headers, jid)
+    assert final['status'] in ('cancelled', 'completed',
+                               'completed_with_errors')
+    fake.execute_delay = 0

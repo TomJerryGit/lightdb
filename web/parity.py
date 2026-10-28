@@ -5,13 +5,16 @@
 """
 import csv
 import io
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid
 from typing import Dict, List, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
+                     UploadFile)
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -19,6 +22,10 @@ from . import api
 from .auth import require_permission, verify_token
 
 router = APIRouter(prefix="/api/v1", tags=["web-parity"])
+
+# task-69：multipart CSV 上传大小上限（可用 env 覆盖；测试可 monkeypatch）
+MAX_IMPORT_BYTES = int(os.environ.get(
+    'LIGHTDB_WEB_IMPORT_MAX_BYTES', str(20 * 1024 * 1024)))
 
 _TYPE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
 _LEN_RE = re.compile(r'^\d+(,\d+)?$')
@@ -953,3 +960,151 @@ async def cancel_import_job(job_id: str,
     job['cancel_event'].set()
     job['status'] = 'cancelling'
     return {'ok': True, 'status': 'cancelling', 'job_id': job_id}
+
+
+@router.post('/databases/{db}/tables/{table}/import/upload')
+async def upload_csv_import(
+        db: str, table: str,
+        file: UploadFile = File(...),
+        has_header: bool = Form(True),
+        connection: Optional[str] = Form(None),
+        payload: dict = Depends(require_permission('write'))):
+    """task-69：multipart/form-data CSV 分块写临时文件，再复用导入 job。
+
+    - 不在内存中拼整个文件；分块读取，超过 MAX_IMPORT_BYTES 显式 413；
+    - 写完后由后台 job 流式逐行 INSERT，复用进度/取消/逐行错误语义；
+    - 临时文件在任务结束或出错时删除。
+    """
+    db = api._ident(db, '数据库名')
+    table = api._ident(table, '表名')
+    conn = _conn_for(db, connection or None, payload)
+    try:
+        table_cols = [str(c.get('name'))
+                      for c in (conn.get_columns(table) or [])]
+    except Exception as exc:                      # noqa: BLE001
+        raise _err(400, f'读取列失败: {exc}', 'import_read_failed')
+    if not table_cols:
+        raise _err(404, f'表不存在: {table}', 'table_not_found')
+    tmp_path = None
+    job = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix='lightdb_upload_', suffix='.csv')
+        total = 0
+        with os.fdopen(fd, 'wb') as out:
+            while True:
+                chunk = await file.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_IMPORT_BYTES:
+                    raise _err(
+                        413, f'上传超过限制 {MAX_IMPORT_BYTES} 字节',
+                        'import_too_large', max_bytes=MAX_IMPORT_BYTES)
+                out.write(chunk)
+        if total == 0:
+            raise _err(400, '上传 CSV 为空', 'empty_import')
+        # 预解析表头并流式计数（不把整文件载入内存）
+        with open(tmp_path, 'r', encoding='utf-8-sig', newline='') as fh:
+            reader = csv.reader(fh)
+            first = next(reader, None)
+            if not first:
+                raise _err(400, 'CSV 没有数据', 'empty_import')
+            if has_header:
+                header = [str(x).strip() for x in first]
+                for name in header:
+                    if name not in table_cols:
+                        raise _err(400, f'CSV 表头列不存在: {name}',
+                                   'invalid_csv_header')
+                insert_cols = header
+            else:
+                insert_cols = table_cols[:len(first)]
+            data_count = 0
+            try:
+                fh.seek(0)
+            except OSError:
+                pass
+            reader = csv.reader(fh)
+            if has_header:
+                next(reader, None)
+            for row in reader:
+                if row and any(str(x).strip() for x in row):
+                    data_count += 1
+        if data_count <= 0:
+            raise _err(400, 'CSV 没有数据行', 'empty_import')
+        cols_sql = ', '.join(f'`{api._ident(c, "列名")}`'
+                             for c in insert_cols)
+        placeholders = ', '.join(['%s'] * len(insert_cols))
+        sql = f'INSERT INTO `{table}` ({cols_sql}) VALUES ({placeholders})'
+        job_id = uuid.uuid4().hex
+        job = {'id': job_id, 'table': table, 'status': 'running',
+               'total': data_count, 'processed': 0, 'inserted': 0,
+               'failed': 0, 'errors': [], 'cancel_event': threading.Event(),
+               'conn': conn, 'sql': sql, 'file_path': tmp_path,
+               'insert_cols': insert_cols, 'has_header': bool(has_header)}
+        with _IMPORT_LOCK:
+            _IMPORT_JOBS[job_id] = job
+
+        def worker():
+            try:
+                with open(tmp_path, 'r', encoding='utf-8-sig',
+                          newline='') as fh:
+                    reader = csv.reader(fh)
+                    if has_header:
+                        next(reader, None)
+                    index = 0
+                    for row in reader:
+                        if not row or not any(str(x).strip() for x in row):
+                            continue
+                        index += 1
+                        if job['cancel_event'].is_set():
+                            job['status'] = 'cancelled'
+                            return
+                        if len(row) != len(insert_cols):
+                            job['failed'] += 1
+                            job['errors'].append({'row': index,
+                                                  'error': '列数不一致'})
+                        else:
+                            try:
+                                n, err = conn.execute(sql, tuple(row))
+                            except Exception as exc:  # noqa: BLE001
+                                n, err = 0, str(exc)
+                            if err:
+                                job['failed'] += 1
+                                if len(job['errors']) < 50:
+                                    job['errors'].append(
+                                        {'row': index, 'error': str(err)})
+                            else:
+                                job['inserted'] += int(n or 0) if n else 1
+                        job['processed'] = index
+                job['status'] = 'completed_with_errors' if job['failed'] \
+                    else 'completed'
+            except Exception as exc:              # noqa: BLE001
+                job['status'] = 'failed'
+                job['errors'].append({'row': 0, 'error': str(exc)})
+            finally:
+                job['cancel_event'].set()
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                job['file_path'] = ''
+
+        threading.Thread(target=worker, daemon=True,
+                         name='web-csv-upload-import').start()
+        return {'ok': True, 'job_id': job_id, 'status': 'running',
+                'total': data_count, 'bytes': total,
+                'upload_mode': 'multipart_stream'}
+    except HTTPException:
+        if job is None and tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+    except Exception as exc:                      # noqa: BLE001
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise _err(400, f'上传导入失败: {exc}', 'import_upload_failed')

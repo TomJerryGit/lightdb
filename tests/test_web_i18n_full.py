@@ -153,6 +153,58 @@ def test_chart_empty_non_numeric_messages_are_i18n_keys():
         eval_js(eng, "setLang('zh')")
 
 
+def test_dynamic_i18n_interpolation_and_untranslated_list():
+    eng = js_engine()
+    eval_js(eng, (STATIC / 'i18n.js').read_text(encoding='utf-8'), 'i18n.js')
+    eval_js(eng, "setLang('en')")
+    row_text = eval_js(
+        eng, "t('status.rows', null, {count: 7, elapsed: '1.5'})").toString()
+    assert row_text == 'Returned 7 rows · 1.5 ms'
+    import_text = eval_js(
+        eng, "t('status.import_progress', null, {progress: 50, processed: 5, total: 10, failed: 1})").toString()
+    assert '50%' in import_text and '5/10' in import_text
+    assert eval_js(eng, "translateText('加载失败: boom')").toString() \
+        == 'Load failed: boom'
+    back = eval_js(eng, "t('error.backend_detail', null, {message: 'raw engine error'})").toString()
+    assert 'Backend error' in back and 'raw engine error' in back
+    untranslated = json.loads(
+        eval_js(eng, 'JSON.stringify(LDB_UNTRANSLATED)').toString())
+    assert len(untranslated) <= 3, untranslated
+    assert any('后端' in x or 'detail' in x for x in untranslated)
+    assert 'status.login_security' in eval_js(
+        eng, 'JSON.stringify(LDB_I18N.en)').toString()
+    html = (STATIC / 'index.html').read_text(encoding='utf-8')
+    assert 'data-i18n="status.login_security"' in html
+    eval_js(eng, "setLang('zh')")
+
+
+def test_er_large_db_virtualization_and_perf():
+    eng = js_engine()
+    eval_js(eng, (STATIC / 'er_interaction.js').read_text(encoding='utf-8'),
+            'er_interaction.js')
+    result = json.loads(eval_js(eng, r"""
+      var nodes = [];
+      for (var i = 0; i < 100; i++) nodes.push({name: 'grp' + (i % 7) + '_t' + i});
+      var t0 = Date.now();
+      var laid = ERInteraction.layoutNodes(nodes, 10);
+      var elapsed = Date.now() - t0;
+      var groups = ERInteraction.groupByPrefix(nodes, 30);
+      JSON.stringify({ms: elapsed, count: laid.length, groups: groups.length});
+    """).toString())
+    assert result['count'] == 100
+    assert result['ms'] < 300, result
+    assert result['groups'] >= 2, result
+    cards = json.loads(eval_js(eng, r"""
+      var nodes = [];
+      for (var i = 0; i < 100; i++) nodes.push({name: 'grp' + (i % 7) + '_t' + i});
+      var g = ERInteraction.groupByPrefix(nodes, 30);
+      var cards = ERInteraction.virtualGroupNodes(g);
+      JSON.stringify({groups: g.length, cards: cards.length});
+    """).toString())
+    assert cards['groups'] >= 2 and cards['cards'] == cards['groups']
+    print(f"  → 100 表布局 {result['ms']}ms，分组 {result['groups']} 组")
+
+
 def test_browser_e2e_explicit_skip():
     try:
         import playwright  # noqa: F401

@@ -40,6 +40,34 @@
       'stream.processing': '流式导出中...',
       'stream.done': '流式 CSV 导出完成',
       'stream.cancelled': '导入任务已取消',
+      'status.operation_failed': '操作失败: {message}',
+      'status.loading': '加载中...',
+      'status.rows': '返回 {count} 行 · {elapsed} ms',
+      'status.affected': '影响 {count} 行 · {elapsed} ms',
+      'status.exec_ok': '✓ 执行成功，影响 {count} 行',
+      'status.import_progress': '导入进度 {progress}%（{processed}/{total}，失败 {failed}）',
+      'status.import_done': '导入结束：{status}，成功 {inserted}，失败 {failed}',
+      'status.import_started': '导入任务已启动：0/{total}',
+      'status.schema_compare': '结构对比：缺少表 {missing}，新增表 {extra}，变化表 {changed}',
+      'status.explain_rows': 'EXPLAIN 返回 {count} 行',
+      'status.format_done': '格式化完成（{before} → {after} 字符）',
+      'status.templates_loaded': '已加载 {count} 个模板',
+      'status.template_saved': '已保存模板: {name}',
+      'status.template_preview': '模板「{name}」共 {total} 行，预览 {returned} 行',
+      'status.template_deleted': '已删除模板: {name}',
+      'status.template_exported': '已导出「{name}」为 {format}（{filename}）',
+      'status.quality_summary': '表 {table}: 共 {total} 项（error {error} / warning {warning} / info {info}）',
+      'status.alter_preview': '预览 {count} 条 ALTER（未执行）',
+      'status.alter_executed': '已执行 {count} 条 ALTER',
+      'status.design_read': '已读取列/索引；修改 JSON 后预览或保存',
+      'status.er_generated': 'ER 图已生成',
+      'status.er_large': '{count} 张表：已启用前缀分组与按需渲染（大库提示）',
+      'status.login_security': '账号来源：服务端 LIGHTDB_WEB_USERS 配置；未配置时使用启动时生成的随机 admin 口令（~/.lightdb_studio/web_admin.txt 或容器启动日志）。出于安全考虑，本页面不再预填任何默认口令。',
+      'login.account_source': '账号来源：',
+      'error.login_expired': '登录已过期，请重新登录',
+      'error.backend_detail': '后端错误: {message}',
+      'error.network': '网络错误: {message}',
+      'error.csv_header': 'CSV 表头列不存在: {name}',
     },
     en: {
       'common.refresh': 'Refresh',
@@ -73,6 +101,34 @@
       'stream.processing': 'Streaming export...',
       'stream.done': 'Streaming CSV export finished',
       'stream.cancelled': 'Import job cancelled',
+      'status.operation_failed': 'Operation failed: {message}',
+      'status.loading': 'Loading...',
+      'status.rows': 'Returned {count} rows · {elapsed} ms',
+      'status.affected': 'Affected {count} rows · {elapsed} ms',
+      'status.exec_ok': '✓ Executed successfully; {count} rows affected',
+      'status.import_progress': 'Import progress {progress}% ({processed}/{total}, failed {failed})',
+      'status.import_done': 'Import finished: {status}, inserted {inserted}, failed {failed}',
+      'status.import_started': 'Import job started: 0/{total}',
+      'status.schema_compare': 'Schema compare: missing {missing}, extra {extra}, changed {changed}',
+      'status.explain_rows': 'EXPLAIN returned {count} rows',
+      'status.format_done': 'Format complete ({before} → {after} chars)',
+      'status.templates_loaded': 'Loaded {count} templates',
+      'status.template_saved': 'Template saved: {name}',
+      'status.template_preview': 'Template "{name}": {total} rows, preview {returned}',
+      'status.template_deleted': 'Template deleted: {name}',
+      'status.template_exported': 'Exported "{name}" as {format} ({filename})',
+      'status.quality_summary': 'Table {table}: {total} issues (error {error} / warning {warning} / info {info})',
+      'status.alter_preview': 'Preview {count} ALTER statements (not executed)',
+      'status.alter_executed': 'Executed {count} ALTER statements',
+      'status.design_read': 'Columns/indexes loaded; edit JSON then preview or save',
+      'status.er_generated': 'ER diagram generated',
+      'status.er_large': '{count} tables: prefix grouping and on-demand rendering enabled',
+      'status.login_security': 'Account source: server LIGHTDB_WEB_USERS configuration; if unset, a random admin password is generated at startup (~/.lightdb_studio/web_admin.txt or container startup log). For security, this page never pre-fills default passwords.',
+      'login.account_source': 'Account source:',
+      'error.login_expired': 'Login expired; please sign in again',
+      'error.backend_detail': 'Backend error: {message}',
+      'error.network': 'Network error: {message}',
+      'error.csv_header': 'CSV header column not found: {name}',
     },
   };
 
@@ -104,16 +160,41 @@
     '模板名称': 'Template name', '无描述': 'No description', '无': 'None',
     '已配置': 'Configured', '未配置': 'Not configured',
   };
+  // task-69：动态状态前缀（保留插值部分，运行时翻译前缀）
+  Object.assign(PHRASES, {
+    '加载失败: ': 'Load failed: ', '加载连接失败: ': 'Load connections failed: ',
+    '加载表数据...': 'Loading table data...', '表数据已加载': 'Table data loaded',
+    '操作失败: ': 'Operation failed: ', '执行失败: ': 'Execution failed: ',
+    '查询失败: ': 'Query failed: ', '导出失败: ': 'Export failed: ',
+    '导入启动失败: ': 'Import start failed: ', '导入失败: ': 'Import failed: ',
+    '保存失败: ': 'Save failed: ', '读取设计器失败: ': 'Load designer failed: ',
+    'JSON 解析失败: ': 'JSON parse failed: ', 'JSON 必须是列数组': 'JSON must be an array of columns',
+    '备份失败: ': 'Backup failed: ', '结构对比失败: ': 'Schema compare failed: ',
+    'EXPLAIN 完成': 'EXPLAIN done', 'EXPLAIN 失败: ': 'EXPLAIN failed: ',
+    '查询结果已导出 CSV': 'Query result exported as CSV',
+    '表 CSV 已导出': 'Table CSV exported',
+    '备份中...': 'Backing up...', '对比中...': 'Comparing...',
+    '读取结构...': 'Reading structure...', '导入任务已启动：0/': 'Import job started: 0/',
+    '导入任务查询失败: ': 'Import job query failed: ',
+    '取消失败: ': 'Cancel failed: ', '取消请求已发送': 'Cancel requested',
+    '流式导出失败: ': 'Stream export failed: ', '加载 ER 图失败: ': 'Load ER diagram failed: ',
+    '加载插件失败: ': 'Load plugins failed: ', '加载模板失败: ': 'Load templates failed: ',
+    '预览失败: ': 'Preview failed: ', '删除失败: ': 'Delete failed: ',
+    '检查失败: ': 'Check failed: ', '格式化失败: ': 'Format failed: ',
+    '检查完成': 'Check complete', '预览中...': 'Previewing...',
+    '保存中...': 'Saving...', '删除中...': 'Deleting...',
+    '刷新中...': 'Refreshing...', '备份中... ': 'Backing up... ',
+  });
+
   const PHRASE_REVERSE = {};
   Object.keys(PHRASES).forEach(zh => { PHRASE_REVERSE[PHRASES[zh]] = zh; });
 
-  // 显式未翻译清单：旧动态拼接文案（含变量/复数），待后续 key 化；
+  // 显式未翻译清单：确实不可译/服务端自由文本；旧页面动态前缀已
+  // 通过 PHRASES 运行时翻译，登录页安全说明已 data-i18n key 化。
   // 不允许静默留中文——测试/ docs 会读取该列表。
   const UNTRANSLATED = [
-    'app.js 动态状态消息（含 e.message/行数等插值，约 80 处）',
-    'app.js 报表/质量/历史面板的动态详情文案（含模板名/计数插值）',
-    'index.html 登录页安全说明长文案（代码/环境变量说明）',
-    '后端错误 detail 透传文本（服务端产生，Web 不做翻译）',
+    '后端错误 detail 原文（服务端生成的 SQL/引擎文本，作为 {message} 参数插入，本身不翻译）',
+    '插件 description/author 字段（插件作者提供的自由文本）',
   ];
 
   let lang = 'zh';
@@ -165,10 +246,16 @@
   root.LDB_PHRASES = PHRASES;
   root.LDB_UNTRANSLATED = UNTRANSLATED;
   root.currentLang = () => lang;
-  root.t = function (key, fallback) {
+  root.t = function (key, fallback, params) {
     const table = DICT[lang] || DICT.zh;
-    return Object.prototype.hasOwnProperty.call(table, key)
+    const template = Object.prototype.hasOwnProperty.call(table, key)
       ? table[key] : (fallback !== undefined ? fallback : key);
+    if (params && typeof params === 'object') {
+      return String(template).replace(/\{([A-Za-z0-9_]+)\}/g, (m, name) =>
+        Object.prototype.hasOwnProperty.call(params, name)
+          ? String(params[name]) : m);
+    }
+    return template;
   };
   root.translateText = translatePhrase;
   root.setLang = function (next) {

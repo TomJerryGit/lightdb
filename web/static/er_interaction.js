@@ -98,12 +98,76 @@
             y: num(node.y, 0) + num(dy, 0)};
   }
 
+  // >30 表按前缀分组（前缀在 "_" 前，否则取前 2 字符）
+  function tablePrefix(name) {
+    const s = String(name || '');
+    if (s.indexOf('_') > 0) return s.split('_')[0];
+    return s.slice(0, 2) || '?';
+  }
+
+  function groupByPrefix(nodes, threshold) {
+    threshold = num(threshold, 30);
+    const list = nodes || [];
+    if (list.length <= threshold) {
+      return [{key: 'all', count: list.length, nodes: list.slice()}];
+    }
+    const map = {}, order = [];
+    list.forEach(n => {
+      const key = tablePrefix(n.name);
+      if (!map[key]) { map[key] = {key: key, count: 0, nodes: []}; order.push(key); }
+      map[key].count += 1;
+      map[key].nodes.push(n);
+    });
+    return order.map(k => map[k]);
+  }
+
+  function virtualGroupNodes(groups) {
+    return (groups || []).map(g => ({
+      name: g.key + ' (' + g.count + ')',
+      prefix: g.key,
+      columns: [{name: 'tables', type: String(g.count), key: ''}],
+    }));
+  }
+
+  function layoutAll(nodes, cols) {
+    return layoutNodes(nodes, cols || 3, 220, 140, 30, 35);
+  }
+
   function render(container, data, options) {
     if (typeof document === 'undefined') return null;
     options = options || {};
     const NS = 'http://www.w3.org/2000/svg';
-    const nodes = layoutNodes(data.nodes || [],
-                              options.cols || 3, 220, 140, 30, 35);
+    const rawNodes = data.nodes || [];
+    // 大库：先用前缀分组卡片渲染（只渲染组，不一次性渲染 100 张表）
+    if (rawNodes.length > 30 && !options.forceSmall) {
+      const groups = groupByPrefix(rawNodes, 30);
+      const groupNodes = virtualGroupNodes(groups);
+      const ctrl = render(container, {nodes: groupNodes, edges: []},
+        Object.assign({}, options, {
+          forceSmall: true,
+          largeGroups: true,
+          onNodeClick: name => {
+            const prefix = String(name).replace(/\s*\(.*$/, '');
+            const g = groups.find(x => x.key === prefix);
+            if (!g) return;
+            render(container, {
+              nodes: g.nodes,
+              edges: (data.edges || []).filter(e => {
+                const names = new Set(g.nodes.map(n => n.name));
+                return names.has(e.from) && names.has(e.to);
+              }),
+            }, Object.assign({}, options, {
+              forceSmall: true,
+              groupLabel: g.key,
+              onNodeClick: null,
+            }));
+          },
+        }));
+      ctrl.groups = groups;
+      ctrl.virtualized = true;
+      return ctrl;
+    }
+    const nodes = layoutNodes(rawNodes, options.cols || 3, 220, 140, 30, 35);
     const edges = data.edges || [];
     const width = options.width || 980;
     const height = options.height || 620;
@@ -257,6 +321,7 @@
       if (!name) return;
       selected = (selected === name) ? null : name;
       refreshHighlight();
+      if (typeof options.onNodeClick === 'function') options.onNodeClick(name);
     });
 
     const controller = {
@@ -286,7 +351,8 @@
     return controller;
   }
 
-  const api = {layoutNodes, clampScale, worldToScreen, screenToWorld, panBy,
+  const api = {layoutNodes, layoutAll, groupByPrefix, virtualGroupNodes,
+               tablePrefix, clampScale, worldToScreen, screenToWorld, panBy,
                applyZoom, fitView, nodeAt, edgesForNode, dragNode, render};
   root.ERInteraction = api;
   if (typeof module !== 'undefined' && module.exports) {
