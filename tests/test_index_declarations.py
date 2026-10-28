@@ -208,21 +208,37 @@ def test_multi_column_unique_is_supported_and_enforced(tmp_path):
           f"全部 Index_type=UNIQUE-CHECK")
 
 
-# ==================== 4. 复合主键：显式拒绝 ====================
+# ==================== 4. 复合主键：真实支持（task-72） ====================
 
 @pytest.mark.parametrize('decl', [
     'PRIMARY KEY (a, b)',
     'CONSTRAINT pk_ab PRIMARY KEY (a, b)',
 ])
-def test_composite_primary_key_is_explicit_1064(tmp_path, decl):
+def test_composite_primary_key_supported(tmp_path, decl):
     db = open_db(tmp_path / 'data')
-    r = err(db, f'CREATE TABLE cpk (a INT, b INT, {decl})')
-    assert r['code'] == 1064, r
-    assert '复合主键' in r['message'], r
-    assert '单列' in r['message'], r
-    # 报错后表**没有**被建出来（不做半套 DDL）
-    assert err(db, 'SHOW INDEX FROM cpk')['code'] == 1146
-    print(f"  → {decl} → {r['code']}: {r['message'][:110]}")
+    ok(db, f'CREATE TABLE cpk (a INT, b INT, v VARCHAR(10), {decl})')
+    idx = index_rows(db, 'cpk')
+    pri = [d for d in idx if d['Key_name'] == 'PRIMARY']
+    assert [(d['Seq_in_index'], d['Column_name']) for d in pri] == [
+        (1, 'a'), (2, 'b')], pri
+    assert all(d['Index_type'] == 'BTREE' for d in pri), pri
+    ok(db, "INSERT INTO cpk VALUES (1, 1, 'x'), (1, 2, 'y')")
+    r = err(db, "INSERT INTO cpk VALUES (1, 1, 'dup')")
+    assert r['code'] == 1062, r
+    assert err(db, "INSERT INTO cpk VALUES (NULL, 3, 'n')")['code'] == 1048
+    got = [tuple(x) for x in rs(db, 'SELECT * FROM cpk ORDER BY a, b')['rows']]
+    assert got == [(1, 1, 'x'), (1, 2, 'y')], got
+    print(f"  → {decl}: 复合主键真实生效（PRI/序列/1062/NULL）")
+
+
+@pytest.mark.parametrize('decl', [
+    'PRIMARY KEY (a, b, c)',
+])
+def test_three_column_primary_key_is_explicit_1235(tmp_path, decl):
+    db = open_db(tmp_path / 'data')
+    r = err(db, f'CREATE TABLE cpk3 (a INT, b INT, c INT, {decl})')
+    assert r['code'] == 1064 and '2 列' in r['message'], r
+    assert err(db, 'SHOW INDEX FROM cpk3')['code'] == 1146
 
 
 # ==================== 5. 不支持的索引形态：显式 1064 ====================

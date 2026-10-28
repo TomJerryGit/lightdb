@@ -384,6 +384,18 @@ class Table:
             (i for i, c in enumerate(cols) if c.get('primary')), 0)
         self.pk_col = cols[self.pk_idx]['name']
         self.pk_type = cols[self.pk_idx]['type']
+        # task-72：复合主键（目前支持 2 列整数）。物理 B+Tree 键不再直接
+        # 使用单列值，而是把两列按「有符号 32 位 -> uint32 偏置」拼成
+        # order-preserving 的 64 位键：`(a+2^31)<<32 | (b+2^31)`。
+        # 这样 WHERE a=? AND b=? 是精确点查，WHERE a=? 是键范围扫描。
+        self._pk_indices = [i for i, c in enumerate(cols)
+                            if c.get('primary')]
+        self._pk_explicit_indices = [i for i, c in enumerate(cols)
+                                     if c.get('primary')
+                                     and not c.get('implicit_pk')]
+        self.composite_pk = len(self._pk_indices) > 1
+        self.pk_cols = [cols[i]['name'] for i in self._pk_indices]
+        self.pk_types = [cols[i]['type'] for i in self._pk_indices]
 
         self.heap_path = str(self.data_dir / f"{name}.dat")
         self.btroot_path = self.data_dir / f"{name}.btroot"
@@ -443,7 +455,8 @@ class Table:
         self._secondary_maps = None
         self._secondary_dirty = True
         self._index_stats = {
-            'lookups': 0, 'fallbacks': 0, 'rebuilds': 0, 'ordered': 0}
+            'lookups': 0, 'fallbacks': 0, 'rebuilds': 0, 'ordered': 0,
+            'like_prefix': 0, 'pk_composite': 0}
 
         # P5：checkpoint 状态（供 SHOW WAL STATUS / 日志观测）。
         # `_last_checkpoint_ts` 在时间阈值判定中使用；`_checkpoint_count`
@@ -886,7 +899,8 @@ class Table:
             # "列不允许为空"，不是"不支持改主键"（后者是存储层限制）。
             if v is None and (c.get('notnull') or c.get('primary')):
                 raise NotNullViolation(f"列 '{c['name']}' 不允许为空")
-            if ci == self.pk_idx and not allow_pk_change:
+            if ci in getattr(self, '_pk_indices', (self.pk_idx,)) \
+                    and not allow_pk_change:
                 raise ValueError("不允许修改主键")
             new[ci] = v
         return new
@@ -1156,6 +1170,38 @@ class Table:
                     break
         return out
 
+    # ==================== task-72：复合主键编码 ====================
+
+    _PK_PART_BIAS = 1 << 31
+    _PK_PART_MAX = (1 << 32) - 1
+
+    @classmethod
+    def _encode_pk_parts(cls, parts) -> int:
+        """把 2 个有符号 32 位整数编码成 order-preserving 64 位 B+Tree 键"""
+        if len(parts) != 2:
+            raise ValueError(
+                f"复合主键最多支持 2 列（收到 {len(parts)} 列）")
+        key = 0
+        for v in parts:
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ValueError(f"复合主键分量必须是整数: {v!r}")
+            if v < -cls._PK_PART_BIAS or v > cls._PK_PART_BIAS - 1:
+                raise ValueError(
+                    f"复合主键分量 {v} 超出有符号 32 位范围"
+                    f"（-2147483648..2147483647）")
+            key = (key << 32) | ((v + cls._PK_PART_BIAS) & 0xFFFFFFFF)
+        return key
+
+    def _row_key(self, values) -> int:
+        """一行对应的物理主键键值（单列 = 列值；复合 = 编码后的 64 位键）"""
+        if not getattr(self, 'composite_pk', False):
+            return values[self.pk_idx]
+        parts = []
+        for i in self._pk_indices:
+            v = coerce(values[i], self.cols[i]['type'])
+            parts.append(v)
+        return self._encode_pk_parts(parts)
+
     # ==================== 元数据 ====================
 
     def _load_btree_root(self):
@@ -1247,7 +1293,10 @@ class Table:
                 if not r:
                     continue
                 row, xmin, _xmax, pp, ps = r
-                pk = row[self.pk_idx]
+                try:
+                    pk = self._row_key(row)
+                except Exception:
+                    continue
                 if isinstance(pk, int):
                     versions.setdefault(pk, []).append(
                         (pid, sid, xmin, pp, ps))
@@ -1912,6 +1961,14 @@ class Table:
         self.pk_idx = idx
         self.pk_col = self.cols[idx]['name']
         self.pk_type = self.cols[idx]['type']
+        self._pk_indices = [i for i, c in enumerate(self.cols)
+                            if c.get('primary')]
+        self._pk_explicit_indices = [i for i, c in enumerate(self.cols)
+                                     if c.get('primary')
+                                     and not c.get('implicit_pk')]
+        self.composite_pk = len(self._pk_indices) > 1
+        self.pk_cols = [self.cols[i]['name'] for i in self._pk_indices]
+        self.pk_types = [self.cols[i]['type'] for i in self._pk_indices]
         self._refresh_check_flag()
         names = [c['name'] for c in self.cols]
         spec = getattr(self, '_partition_spec', None) or {}
@@ -2124,14 +2181,27 @@ class Table:
         # 只有"列清单里没给主键"（`_OMITTED`）才沿用本引擎的既有能力
         # —— 自取下一个主键值（tests/test_insert_atomicity.py ⑤）。
         # 没有声明主键的表（pk_idx 回退到 0，仅作内部行键）保持旧行为。
-        pk = row[self.pk_idx]
-        if pk is None:
-            pk_col = self.cols[self.pk_idx]
-            if pk_col.get('primary') and self.pk_idx not in omitted:
+        if getattr(self, 'composite_pk', False):
+            # 复合主键：必须给出全部主键列（显式 NULL/缺列 → 1048），
+            # 物理键由 `_row_key` 编码；唯一性由 B+Tree 键天然强制。
+            bad = [self.cols[i]['name'] for i in self._pk_indices
+                   if row[i] is None]
+            if bad:
                 raise NotNullViolation(
-                    f"列 '{pk_col['name']}' 不允许为空")
-            pk = self._next_pk
-            row[self.pk_idx] = pk
+                    f"列 '{bad[0]}' 不允许为空（复合主键列不能为 NULL）")
+            try:
+                pk = self._row_key(row)
+            except ValueError as e:
+                raise ValueError(f"复合主键编码失败: {e}")
+        else:
+            pk = row[self.pk_idx]
+            if pk is None:
+                pk_col = self.cols[self.pk_idx]
+                if pk_col.get('primary') and self.pk_idx not in omitted:
+                    raise NotNullViolation(
+                        f"列 '{pk_col['name']}' 不允许为空")
+                pk = self._next_pk
+                row[self.pk_idx] = pk
 
         # CHECK 约束：两条写入路径（SQL `INSERT` 与 `Table.insert` 直写）
         # 都汇到这里，因此这一处校验覆盖全部入口（SQL `UPDATE` 见
@@ -2162,6 +2232,9 @@ class Table:
                 visible = self._is_visible(
                     old_xmin, old_xmax, read_view)
                 if visible:
+                    if getattr(self, 'composite_pk', False):
+                        shown = tuple(row[i] for i in self._pk_indices)
+                        raise ValueError(f"主键重复: {shown}")
                     raise ValueError(f"主键重复: {pk}")
                 # ★ 复用墓碑/不可见旧版本的主键时，把新版本接到它后面，
                 #   否则索引项被覆盖后，老快照就再也找不到被删的旧值。
@@ -2799,6 +2872,46 @@ class Table:
             return [(str(order_by[0]), bool(order_by[1]))]
         return []
 
+    def _secondary_like_plan(self, where):
+        """`LIKE 'abc%'` 前缀匹配是否可用某个二级索引的首列
+
+        只有**纯字面量前缀 + 尾部 `%`** 才走索引范围：
+        `abc%` 可用；`%abc` / `%abc%` / `a%c` / `a_c%` / `abc` 都返回
+        None（安全回退全表扫描，结果仍由 LIKE 求值器逐行判定）。
+        """
+        if not isinstance(where, dict) or 'or' in where:
+            return None
+        for cond in self._secondary_conjuncts(where):
+            if cond.get('op') != 'LIKE':
+                continue
+            pat = cond.get('value')
+            if not isinstance(pat, str) or not pat.endswith('%'):
+                continue
+            prefix = pat[:-1]
+            if not prefix or '%' in prefix or '_' in prefix:
+                continue
+            col = cond.get('column')
+            for spec in (self._secondary_indexes or []):
+                cols = [str(c) for c in (spec.get('columns') or [])]
+                if cols and cols[0] == col:
+                    return spec, prefix
+        return None
+
+    def _secondary_like_candidate_pks(self, spec, prefix):
+        entry = self._secondary_entry(spec)
+        if entry is None:
+            return None
+        keys = self._secondary_sorted_keys(entry, 1)
+        vals = [k[0] for k in keys if isinstance(k[0], str)]
+        lo = bisect.bisect_left(vals, prefix)
+        out = set()
+        full_map = entry['maps'][1]
+        for v in vals[lo:]:
+            if not v.startswith(prefix):
+                break
+            out.update(full_map.get((v,), ()))
+        return out
+
     def _index_ordered_pks(self, order_by, where, limit, read_view):
         """ORDER BY 与某个二级索引列前缀一致时的有序主键流；否则 None
 
@@ -2851,13 +2964,116 @@ class Table:
         return dict(self._index_stats, secondary_indexes=len(
             getattr(self, '_secondary_indexes', []) or []))
 
+    def _composite_pk_candidates(self, where, read_view):
+        """复合主键前缀/点查候选键；不可用返回 None（安全回退全表扫描）
+
+        `WHERE a=? AND b=?` → BTree 精确点查；`WHERE a=?` → 编码键范围扫描；
+        `WHERE a=? AND b>?` → 前缀 + 范围。条件不在最左主键列 / OR / LIKE /
+        无法比较时返回 None，由调用方走其它索引或全表扫描。
+        """
+        if not isinstance(where, dict) or 'or' in where:
+            return None
+        conds = self._secondary_conjuncts(where)
+        if not conds:
+            return None
+        idx_by_name = {self.cols[i]['name']: i
+                       for i in self._pk_indices}
+        by_idx = {}
+        for cond in conds:
+            ci = idx_by_name.get(cond.get('column'))
+            if ci is None:
+                continue
+            if cond.get('op') not in ('=', '<', '>', '<=', '>='):
+                continue
+            by_idx.setdefault(ci, []).append(cond)
+        if not by_idx or self._pk_indices[0] not in by_idx:
+            return None
+        n = len(self._pk_indices)
+        lo_part, hi_part = -(1 << 31), (1 << 31) - 1
+        parts = []
+
+        def conv(v, idx):
+            try:
+                return int(coerce(v, self.cols[idx]['type']))
+            except Exception:
+                raise ValueError(f"复合主键值无法转为整数: {v!r}")
+
+        def scan_range(prefix_parts, lo, hi):
+            start = self._encode_pk_parts(
+                prefix_parts + [lo] + [lo_part] * (n - len(prefix_parts) - 1))
+            end = self._encode_pk_parts(
+                prefix_parts + [hi] + [hi_part] * (n - len(prefix_parts) - 1))
+            out = []
+            for key, _pid, _sid in self.bt.scan(start, end):
+                v = self._read_version(key, read_view)
+                if v is not None and self._match(v[0], where):
+                    out.append(key)
+            return out
+
+        for pos, idx in enumerate(self._pk_indices):
+            col_conds = by_idx.get(idx, [])
+            eqs = [c for c in col_conds if c.get('op') == '=']
+            if eqs:
+                try:
+                    vals = {conv(c.get('value'), idx) for c in eqs}
+                except ValueError:
+                    return []
+                if len(vals) != 1:
+                    return []
+                v = next(iter(vals))
+                if not (lo_part <= v <= hi_part):
+                    return []
+                parts.append(v)
+                continue
+            ranges = [c for c in col_conds
+                      if c.get('op') in ('<', '>', '<=', '>=')]
+            if ranges:
+                lo, hi = lo_part, hi_part
+                try:
+                    for c in ranges:
+                        v = conv(c.get('value'), idx)
+                        op = c.get('op')
+                        if op == '>':
+                            lo = max(lo, v + 1)
+                        elif op == '>=':
+                            lo = max(lo, v)
+                        elif op == '<':
+                            hi = min(hi, v - 1)
+                        elif op == '<=':
+                            hi = min(hi, v)
+                except (ValueError, TypeError):
+                    return []
+                if lo > hi:
+                    return []
+                return scan_range(parts, lo, hi)
+            # 前缀等值已建立、但下一列没有条件 → 前缀范围扫描
+            if parts:
+                return scan_range(parts, lo_part, hi_part)
+            return None
+        # 所有主键列都有等值 → 精确点查
+        try:
+            key = self._encode_pk_parts(parts)
+        except ValueError:
+            return []
+        v = self._read_version(key, read_view)
+        if v is not None and self._match(v[0], where):
+            return [key]
+        return []
+
     def _find_pks(self, where: Optional[Dict],
                   read_view=None) -> List:
         if where is None:
             return [v[0] for v in self._visible_pks(read_view)]
 
+        # task-72：复合主键点查/前缀范围（WHERE a=? AND b=? / a=?）
+        if getattr(self, 'composite_pk', False):
+            cand = self._composite_pk_candidates(where, read_view)
+            if cand is not None:
+                self._index_stats['pk_composite'] += 1
+                return cand
+
         # 主键等值
-        if 'column' in where:
+        if not getattr(self, 'composite_pk', False) and 'column' in where:
             col, op, val = (where['column'], where['op'],
                             where['value'])
             if col == self.pk_col and op == '=':
@@ -2874,6 +3090,17 @@ class Table:
 
         # P5.1：二级索引等值/范围（安全条件下；结果仍逐行用 _match 复核）
         if self._secondary_usable(read_view):
+            like_plan = self._secondary_like_plan(where)
+            if like_plan is not None:
+                cand = self._secondary_like_candidate_pks(*like_plan)
+                if cand is not None:
+                    self._index_stats['like_prefix'] += 1
+                    result = []
+                    for pk in sorted(cand):
+                        v = self._read_version(pk, read_view)
+                        if v is not None and self._match(v[0], where):
+                            result.append(pk)
+                    return result
             plan = self._secondary_plan(where)
             if plan is not None:
                 cand = self._secondary_candidate_pks(plan[0], plan[1])
@@ -3999,7 +4226,7 @@ class Table:
                     r = self._decode_row_ver(rb)
                     if r is None:
                         continue
-                    pk = r[0][self.pk_idx]
+                    pk = self._row_key(r[0])
                     if not isinstance(pk, int):
                         continue
                     versions.setdefault(pk, []).append(

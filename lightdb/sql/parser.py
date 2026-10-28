@@ -2405,22 +2405,25 @@ class Parser:
                 raise SyntaxError(
                     "Multiple primary key defined（列级 PRIMARY KEY 与表级 "
                     "PRIMARY KEY 同时出现；本引擎只支持一个主键）")
-            if len(table_pk['columns']) != 1:
-                # 主轴索引是「一个主键值 → 版本位置」的 B+Tree，**不支持**
-                # 复合键。这里如实拒绝而不是只取第一列（那等于悄悄换了
-                # 主键语义）。
+            pk_columns = list(table_pk['columns'])
+            if len(pk_columns) > 2:
+                # 物理键是 order-preserving 64 位整数：最多编码 2 个
+                # signed-32 位分量。3 列及以上显式拒绝（不静默只取前两列）。
                 raise SyntaxError(
-                    f"本引擎不支持复合主键：表级 PRIMARY KEY "
-                    f"({', '.join(table_pk['columns'])}) 无法生效"
-                    f"（主键 B+Tree 只支持单列）。请改成单列主键，或去掉"
-                    f"该表级声明后用列级 PRIMARY KEY")
-            target = table_pk['columns'][0]
-            hit = [c for c in cols if c['name'] == target]
-            if not hit:
+                    f"本引擎复合主键最多支持 2 列：表 {table} 的 "
+                    f"PRIMARY KEY ({', '.join(pk_columns)}) 有 "
+                    f"{len(pk_columns)} 列，无法编码到 64 位主键 B+Tree"
+                    f"（3 列及以上显式拒绝，绝不静默截断）")
+            if len(set(pk_columns)) != len(pk_columns):
                 raise SyntaxError(
-                    f"Key column '{target}' doesn't exist in table "
-                    f"{table}（表级 PRIMARY KEY 引用了不存在的列）")
-            hit[0]['primary'] = True
+                    f"表 {table} 的 PRIMARY KEY 列清单有重复列: {pk_columns}")
+            for target in pk_columns:
+                hit = [c for c in cols if c['name'] == target]
+                if not hit:
+                    raise SyntaxError(
+                        f"Key column '{target}' doesn't exist in table "
+                        f"{table}（表级 PRIMARY KEY 引用了不存在的列）")
+                hit[0]['primary'] = True
 
         # ★ 修复 F1：非整型主键在**定义期**显式拒绝（1064）。
         #
@@ -2518,12 +2521,11 @@ class Parser:
             if base in self._INTEGER_PK_TYPES:
                 continue
             raise SyntaxError(
-                f"本引擎主键仅支持整数类型 INT/BIGINT/TINYINT/SMALLINT："
-                f"表 {table} 的主键列 '{c['name']}' 声明为 "
-                f"{c.get('type') or '未知'}，无法作为主键"
-                f"（主键 B+Tree 的键按 uint32 存储，非整型主键会导致该表"
-                f"所有写入永久失败）。请改用整数主键；字符串列请用 UNIQUE "
-                f"约束代替（例如 id INT PRIMARY KEY, name VARCHAR(20) UNIQUE）")
+                f"主键仅支持整数类型 INT/SMALLINT/TINYINT：表 {table} 的"
+                f"主键列 '{c['name']}' 声明为 {c.get('type') or '未知'}，"
+                f"无法作为主键（主键 B+Tree 键是 64 位整数；复合主键每个"
+                f"分量必须能放进 signed-32 位）。请改用整数主键；字符串列"
+                f"请用 UNIQUE 约束代替")
 
     #: 表级键/索引声明的起始关键字（长的在前，避免 `UNIQUE KEY` 被
     #: `UNIQUE` 抢先匹配）。`\b` 保证 `KEYED` 这类标识符不会被误判。

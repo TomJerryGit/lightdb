@@ -390,6 +390,8 @@ class TableSchema:
         的解析/恢复行为不变）。
         """
         parts = []
+        pk_cols = [c for c in self.columns if c.get('primary')]
+        composite_pk = len(pk_cols) > 1
         for c in self.columns:
             # 列定义的属性顺序按 MySQL 的 `SHOW CREATE TABLE` 习惯：
             #   `类型` → `NOT NULL|NULL` → `DEFAULT` → `PRIMARY KEY`
@@ -403,7 +405,7 @@ class TableSchema:
                     + (' NOT NULL' if c.get('notnull') else ' NULL'))
             if c.get('has_default'):
                 line += ' DEFAULT ' + _default_literal(c)
-            if c.get('primary'):
+            if c.get('primary') and not composite_pk:
                 line += ' PRIMARY KEY'
             if c.get('unique'):
                 line += ' UNIQUE'
@@ -411,6 +413,11 @@ class TableSchema:
             if ck.get('expr'):
                 line += f" CHECK ({ck['expr']})"
             parts.append(line)
+        if composite_pk:
+            # 复合主键只能写成表级约束（列级语法只表达单列主键）；
+            # 恢复端解析后给两列都打 primary 标记，与 ALTER 元数据一致。
+            parts.append("  PRIMARY KEY ("
+                         + ', '.join(str(c['name']) for c in pk_cols) + ')')
         # 表级 UNIQUE 约束（真强制）：必须写回 DDL，否则恢复后唯一性
         # 静默消失。名字/列名都在 `assert_supported` 里校验过能原样解析。
         for uq in self.unique_indexes:
@@ -779,24 +786,28 @@ def parse_create_table(stmt: str) -> TableSchema:
             'check': col_check,
         })
 
-    # 表级 `PRIMARY KEY (col)`：本引擎主键 B+Tree 只支持单列，dump 侧
-    # 同样只接受单列；复合主键显式报错（不静默降级成复合语义）。
+    # 表级 `PRIMARY KEY (col[, col2])`：单列或 2 列复合（物理键是 64 位
+    # 编码）；更多列显式拒绝，绝不静默降级。
     if table_pk_cols is not None:
-        if len(table_pk_cols) != 1:
+        if len(table_pk_cols) > 2:
             raise BackupError(
                 f"表 {name} 使用多列主键 PRIMARY KEY "
-                f"({', '.join(table_pk_cols)})，lightdb-logical-dump v1 不支持"
-                f"（主键 B+Tree 只支持单列）")
+                f"({', '.join(table_pk_cols)})，lightdb-logical-dump v1 只"
+                f"支持单列或 2 列复合主键")
         if any(c.get('primary') for c in columns):
             raise BackupError(
                 f"表 {name} 同时有列级 PRIMARY KEY 与表级 PRIMARY KEY"
                 f"（Multiple primary key defined）")
-        target = table_pk_cols[0]
-        hit = [c for c in columns if c['name'] == target]
-        if not hit:
+        if len(set(table_pk_cols)) != len(table_pk_cols):
             raise BackupError(
-                f"表 {name} 的表级 PRIMARY KEY 引用了不存在的列 {target!r}")
-        hit[0]['primary'] = True
+                f"表 {name} 的表级 PRIMARY KEY 列清单有重复: {table_pk_cols}")
+        for target in table_pk_cols:
+            hit = [c for c in columns if c['name'] == target]
+            if not hit:
+                raise BackupError(
+                    f"表 {name} 的表级 PRIMARY KEY 引用了不存在的列 "
+                    f"{target!r}")
+            hit[0]['primary'] = True
 
     # 没有显式 PRIMARY KEY 的 DDL（例如源表执行过 DROP PRIMARY KEY）仍可
     # 恢复：引擎会为第一列建立内部行键；dump 侧用同一列作为行键扫描，
@@ -1589,13 +1600,14 @@ def verify_restore(db, plan: DumpPlan) -> VerifyReport:
         rep.add(bt_entries == len(rows),
                 f"表 {name}: 主键索引条目 {bt_entries} == 数据行 {len(rows)}")
 
-        pk_idx = [i for i, c in enumerate(tbl.cols) if c.get('primary')]
-        pk_idx = pk_idx[0] if pk_idx else 0
+        pk_idxs = [i for i, c in enumerate(tbl.cols) if c.get('primary')]
+        if not pk_idxs:
+            pk_idxs = [0]
         seen = set()
         bad_pk = null_pk = 0
         for r in rows:
-            pk = r[pk_idx]
-            if pk is None:
+            pk = tuple(r[i] for i in pk_idxs)
+            if any(v is None for v in pk):
                 null_pk += 1
             elif pk in seen:
                 bad_pk += 1

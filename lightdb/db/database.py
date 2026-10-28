@@ -1659,98 +1659,151 @@ class Database:
         tbl._next_pk = tbl._calc_next_pk()
         tbl._secondary_dirty = True
 
+    def _rekey_primary_key_multi(self, tbl, col_indices):
+        """把物理主键 B+Tree 重建成复合键（2 列编码，行载荷不变）"""
+        from ..storage.btree import BTree
+        rows = tbl._visible_pks(None)
+        new_bt = BTree(tbl.bp, root_page_id=None)
+        seen = set()
+        for _oldpk, values, _xmin, _xmax, pid, sid in rows:
+            parts = []
+            for i in col_indices:
+                raw = values[i] if i < len(values) else None
+                parts.append(int(coerce(raw, tbl.cols[i]['type'])))
+            key = Table._encode_pk_parts(parts)
+            if key in seen:
+                raise DdlError(
+                    f"Duplicate entry '{parts}' for key 'PRIMARY'",
+                    errno=1062, sqlstate='23000')
+            seen.add(key)
+            new_bt.insert(key, pid, sid)
+        tbl.bp.flush()
+        tbl.bt = new_bt
+        tbl._save_btree_root(new_bt.root_page_id, sync=True)
+        tbl._next_pk = tbl._calc_next_pk()
+        tbl._secondary_dirty = True
+
+    #: 复合主键每个分量必须能放进 signed-32 位
+    _PK_COMPOSITE_TYPES = frozenset(
+        ('INT', 'INTEGER', 'SMALLINT', 'TINYINT', 'MEDIUMINT'))
+
     def alter_add_primary_key(self, name: str, columns: List[str]) -> dict:
-        """`ALTER TABLE t ADD PRIMARY KEY (col)`（单列；MySQL 语义）
+        """`ALTER TABLE t ADD PRIMARY KEY (col[, col2])`（MySQL 语义）
 
         * 已有显式主键 → 1068 `Multiple primary key defined`；
         * 列不存在 → 1072；类型不是主键兼容类型 → 1064；
         * 目标列已有 NULL 值 → 1138 `Invalid use of NULL value`；
-        * 已有重复值 → 1062 `Duplicate entry ... for key 'PRIMARY'`；
-        * AUTO_INCREMENT 列存在且目标不是该列 → 1075（自增列必须是键）；
-        * 成功：主键 B+Tree 真实重键（目标列与旧内部行键不同列时）、
+        * 已有重复值（含复合元组重复）→ 1062；
+        * AUTO_INCREMENT 列存在且目标未覆盖它 → 1075；
+        * 成功：主键 B+Tree 真实重键（更换单列/切换复合时）、
           `cols` 的主键/NOT NULL 标记与 `_meta.json` 原子更新，
           `SHOW CREATE` / `SHOW COLUMNS Key` / `SHOW INDEX` 同步。
         """
         tbl = self._get_table_for_ddl(name)
-        cols = [str(c).strip().strip('`"') for c in (columns or [])]
-        cols = [c for c in cols if c]
-        if len(cols) != 1:
+        targets = [str(c).strip().strip('`"') for c in (columns or [])]
+        targets = [c for c in targets if c]
+        if len(targets) not in (1, 2):
             raise DdlError(
-                f"ALTER TABLE {name} ADD PRIMARY KEY 只支持单列主键"
-                f"（本引擎主键 B+Tree 只支持单列；收到 {cols}）",
+                f"ALTER TABLE {name} ADD PRIMARY KEY 只支持单列或 2 列复合"
+                f"主键（物理键是 64 位整数；收到 {targets}）",
                 errno=1235, sqlstate='42000')
-        target = cols[0]
-        names = [c['name'] for c in tbl.cols]
-        if target not in names:
+        if len(set(targets)) != len(targets):
             raise DdlError(
-                f"Key column '{target}' doesn't exist in table '{name}'",
-                errno=1072, sqlstate='42022')
+                f"Duplicate column name in PRIMARY KEY ({', '.join(targets)})",
+                errno=1060, sqlstate='42000')
+        names = [c['name'] for c in tbl.cols]
+        for target in targets:
+            if target not in names:
+                raise DdlError(
+                    f"Key column '{target}' doesn't exist in table '{name}'",
+                    errno=1072, sqlstate='42022')
         if self._explicit_primary_cols(tbl):
             raise DdlError("Multiple primary key defined", errno=1068,
                            sqlstate='42000')
-        idx = names.index(target)
-        col = tbl.cols[idx]
-        base = self._primary_type_base(col)
-        if base not in self._PK_COMPATIBLE_TYPES:
-            raise DdlError(
-                f"列 '{target}' 的类型 {col.get('type')} 不能作为主键"
-                f"（主键 B+Tree 键只支持整数类型）", errno=1064)
+        idxs = [names.index(t) for t in targets]
+        for idx, target in zip(idxs, targets):
+            col = tbl.cols[idx]
+            base = self._primary_type_base(col)
+            if base not in self._PK_COMPATIBLE_TYPES:
+                raise DdlError(
+                    f"列 '{target}' 的类型 {col.get('type')} 不能作为主键"
+                    f"（主键 B+Tree 键只支持整数类型）", errno=1064)
+            if len(targets) == 2 and base not in self._PK_COMPOSITE_TYPES:
+                raise DdlError(
+                    f"列 '{target}' 的类型 {col.get('type')} 不能作为复合"
+                    f"主键分量（每个分量必须是 signed-32 位整数；BIGINT "
+                    f"复合键无法编码到 64 位 B+Tree）", errno=1064)
         autos = self._auto_increment_cols(tbl)
-        if autos and target not in autos:
+        if autos and any(a not in targets for a in autos):
             raise DdlError(
                 f"Incorrect table definition; there can be only one auto "
                 f"column and it must be defined as a key（AUTO_INCREMENT "
                 f"列 {', '.join(autos)} 必须先成为键；显式错误，不静默"
                 f"把自增列变成非键列）", errno=1075, sqlstate='42000')
+        composite = len(targets) == 2
         with tbl._lock:
             self._ddl_guard(tbl, 'ALTER TABLE ... ADD PRIMARY KEY')
             seen = {}
             for pk, values in tbl._live_rows():
-                raw = values[idx] if idx < len(values) else None
-                if raw is None:
-                    raise DdlError(
-                        f"Invalid use of NULL value（列 '{target}' 在行 "
-                        f"pk={pk} 上是 NULL，MySQL 不允许把含 NULL 的列"
-                        f"加为主键）", errno=1138, sqlstate='22004')
+                parts = []
+                for i in idxs:
+                    raw = values[i] if i < len(values) else None
+                    if raw is None:
+                        raise DdlError(
+                            f"Invalid use of NULL value（列 "
+                            f"'{tbl.cols[i]['name']}' 在行 pk={pk} 上是 NULL，"
+                            f"MySQL 不允许把含 NULL 的列加为主键）",
+                            errno=1138, sqlstate='22004')
+                    try:
+                        parts.append(int(coerce(
+                            raw, tbl.cols[i]['type'])))
+                    except Exception:
+                        raise DdlError(
+                            f"Incorrect integer value: '{raw}' for column "
+                            f"'{tbl.cols[i]['name']}' at row pk={pk}",
+                            errno=1366, sqlstate='HY000')
                 try:
-                    key = coerce(raw, col['type'])
-                except Exception:
-                    raise DdlError(
-                        f"Incorrect integer value: '{raw}' for column "
-                        f"'{target}' at row pk={pk}", errno=1366,
-                        sqlstate='HY000')
+                    key = (Table._encode_pk_parts(parts) if composite
+                           else parts[0])
+                except ValueError as e:
+                    raise DdlError(str(e), errno=1366, sqlstate='HY000')
                 if key in seen:
+                    shown = '-'.join(str(v) for v in parts)
                     raise DdlError(
-                        f"Duplicate entry '{raw}' for key 'PRIMARY'",
+                        f"Duplicate entry '{shown}' for key 'PRIMARY'",
                         errno=1062, sqlstate='23000')
                 seen[key] = pk
-            same_col = (target == getattr(tbl, 'pk_col', None))
-            if not same_col:
+            same_key = (list(idxs) == list(tbl._pk_indices)
+                        and bool(tbl.composite_pk) == composite)
+            if not same_key:
                 # 结构变化涉及行键重写：先退休 WAL，避免恢复时用旧主键
                 # 重放这些行；随后重建 B+Tree 并同步元数据。
                 self._ddl_retire_wal(tbl, 'ADD PRIMARY KEY')
-                self._rekey_primary_key(tbl, idx, col)
+                if composite:
+                    self._rekey_primary_key_multi(tbl, idxs)
+                else:
+                    self._rekey_primary_key(tbl, idxs[0], tbl.cols[idxs[0]])
             new_cols = [dict(c) for c in tbl.cols]
             for c in new_cols:
                 c['primary'] = False
                 c['implicit_pk'] = False
-            new_cols[idx]['primary'] = True
-            new_cols[idx]['implicit_pk'] = False
-            new_cols[idx]['notnull'] = True
+            for i in idxs:
+                new_cols[i]['primary'] = True
+                new_cols[i]['implicit_pk'] = False
+                new_cols[i]['notnull'] = True
             tbl.cols = new_cols
             tbl.refresh_schema_meta()
             self.save_meta()
-        return {'columns': [target], 'rows': len(seen),
-                'rekeyed': not same_col}
+        return {'columns': targets, 'rows': len(seen),
+                'rekeyed': not same_key, 'composite': composite}
 
     def alter_drop_primary_key(self, name: str) -> dict:
         """`ALTER TABLE t DROP PRIMARY KEY`
 
         * 没有显式主键 → 1091（MySQL：`Can't DROP 'PRIMARY'`）；
-        * 存在 AUTO_INCREMENT 列 → 1075（自增列必须保持为键；显式拒绝，
-          不会留下"自增列不再是键"的坏定义）；
-        * 成功：约束从元数据移除（列保留 NOT NULL），物理行键继续由该列
-          作为内部隐式键支撑（本引擎每张表都需要一个行键），因此数据与
+        * 存在 AUTO_INCREMENT 列 → 1075（自增列必须保持为键）；
+        * 成功：显式主键约束移除（列保留 NOT NULL），物理行键继续由原
+          主键列（单列或编码后的复合键）作为内部隐式键支撑，因此数据与
           索引始终一致；随后可再 `ADD PRIMARY KEY` 恢复显式约束。
         """
         tbl = self._get_table_for_ddl(name)
@@ -1767,18 +1820,19 @@ class Database:
                 f"{', '.join(autos)} 依赖主键，不能 DROP PRIMARY KEY；"
                 f"请先移除 AUTO_INCREMENT 或保留主键）", errno=1075,
                 sqlstate='42000')
-        pkcol = explicit[0]['name']
+        pkcols = [c['name'] for c in explicit]
         with tbl._lock:
             self._ddl_guard(tbl, 'ALTER TABLE ... DROP PRIMARY KEY')
             new_cols = [dict(c) for c in tbl.cols]
             for c in new_cols:
-                if c.get('name') == pkcol:
+                if c.get('name') in pkcols:
                     c['implicit_pk'] = True
                     c['notnull'] = True
             tbl.cols = new_cols
             tbl.refresh_schema_meta()
             self.save_meta()
-        return {'dropped': 'PRIMARY', 'column': pkcol}
+        return {'dropped': 'PRIMARY', 'columns': pkcols,
+                'column': pkcols[0]}
 
     def alter_add_unique(self, name: str, index_name, columns) -> dict:
         """`ALTER TABLE t ADD UNIQUE [INDEX|KEY] [name] (cols)`

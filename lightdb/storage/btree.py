@@ -18,8 +18,8 @@ from .page import (
 
 LEAF_HEADER = 6
 INTERNAL_HEADER = 6
-LEAF_ENTRY_SIZE = 12
-INTERNAL_ENTRY_SIZE = 8
+LEAF_ENTRY_SIZE = 16            # key(8) + pid(4) + sid(4)
+INTERNAL_ENTRY_SIZE = 12        # key(8) + child(4)
 
 LEAF_CAPACITY = (4096 - PAGE_HEADER_SIZE - LEAF_HEADER) // LEAF_ENTRY_SIZE - 1
 INTERNAL_CAPACITY = (4096 - PAGE_HEADER_SIZE - INTERNAL_HEADER) // INTERNAL_ENTRY_SIZE - 1
@@ -96,7 +96,7 @@ class BTree:
 
     def _leaf_entry(self, page, i):
         off = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
-        return struct.unpack_from('<III', page.data, off)
+        return struct.unpack_from('<QII', page.data, off)
 
     def _leaf_lower_bound(self, page, key) -> int:
         """叶子内**二分**定位第一个 key' >= key 的下标（等价于原来的线性扫描）
@@ -170,7 +170,7 @@ class BTree:
 
     def _leaf_set_entry(self, page, i, k, pid, sid):
         off = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
-        struct.pack_into('<III', page.data, off, k, pid, sid)
+        struct.pack_into('<QII', page.data, off, k, pid, sid)
 
     # ==================== 内部节点操作 ====================
 
@@ -195,11 +195,11 @@ class BTree:
 
     def _internal_entry(self, page, i):
         off = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE
-        return struct.unpack_from('<II', page.data, off)
+        return struct.unpack_from('<QI', page.data, off)
 
     def _internal_set_entry(self, page, i, k, c):
         off = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE
-        struct.pack_into('<II', page.data, off, k, c)
+        struct.pack_into('<QI', page.data, off, k, c)
 
     # ==================== 查找 ====================
 

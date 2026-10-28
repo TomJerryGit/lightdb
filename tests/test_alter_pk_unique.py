@@ -101,8 +101,8 @@ def test_add_primary_key_errors(env):
     # 缺列 1072
     r = err(ex, 'ALTER TABLE nn ADD PRIMARY KEY (nope)')
     assert r['code'] == 1072, r
-    # 复合主键：本引擎只支持单列 → 显式 1235
-    r = err(ex, 'ALTER TABLE nn ADD PRIMARY KEY (id, x)')
+    # 超过 2 列的复合主键：物理键是 64 位整数 → 显式 1235
+    r = err(ex, 'ALTER TABLE nn ADD PRIMARY KEY (id, x, id)')
     assert r['code'] == 1235, r
     # 非整数类型 1064
     ok(ex, 'CREATE TABLE s (id INT, name VARCHAR(20))')
