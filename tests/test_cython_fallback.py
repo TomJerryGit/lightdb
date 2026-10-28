@@ -134,16 +134,18 @@ def test_btree_leaf_functions_match_storage_btree_page_layout():
     import tempfile
     from lightdb.storage.btree import (
         BTree, LEAF_HEADER, LEAF_ENTRY_SIZE, INTERNAL_HEADER,
+        INTERNAL_ENTRY_SIZE,
     )
     from lightdb.storage.buffer_pool import BufferPool
     from lightdb.storage.page import (
         PAGE_HEADER_SIZE, PAGE_TYPE_BTREE_LEAF, Page,
     )
 
-    # 常量必须与 .pyx / 回退完全一致，否则读到的页是错的
+    # 常量必须与 .pyx / 回退 / storage v2 完全一致，否则读到的页是错的
     assert btree_pyx.LEAF_HEADER == LEAF_HEADER == 6
     assert btree_pyx.INTERNAL_HEADER == INTERNAL_HEADER == 6
-    assert btree_pyx.LEAF_ENTRY_SIZE == LEAF_ENTRY_SIZE == 12
+    assert btree_pyx.LEAF_ENTRY_SIZE == LEAF_ENTRY_SIZE == 16
+    assert btree_pyx.INTERNAL_ENTRY_SIZE == INTERNAL_ENTRY_SIZE == 12
     assert btree_pyx.PAGE_HEADER_SIZE == PAGE_HEADER_SIZE == 24
 
     tmpdir = tempfile.mkdtemp(prefix='lightdb_cython_fb_')
@@ -176,8 +178,8 @@ def test_btree_leaf_functions_match_storage_btree_page_layout():
         struct.pack_into('<H', page.data, PAGE_HEADER_SIZE, 2)
         struct.pack_into('<I', page.data, PAGE_HEADER_SIZE + 2, 100)  # first child
         base = PAGE_HEADER_SIZE + 6
-        struct.pack_into('<II', page.data, base, 50, 200)     # key=50 → child 200
-        struct.pack_into('<II', page.data, base + 8, 80, 300)  # key=80 → child 300
+        struct.pack_into('<QI', page.data, base, 50, 200)     # key=50 → child 200
+        struct.pack_into('<QI', page.data, base + 12, 80, 300)  # key=80 → child 300
         idata = bytes(page.data)
         assert btree_pyx.internal_find_child(idata, 10) == 100
         assert btree_pyx.internal_find_child(idata, 50) == 200
@@ -192,15 +194,118 @@ def test_btree_leaf_functions_match_storage_btree_page_layout():
                 os.remove(f)
 
 
+def test_btree_fallback_matches_native_v2_after_splits():
+    """v2 下原生 BTree 分裂后，回退读取每个叶子页与原生 scan/search 一致
+
+    覆盖：构造（BTree 插入触发多级分裂）、查找（leaf_search/lower_bound）、
+    遍历（leaf_range_scan/BTreeLeafView）、与 BTree.scan 结果逐项比对。
+    """
+    import tempfile
+    from lightdb.storage.btree import BTree
+    from lightdb.storage.buffer_pool import BufferPool
+    from lightdb.storage.page import (
+        PAGE_TYPE_BTREE_LEAF, PAGE_HEADER_SIZE,
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix='lightdb_cython_fb_split_')
+    path = os.path.join(tmpdir, 'split.db')
+    bp = BufferPool(path, capacity=6000)
+    try:
+        tree = BTree(bp)
+        # 乱序键触发叶子/内部节点分裂（800 行 > 单叶容量）
+        keys = list(range(0, 8000, 10))
+        random.seed(21)
+        random.shuffle(keys)
+        for k in keys:
+            tree.insert(k, k + 1, k + 2)
+        native = list(tree.scan())
+        assert len(native) == len(keys)
+        fallback_entries = []
+        leaf_pages = []
+        for pid in range(1, bp.total_pages()):
+            page = bp.get_page(pid)
+            if page is not None and page.page_type == PAGE_TYPE_BTREE_LEAF:
+                leaf_pages.append(page)
+        assert leaf_pages, 'BTree 应该至少有一个叶子页'
+        leaf_data = []
+        for page in leaf_pages:
+            data = bytes(page.data)
+            view = btree_pyx.BTreeLeafView(data)
+            entries = btree_pyx.leaf_range_scan(data, 0, 2 ** 64 - 1)
+            assert len(entries) == view.n_keys
+            fallback_entries.extend(entries)
+            leaf_data.append((data, entries))
+        assert sorted(fallback_entries) == sorted(native)
+        native_map = {k: (pid, sid) for k, pid, sid in native}
+        # 每个键的查找结果与原生 BTree 完全一致
+        for key in (0, 10, 390, 4000, 7990):
+            expect = native_map[key]
+            hit = None
+            for data, entries in leaf_data:
+                if any(e[0] == key for e in entries):
+                    hit = btree_pyx.leaf_search(data, key)
+                    break
+            assert hit == (True, expect[0], expect[1]), (key, hit, expect)
+        # lower_bound 与有序条目一致
+        for data, entries in leaf_data:
+            for k, _pid, _sid in entries[:5]:
+                pos = btree_pyx.leaf_lower_bound(data, k)
+                assert pos < len(entries)
+                assert entries[pos][0] == k
+        print(f'\n    v2 分裂后回退遍历 {len(leaf_pages)} 个叶子页、'
+              f'{len(fallback_entries)} 个键，与原生 BTree.scan 一致')
+    finally:
+        bp.close()
+        for f in os.listdir(tmpdir):
+            try:
+                os.remove(os.path.join(tmpdir, f))
+            except OSError:
+                pass
+
+
+def test_btree_fallback_reads_uint64_v2_keys():
+    """v2 键是 uint64：回退必须能读 > 2**32（含 >2**63）的键，不得截断成 int32"""
+    import tempfile
+    from lightdb.storage.btree import BTree
+    from lightdb.storage.buffer_pool import BufferPool
+    from lightdb.storage.page import PAGE_TYPE_BTREE_LEAF
+
+    tmpdir = tempfile.mkdtemp(prefix='lightdb_cython_fb_u64_')
+    path = os.path.join(tmpdir, 'u64.db')
+    bp = BufferPool(path, capacity=64)
+    try:
+        tree = BTree(bp)
+        keys = [2 ** 32, 2 ** 40, 2 ** 63 + 123, 2 ** 64 - 1]
+        for k in keys:
+            tree.insert(k, k % 97, k % 1009)
+        page = bp.get_page(tree.root_page_id)
+        assert page.page_type == PAGE_TYPE_BTREE_LEAF
+        data = bytes(page.data)
+        for k in keys:
+            found, pid, sid = btree_pyx.leaf_search(data, k)
+            assert found and pid == k % 97 and sid == k % 1009, (k, pid, sid)
+        assert btree_pyx.leaf_lower_bound(data, 2 ** 63) == 2
+        assert [e[0] for e in btree_pyx.leaf_range_scan(
+            data, 2 ** 40, 2 ** 63 + 123)] == [2 ** 40, 2 ** 63 + 123]
+        print('\n    v2 uint64 键：回退读取 >2**32 / >2**63 键正确')
+    finally:
+        bp.close()
+        for f in os.listdir(tmpdir):
+            try:
+                os.remove(os.path.join(tmpdir, f))
+            except OSError:
+                pass
+
+
 def test_btree_compare_keys_bulk_accepts_python_objects():
     """
     compare_keys_bulk 原先是 cpdef + const unsigned char*，Python 层无法调用
     （本身就是编译错误）。回退必须能直接吃 bytes。
     """
-    a = struct.pack('<3i', 1, 2, 3)
-    b = struct.pack('<3i', 1, 2, 3)
-    c = struct.pack('<3i', 1, 2, 4)
-    d = struct.pack('<3i', 1, 1, 9)
+    a = struct.pack('<3Q', 1, 2, 3)
+    b = struct.pack('<3Q', 1, 2, 3)
+    c = struct.pack('<3Q', 1, 2, 4)
+    d = struct.pack('<3Q', 1, 1, 9)
     assert btree_pyx.compare_keys_bulk(a, b, 3) == 0
     assert btree_pyx.compare_keys_bulk(a, c, 3) == -1
     assert btree_pyx.compare_keys_bulk(c, a, 3) == 1
