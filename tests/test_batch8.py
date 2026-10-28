@@ -19,6 +19,25 @@ BACKUP_DIR = os.path.join(os.path.dirname(__file__), '..', 'backups_b8')
 MASTER_PORT = 8891
 
 
+def _free_port() -> int:
+    """取一个当前空闲的本地端口
+
+    复制测试用固定端口（MASTER_PORT+2=8893）时，全量套件里若前序用例
+    （如回归目录的 multiprocess 测试）失败后留下了仍监听该端口的进程/线程，
+    Windows 的 SO_REUSEADDR 会让新 server "绑定成功"却把连接交给残留监听者
+    —— 本测试就会连到错误的 server（Last_IO_Errno=2013），表现为
+    "复制未追平"的假失败。这里改用临时空闲端口，被测语义不变。
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+
 def reset():
     for d in (MASTER_DIR, SLAVE_DIR, BACKUP_DIR):
         if os.path.exists(d):
@@ -322,11 +341,13 @@ def test_slave_status_reports_real_replication():
         assert st0[col] is None, (col, st0[col])
 
     # ---------- 2) 启动真实主库 + 真实从库复制器 ----------
-    port = MASTER_PORT + 2
+    # 用临时空闲端口（见 _free_port 注释）：避免全量顺序下被残留监听者抢占
+    port = _free_port()
     cfg = Config()
     cfg.host = '127.0.0.1'
     cfg.port = port
     srv = track(MySQLServer(cfg, master_db, master_ex))
+    assert srv.server_address[1] == port, srv.server_address
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     time.sleep(0.5)
 

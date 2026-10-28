@@ -53,6 +53,37 @@ def _clean_env(monkeypatch):
     yield
 
 
+#: 审计相关的进程级环境变量：**必须显式隔离**
+#:
+#: 根因（task-77）：`tests/test_benchmark_harness.py` 会在本进程内跑
+#: benchmark harness，`benchmarks/heap_insert.py::prepare_env()` 直接写
+#: `os.environ['LIGHTDB_AUDIT_LEVEL'] = 'NONE'` / `LIGHTDB_LOG_LEVEL=ERROR`
+#: 且不恢复。全量套件按字母序先跑 benchmark_harness，再跑本文件时
+#: `_AuditSink.__init__` 读到 NONE（level=0）→ 所有语句都不审计 →
+#: audit.log / rotations 断言失败（单独跑本文件时环境干净 → 通过）。
+#: 这是**环境变量泄漏**，不是审计 sink 单例；这里做用例级隔离并恢复原值，
+#: 不改变生产行为，也不依赖其它测试是否清理环境。
+AUDIT_ENV_KEYS = ('LIGHTDB_AUDIT_LEVEL', 'LIGHTDB_AUDIT_MAX_BYTES',
+                  'LIGHTDB_AUDIT_MAX_RECORDS', 'LIGHTDB_AUDIT_KEEP')
+
+
+@pytest.fixture(autouse=True)
+def _isolate_audit_config():
+    """审计配置自隔离：固定 DML 级别、清空轮转阈值，测试后恢复原值"""
+    saved = {k: os.environ.get(k) for k in AUDIT_ENV_KEYS}
+    os.environ['LIGHTDB_AUDIT_LEVEL'] = 'DML'     # DDL(2)+DML(3) 都审计
+    for key in AUDIT_ENV_KEYS[1:]:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 # ==================== 公共工具 ====================
 
 def free_port() -> int:
