@@ -62,6 +62,28 @@ _UNSET = object()
 _MISSING = object()
 
 
+#: errno → SQLSTATE 兜底表（`__SLOW_QUERY_LOG__` 展示用；与
+#: `net/server.py::_SQLSTATE_BY_ERRNO` 同一口径，避免为了一个展示字段
+#: 反向 import net.server 造成循环依赖）
+_SQLSTATE_MINI = {
+    1044: '42000', 1048: '23000', 1049: '42000', 1054: '42S22',
+    1062: '23000', 1064: '42000', 1105: 'HY000', 1141: '42000',
+    1142: '42000', 1146: '42S02', 1227: '42000', 1264: '22003',
+    1292: '22007', 1366: '22007', 1406: '22001', 1180: 'HY000',
+    1819: 'HY000',
+}
+
+
+def _sqlstate_for(code):
+    """errno -> SQLSTATE（无码返回 None；未知码 HY000）"""
+    if code is None:
+        return None
+    try:
+        return _SQLSTATE_MINI.get(int(code), 'HY000')
+    except (TypeError, ValueError):
+        return 'HY000'
+
+
 class _CTERelation:
     """WITH 子句物化出来的内存关系
 
@@ -115,6 +137,15 @@ class _CTERelation:
 # 用 WeakSet 而不是 atexit 里逐个强引用，是为了不让审计器（及其
 # 2000 条环形缓冲）因为"注册了 atexit"而永远无法回收。
 _LIVE_AUDIT_SINKS = weakref.WeakSet()
+
+
+def _audit_env_int(name: str, default: int) -> int:
+    """读取审计轮转的整数环境变量（非法/缺失回默认；负数原样返回以便关闭）"""
+    raw = os.environ.get(name)
+    try:
+        return int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _flush_all_audit_sinks():
@@ -176,6 +207,16 @@ class _AuditSink:
       尚未攒到落盘条件的那 ≤31 条记录会丢 —— 这是"批量"与"每进程崩溃
       零丢失"之间的取舍；既有实现（每条 close）在硬杀下确实一条不丢。
       正常退出、`Database.shutdown()`、显式 `close()` 三条路径都保证落盘。
+
+    ★ task-70：**审计文件按大小/条数轮转**（内存环形缓冲与 `SHOW AUDIT
+    LOG` 行为完全不变）。配置全部来自环境变量：
+      * ``LIGHTDB_AUDIT_MAX_BYTES``   单文件阈值（默认 10MB，<=0 关闭）
+      * ``LIGHTDB_AUDIT_MAX_RECORDS`` 单文件条数阈值（默认 100000，<=0 关闭）
+      * ``LIGHTDB_AUDIT_KEEP``        保留的历史文件数（默认 5）
+    轮转只发生在**本次 append 成功之后**（整批记录已落盘）：先删最旧
+    `audit.log.N`，再 `audit.log.(N-1) -> .N` … 最后 `audit.log -> .1`；
+    任何一步失败都继续写当前文件（只告警、不丢记录）。启动时按
+    `.N … .1, audit.log` 顺序载入内存缓冲，因此"轮转后仍可查询"。
     """
 
     #: 攒够多少条审计记录就落盘（一次 append 写多条）
@@ -195,6 +236,15 @@ class _AuditSink:
         self._closed = False
         self.flushed_records = 0
         self.dropped_records = 0
+        # ★ task-70：文件轮转配置（env；<=0 表示关闭该维度）
+        self.max_bytes = _audit_env_int(
+            'LIGHTDB_AUDIT_MAX_BYTES', 10 * 1024 * 1024)
+        self.max_records = _audit_env_int(
+            'LIGHTDB_AUDIT_MAX_RECORDS', 100000)
+        self.keep = max(1, _audit_env_int('LIGHTDB_AUDIT_KEEP', 5))
+        self.rotations = 0
+        self._file_bytes = 0
+        self._file_records = 0
         try:
             from ..security.audit import AuditLogger
             self._levels = dict(AuditLogger.LEVELS)
@@ -215,19 +265,33 @@ class _AuditSink:
         _LIVE_AUDIT_SINKS.add(self)
 
     def _load(self):
-        """启动时把已落盘的审计记录载入内存环形缓冲（重启后仍可查询）"""
+        """启动时把已落盘的审计记录载入内存环形缓冲（重启后仍可查询）
+
+        ★ task-70：轮转后的历史文件（``audit.log.N`` … ``.1``）先读、当前
+        ``audit.log`` 后读，因此轮转不会让"重启后 SHOW AUDIT LOG"少记录
+        （缓冲上限 2000 条仍生效）。同时恢复当前文件的字节/条数计数，
+        供轮转阈值判断。损坏/半行只跳过该行（不整文件失败）。
+        """
+        files = [f'{self.path}.{i}' for i in range(self.keep, 0, -1)]
+        files.append(self.path)
         try:
-            if not os.path.exists(self.path):
-                return
-            with open(self.path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        self.recent.append(json.loads(line))
-                    except Exception:
-                        continue
+            for path in files:
+                if not os.path.exists(path):
+                    continue
+                is_current = (path == self.path)
+                with open(path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if is_current:
+                            self._file_records += 1
+                        try:
+                            self.recent.append(json.loads(line))
+                        except Exception:
+                            continue
+            if os.path.exists(self.path):
+                self._file_bytes = os.path.getsize(self.path)
         except Exception as e:                   # pragma: no cover
             logger.warn(f"审计日志载入失败: {e}")
 
@@ -325,6 +389,61 @@ class _AuditSink:
         self._pending = []
         self._pending_since = None
         self.flushed_records += n
+        # ★ task-70：文件轮转计量（本次 append 已成功 → 数据先落盘再轮转）
+        try:
+            self._file_bytes += len(data.encode('utf-8'))
+            self._file_records += n
+        except Exception:                        # pragma: no cover - 防御
+            pass
+        if self._rotation_due():
+            self._rotate_locked()
+
+    # ==================== 文件轮转（task-70） ====================
+
+    def _rotation_due(self) -> bool:
+        """按大小/条数判断是否需要轮转（任一阈值为正且达到）"""
+        try:
+            if self.max_bytes and self.max_bytes > 0 \
+                    and self._file_bytes >= self.max_bytes:
+                return True
+            if self.max_records and self.max_records > 0 \
+                    and self._file_records >= self.max_records:
+                return True
+        except Exception:                        # pragma: no cover - 防御
+            return False
+        return False
+
+    def _rotate_locked(self):
+        """audit.log → audit.log.1 → … → audit.log.KEEP（超出删除）
+
+        调用时机：`_flush_locked` 成功 append 之后（**记录已落盘**）。
+        轮转顺序：先删最旧，再从大到小重命名；任何一步失败只告警并继续
+        写当前文件 —— 不丢记录（最坏是文件超过阈值一点点）。
+        """
+        try:
+            oldest = f'{self.path}.{self.keep}'
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for i in range(self.keep - 1, 0, -1):
+                src = f'{self.path}.{i}'
+                dst = f'{self.path}.{i + 1}'
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            if os.path.exists(self.path):
+                os.replace(self.path, f'{self.path}.1')
+            # 轮转后建回一个空的当前文件（"当前审计日志"始终存在；崩溃后
+            # `_load` 对不存在的文件也已容错，这里只是运维可见性）
+            try:
+                with open(self.path, 'a', encoding='utf-8'):
+                    pass
+            except OSError as e:                  # pragma: no cover - 防御
+                logger.warn(f"审计轮转后创建空当前文件失败: {e}")
+            self._file_bytes = 0
+            self._file_records = 0
+            self.rotations += 1
+        except Exception as e:                   # pragma: no cover - 磁盘故障
+            logger.warn(
+                f"审计日志轮转失败（继续写当前文件，记录不丢）: {e}")
 
     def rows(self, limit: int = None) -> list:
         """按时间顺序返回 (ts, user, cmd, success, elapsed_ms, sql)"""
@@ -399,6 +518,19 @@ class Executor:
         except Exception as e:                   # pragma: no cover
             logger.warn(f"初始化审计日志失败: {e}")
             self.audit = None
+
+        # ★ task-70：慢查询日志（环形缓冲 + 可选落盘轮转）。
+        #   阈值/文件/轮转全部读环境变量（见 net/observability.py 模块头）。
+        #   慢查询器**每库一个**（`Database.slowlog`），多个 Executor 共享，
+        #   避免同一数据目录被多个写者各自轮转；惰性导入避免 net 包循环依赖。
+        self.slowlog = None
+        try:
+            self.slowlog = getattr(db, 'slowlog', None)
+        except Exception as e:                   # pragma: no cover - 防御
+            logger.warn(f"初始化慢查询日志失败（不影响查询）: {e}")
+            self.slowlog = None
+        #: 递归执行深度：只有最外层语句记一次慢查询（子查询/CTE 不重复计）
+        self._exec_depth = 0
 
         # 密码策略（`CREATE USER` 强口令校验用；`SET PASSWORD POLICY` 可改）
         try:
@@ -589,6 +721,7 @@ class Executor:
         # 由这里兜底，避免子查询在无事务上下文里重新执行。
         prev_session = getattr(self, '_active_session', None)
         self._active_session = session
+        self._exec_depth = int(getattr(self, '_exec_depth', 0)) + 1
         result = None
         try:
             # ★ P1 阶段 1.1：执行期鉴权（在**分发之前**做，拒绝的语句不会
@@ -696,7 +829,40 @@ class Executor:
                 self._binlog_finish(session, parsed, result)
             except Exception as e:              # pragma: no cover - 防御
                 logger.error(f"binlog 收尾失败: {e}")
+            # ★ task-70：慢查询记录（真实耗时；只有最外层语句记一次）。
+            #   放在 finally 里，成功/失败/异常分支都能记到；阈值由
+            #   `LIGHTDB_SLOW_QUERY_MS` 控制（默认 500ms）。
+            self._exec_depth = max(0, int(getattr(self, '_exec_depth', 1)) - 1)
+            if self._exec_depth == 0:
+                try:
+                    self._record_slow_query(parsed, session, result,
+                                            time.time() - start)
+                except Exception as e:          # pragma: no cover - 防御
+                    logger.warn(f"慢查询记录失败（不影响查询）: {e}")
             self._active_session = prev_session
+
+    def _record_slow_query(self, parsed, session, result, elapsed: float):
+        """把慢语句写进 `SlowQueryLog`（未达阈值时由它自己忽略）
+
+        记录：时间/用户/耗时(ms)/命令/SQL 截断+口令脱敏/成功与否/errno。
+        数据源：`parsed['source_sql']`（解析器附带的原文），缺失时退回
+        AST 文本（仍截断，不落整段 AST）。
+        """
+        slowlog = getattr(self, 'slowlog', None)
+        if slowlog is None or not isinstance(parsed, dict):
+            return
+        user = ''
+        if isinstance(session, dict):
+            user = str(session.get('user') or '')
+        ok = not (isinstance(result, dict) and result.get('type') == 'error')
+        code = result.get('code') if isinstance(result, dict) else None
+        sqlstate = (result.get('sqlstate')
+                    if isinstance(result, dict) else None)
+        sql = parsed.get('source_sql') or str(parsed)
+        slowlog.record(
+            user=user, sql=str(sql), elapsed_ms=elapsed * 1000.0,
+            cmd=str(parsed.get('command') or ''), success=ok,
+            errno=code, sqlstate=sqlstate)
 
     def _use_session(self, session):
         """取本次执行使用的会话（显式传参优先，其次 execute() 记录的会话）"""
@@ -1940,12 +2106,244 @@ class Executor:
             return self._materialize_view_relation(name, alias, s)
         return self._materialize_table_relation(name, alias, s)
 
-    def _select_join_with_views(self, p, s):
-        """`FROM view|table [alias] JOIN view|table ...`：物化后内存 JOIN
+    # ---------- task-67：视图 JOIN 定义内联 ----------
 
-        采用「物化 → 等值 Hash Join / 非等值嵌套循环 → 复用统一 SELECT
-        路径」：参与 JOIN 的视图与基表都先物化成内存关系。支持
-        INNER / LEFT [OUTER] / CROSS JOIN；RIGHT/FULL JOIN、重复别名、
+    @staticmethod
+    def _projection_has_star(columns) -> bool:
+        for c in (columns or []):
+            t = str(c).strip()
+            if t == '*' or t.endswith('.*'):
+                return True
+        return False
+
+    @staticmethod
+    def _plain_projection_col(text):
+        """视图投影项是裸列/限定裸列时返回输出列名，否则 None（表达式/别名）"""
+        t = str(text).strip()
+        m = re.fullmatch(
+            r'[`"]?(?:([A-Za-z_]\w*)[`"]?\s*\.\s*)?[`"]?([A-Za-z_]\w*)[`"]?',
+            t)
+        return m.group(2) if m else None
+
+    @classmethod
+    def _qualify_where_columns(cls, node, alias):
+        """把视图定义 WHERE 里的列引用统一限定成内联后的来源别名
+
+        视图自身的 `WHERE users.dept='eng'` / `WHERE dept='eng'` 内联到
+        外层 `FROM users v` 后，必须写成 `v.dept`：不加限定会在 JOIN 后
+        与另一侧同名列歧义（例如 users.id 与 orders.id），加错限定会
+        静默过滤错行。字符串字面量原样保留。
+        """
+        if isinstance(node, dict):
+            out = {}
+            for k, v in node.items():
+                if k in ('column', 'value_column') and isinstance(v, str):
+                    base = v.split('.')[-1].strip('`"')
+                    out[k] = f"{alias}.{base}"
+                elif k == 'name' and node.get('kind') == 'col' \
+                        and isinstance(v, str):
+                    base = v.split('.')[-1].strip('`"')
+                    out[k] = f"{alias}.{base}"
+                else:
+                    out[k] = cls._qualify_where_columns(v, alias)
+            return out
+        if isinstance(node, list):
+            return [cls._qualify_where_columns(x, alias) for x in node]
+        return node
+
+    def _view_inline_def(self, view_name):
+        """判断视图能否安全内联：返回内联描述 dict 或 None（走物化回退）
+
+        仅接受单层、无 JOIN/子查询/聚合/DISTINCT/GROUP BY/HAVING/窗口/
+        ORDER BY/LIMIT/UNION 的视图，且投影只能是 `*` 或裸列（输出列名
+        与基表列名一致）。基表必须是真实表（嵌套视图保留物化路径）。
+        """
+        view = self.db.get_view(view_name)
+        if view is None:
+            return None
+        if view.get('columns'):
+            # `CREATE VIEW v (c1, c2) AS ...`：输出列名被重命名，内联时
+            # 需要重写所有外层列引用；复杂形态统一走物化，正确性优先。
+            return None
+        from .parser import parser as _parser
+        try:
+            ast = _parser.parse(view['sql'])
+        except Exception:
+            return None
+        if not isinstance(ast, dict) or ast.get('command') != 'SELECT':
+            return None
+        if ast.get('joins') or ast.get('subquery') or ast.get('no_from'):
+            return None
+        if ast.get('distinct') or ast.get('group_by') \
+                or ast.get('having') or ast.get('windows'):
+            return None
+        if ast.get('order_by') or ast.get('limit') is not None \
+                or ast.get('offset'):
+            return None
+        base = ast.get('table')
+        if not base or not any(str(t).lower() == str(base).lower()
+                               for t in self.db.tables):
+            return None
+        inner_where = ast.get('where')
+        if inner_where is not None and self._contains_subquery(inner_where):
+            return None
+        cols = ast.get('columns') or ['*']
+        if cols == ['*']:
+            star_ok = True
+        else:
+            names = [self._plain_projection_col(c) for c in cols]
+            if any(n is None for n in names):
+                return None
+            if len(set(n.lower() for n in names)) != len(names):
+                return None
+            base_cols = {c['name'] for c in self.db.get_table(base).cols}
+            if any(n not in base_cols for n in names):
+                return None
+            star_ok = False
+        return {'name': view_name, 'base': base, 'where': inner_where,
+                'cols': cols, 'star_ok': star_ok}
+
+    @classmethod
+    def _ast_qualified_refs(cls, node):
+        """收集 AST 文本里的 `限定名.列` 引用（用于内联安全校验）"""
+        refs = set()
+        pat = re.compile(r'(?i)\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)')
+
+        def walk(x):
+            if isinstance(x, dict):
+                for v in x.values():
+                    walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x:
+                    walk(v)
+            elif isinstance(x, str):
+                for q, c in pat.findall(x):
+                    refs.add((q.lower(), c.lower()))
+        walk(node)
+        return refs
+
+    def _try_inline_view_join(self, p, s):
+        """把简单视图定义内联进 JOIN AST 后走计划执行器；不可内联返回 None"""
+        joins = p.get('joins') or []
+        main_name = p.get('table')
+        # 与物化路径保持同一套支持面：RIGHT/FULL 等显式 1105 的形态不能
+        # 通过内联悄悄执行（否则行为随"是否视图"而变化）。
+        aliases = [str(p.get('table_alias') or main_name or '').lower()]
+        for j in joins:
+            jtype = str(j.get('type') or 'INNER').upper()
+            if jtype not in ('INNER', 'LEFT', 'LEFT OUTER', 'CROSS'):
+                return None
+            aliases.append(str(j.get('alias') or j.get('table') or '').lower())
+        if len(set(aliases)) != len(aliases):
+            # 重复别名交给物化路径的显式 1105（列绑定无法无歧义）
+            return None
+        main_is_view = self.db.get_view(str(main_name or '')) is not None
+        join_view_names = [j.get('table') for j in joins
+                           if self.db.get_view(str(j.get('table') or ''))
+                           is not None]
+        if not main_is_view and not join_view_names:
+            return None
+        infos = {}
+        for name in ([main_name] if main_is_view else []) + join_view_names:
+            if name in infos:
+                continue
+            info = self._view_inline_def(name)
+            if info is None:
+                return None
+            infos[name] = info
+        outer_has_star = self._projection_has_star(p.get('columns'))
+        for info in infos.values():
+            if outer_has_star and not info['star_ok']:
+                return None
+        # 子集投影视图：外层若引用了该视图**未投影**的列，内联后基表里
+        # 恰好有同名列，会"看起来能跑"但手写 SQL 本来是 1054；这种形态
+        # 回退物化，让物化视图的列集自然报错（不静默错答）。
+        alias_to_info = {}
+        if main_is_view:
+            alias_to_info[str(p.get('table_alias') or main_name).lower()] = \
+                infos[main_name]
+        for j in joins:
+            jname = j.get('table')
+            if jname in infos:
+                alias_to_info[str(j.get('alias') or jname).lower()] = \
+                    infos[jname]
+        if any(not info['star_ok'] for info in alias_to_info.values()):
+            refs = self._ast_qualified_refs(p)
+            for alias, info in alias_to_info.items():
+                if info['star_ok']:
+                    continue
+                projected = {self._plain_projection_col(c)
+                             for c in info['cols'] or []}
+                projected = {str(x).lower() for x in projected if x}
+                for q, c in refs:
+                    if q == alias and c not in projected:
+                        return None
+        p2 = dict(p)
+        merged = []
+        if main_is_view:
+            info = infos[main_name]
+            p2['table'] = info['base']
+            # 外层没起别名时用视图名当别名：外层 `v_users.id` 这类限定
+            # 引用仍然能解析；视图定义自身 WHERE 的限定名会被剥掉。
+            p2['table_alias'] = p.get('table_alias') or main_name
+            if info['where'] is not None:
+                merged.append(self._qualify_where_columns(
+                    info['where'], p2['table_alias']))
+        joins2 = []
+        for j in joins:
+            j2 = dict(j)
+            jname = j.get('table')
+            jtype = str(j.get('type') or 'INNER').upper()
+            if self.db.get_view(str(jname or '')) is not None:
+                info = infos[jname]
+                # LEFT JOIN 右表的视图谓词必须在连接前过滤；并进外层
+                # WHERE 会把"无匹配行"错误地过滤掉，因此这里回退物化。
+                if jtype in ('LEFT', 'LEFT OUTER') \
+                        and info['where'] is not None:
+                    return None
+                j2['table'] = info['base']
+                j2['alias'] = j.get('alias') or jname
+                if info['where'] is not None:
+                    merged.append(self._qualify_where_columns(
+                        info['where'], j2['alias']))
+            joins2.append(j2)
+        p2['joins'] = joins2
+        if p.get('where') is not None:
+            merged.append(p['where'])
+        if len(merged) > 1:
+            p2['where'] = {'and': merged}
+        elif merged:
+            p2['where'] = merged[0]
+        else:
+            p2['where'] = None
+        try:
+            res = self._exec_join_query(p2, s)
+        except Exception as e:                     # 内联失败 → 物化回退
+            logger.warn(f"视图 JOIN 内联失败，回退物化: {e}")
+            return None
+        if isinstance(res, dict) and res.get('type') == 'error':
+            # 内联路径报错时安全回退到物化路径（正确性优先；若物化也
+            # 失败，最终返回物化的显式错误）。
+            return None
+        return res
+
+    def _select_join_with_views(self, p, s):
+        """`FROM view|table [alias] JOIN view|table ...`
+
+        task-67：简单单层视图优先**定义内联**（视图展开进 JOIN AST，走
+        计划执行器的 Hash Join/谓词下推，避免整视图物化）；复杂视图
+        （聚合/DISTINCT/GROUP BY/UNION/嵌套/投影别名等）或内联不安全形态
+        自动回退到下面的物化路径（正确性优先）。
+        """
+        inlined = self._try_inline_view_join(p, s)
+        if inlined is not None:
+            return inlined
+        return self._materialize_join_with_views(p, s)
+
+    def _materialize_join_with_views(self, p, s):
+        """视图 JOIN 物化回退：物化各来源 → Hash/嵌套循环 JOIN → 统一 SELECT
+
+        支持 INNER / LEFT [OUTER] / CROSS JOIN；RIGHT/FULL JOIN、重复别名、
         WHERE 含子查询等无法无歧义处理的形态显式 1105（不静默错答）。
         """
         main_name = p.get('table')
@@ -1999,7 +2397,11 @@ class Executor:
                 is_left = jtype in ('LEFT', 'LEFT OUTER')
                 for r in rows:
                     matched = False
-                    for jr in buckets.get(r[li], ()):
+                    # SQL 等值连接：NULL 键不匹配任何行（NULL=NULL 为
+                    # UNKNOWN）。哈希桶里虽然有 None 键，也必须跳过，
+                    # 否则会把"无 dept 的聚合行"错误连到"dept IS NULL"。
+                    for jr in (() if r[li] is None
+                               else buckets.get(r[li], ())):
                         new_rows.append(list(r) + list(jr))
                         matched = True
                     if is_left and not matched:
@@ -2596,6 +2998,12 @@ class Executor:
         # （从库 io 线程拉事件用的接口），数据来自真实 WAL 记录。
         if str(p.get('table') or '').upper() == '__BINLOG_FETCH__':
             return self._select_from_relation(p, s, self._binlog_relation())
+
+        # ★ task-70：慢查询日志虚拟表（只读，数据来自执行器的
+        #   SlowQueryLog 环形缓冲；口径见 net/observability.py 模块头）。
+        if str(p.get('table') or '').upper() == '__SLOW_QUERY_LOG__':
+            return self._select_from_relation(p, s,
+                                              self._slow_query_relation())
 
         # 全文谓词 `MATCH(列) AGAINST('词')`：先用表上的倒排索引真算命中主键，
         # 再改写为 `主键 IN (...)` 交给既有下推/求值路径（含 JOIN 之外的
@@ -7654,6 +8062,35 @@ class Executor:
             return _CTERelation('__BINLOG_FETCH__', cols, [])
         rows = rec.fetch_rows(0)
         return _CTERelation('__BINLOG_FETCH__', cols, rows)
+
+    def _slow_query_relation(self):
+        """`__SLOW_QUERY_LOG__` 虚拟表（task-70）
+
+        数据源 = 执行器自己的 `SlowQueryLog` 环形缓冲（与指标 top 榜、
+        落盘文件同一份记录）。列：
+
+        * ``ts``         记录时间（`YYYY-MM-DD HH:MM:SS`）
+        * ``user``       会话用户名（进程内/内部语句为空串）
+        * ``elapsed_ms`` 真实耗时（毫秒，保留 3 位）
+        * ``cmd``        MySQL 命令名（SELECT/INSERT/...）
+        * ``success``    1=成功返回，0=错误返回
+        * ``errno``      MySQL errno（成功为 NULL）
+        * ``sqlstate``   由 errno 兜底映射（保留列位；数据在日志器里已脱敏）
+        * ``sql``        截断 + 口令脱敏后的 SQL
+
+        慢查询器未初始化（极端环境）时返回空关系（列仍在），不编造数据。
+        """
+        cols = ['ts', 'user', 'elapsed_ms', 'cmd', 'success', 'errno',
+                'sqlstate', 'sql']
+        slowlog = getattr(self, 'slowlog', None)
+        if slowlog is None:
+            return _CTERelation('__SLOW_QUERY_LOG__', cols, [])
+        rows = []
+        for ts, user, elapsed_ms, cmd, success, errno, sql in \
+                slowlog.rows():
+            rows.append((ts, user, elapsed_ms, cmd, success, errno,
+                         _sqlstate_for(errno), sql))
+        return _CTERelation('__SLOW_QUERY_LOG__', cols, rows)
 
     # ---------- SHOW 系列（结果集回传） ----------
 

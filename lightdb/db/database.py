@@ -25,6 +25,7 @@ import re
 import secrets
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -319,6 +320,14 @@ class Database:
         # `shutdown()` 是"正常停机 → 待落盘批一定写出去"的确定性落盘点：
         # 执行器与库同生共死，但库不知道执行器，所以由执行器反向注册进来。
         self._audit_sinks = []
+
+        # ★ task-70：生产可观测性
+        # * 慢查询器**每个库一个**（多个 Executor 共享同一份环形缓冲/文件，
+        #   避免同一数据目录被多个写者各自轮转）；
+        # * checkpoint 真实计数（/metrics 的 checkpoints_total 数据源）。
+        self._slowlog = None
+        self._slowlog_lock = threading.RLock()
+        self.checkpoint_stats = {'calls': 0, 'tables': 0, 'last_ts': 0.0}
 
         #: **进行中的结构变更**（ALTER / TRUNCATE / RENAME）。
         #:
@@ -2665,6 +2674,16 @@ class Database:
                     n += 1
             except Exception as e:
                 logger.warn(f"checkpoint {tbl.name} 失败: {e}")
+        # ★ task-70：真实 checkpoint 计数（/metrics checkpoints_total、
+        #   checkpoint_tables_total 的数据源；只统计真正执行的调用）。
+        try:
+            self.checkpoint_stats['calls'] = \
+                int(self.checkpoint_stats.get('calls', 0)) + 1
+            self.checkpoint_stats['tables'] = \
+                int(self.checkpoint_stats.get('tables', 0)) + int(n)
+            self.checkpoint_stats['last_ts'] = time.time()
+        except Exception:                         # pragma: no cover - 防御
+            pass
         # P6：自增计数是**已分配号**的不变量（回滚/删除不回收），checkpoint
         # 是确定性落盘点：把计数写进 `_meta.json`，重启后不会因"最大行被删"
         # 而重用旧号。
@@ -2704,6 +2723,54 @@ class Database:
                 self._binlog_log.close()
             except Exception:
                 pass
+        # ★ task-70：慢查询器（不持有常驻句柄，close 是幂等的收尾）
+        if self._slowlog is not None:
+            try:
+                self._slowlog.close()
+            except Exception:                     # pragma: no cover - 防御
+                pass
+            self._slowlog = None
+
+    @property
+    def slowlog(self):
+        """本库的慢查询日志器（`net/observability.py::SlowQueryLog`）
+
+        * 惰性创建：阈值 ``LIGHTDB_SLOW_QUERY_MS``（默认 500ms）；
+        * **每库一个**：同一数据目录的多个 Executor 共享同一份环形缓冲与
+          落盘文件，避免多个写者并发轮转同一文件；
+        * 初始化失败返回 None（执行器/指标都按"无慢查询数据"处理）。
+        """
+        if self._slowlog is not None:
+            return self._slowlog
+        with self._slowlog_lock:
+            if self._slowlog is not None:
+                return self._slowlog
+            try:
+                from ..net.observability import SlowQueryLog
+                self._slowlog = SlowQueryLog(str(self.data_dir))
+            except Exception as e:                # pragma: no cover - 防御
+                logger.warn(f"初始化慢查询日志失败（不影响查询）: {e}")
+                return None
+            return self._slowlog
+
+    def attach_slowlog(self, sink):
+        """兼容入口：登记外部慢查询器（一般不需要，`slowlog` 属性已共享）"""
+        if sink is None:
+            return sink
+        with self._slowlog_lock:
+            if self._slowlog is None:
+                self._slowlog = sink
+        return sink
+
+    def wal_stats(self) -> dict:
+        """各表 WAL 当前真实字节数（/metrics ``*_wal_bytes`` 的数据源）"""
+        out = {}
+        for name, tbl in list(self.tables.items()):
+            try:
+                out[str(name)] = int(tbl.wal.size_bytes())
+            except Exception:                     # pragma: no cover - 防御
+                continue
+        return out
 
     def attach_audit_sink(self, sink):
         """登记一个审计器：`shutdown()` 时保证它的待落盘批被写出去"""

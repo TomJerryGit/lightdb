@@ -27,6 +27,9 @@ from ..logger import logger
 # 实现（db/database.py），避免三条路径各编一套元数据。
 from ..db.database import describe_columns
 from . import mysql_protocol as mp
+# ★ 生产可观测性（task-70）：真实运行期指标 + 内嵌 /metrics 端点
+from .observability import ServerRuntimeMetrics
+from .metrics_server import maybe_start_metrics
 
 
 #: 登录失败后的固定延迟（秒）。它让暴力破解/口令扫描变慢，同时不改变
@@ -226,6 +229,14 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         return self._recv_exact(length)
 
     def _send_packet(self, payload: bytes):
+        # ★ task-70：所有 ERR 包（鉴权/权限/执行/语法）都在这里经过，
+        #   按真实 errno 计数（比在每个错误分支手写计数更完整）。
+        if payload[:1] == b'\xff' and len(payload) >= 3:
+            try:
+                self.server.runtime_metrics.on_error(
+                    struct.unpack_from('<H', payload, 1)[0])
+            except Exception:                     # pragma: no cover - 防御
+                pass
         pkt = mp.build_packet(payload, self.seq)
         try:
             self.sock.sendall(pkt)
@@ -335,6 +346,11 @@ class MySQLHandler(socketserver.BaseRequestHandler):
         完全不变；日志里带来源 IP，方便发现口令扫描。
         """
         self._send_packet(mp.make_err_packet(code, sql_state, message))
+        try:
+            # ★ task-70：失败计数（真实登录失败次数，不含准入拒绝）
+            self.server.runtime_metrics.on_auth_failure()
+        except Exception:                         # pragma: no cover - 防御
+            pass
         logger.warn(
             f"登录失败 {self.user or '?'}@{self.client_address[0]} "
             f"(sid={self.server_id}): {message[:160]}")
@@ -504,6 +520,14 @@ class MySQLHandler(socketserver.BaseRequestHandler):
     def _dispatch(self, packet: bytes):
         cmd = packet[0]
         body = packet[1:]
+
+        # ★ task-70：语句数/QPS 真实计数（COM_QUERY 与预处理 EXECUTE 都是
+        #   "客户端发起的语句"；PREPARE/CLOSE 等协议管理命令不计入 QPS）。
+        if cmd in (mp.COM_QUERY, mp.COM_STMT_EXECUTE):
+            try:
+                self.server.runtime_metrics.on_query()
+            except Exception:                     # pragma: no cover - 防御
+                pass
 
         if cmd == mp.COM_QUIT:
             self.closed = True
@@ -2336,9 +2360,38 @@ class MySQLServer(socketserver.ThreadingTCPServer):
         self.ssl_context = None
         self._init_ssl_context()
 
+        # ★ task-70：真实运行期指标（连接/QPS/错误码/慢查询由执行器侧采集）
+        self.runtime_metrics = ServerRuntimeMetrics()
+        self.metrics_server = None
+        self.metrics_url = None
+
         super().__init__(
             (config.host, config.port),
             MySQLHandler)
+
+        # 内嵌 /metrics（LIGHTDB_METRICS_PORT>0 时启动；失败只告警不阻断 DB）
+        try:
+            self.metrics_server = maybe_start_metrics(self)
+            if self.metrics_server is not None:
+                self.metrics_url = self.metrics_server.url
+        except Exception as e:                   # pragma: no cover - 防御
+            logger.warn(f"指标端点初始化失败（数据库继续运行）: {e}")
+            self.metrics_server = None
+            self.metrics_url = None
+
+    def shutdown(self):
+        """先停指标 HTTP 线程，再走 socketserver 的正常关闭"""
+        metrics = getattr(self, 'metrics_server', None)
+        if metrics is not None:
+            try:
+                metrics.stop()
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"停止指标端点失败: {e}")
+            self.metrics_server = None
+        try:
+            super().shutdown()
+        except Exception:                        # pragma: no cover - 防御
+            pass
 
     def _init_ssl_context(self):
         """按配置初始化服务端 TLS 上下文。
@@ -2415,6 +2468,10 @@ class MySQLServer(socketserver.ThreadingTCPServer):
         # 1) IP 白名单
         if not self._is_ip_allowed(ip):
             logger.warn(f"拒绝连接 {ip}：不在 IP 白名单内")
+            try:
+                self.runtime_metrics.on_connection_rejected()
+            except Exception:                     # pragma: no cover - 防御
+                pass
             self._reject_connection(
                 request, 1130, "HY000",
                 f"Host '{ip}' is not allowed to connect "
@@ -2441,9 +2498,17 @@ class MySQLServer(socketserver.ThreadingTCPServer):
 
         if reject_reason is not None:
             logger.warn(f"拒绝连接 {ip}：{reject_reason}")
+            try:
+                self.runtime_metrics.on_connection_rejected()
+            except Exception:                     # pragma: no cover - 防御
+                pass
             self._reject_connection(
                 request, 1040, "08004", reject_reason)
             return False
+        try:
+            self.runtime_metrics.on_connection_accepted()
+        except Exception:                         # pragma: no cover - 防御
+            pass
         return True
 
     def shutdown_request(self, request):
@@ -2479,12 +2544,24 @@ class MySQLServer(socketserver.ThreadingTCPServer):
     def connection_stats(self) -> dict:
         """当前连接计数（调试/测试/监控用）"""
         with self._admission_lock:
-            return {
+            stats = {
                 'active_connections': self._active_connections,
                 'active_by_ip': dict(self._active_by_ip),
                 'max_connections': self.max_connections,
                 'max_conn_per_ip': self.max_conn_per_ip,
             }
+        # 累计计数（task-70 /metrics 使用；真实打点见 verify_request）
+        try:
+            snap = self.runtime_metrics.snapshot()
+            stats.update({
+                'connections_total': snap.get('connections_total', 0),
+                'connections_rejected': snap.get(
+                    'connections_rejected', 0),
+                'auth_failures': snap.get('auth_failures', 0),
+            })
+        except Exception:                         # pragma: no cover - 防御
+            pass
+        return stats
 
     def start(self):
         logger.info(
