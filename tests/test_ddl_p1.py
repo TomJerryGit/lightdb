@@ -645,17 +645,15 @@ def test_concurrent_insert_during_add_column_never_mixes_arity(tmp_path):
 UNSUPPORTED_ALTER = [
     # E2 起 MODIFY COLUMN / ENGINE= 兼容别名已实现，不再属于"不支持变体"
     # （见 tests/test_mysql_compat_e2.py）。
+    # task-62 起 ADD PRIMARY KEY / DROP PRIMARY KEY / ADD UNIQUE / DROP INDEX
+    # 已实现（见 tests/test_alter_pk_unique.py），从本清单移除。
     'ALTER TABLE t CHANGE COLUMN age years BIGINT',
     'ALTER TABLE t ALTER COLUMN age SET DEFAULT 1',
     'ALTER TABLE t ADD INDEX idx_age (age)',
     'ALTER TABLE t ADD KEY idx_age (age)',
-    'ALTER TABLE t ADD UNIQUE KEY uq (name)',
     'ALTER TABLE t ADD CONSTRAINT ck CHECK (age > 0)',
     'ALTER TABLE t ADD CHECK (age > 0)',
-    'ALTER TABLE t ADD PRIMARY KEY (age)',
     'ALTER TABLE t ADD FOREIGN KEY (age) REFERENCES t(id)',
-    'ALTER TABLE t DROP PRIMARY KEY',
-    'ALTER TABLE t DROP INDEX idx_age',
     'ALTER TABLE t DROP CHECK age_pos',
     'ALTER TABLE t RENAME COLUMN age TO years',
     'ALTER TABLE t COMMENT = "x"',
