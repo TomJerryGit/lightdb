@@ -14,12 +14,117 @@
 import struct
 from .page import (
     PAGE_HEADER_SIZE, PAGE_TYPE_BTREE_LEAF, PAGE_TYPE_BTREE_INTERNAL,
+    PAGE_TYPE_HEAP,
 )
 
 LEAF_HEADER = 6
 INTERNAL_HEADER = 6
+#: task-72：主键键从 uint32 扩到 uint64（复合主键），B+Tree 页条目从
+#: 12/8 字节扩到 16/12 字节。页头 reserved[21] 写格式版本号：
+#: * 0 = task-72 之前的旧格式（uint32 键，12/8 字节条目）；
+#: * 2 = 当前格式。启动时据此显式拒绝旧 .dat 并指向迁移脚本。
+BTREE_FORMAT_VERSION = 2
+BTREE_FORMAT_LEGACY = 1
+BTREE_FORMAT_MARKER_OFFSET = 21
 LEAF_ENTRY_SIZE = 16            # key(8) + pid(4) + sid(4)
 INTERNAL_ENTRY_SIZE = 12        # key(8) + child(4)
+
+
+def classify_btree_root_page(root_raw, read_page, file_pages):
+    """判定 `.btroot` 根页的物理格式：1=旧(uint32) / 2=新(uint64) / 0=非 BTree
+
+    仅靠页头标记不够：task-72 格式升级到"写入标记"之间创建的数据库也是
+    uint64 新布局但 marker=0。这里按条目结构做**双重校验**：
+      * 旧布局：叶 12B（`<III`）/ 内部 8B（`<II`）；
+      * 新布局：叶 16B（`<QII`）/ 内部 12B（`<QI`）；
+    对叶页要求每个 (pid, sid) 指向真实堆页的有效槽位、key 严格递增；
+    对内部页要求 child 指向真实 BTree 页。两种布局只有一个通过时判定明确。
+    """
+    if not root_raw or len(root_raw) < 24 or root_raw[:4] != b'LDBP':
+        return 0
+    page_type = root_raw[16]
+    leaf = page_type == PAGE_TYPE_BTREE_LEAF
+    internal = page_type == PAGE_TYPE_BTREE_INTERNAL
+    if not (leaf or internal):
+        return 0
+    if root_raw[BTREE_FORMAT_MARKER_OFFSET] == BTREE_FORMAT_VERSION:
+        return BTREE_FORMAT_VERSION
+    n = struct.unpack_from('<H', root_raw, PAGE_HEADER_SIZE)[0]
+    if n == 0:
+        # 空树没有旧条目可误读；按新格式处理（写入时补上 v2 标记）
+        return BTREE_FORMAT_VERSION
+
+    def _page(pid):
+        if pid < 1 or pid >= file_pages:
+            return None
+        return read_page(pid)
+
+    def _valid_heap_slot(pid, sid):
+        raw = _page(pid)
+        if raw is None or raw[:4] != b'LDBP' or raw[16] != PAGE_TYPE_HEAP:
+            return False
+        nslots = struct.unpack_from('<H', raw, 17)[0]
+        if sid >= nslots:
+            return False
+        off, ln = struct.unpack_from('<HH',
+                                     raw, PAGE_HEADER_SIZE + sid * 4)
+        return off != 0 and ln > 0
+
+    def _valid_btree_child(pid):
+        raw = _page(pid)
+        return bool(raw is not None and raw[:4] == b'LDBP'
+                    and raw[16] in (PAGE_TYPE_BTREE_LEAF,
+                                    PAGE_TYPE_BTREE_INTERNAL))
+
+    def _leaf_ok(entry_size, fmt):
+        end = PAGE_HEADER_SIZE + LEAF_HEADER + n * entry_size
+        if end > 4096:
+            return False
+        prev = None
+        for i in range(n):
+            try:
+                key, pid, sid = struct.unpack_from(
+                    fmt, root_raw, PAGE_HEADER_SIZE + LEAF_HEADER
+                    + i * entry_size)
+            except struct.error:                 # pragma: no cover - 防御
+                return False
+            if not _valid_heap_slot(pid, sid):
+                return False
+            if prev is not None and key <= prev:
+                return False
+            prev = key
+        return True
+
+    def _internal_ok(entry_size, fmt):
+        end = PAGE_HEADER_SIZE + INTERNAL_HEADER + n * entry_size
+        if end > 4096:
+            return False
+        prev = None
+        for i in range(n):
+            try:
+                key, child = struct.unpack_from(
+                    fmt, root_raw, PAGE_HEADER_SIZE + INTERNAL_HEADER
+                    + i * entry_size)
+            except struct.error:                 # pragma: no cover - 防御
+                return False
+            if not _valid_btree_child(child):
+                return False
+            if prev is not None and key <= prev:
+                return False
+            prev = key
+        return True
+
+    old_ok = (_leaf_ok(12, '<III') if leaf else _internal_ok(8, '<II'))
+    new_ok = (_leaf_ok(16, '<QII') if leaf else _internal_ok(12, '<QI'))
+    if old_ok and not new_ok:
+        return BTREE_FORMAT_LEGACY
+    if new_ok and not old_ok:
+        return BTREE_FORMAT_VERSION
+    if old_ok and new_ok:
+        # 两种都通过：无法证明是旧格式时按旧格式拒绝更安全（宁可让用户
+        # 跑迁移/备份，也不按新格式误读旧页静默产出错行）。
+        return BTREE_FORMAT_LEGACY
+    return -1
 
 LEAF_CAPACITY = (4096 - PAGE_HEADER_SIZE - LEAF_HEADER) // LEAF_ENTRY_SIZE - 1
 INTERNAL_CAPACITY = (4096 - PAGE_HEADER_SIZE - INTERNAL_HEADER) // INTERNAL_ENTRY_SIZE - 1
@@ -79,6 +184,7 @@ class BTree:
         base = PAGE_HEADER_SIZE
         struct.pack_into('<H', page.data, base, 0)
         struct.pack_into('<I', page.data, base + 2, 0)
+        page.data[BTREE_FORMAT_MARKER_OFFSET] = BTREE_FORMAT_VERSION
         page.dirty = True
 
     def _leaf_n(self, page):
@@ -178,6 +284,7 @@ class BTree:
         base = PAGE_HEADER_SIZE
         struct.pack_into('<H', page.data, base, 0)
         struct.pack_into('<I', page.data, base + 2, 0)
+        page.data[BTREE_FORMAT_MARKER_OFFSET] = BTREE_FORMAT_VERSION
         page.dirty = True
 
     def _internal_n(self, page):

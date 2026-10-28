@@ -1924,6 +1924,28 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                       '（提供的参数多于 SQL 里的 `?`）')
         return ''.join(out)
 
+    def _validate_prepared_sql(self, sql: str):
+        """COM_STMT_PREPARE 阶段做语法校验（与文本 PREPARE 一致）
+
+        客户端 PREPARE 的 SQL 含 `?` 占位符，parser 不能直接吃；这里把
+        占位符替换成数字 0（对 `LIMIT ?` / `VALUES (?)` / 比较位置都合法），
+        只做 parse 不执行。语法错误在 PREPARE 阶段显式 1064，而不是等到
+        EXECUTE 才报。
+        """
+        probe = []
+        for _pos, ch, is_code in self._iter_sql_chars(sql):
+            probe.append('0' if is_code and ch == '?' else ch)
+        text = ''.join(probe)
+        from ..sql.parser import parser as _parser
+        try:
+            _parser.parse(text)
+        except SyntaxError as e:
+            raise mp.StmtProtocolError(
+                1064, f'PREPARE 语法错误: {e}')
+        except Exception as e:                  # 解析器内部错误也显式报
+            raise mp.StmtProtocolError(
+                1064, f'PREPARE 无法解析: {type(e).__name__}: {e}')
+
     # ---------- PREPARE：静态元数据（绝不执行语句） ----------
 
     @classmethod
@@ -2080,6 +2102,12 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             return
 
         num_params = self._count_placeholders(sql)
+        try:
+            self._validate_prepared_sql(sql)
+        except mp.StmtProtocolError as e:
+            self._send_packet(mp.make_err_packet(
+                e.errno, e.sqlstate, e.message[:200]))
+            return
         columns, table = self._prepared_result_metadata(sql)
 
         # 连接级数量上限（防"只 PREPARE 不 CLOSE"把服务端内存吃光）

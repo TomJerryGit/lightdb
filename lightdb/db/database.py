@@ -33,7 +33,7 @@ from ..logger import logger
 from ..storage.txn import TxnManager
 from ..storage.lock_manager import LockManager
 from ..storage.mvcc import MVCCManager
-from .errors import DdlError
+from .errors import DdlError, LegacyBTreeFormatError
 from .table import Table, coerce
 
 
@@ -341,6 +341,9 @@ class Database:
         # P5：COMPACT 在 `_load()` 之前先把"崩溃中断的多文件替换"补完，
         # 否则随后 `_load`/`_recover` 会看到新旧文件混在一起的状态。
         self._pre_recover_compact()
+        # task-72 旧 B+Tree 页格式（uint32 键）与新格式（uint64 键）的条目
+        # 大小不同，必须在加载表之前显式拒绝，绝不按新格式误读旧页。
+        self._detect_legacy_btree_format()
         self._load()
         # 认证引导必须紧跟在用户表加载之后：新库要生成随机口令，旧数据目录
         # （root 仍为空口令）要在启动时安全迁移 —— 否则"升级后默认不再无认证"
@@ -507,6 +510,46 @@ class Database:
         except OSError:
             pass
         return path
+
+    def _detect_legacy_btree_format(self):
+        """启动自检：旧 B+Tree 页格式（uint32 键）→ 显式报错并指向迁移脚本
+
+        优先看页头 v2 标记；对"task-72 新布局但尚无标记"的库，用
+        `classify_btree_root_page` 按条目结构（12/8 vs 16/12 字节、槽位/
+        子页有效性）双重校验，避免把新库误判成旧库。
+        """
+        from ..storage.page import PAGE_SIZE
+        from ..storage.btree import (classify_btree_root_page,
+                                     BTREE_FORMAT_LEGACY)
+        for btroot in sorted(self.data_dir.glob('*.btroot')):
+            table = btroot.stem
+            data_file = self.data_dir / f"{table}.dat"
+            if not data_file.exists():
+                continue
+            try:
+                root_id = int(btroot.read_text().strip())
+            except Exception:
+                continue
+            if root_id < 1:
+                continue
+            try:
+                file_pages = max(1, data_file.stat().st_size // PAGE_SIZE)
+
+                def read_page(pid):
+                    with open(data_file, 'rb') as f:
+                        f.seek(pid * PAGE_SIZE)
+                        return f.read(PAGE_SIZE)
+
+                root_raw = read_page(root_id)
+            except OSError:
+                continue
+            try:
+                fmt = classify_btree_root_page(
+                    root_raw, read_page, file_pages)
+            except Exception:
+                fmt = -1
+            if fmt in (BTREE_FORMAT_LEGACY, -1):
+                raise LegacyBTreeFormatError(table, root_id, str(data_file))
 
     def _load(self):
         p = self._meta_path()
