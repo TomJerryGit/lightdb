@@ -32,7 +32,8 @@ REQUIRED_CASES = {
 JSON_TOP_LEVEL = {
     'schema', 'harness_version', 'generated_at', 'suite', 'seed',
     'lightdb_version', 'python_version', 'git_rev', 'environment',
-    'method', 'reference_db', 'targets', 'cases', 'gate', 'total_wall_s',
+    'method', 'reference_db', 'targets', 'cases', 'gate', 'scaling',
+    'total_wall_s',
 }
 TINY_ARGS = ['--suite', 'quick', '--scale', '0.02', '--json-only']
 
@@ -206,7 +207,8 @@ def test_cli_tiny_run_produces_complete_json(tmp_path):
 
 
 def test_cli_gate_fail_simulation_exit_1(tmp_path):
-    rc, payload, _ = _run_cli(tmp_path, ['--gate', '--target-scale', '1e9'])
+    rc, payload, _ = _run_cli(
+        tmp_path, ['--gate', '--target-scale', '1e9', '--gate-retries', '0'])
     # 阈值 ×1e9 后所有非零指标都不可能达标：退出码必须为 1
     assert rc == 1
     assert payload is not None
@@ -214,8 +216,33 @@ def test_cli_gate_fail_simulation_exit_1(tmp_path):
     assert payload['gate']['passed'] is False
     assert payload['gate']['failed'], '门禁失败时必须列出未达标项'
     assert payload['gate']['n_checks'] == len(payload['gate']['checks'])
+    assert payload['gate']['retries_used'] == 0
     # JSON 仍完整写出（失败也要可分析）
     assert REQUIRED_CASES <= set(payload['cases'])
+
+
+def test_merge_best_cases_and_gate_retry_attempts(tmp_path):
+    # 合并语义：逐项取更有利一次（higher 取大、lower 取小），记录 attempt 历史
+    best = {'a': {'median': 10.0, 'better': 'higher'},
+            'b': {'median': 5.0, 'better': 'lower'}}
+    new = {'a': {'median': 12.0, 'better': 'higher'},
+           'b': {'median': 6.0, 'better': 'lower'}}
+    merged = CH._merge_best_cases(best, new)
+    assert merged['a']['median'] == 12.0
+    assert merged['a']['attempt_values'] == [10.0, 12.0]
+    assert merged['a']['attempt_source'] == 'attempt_2'
+    assert merged['b']['median'] == 5.0            # lower better：5 更优
+    assert merged['b']['attempt_source'] == 'attempt_1'
+
+    # 真实门禁失败 + 默认重试 1 次：attempts 应记录 2 次，仍失败 -> exit 1
+    rc, payload, _ = _run_cli(tmp_path, ['--gate', '--target-scale', '1e9'])
+    assert rc == 1
+    g = payload['gate']
+    assert g['retries_used'] == 1
+    assert len(g['attempts']) == 2
+    assert g['attempts'][0]['attempt'] == 1
+    assert g['attempts'][1]['attempt'] == 2
+    assert 'point_inproc_qps' in g['failed']
 
 
 def test_cli_rejects_unknown_target_and_bad_suite(tmp_path):
