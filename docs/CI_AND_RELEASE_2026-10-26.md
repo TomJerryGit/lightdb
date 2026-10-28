@@ -32,8 +32,18 @@
 
 ## 待办
 
-- CI 完整绿一次（benchmark/perf/packaging 实际执行）
+- CI 完整绿一次（benchmark/perf/packaging 实际执行）→ **已完成 2026-10-27**
+  （提交 `0949a5c`：1,598 tests / 0 failed + benchmark/perf/packaging 全绿）
 - 安装/卸载人工冒烟 + 可选代码签名证书
+  - 2026-10-28 复核：全新 USERPROFILE/新路径静默安装在 Low IL 受限会话被
+    拒绝写 HKCU 卸载注册表（`RegCreateKeyEx code 5`），安装器已自动回滚且清理
+    干净；安装树拷贝/onedir 版启动、插件加载、版本 4.0.0 验证 PASS；
+    正常完整性会话的人工冒烟仍待做（见 `docs/RELEASE_NOTES_4.0.0.md` §5）。
 - Navicat 剩余 GUI 截图（表数据/设计表保存/备份向导）
-- SSH 真实隧道联调（paramiko + 本机 SSH server）
+- SSH 真实隧道联调（paramiko + 本机 SSH server）→ **已完成**（6 tests，
+  进程内 paramiko SSH server 真实端到端）
 - 性能深化（WAL 命名多段轮转、二级索引范围加速、>100 万行虚拟表索引）
+  → WAL 多段轮转 + 单列/多列索引已完成；>100 万行虚拟表索引待做
+- 自动更新下发链路 → **已完成**（`scripts/verify_auto_update.py` PASS=11，
+  三分支；不实现自动安装）
+

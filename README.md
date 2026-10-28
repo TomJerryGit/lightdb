@@ -7,6 +7,14 @@
 [![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)]()
 [![Status](https://img.shields.io/badge/status-beta-orange.svg)]()
 
+> 📦 **4.0.0 发布材料**：[CHANGELOG](docs/CHANGELOG.md) ·
+> [RELEASE_NOTES](docs/RELEASE_NOTES_4.0.0.md) ·
+> [路线图完成项/backlog](docs/review/04_ROADMAP.md) ·
+> 安装包 `dist/installer/LightDB-Studio-Setup-4.0.0.exe`
+> （未签名，SHA256 见发布说明）。
+> 下方"当前实测状态"各节写于 2026-10-19 审计基线，最新交付与实测以
+> CHANGELOG/发布说明为准。
+
 ---
 
 ## ⚠️ 当前实测状态（2026-10）

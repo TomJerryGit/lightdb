@@ -128,3 +128,75 @@
 | 10 万次更新后 `.dat` | 16 MB | — | — | ≤4 MB |
 | GUI 大结果集冻结 | 2448ms | — | 0（移出线程） | 0 |
 | 可复现的性能基准脚本 | 0 个 | — | 1 个 | ≥5 个 |
+
+---
+
+## 2026-10-28 Wave 2 收尾：完成项与剩余 backlog
+
+> 本文件上面各节写于 **2026-10-19 基线分析**（当时为"止血/可信度/性能"规划）。
+> 2026-10-21 ~ 10-28 的 4.0.0 交付已把其中大部分落地；以下为**实际完成状态**
+> 与**仍未做**的清单（详细变更见 [../CHANGELOG.md](../CHANGELOG.md)、
+> [../RELEASE_NOTES_4.0.0.md](../RELEASE_NOTES_4.0.0.md)）。
+
+### ✅ 已完成（4.0.0，2026-10-28）
+
+| 原路线图项 | 状态 | 证据 |
+|---|---|---|
+| 阶段 0 止血（聚合溢出/过滤不生效/CHECK/策略 id） | ✅ 完成 | 阶段 0 表各项验收测试通过 |
+| 阶段 1 可信度（GUI 原文错误/快照失败显式/KILL 真实） | ✅ 完成 | `test_gui_errors`、快照失败路径、KILL 端到端 |
+| 阶段 2.1 索引/写入/WAL 性能 | ✅ 基本完成（WAL 多段轮转 + 单列/多列索引） | `benchmarks/README.md`、P5.1 记录 |
+| 阶段 2.4 并发 | ⚠️ 仅量化、未消除（GIL + 表级锁 + 每事务 flush） | `docs/CONCURRENCY_SCALING.md`（16 客户端效率 3.4–6.5%） |
+| 阶段 3.1 ALTER 深水区 | ✅ 完成（ADD/DROP COLUMN、PK/UNIQUE、AUTO_INCREMENT） | engine 相关 40+ tests |
+| 阶段 3.2.1/3.2.2 查询移出 GUI 线程/结果虚拟化 | ✅ 完成 | G3 10 万行虚拟化、多窗口、SSH 连接 |
+| 阶段 3.2.3 事务开关/多会话 | ✅ 基本完成（G2/G2-b/G3） | test_studio_* |
+| 阶段 3.2.5 凭据安全 | ⚠️ 部分（SSL/SSH/审计已做；明文连接串与 web SECRET 仍待改） | 见 backlog |
+| 阶段 3.2.6 死代码 | ⚠️ 大幅清理（Studio 134→90 文件），仍有残留 | `docs/DEAD_CODE.md` |
+| 发布工程（P3-3/P6/CI/安装包） | ✅ 完成（构建、校验、CI 全绿） | `dist/installer`、`docs/CI_AND_RELEASE_2026-10-26.md` |
+| 自动更新分发 | ✅ 下载+校验链路完成（不含自动安装） | `scripts/verify_auto_update.py` PASS=11 |
+| 干净安装验证 | ⚠️ 受限会话可验证的部分完成（见下） | `_analysis_tmp/gui_full/wave2_clean_install_result.json` |
+
+### ⏳ 剩余 backlog
+
+**A. 发布项（优先，阻塞正式对外）**
+1. **代码签名证书**：安装包未签名（SmartScreen WARN）；签名后 `verify_release`
+   的 WARN 才能消除。
+2. **正常完整性会话复验安装/卸载**：本会话 Low IL 被拒写 HKCU 卸载注册表
+   （`RegCreateKeyEx code 5`），安装器按设计回滚；需正常用户/管理员会话完成
+   开始菜单快捷方式 + 安装→卸载全链路。
+3. **onefile 产物复验**：本次 `--smoke` 退出码 0xFFFFFFFF 且无解包目录，需正常
+   桌面会话确认是产物问题还是沙箱限制；未确认前推荐分发 onedir 安装包。
+4. CHANGELOG/RELEASE_NOTES 定稿已入库，发布 tag/Release page 待创建。
+
+**B. 生产化**
+5. 凭据安全：`connections.json` 明文密码 → 系统密钥链/加密存储；Web `SECRET`
+   与默认口令改环境注入；CORS 白名单。
+6. 多进程查询分片：现有 master/worker 只并行连接层，查询仍单线程；需存储层
+   只读副本/页共享或进程内分片，才能真正利用多核（当前 GIL 上限）。
+7. 复制体系补全：`Seconds_Behind_Master` 需 WAL 事件时间戳；binlog 字节位点/
+   日志轮转语义对齐 MySQL。
+8. Cython 加速层：需 MSVC 构建验证后再决定是否进入发布（当前默认纯 Python）。
+
+**C. 引擎深水区**
+9. 并发写路径的组提交/批量 fsync（需先定义 durability 级别，属语义变更）。
+10. SQL 解析缓存（读 CPU 47% 在 parser；需审计 AST/会话变量影响）。
+11. 表级 RLock 拆读写锁（读-读互斥是当前并发瓶颈之一，高风险需长稳测试）。
+12. 复制/连接池/大结果集流式协议等协议层完善。
+
+**D. 验证/文档**
+13. 性能 KPI 复测（本文件末尾表格仍为 2026-10 初值）：benchmark gate 已更新为
+    负载容差版本，需在静息机器上重标一次基线并回填。
+14. Navicat 剩余 GUI 截图（表数据/设计表保存/备份向导）与手册截图。
+15. onefile/安装的自动化用例（当前仅证据脚本，不进 pytest 硬门禁）。
+
+### KPI 更新（2026-10-28 实测）
+
+| 指标 | 旧值 | 当前 |
+|---|---|---|
+| A 类失败数 / CI | 24 | **0**（1,598 tests / 0 failed，提交 `0949a5c`） |
+| 静默错值（已知） | 3 | 0（审计回归） |
+| 批量写吞吐 | 1,356 rows/s | ~1,500 rows/s（并行负载下 800–2,100） |
+| 8 客户端并发 vs 1 | 0.64x | **0.58–1.2x**（读点查 0.57x；mix 0.84x）——未解决 |
+| GUI 大结果集冻结 | 2448ms | **0**（10 万行虚拟化） |
+| 可复现性能基准脚本 | 0 个 | ≥6 个（benchmarks/ + concurrency scaling + snapshot） |
+| 发布校验 | — | `verify_release` PASS=12 / FAIL=0 |
+
