@@ -33,16 +33,22 @@ jobs:
           $ErrorActionPreference = 'Continue'
           # 上一轮 job 的 pytest/Studio 子进程可能残留（端口/文件锁），
           # 会让下一轮 wire_union/batch10/first_run 等用例间歇失败。
+          # 注意：GitHub runner 的 pytest 命令行是 `python -m pytest tests -q ... --junitxml=pytest-results.xml`，
+          # 不含工作区路径，所以必须额外按 pytest/ junitxml 特征匹配，否则杀不掉真正的残留进程。
           $killed = 0
           Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
             Where-Object {
               $_.CommandLine -and (
                 $_.CommandLine -like '*_work\lightdb\lightdb*' -or
                 $_.CommandLine -like '*lightdb_studio*' -or
-                $_.CommandLine -like '*lightdb.main*'
+                $_.CommandLine -like '*lightdb.main*' -or
+                $_.CommandLine -like '*pytest-results.xml*' -or
+                $_.CommandLine -like '*-m pytest*'
               )
             } |
             ForEach-Object {
+              # 先尝试 WMI Terminate（普通 Stop-Process 对部分孤儿进程无效）
+              Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null
               Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
               $killed++
             }
