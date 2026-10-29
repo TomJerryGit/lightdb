@@ -92,7 +92,7 @@ jobs:
           $ErrorActionPreference = 'Continue'
           $raw = 0
           try {
-            python -m pytest tests -q -p no:cacheprovider --junitxml=pytest-results.xml *> pytest-console.log
+            python -m pytest tests -q -p no:cacheprovider --timeout=300 --timeout-method=thread --junitxml=pytest-results.xml *> pytest-console.log
             $raw = $LASTEXITCODE
           } catch {
             Write-Host "pytest launch failed: $_"

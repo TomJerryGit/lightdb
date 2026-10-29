@@ -64,6 +64,9 @@ all = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    # CI 全量套件加 --timeout：曾有测试在 CI 上挂起导致 job 被取消（98% 卡住），
+    # 超时后由 pytest-timeout 打印线程栈定位，避免整轮卡死。
+    "pytest-timeout>=2.2",
     "black>=23.0",
     "ruff>=0.1",
     "httpx>=0.25.0",
