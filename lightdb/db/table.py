@@ -384,9 +384,9 @@ class Table:
             (i for i, c in enumerate(cols) if c.get('primary')), 0)
         self.pk_col = cols[self.pk_idx]['name']
         self.pk_type = cols[self.pk_idx]['type']
-        # task-72：复合主键（目前支持 2 列整数）。物理 B+Tree 键不再直接
-        # 使用单列值，而是把两列按「有符号 32 位 -> uint32 偏置」拼成
-        # order-preserving 的 64 位键：`(a+2^31)<<32 | (b+2^31)`。
+        # task-72/task-80：复合主键（2–4 列整数）。各列按「有符号 32 位
+        # -> uint32 偏置」顺序拼接成 order-preserving 键（2 列 64 位、
+        # 3 列 96 位、4 列 128 位；v3 页用 16 字节大端存储）。
         # 这样 WHERE a=? AND b=? 是精确点查，WHERE a=? 是键范围扫描。
         self._pk_indices = [i for i, c in enumerate(cols)
                             if c.get('primary')]
@@ -1170,17 +1170,23 @@ class Table:
                     break
         return out
 
-    # ==================== task-72：复合主键编码 ====================
+    # ==================== task-72/task-80：复合主键编码 ====================
 
     _PK_PART_BIAS = 1 << 31
     _PK_PART_MAX = (1 << 32) - 1
 
     @classmethod
     def _encode_pk_parts(cls, parts) -> int:
-        """把 2 个有符号 32 位整数编码成 order-preserving 64 位 B+Tree 键"""
-        if len(parts) != 2:
+        """把 2–4 个有符号 32 位整数编码成 order-preserving 128 位键
+
+        每分量偏置 2^31 后取 32 位、按顺序大端拼接：2 列→64 位、3 列→96 位、
+        4 列→128 位。B+Tree v3 页用 16 字节大端保存，因此键顺序与元组
+        字典序一致。
+        """
+        n = len(parts)
+        if n < 2 or n > 4:
             raise ValueError(
-                f"复合主键最多支持 2 列（收到 {len(parts)} 列）")
+                f"复合主键只支持 2–4 列（收到 {n} 列）")
         key = 0
         for v in parts:
             if isinstance(v, bool) or not isinstance(v, int):
@@ -1193,7 +1199,7 @@ class Table:
         return key
 
     def _row_key(self, values) -> int:
-        """一行对应的物理主键键值（单列 = 列值；复合 = 编码后的 64 位键）"""
+        """一行对应的物理主键键值（单列 = 列值；复合 = 编码后的 128 位内 int）"""
         if not getattr(self, 'composite_pk', False):
             return values[self.pk_idx]
         parts = []

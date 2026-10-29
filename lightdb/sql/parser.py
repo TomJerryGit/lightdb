@@ -2406,14 +2406,13 @@ class Parser:
                     "Multiple primary key defined（列级 PRIMARY KEY 与表级 "
                     "PRIMARY KEY 同时出现；本引擎只支持一个主键）")
             pk_columns = list(table_pk['columns'])
-            if len(pk_columns) > 2:
-                # 物理键是 order-preserving 64 位整数：最多编码 2 个
-                # signed-32 位分量。3 列及以上显式拒绝（不静默只取前两列）。
+            if len(pk_columns) > 4:
+                # task-80：键扩到 128 位，最多 4 个 signed-32 位分量。
                 raise SyntaxError(
-                    f"本引擎复合主键最多支持 2 列：表 {table} 的 "
+                    f"本引擎复合主键最多支持 4 列：表 {table} 的 "
                     f"PRIMARY KEY ({', '.join(pk_columns)}) 有 "
-                    f"{len(pk_columns)} 列，无法编码到 64 位主键 B+Tree"
-                    f"（3 列及以上显式拒绝，绝不静默截断）")
+                    f"{len(pk_columns)} 列，无法编码到 128 位主键 B+Tree"
+                    f"（5 列及以上显式拒绝，绝不静默截断）")
             if len(set(pk_columns)) != len(pk_columns):
                 raise SyntaxError(
                     f"表 {table} 的 PRIMARY KEY 列清单有重复列: {pk_columns}")
@@ -2424,6 +2423,23 @@ class Parser:
                         f"Key column '{target}' doesn't exist in table "
                         f"{table}（表级 PRIMARY KEY 引用了不存在的列）")
                 hit[0]['primary'] = True
+            if len(pk_columns) > 1:
+                # 复合主键每个分量必须能放进 signed-32 位；BIGINT/字符串等
+                # 显式拒绝（否则运行时无法无损编码，绝不静默截断）。
+                comp_ok = {'INT', 'INTEGER', 'SMALLINT', 'TINYINT',
+                           'MEDIUMINT'}
+                for c in cols:
+                    if not c.get('primary'):
+                        continue
+                    raw = str(c.get('type') or '').strip().upper()
+                    m = re.match(r'^([A-Z_][A-Z0-9_]*)', raw)
+                    base = m.group(1) if m else ''
+                    if base not in comp_ok:
+                        raise SyntaxError(
+                            f"复合主键列 '{c['name']}' 的类型 "
+                            f"{c.get('type')} 不受支持：每个分量必须是 "
+                            f"signed-32 位整数（INT/INTEGER/SMALLINT/"
+                            f"TINYINT/MEDIUMINT），无法无损编码到 128 位键")
 
         # ★ 修复 F1：非整型主键在**定义期**显式拒绝（1064）。
         #

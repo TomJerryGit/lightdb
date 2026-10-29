@@ -786,14 +786,14 @@ def parse_create_table(stmt: str) -> TableSchema:
             'check': col_check,
         })
 
-    # 表级 `PRIMARY KEY (col[, col2])`：单列或 2 列复合（物理键是 64 位
-    # 编码）；更多列显式拒绝，绝不静默降级。
+    # 表级 `PRIMARY KEY (col[, ...])`：单列或 2–4 列复合（物理键是
+    # order-preserving 128 位内编码）；更多列显式拒绝，绝不静默降级。
     if table_pk_cols is not None:
-        if len(table_pk_cols) > 2:
+        if len(table_pk_cols) > 4:
             raise BackupError(
                 f"表 {name} 使用多列主键 PRIMARY KEY "
                 f"({', '.join(table_pk_cols)})，lightdb-logical-dump v1 只"
-                f"支持单列或 2 列复合主键")
+                f"支持单列或 2–4 列复合主键")
         if any(c.get('primary') for c in columns):
             raise BackupError(
                 f"表 {name} 同时有列级 PRIMARY KEY 与表级 PRIMARY KEY"

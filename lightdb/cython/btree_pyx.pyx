@@ -32,8 +32,8 @@ from libc.string cimport memcpy, memset
 # ==================== 常量 ====================
 cdef int LEAF_HEADER = 6       # n_keys(2) + next_leaf(4)
 cdef int INTERNAL_HEADER = 6
-cdef int LEAF_ENTRY_SIZE = 16   # v2: key(8) + pid(4) + sid(4)
-cdef int INTERNAL_ENTRY_SIZE = 12  # v2: key(8) + child(4)
+cdef int LEAF_ENTRY_SIZE = 24   # v3: key(16) + pid(4) + sid(4)
+cdef int INTERNAL_ENTRY_SIZE = 20  # v3: key(16) + child(4)
 cdef int PAGE_HEADER_SIZE = 24
 
 
@@ -54,6 +54,15 @@ cdef inline uint16_t _read_uint16(const unsigned char* buf, int offset) nogil:
     memcpy(&v, buf + offset, 2)
     return v
 
+
+cdef inline object _read_key(const unsigned char* buf, int offset):
+    """v3 页键：16 字节大端 → Python int（128 位；未编译验证，回退为准）"""
+    cdef int i
+    cdef object v = 0
+    for i in range(16):
+        v = (v << 8) | buf[offset + i]
+    return v
+
 cdef inline void _write_int32(unsigned char* buf, int offset, int32_t v) nogil:
     memcpy(buf + offset, &v, 4)
 
@@ -69,24 +78,24 @@ cdef inline void _write_uint16(unsigned char* buf, int offset, uint16_t v) nogil
 cdef inline int _leaf_n_keys(const unsigned char* data) nogil:
     return <int>_read_uint16(data, PAGE_HEADER_SIZE)
 
-cdef inline uint64_t _leaf_key_at(const unsigned char* data, int i) nogil:
+cdef inline object _leaf_key_at(const unsigned char* data, int i):
     cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
-    return _read_int64(data, offset)
+    return _read_key(data, offset)
 
 
 cdef inline int _leaf_pid_at(const unsigned char* data, int i) nogil:
-    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 8
+    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 16
     return _read_int32(data, offset)
 
 
 cdef inline int _leaf_sid_at(const unsigned char* data, int i) nogil:
-    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 12
+    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 20
     return _read_int32(data, offset)
 
 
 # ==================== 二分查找 ====================
 
-cdef tuple _leaf_search_c(const unsigned char* data, uint64_t key):
+cdef tuple _leaf_search_c(const unsigned char* data, object key):
     """
     叶子节点二分查找（C 指针内核）
 
@@ -97,7 +106,7 @@ cdef tuple _leaf_search_c(const unsigned char* data, uint64_t key):
     cdef int lo = 0
     cdef int hi = n - 1
     cdef int mid
-    cdef uint64_t k
+    cdef object k
 
     while lo <= hi:
         mid = (lo + hi) >> 1
@@ -112,7 +121,7 @@ cdef tuple _leaf_search_c(const unsigned char* data, uint64_t key):
     return (False, 0, 0)
 
 
-cpdef tuple leaf_search(const unsigned char[:] data, uint64_t key):
+cpdef tuple leaf_search(const unsigned char[:] data, object key):
     """
     叶子节点二分查找
     返回 (found, page_id, slot_id)
@@ -125,7 +134,7 @@ cpdef tuple leaf_search(const unsigned char[:] data, uint64_t key):
     return _leaf_search_c(&data[0], key)
 
 
-cdef int _leaf_lower_bound_c(const unsigned char* data, uint64_t key) nogil:
+cdef int _leaf_lower_bound_c(const unsigned char* data, object key):
     """找第一个 >= key 的位置（C 指针内核）"""
     cdef int n = _leaf_n_keys(data)
     cdef int lo = 0
@@ -141,7 +150,7 @@ cdef int _leaf_lower_bound_c(const unsigned char* data, uint64_t key) nogil:
     return lo
 
 
-cpdef int leaf_lower_bound(const unsigned char[:] data, uint64_t key):
+cpdef int leaf_lower_bound(const unsigned char[:] data, object key):
     """
     找第一个 >= key 的位置（修复 3：指针参数 → 内存视图签名）
     """
@@ -153,24 +162,24 @@ cpdef int leaf_lower_bound(const unsigned char[:] data, uint64_t key):
 cdef inline int _internal_n_keys(const unsigned char* data) nogil:
     return <int>_read_uint16(data, PAGE_HEADER_SIZE)
 
-cdef inline uint64_t _internal_key_at(const unsigned char* data, int i) nogil:
+cdef inline object _internal_key_at(const unsigned char* data, int i):
     cdef int offset = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE
-    return _read_int64(data, offset)
+    return _read_key(data, offset)
 
 cdef inline int _internal_child_at(const unsigned char* data, int i) nogil:
-    cdef int offset = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE + 8
+    cdef int offset = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE + 16
     return _read_int32(data, offset)
 
 cdef inline int _internal_first_child(const unsigned char* data) nogil:
     return _read_int32(data, PAGE_HEADER_SIZE + 2)
 
 
-cdef int _internal_find_child_c(const unsigned char* data, uint64_t key) nogil:
+cdef int _internal_find_child_c(const unsigned char* data, object key):
     """找内部节点的子节点（C 指针内核）"""
     cdef int n = _internal_n_keys(data)
     cdef int child = _internal_first_child(data)
     cdef int i
-    cdef uint64_t k
+    cdef object k
 
     for i in range(n):
         k = _internal_key_at(data, i)
@@ -180,7 +189,7 @@ cdef int _internal_find_child_c(const unsigned char* data, uint64_t key) nogil:
     return child
 
 
-cpdef int internal_find_child(const unsigned char[:] data, uint64_t key):
+cpdef int internal_find_child(const unsigned char[:] data, object key):
     """
     找内部节点的子节点（修复 3：指针参数 → 内存视图签名）
     """
@@ -190,13 +199,13 @@ cpdef int internal_find_child(const unsigned char[:] data, uint64_t key):
 # ==================== 批量键比较 ====================
 
 cdef int _compare_keys_bulk_c(const unsigned char* a,
-                              const unsigned char* b, int n) nogil:
-    """批量比较两个键数组，返回 -1 / 0 / 1（C 指针内核）"""
+                              const unsigned char* b, int n):
+    """批量比较两个 128 位键数组（v3：每键 16 字节大端），返回 -1/0/1"""
     cdef int i
-    cdef uint64_t ka, kb
+    cdef object ka, kb
     for i in range(n):
-        ka = _read_int64(a, i * 8)
-        kb = _read_int64(b, i * 8)
+        ka = _read_key(a, i * 16)
+        kb = _read_key(b, i * 16)
         if ka < kb:
             return -1
         elif ka > kb:
@@ -220,12 +229,12 @@ cpdef int compare_keys_bulk(
 # ==================== 范围扫描 ====================
 
 cdef list _leaf_range_scan_c(const unsigned char* data,
-                             uint64_t start_key, uint64_t end_key):
+                             object start_key, object end_key):
     """叶子节点范围扫描（C 指针内核；返回 list，故不能标 nogil）"""
     cdef int n = _leaf_n_keys(data)
     cdef list result = []
     cdef int i
-    cdef uint64_t k
+    cdef object k
 
     for i in range(n):
         k = _leaf_key_at(data, i)
@@ -240,7 +249,7 @@ cdef list _leaf_range_scan_c(const unsigned char* data,
 
 cpdef list leaf_range_scan(
         const unsigned char[:] data,
-        uint64_t start_key, uint64_t end_key):
+        object start_key, object end_key):
     """
     叶子节点范围扫描
     返回 [(key, pid, sid), ...]
@@ -271,11 +280,11 @@ cdef class BTreeLeafView:
     def n_keys(self):
         return self.n
 
-    cpdef tuple search(self, uint64_t key):
+    cpdef tuple search(self, object key):
         cdef int lo = 0
         cdef int hi = self.n - 1
         cdef int mid
-        cdef uint64_t k
+        cdef object k
         while lo <= hi:
             mid = (lo + hi) >> 1
             k = _leaf_key_at(self.data, mid)
@@ -288,10 +297,10 @@ cdef class BTreeLeafView:
                 hi = mid - 1
         return (False, 0, 0)
 
-    cpdef list scan(self, uint64_t start, uint64_t end):
+    cpdef list scan(self, object start, object end):
         cdef list result = []
         cdef int i
-        cdef uint64_t k
+        cdef object k
         for i in range(self.n):
             k = _leaf_key_at(self.data, i)
             if k < start:

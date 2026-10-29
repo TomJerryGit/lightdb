@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""旧 B+Tree 页格式迁移（task-72 → task-73）
+"""旧 B+Tree 页格式迁移（v1/v2 → v3）
 
-task-72 把主键 B+Tree 的键从 uint32 扩到 uint64，叶/内部页条目从
-12/8 字节扩到 16/12 字节。旧 `.dat` 不能按新格式直接读取。本脚本：
+task-72 把键扩到 uint64（v2）；task-80 支持 3–4 列复合主键后，页条目改为
+「16 字节大端 128 位键 + pid/sid 或 child」（叶 24B / 内部 20B，v3）。
+旧 `.dat` 不能按 v3 直接读取。本脚本支持 **v1/v2 → v3**：
 
-1. 只接受**旧格式**数据目录（按 `.btroot` 根页 reserved[21] 标记判断）；
+1. 只接受**旧格式**数据目录（按 .btroot 根页结构判定 v1/v2）；
 2. 逐表扫描旧堆页，读取 xmax=0 的可见行版本（要求旧库已正常关闭/checkpoint；
    未完成事务/崩溃中的旧库请先从备份恢复）；
-3. 在新目录用当前格式重建同样的表（cols/UNIQUE/二级索引/CHECK/分区/
-   AUTO_INCREMENT 计数/表选项），逐行插入；
-4. 重新打开新目录，校验每张表行数、主键集合、索引条目与旧库一致；
+3. 在新目录用 v3 格式重建同样的表（cols/UNIQUE/二级索引/CHECK/分区/
+   AUTO_INCREMENT 计数/表选项，含 2–4 列复合主键），逐行插入；
+4. 重新打开新目录，校验每张表行数、行内容、索引与旧库一致；
 5. 复制用户/视图/存储过程等非表元数据。
 
 用法：
@@ -56,7 +57,7 @@ def _read_page_bytes(f, page_id):
 
 
 def _is_legacy_file(data_file: Path) -> bool:
-    """.dat 里是否有旧 BTree 根页（按条目结构判定，不只看 v2 标记）"""
+    """.dat 里是否有旧 BTree 根页（v1 或 v2；按条目结构判定）"""
     btroot = data_file.with_suffix('.btroot')
     if not btroot.exists() or not data_file.exists():
         return False
@@ -67,7 +68,7 @@ def _is_legacy_file(data_file: Path) -> bool:
     if root_id < 1:
         return False
     from lightdb.storage.btree import (classify_btree_root_page,
-                                       BTREE_FORMAT_LEGACY)
+                                       BTREE_FORMAT_VERSION)
     try:
         file_pages = max(1, data_file.stat().st_size // PAGE_SIZE)
 
@@ -77,8 +78,8 @@ def _is_legacy_file(data_file: Path) -> bool:
 
         with open(data_file, 'rb') as f:
             root_raw = _read_page_bytes(f, root_id)
-        return classify_btree_root_page(
-            root_raw, read_page, file_pages) == BTREE_FORMAT_LEGACY
+        fmt = classify_btree_root_page(root_raw, read_page, file_pages)
+        return fmt in (1, 2) and fmt != BTREE_FORMAT_VERSION
     except Exception:
         return False
 
@@ -98,10 +99,10 @@ def _decode_row(rb):
 
 
 def read_legacy_visible_rows(data_file: Path, cols):
-    """旧堆页 → 可见行（xmax=0；同 pk 取最大 xmin）；返回按 pk 排序的行列表"""
+    """旧堆页 → 可见行（xmax=0；同主键元组取最大 xmin）；按主键排序"""
     names = [c.get('name') for c in cols]
-    pk_idx = next((i for i, c in enumerate(cols) if c.get('primary')), 0)
-    by_pk = {}
+    pk_idxs = [i for i, c in enumerate(cols) if c.get('primary')] or [0]
+    by_key = {}
     with open(data_file, 'rb') as f:
         total = os.fstat(f.fileno()).st_size // PAGE_SIZE
         for pid in range(1, total + 1):
@@ -120,12 +121,12 @@ def read_legacy_visible_rows(data_file: Path, cols):
                     raise MigrationError(
                         f"{data_file.name}: 行载荷列数 {len(values)} 与元数据 "
                         f"列数 {len(names)} 不一致（不能静默截断/补列）")
-                pk = values[pk_idx]
-                old = by_pk.get(pk)
+                key = tuple(values[i] for i in pk_idxs)
+                old = by_key.get(key)
                 if old is None or xmin > old[0]:
-                    by_pk[pk] = (xmin, list(values))
-    return [(pk, row[1]) for pk, row in sorted(by_pk.items(),
-                                               key=lambda kv: kv[0])]
+                    by_key[key] = (xmin, list(values))
+    return [(key, row[1]) for key, row in sorted(by_key.items(),
+                                                 key=lambda kv: str(kv[0]))]
 
 
 def _load_meta(old_dir: Path):
@@ -164,8 +165,8 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
               if _is_legacy_file(old_dir / f"{name}.dat")]
     if not legacy:
         raise MigrationError(
-            "未检测到旧格式 B+Tree 页（.btroot 根页已有 v2 标记）："
-            "该目录可能已是新格式，无需迁移；直接启动即可")
+            "未检测到旧格式 B+Tree 页（v1/v2）：该目录可能已是 v3 格式，"
+            "无需迁移；直接启动即可")
     _prepare_target(old_dir, new_dir, force)
 
     from lightdb.db.database import Database
@@ -178,10 +179,10 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
             if not cols:
                 raise MigrationError(f"表 {name} 没有列定义")
             pk_cols = [c for c in cols if c.get('primary')]
-            if len(pk_cols) > 1:
+            if len(pk_cols) > 4:
                 raise MigrationError(
-                    f"表 {name} 的元数据含多列主键（旧格式不可能出现）；"
-                    f"请先确认元数据未被手工修改")
+                    f"表 {name} 的主键列数 {len(pk_cols)} > 4（v3 只支持"
+                    f"最多 4 列）；请先确认元数据未被手工修改")
             data_file = old_dir / f"{name}.dat"
             rows = []
             if data_file.exists():
@@ -205,7 +206,7 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
                 tbl._auto_reserved = {}
             report['tables'][name] = {
                 'rows': len(rows),
-                'pks': [pk for pk, _row in rows],
+                'row_tuples': [tuple(row) for _pk, row in rows],
                 'indexes': len(tbl.index_specs()),
                 'auto_increment': len(old_auto),
             }
@@ -234,13 +235,11 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
             if len(got) != want:
                 raise MigrationError(
                     f"迁移校验失败：表 {name} 行数 {len(got)} != 期望 {want}")
-            got_pks = {pk for pk, _values in got}
-            want_pks = set(report['tables'][name]['pks'])
-            if got_pks != want_pks:
+            got_tuples = [tuple(values) for _pk, values in got]
+            want_tuples = report['tables'][name]['row_tuples']
+            if sorted(got_tuples, key=str) != sorted(want_tuples, key=str):
                 raise MigrationError(
-                    f"迁移校验失败：表 {name} 主键集合不一致"
-                    f"（缺 {len(want_pks - got_pks)} 个 / 多 "
-                    f"{len(got_pks - want_pks)} 个）")
+                    f"迁移校验失败：表 {name} 行内容与旧库不一致")
             report['tables'][name]['validated'] = True
     finally:
         chk.shutdown()
@@ -249,7 +248,7 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description='LightDB 旧 B+Tree 页格式（uint32 键）迁移到 v2（uint64）')
+        description='LightDB 旧 B+Tree 页格式（v1 uint32 / v2 uint64）迁移到 v3')
     ap.add_argument('old_dir', help='旧数据目录（只读）')
     ap.add_argument('new_dir', help='新数据目录（会被创建/覆盖需 --force）')
     ap.add_argument('--force', action='store_true',

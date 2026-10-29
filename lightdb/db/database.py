@@ -512,15 +512,16 @@ class Database:
         return path
 
     def _detect_legacy_btree_format(self):
-        """启动自检：旧 B+Tree 页格式（uint32 键）→ 显式报错并指向迁移脚本
+        """启动自检：旧 B+Tree 页格式（v1 uint32 / v2 uint64）→ 迁移指引
 
-        优先看页头 v2 标记；对"task-72 新布局但尚无标记"的库，用
-        `classify_btree_root_page` 按条目结构（12/8 vs 16/12 字节、槽位/
-        子页有效性）双重校验，避免把新库误判成旧库。
+        v3 页条目为 24/20 字节、16 字节大端 128 位键。优先看页头 v3 标记；
+        对无 marker 的历史库用 `classify_btree_root_page` 按条目结构
+        （12/8 vs 16/12 vs 24/20 字节、槽位/子页有效性）判定，避免把新库
+        误判成旧库，也避免旧库被按 v3 误读。
         """
         from ..storage.page import PAGE_SIZE
         from ..storage.btree import (classify_btree_root_page,
-                                     BTREE_FORMAT_LEGACY)
+                                     BTREE_FORMAT_VERSION)
         for btroot in sorted(self.data_dir.glob('*.btroot')):
             table = btroot.stem
             data_file = self.data_dir / f"{table}.dat"
@@ -548,7 +549,7 @@ class Database:
                     root_raw, read_page, file_pages)
             except Exception:
                 fmt = -1
-            if fmt in (BTREE_FORMAT_LEGACY, -1):
+            if fmt != BTREE_FORMAT_VERSION:
                 raise LegacyBTreeFormatError(table, root_id, str(data_file))
 
     def _load(self):
@@ -1745,10 +1746,10 @@ class Database:
         tbl = self._get_table_for_ddl(name)
         targets = [str(c).strip().strip('`"') for c in (columns or [])]
         targets = [c for c in targets if c]
-        if len(targets) not in (1, 2):
+        if len(targets) not in (1, 2, 3, 4):
             raise DdlError(
-                f"ALTER TABLE {name} ADD PRIMARY KEY 只支持单列或 2 列复合"
-                f"主键（物理键是 64 位整数；收到 {targets}）",
+                f"ALTER TABLE {name} ADD PRIMARY KEY 只支持单列或 2–4 列"
+                f"复合主键（物理键是 128 位内整数；收到 {targets}）",
                 errno=1235, sqlstate='42000')
         if len(set(targets)) != len(targets):
             raise DdlError(
@@ -1771,11 +1772,11 @@ class Database:
                 raise DdlError(
                     f"列 '{target}' 的类型 {col.get('type')} 不能作为主键"
                     f"（主键 B+Tree 键只支持整数类型）", errno=1064)
-            if len(targets) == 2 and base not in self._PK_COMPOSITE_TYPES:
+            if len(targets) > 1 and base not in self._PK_COMPOSITE_TYPES:
                 raise DdlError(
                     f"列 '{target}' 的类型 {col.get('type')} 不能作为复合"
                     f"主键分量（每个分量必须是 signed-32 位整数；BIGINT "
-                    f"复合键无法编码到 64 位 B+Tree）", errno=1064)
+                    f"复合键无法无损编码到 128 位键）", errno=1064)
         autos = self._auto_increment_cols(tbl)
         if autos and any(a not in targets for a in autos):
             raise DdlError(
@@ -1783,7 +1784,7 @@ class Database:
                 f"column and it must be defined as a key（AUTO_INCREMENT "
                 f"列 {', '.join(autos)} 必须先成为键；显式错误，不静默"
                 f"把自增列变成非键列）", errno=1075, sqlstate='42000')
-        composite = len(targets) == 2
+        composite = len(targets) > 1
         with tbl._lock:
             self._ddl_guard(tbl, 'ALTER TABLE ... ADD PRIMARY KEY')
             seen = {}

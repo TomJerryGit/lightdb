@@ -143,15 +143,15 @@ def test_alter_composite_pk_errors(env):
     ok(ex, 'INSERT INTO cpn VALUES (1,1,NULL)')
     r = err(ex, 'ALTER TABLE cpn ADD PRIMARY KEY (a, b)')
     assert r['code'] == 1138, r
-    # 3 列 → 1235
-    ok(ex, 'CREATE TABLE cp3 (a INT, b INT, c INT)')
-    r = err(ex, 'ALTER TABLE cp3 ADD PRIMARY KEY (a, b, c)')
+    # 5 列 → 1235（v3 最多 4 列）
+    ok(ex, 'CREATE TABLE cp5 (a INT, b INT, c INT, d INT, e INT)')
+    r = err(ex, 'ALTER TABLE cp5 ADD PRIMARY KEY (a, b, c, d, e)')
     assert r['code'] == 1235, r
     # 已有显式主键 → 1068
     ok(ex, 'CREATE TABLE cpk (a INT PRIMARY KEY, b INT)')
     r = err(ex, 'ALTER TABLE cpk ADD PRIMARY KEY (a, b)')
     assert r['code'] == 1068, r
-    print("\n    复合主键错误码：重复 1062 / NULL 1138 / 3 列 1235 / "
+    print("\n    复合主键错误码：重复 1062 / NULL 1138 / 5 列 1235 / "
           "已有主键 1068")
 
 

@@ -141,11 +141,11 @@ def test_btree_leaf_functions_match_storage_btree_page_layout():
         PAGE_HEADER_SIZE, PAGE_TYPE_BTREE_LEAF, Page,
     )
 
-    # 常量必须与 .pyx / 回退 / storage v2 完全一致，否则读到的页是错的
+    # 常量必须与 .pyx / 回退 / storage v3 完全一致，否则读到的页是错的
     assert btree_pyx.LEAF_HEADER == LEAF_HEADER == 6
     assert btree_pyx.INTERNAL_HEADER == INTERNAL_HEADER == 6
-    assert btree_pyx.LEAF_ENTRY_SIZE == LEAF_ENTRY_SIZE == 16
-    assert btree_pyx.INTERNAL_ENTRY_SIZE == INTERNAL_ENTRY_SIZE == 12
+    assert btree_pyx.LEAF_ENTRY_SIZE == LEAF_ENTRY_SIZE == 24
+    assert btree_pyx.INTERNAL_ENTRY_SIZE == INTERNAL_ENTRY_SIZE == 20
     assert btree_pyx.PAGE_HEADER_SIZE == PAGE_HEADER_SIZE == 24
 
     tmpdir = tempfile.mkdtemp(prefix='lightdb_cython_fb_')
@@ -178,8 +178,11 @@ def test_btree_leaf_functions_match_storage_btree_page_layout():
         struct.pack_into('<H', page.data, PAGE_HEADER_SIZE, 2)
         struct.pack_into('<I', page.data, PAGE_HEADER_SIZE + 2, 100)  # first child
         base = PAGE_HEADER_SIZE + 6
-        struct.pack_into('<QI', page.data, base, 50, 200)     # key=50 → child 200
-        struct.pack_into('<QI', page.data, base + 12, 80, 300)  # key=80 → child 300
+        page.data[base:base + 16] = (50).to_bytes(16, 'big')
+        struct.pack_into('<I', page.data, base + 16, 200)       # key=50 → child 200
+        b2 = base + 20
+        page.data[b2:b2 + 16] = (80).to_bytes(16, 'big')
+        struct.pack_into('<I', page.data, b2 + 16, 300)         # key=80 → child 300
         idata = bytes(page.data)
         assert btree_pyx.internal_find_child(idata, 10) == 100
         assert btree_pyx.internal_find_child(idata, 50) == 200
@@ -263,19 +266,19 @@ def test_btree_fallback_matches_native_v2_after_splits():
                 pass
 
 
-def test_btree_fallback_reads_uint64_v2_keys():
-    """v2 键是 uint64：回退必须能读 > 2**32（含 >2**63）的键，不得截断成 int32"""
+def test_btree_fallback_reads_uint128_v3_keys():
+    """v3 键是 16 字节大端 128 位：回退必须能读 >2**64 的键，不得截断"""
     import tempfile
     from lightdb.storage.btree import BTree
     from lightdb.storage.buffer_pool import BufferPool
     from lightdb.storage.page import PAGE_TYPE_BTREE_LEAF
 
-    tmpdir = tempfile.mkdtemp(prefix='lightdb_cython_fb_u64_')
-    path = os.path.join(tmpdir, 'u64.db')
+    tmpdir = tempfile.mkdtemp(prefix='lightdb_cython_fb_u128_')
+    path = os.path.join(tmpdir, 'u128.db')
     bp = BufferPool(path, capacity=64)
     try:
         tree = BTree(bp)
-        keys = [2 ** 32, 2 ** 40, 2 ** 63 + 123, 2 ** 64 - 1]
+        keys = [2 ** 32, 2 ** 64, 2 ** 100, 2 ** 127, (1 << 128) - 2]
         for k in keys:
             tree.insert(k, k % 97, k % 1009)
         page = bp.get_page(tree.root_page_id)
@@ -284,10 +287,10 @@ def test_btree_fallback_reads_uint64_v2_keys():
         for k in keys:
             found, pid, sid = btree_pyx.leaf_search(data, k)
             assert found and pid == k % 97 and sid == k % 1009, (k, pid, sid)
-        assert btree_pyx.leaf_lower_bound(data, 2 ** 63) == 2
+        assert btree_pyx.leaf_lower_bound(data, 2 ** 100) == 2
         assert [e[0] for e in btree_pyx.leaf_range_scan(
-            data, 2 ** 40, 2 ** 63 + 123)] == [2 ** 40, 2 ** 63 + 123]
-        print('\n    v2 uint64 键：回退读取 >2**32 / >2**63 键正确')
+            data, 2 ** 64, 2 ** 127)] == [2 ** 64, 2 ** 100, 2 ** 127]
+        print('\n    v3 uint128 键：回退读取 >2**64 / >2**100 键正确')
     finally:
         bp.close()
         for f in os.listdir(tmpdir):
@@ -302,10 +305,13 @@ def test_btree_compare_keys_bulk_accepts_python_objects():
     compare_keys_bulk 原先是 cpdef + const unsigned char*，Python 层无法调用
     （本身就是编译错误）。回退必须能直接吃 bytes。
     """
-    a = struct.pack('<3Q', 1, 2, 3)
-    b = struct.pack('<3Q', 1, 2, 3)
-    c = struct.pack('<3Q', 1, 2, 4)
-    d = struct.pack('<3Q', 1, 1, 9)
+    def _keys(*vals):
+        return b''.join(int(v).to_bytes(16, 'big') for v in vals)
+
+    a = _keys(1, 2, 3)
+    b = _keys(1, 2, 3)
+    c = _keys(1, 2, 4)
+    d = _keys(1, 1, 9)
     assert btree_pyx.compare_keys_bulk(a, b, 3) == 0
     assert btree_pyx.compare_keys_bulk(a, c, 3) == -1
     assert btree_pyx.compare_keys_bulk(c, a, 3) == 1

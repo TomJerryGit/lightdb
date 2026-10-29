@@ -140,6 +140,92 @@ def test_migration_script_rebuilds_new_format(tmp_path):
     print('\n    迁移脚本：旧格式→新格式，行数/主键/唯一性校验通过，重启一致')
 
 
+def make_v2_legacy_dir(base):
+    """v2（uint64 键、16/12 字节条目）2 列复合主键旧库"""
+    from lightdb.storage.buffer_pool import BufferPool
+    from lightdb.storage.page import PAGE_TYPE_HEAP, PAGE_TYPE_BTREE_LEAF
+    from lightdb.storage.btree import PAGE_HEADER_SIZE, LEAF_HEADER
+
+    old = base / 'old_v2'
+    old.mkdir(parents=True)
+    cols = [
+        {'name': 'a', 'type': 'INT', 'primary': True, 'unique': False,
+         'notnull': True, 'has_default': False, 'default': None,
+         'check': None, 'implicit_pk': False},
+        {'name': 'b', 'type': 'INT', 'primary': True, 'unique': False,
+         'notnull': True, 'has_default': False, 'default': None,
+         'check': None, 'implicit_pk': False},
+        {'name': 'v', 'type': 'VARCHAR(10)', 'primary': False,
+         'unique': False, 'notnull': False, 'has_default': False,
+         'default': None, 'check': None},
+    ]
+    meta = {'tables': {'old2': {
+        'cols': cols, 'partition': None, 'unique_indexes': [],
+        'indexes': [], 'checks': None, 'requested_engine': 'LightDB',
+        'table_options': {'engine': 'LightDB', 'charset': 'utf8mb4',
+                          'collate': 'utf8mb4_bin', 'comment': None},
+        'comment': '', 'auto_increment_next': {}}},
+        'users': {}, 'views': {}, 'pending_ddl': None}
+    with open(old / '_meta.json', 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    rows = [(1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')]
+    dat = old / 'old2.dat'
+    bp = BufferPool(str(dat))
+    heap = bp.new_page(PAGE_TYPE_HEAP)
+    entries = []
+    bias = 1 << 31
+    for a, b, v in rows:
+        payload = json.dumps([a, b, v], ensure_ascii=False).encode('utf-8')
+        rb = struct.pack('<IIBIII', 1, 0, 0, len(payload),
+                         0xFFFFFFFF, 0) + payload
+        sid = heap.insert_row(rb)
+        key = ((a + bias) << 32) | (b + bias)
+        entries.append((key, heap.page_id, sid))
+    leaf = bp.new_page(PAGE_TYPE_BTREE_LEAF)
+    leaf.data[21] = 2                    # v2 marker
+    struct.pack_into('<H', leaf.data, PAGE_HEADER_SIZE, len(entries))
+    struct.pack_into('<I', leaf.data, PAGE_HEADER_SIZE + 2, 0)
+    for i, (key, pid, sid) in enumerate(entries):
+        struct.pack_into('<QII', leaf.data,
+                         PAGE_HEADER_SIZE + LEAF_HEADER + i * 16,
+                         key, pid, sid)
+    leaf.dirty = True
+    bp.flush()
+    bp.close()
+    (old / 'old2.btroot').write_text(str(leaf.page_id))
+    return old
+
+
+def test_v2_composite_migrates_to_v3(tmp_path):
+    """v2 的 2 列复合主键库 → v3：检测/迁移/复合唯一性/点查校验"""
+    from lightdb.db.database import Database
+    from lightdb.db.errors import LegacyBTreeFormatError
+    from lightdb.sql.executor import Executor
+    old = make_v2_legacy_dir(tmp_path)
+    with pytest.raises(LegacyBTreeFormatError):
+        Database(str(old))
+    new = tmp_path / 'new_v2'
+    script = os.path.join(ROOT, 'scripts', 'migrate_btree_format.py')
+    env = dict(os.environ, PYTHONIOENCODING='utf-8')
+    p = subprocess.run([sys.executable, script, str(old), str(new)],
+                       capture_output=True, text=True, timeout=180, env=env,
+                       encoding='utf-8', errors='replace')
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    assert '校验=OK' in p.stdout, p.stdout
+    db = Database(str(new))
+    ex = Executor(db)
+    try:
+        assert ex.execute_sql('SELECT * FROM old2 WHERE a=1 AND b=2',
+                              {})['rows'] == [(1, 2, 'y')]
+        assert ex.execute_sql('SELECT * FROM old2 WHERE a=1 ORDER BY b',
+                              {})['rows'] == [(1, 1, 'x'), (1, 2, 'y')]
+        r = ex.execute_sql("INSERT INTO old2 VALUES (1,1,'dup')", {})
+        assert r.get('code') == 1062, r
+    finally:
+        db.shutdown()
+    print('\n    v2（2 列复合主键）→ v3 迁移：行数/复合唯一性/前缀查询一致')
+
+
 def test_window_new_format_without_marker_is_not_false_positive(tmp_path):
     """task-72 格式升级到写 marker 之间创建的库：marker=0 但条目是新布局
 

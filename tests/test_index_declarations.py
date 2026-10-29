@@ -232,13 +232,14 @@ def test_composite_primary_key_supported(tmp_path, decl):
 
 
 @pytest.mark.parametrize('decl', [
-    'PRIMARY KEY (a, b, c)',
+    'PRIMARY KEY (a, b, c, d, e)',
 ])
-def test_three_column_primary_key_is_explicit_1235(tmp_path, decl):
+def test_five_column_primary_key_is_explicit_1064(tmp_path, decl):
     db = open_db(tmp_path / 'data')
-    r = err(db, f'CREATE TABLE cpk3 (a INT, b INT, c INT, {decl})')
-    assert r['code'] == 1064 and '2 列' in r['message'], r
-    assert err(db, 'SHOW INDEX FROM cpk3')['code'] == 1146
+    r = err(db, f'CREATE TABLE cpk5 (a INT, b INT, c INT, d INT, e INT, '
+                f'{decl})')
+    assert r['code'] == 1064 and '4 列' in r['message'], r
+    assert err(db, 'SHOW INDEX FROM cpk5')['code'] == 1146
 
 
 # ==================== 5. 不支持的索引形态：显式 1064 ====================
