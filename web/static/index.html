@@ -133,6 +133,7 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           <button id="tool-quality-btn" class="tab-btn" data-tool="quality">数据质量</button>
           <button id="tool-er-btn" class="tab-btn" data-tool="er" data-i18n="er.tab">ER 图</button>
           <button id="tool-plugins-btn" class="tab-btn" data-tool="plugins" data-i18n="plugins.tab">插件</button>
+          <button id="tool-production-btn" class="tab-btn" data-tool="production">生产</button>
         </div>
 
         <div id="history-section" class="tool-section">
@@ -191,6 +192,36 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           </div>
           <div id="plugins-status" class="status"></div>
           <div id="plugins-table" class="result-table"></div>
+        </div>
+
+        <div id="production-section" class="tool-section hidden">
+          <h3>生产化能力（真实数据）</h3>
+          <h4>复制状态</h4>
+          <div class="form-row">
+            <input id="prod-state-file" type="text" placeholder="复制状态文件（可选）">
+            <button id="prod-rep-refresh" class="btn-small">刷新复制状态</button>
+          </div>
+          <div id="prod-rep-status" class="status"></div>
+          <div id="prod-rep-table" class="result-table"></div>
+          <h4>Metrics 摘要</h4>
+          <div class="form-row">
+            <input id="prod-metrics-url" type="text" placeholder="http://127.0.0.1:8080/metrics">
+            <button id="prod-metrics-refresh" class="btn-small">拉取指标</button>
+          </div>
+          <div id="prod-metrics-status" class="status"></div>
+          <div id="prod-metrics-table" class="result-table"></div>
+          <h4>二进制快照（CLI）</h4>
+          <div class="form-row">
+            <input id="prod-snapshot-data" type="text" placeholder="data-dir">
+            <input id="prod-snapshot-out" type="text" placeholder="out 目录">
+            <button id="prod-snapshot-backup" class="btn-small">备份</button>
+          </div>
+          <div class="form-row">
+            <input id="prod-restore-path" type="text" placeholder="快照目录（恢复需确认）">
+            <button id="prod-snapshot-restore" class="btn-small">恢复</button>
+          </div>
+          <div id="prod-snapshot-status" class="status"></div>
+          <pre id="prod-snapshot-log" class="sql-preview"></pre>
         </div>
       </aside>
     </div>

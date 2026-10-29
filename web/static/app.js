@@ -709,7 +709,8 @@ async function loadHistory() {
 // ==================== 报表模板 ====================
 
 function switchTool(tool) {
-  ['history', 'reports', 'quality', 'er', 'plugins'].forEach(name => {
+  ['history', 'reports', 'quality', 'er', 'plugins', 'production']
+    .forEach(name => {
     const btn = $id('tool-' + name + '-btn');
     if (btn) btn.classList.toggle('active', name === tool);
     const section = $id(name + '-section');
@@ -718,6 +719,7 @@ function switchTool(tool) {
   if (tool === 'reports') loadReportTemplates();
   if (tool === 'er') loadER();
   if (tool === 'plugins') loadPlugins();
+  if (tool === 'production') loadReplicationStatus();
 }
 
 function selectedTemplate() {
@@ -1288,6 +1290,146 @@ async function cancelImport() {
 }
 
 
+// ==================== task-83：生产化面板 ====================
+
+function renderKeyValueTable(target, rows) {
+  clearNode(target);
+  if (!rows || !rows.length) {
+    target.appendChild(el('div', 'empty-hint', '无数据'));
+    return;
+  }
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const hr = document.createElement('tr');
+  hr.appendChild(el('th', '', '字段'));
+  hr.appendChild(el('th', '', '值'));
+  thead.appendChild(hr); table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  rows.forEach(pair => {
+    const tr = document.createElement('tr');
+    tr.appendChild(el('td', '', pair[0]));
+    tr.appendChild(el('td', '', pair[1] === null || pair[1] === undefined ? '—' : pair[1]));
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody); target.appendChild(table);
+}
+
+async function loadReplicationStatus() {
+  const target = $id('prod-rep-table');
+  const status = $id('prod-rep-status');
+  if (!target || !status) return;
+  status.textContent = '读取中...';
+  status.classList.remove('status-error');
+  try {
+    const stateFile = $id('prod-state-file').value.trim();
+    const q = (stateFile ? '&state_file=' + encodeURIComponent(stateFile) : '') +
+      (currentConn ? '&connection=' + encodeURIComponent(currentConn) : '');
+    const data = await api('/replication/status?x=1' + q);
+    clearNode(target);
+    if (!data.configured) {
+      status.textContent = data.notice || '未配置复制';
+      status.classList.add('status-error');
+      return;
+    }
+    const rows = Object.keys(data.fields || {}).map(k => {
+      const f = data.fields[k];
+      return [f.label || k, f.value];
+    });
+    renderKeyValueTable(target, rows);
+    status.textContent = '来源: ' + data.source +
+      (data.unknown_fields && data.unknown_fields.length
+        ? '；新增字段: ' + data.unknown_fields.join(', ') : '');
+  } catch (e) {
+    status.textContent = '复制状态读取失败: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
+async function loadMetricsSummary() {
+  const target = $id('prod-metrics-table');
+  const status = $id('prod-metrics-status');
+  const url = $id('prod-metrics-url').value.trim();
+  if (!target || !status) return;
+  if (!url) {
+    status.textContent = '请输入 metrics URL（可设置 LIGHTDB_METRICS_URL）';
+    status.classList.add('status-error');
+    return;
+  }
+  status.textContent = '拉取中...';
+  status.classList.remove('status-error');
+  try {
+    const data = await api('/metrics/summary?url=' + encodeURIComponent(url) +
+      (currentConn ? '&connection=' + encodeURIComponent(currentConn) : ''));
+    const s = data.summary || {};
+    const labels = [['qps', 'QPS'], ['connections', '连接'],
+                    ['errors', '错误'], ['slow', '慢查询'],
+                    ['wal', 'WAL'], ['checkpoint', 'Checkpoint'],
+                    ['pool', '连接/缓冲池']];
+    renderKeyValueTable(target, labels.map(p => {
+      const item = s[p[0]] || {};
+      return [p[1], item.value === null || item.value === undefined ? '—' : item.value];
+    }));
+    status.textContent = '已拉取 ' + (s.sample_count || 0) + ' 个指标样本';
+  } catch (e) {
+    status.textContent = 'metrics 不可达/解析失败（可重试）: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
+async function runSnapshotBackup() {
+  const status = $id('prod-snapshot-status');
+  const log = $id('prod-snapshot-log');
+  try {
+    const data = await api('/snapshot/backup', {
+      method: 'POST',
+      body: JSON.stringify({
+        data_dir: $id('prod-snapshot-data').value.trim(),
+        out: $id('prod-snapshot-out').value.trim(),
+      }),
+    });
+    status.textContent = '备份 ' + (data.ok ? '成功' : '失败') +
+      '，返回码 ' + data.returncode;
+    status.classList.toggle('status-error', !data.ok);
+    log.textContent = (data.stdout || '') + '\n' + (data.stderr || '') +
+      '\n' + (data.error || '');
+  } catch (e) {
+    status.textContent = '备份失败: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
+async function runSnapshotRestore() {
+  const status = $id('prod-snapshot-status');
+  const log = $id('prod-snapshot-log');
+  const snapshot = $id('prod-restore-path').value.trim();
+  const dataDir = $id('prod-snapshot-data').value.trim();
+  if (!snapshot || !dataDir) {
+    status.textContent = '恢复需要快照目录和 data-dir';
+    status.classList.add('status-error');
+    return;
+  }
+  if (!window.confirm('恢复快照会覆盖目标数据目录，不可逆。是否继续？')) {
+    status.textContent = '用户取消恢复（未执行）';
+    return;
+  }
+  try {
+    const data = await api('/snapshot/restore', {
+      method: 'POST',
+      body: JSON.stringify({snapshot: snapshot, data_dir: dataDir,
+                            confirm: true}),
+    });
+    status.textContent = '恢复 ' + (data.ok ? '成功' : '失败') +
+      '，返回码 ' + data.returncode;
+    status.classList.toggle('status-error', !data.ok);
+    log.textContent = (data.stdout || '') + '\n' + (data.stderr || '') +
+      '\n' + (data.error || '');
+  } catch (e) {
+    status.textContent = '恢复失败: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
+
 window.addEventListener('DOMContentLoaded', async () => {
   $id('login-btn').onclick = doLogin;
   $id('login-pass').onkeydown = (e) => {
@@ -1341,6 +1483,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   $id('tool-quality-btn').onclick = () => switchTool('quality');
   $id('tool-er-btn').onclick = () => switchTool('er');
   $id('tool-plugins-btn').onclick = () => switchTool('plugins');
+  $id('tool-production-btn').onclick = () => switchTool('production');
+  $id('prod-rep-refresh').onclick = loadReplicationStatus;
+  $id('prod-metrics-refresh').onclick = loadMetricsSummary;
+  $id('prod-snapshot-backup').onclick = runSnapshotBackup;
+  $id('prod-snapshot-restore').onclick = runSnapshotRestore;
   $id('er-refresh-btn').onclick = loadER;
   $id('er-fit-btn').onclick = () => { if (erController) erController.fit(); };
   $id('er-reset-btn').onclick = () => { if (erController) erController.reset(); };

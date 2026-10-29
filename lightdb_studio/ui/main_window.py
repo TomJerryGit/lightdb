@@ -689,6 +689,11 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._open_snapshot)
         m_tools.addAction(a)
 
+        a = QAction("🩺 生产面板：复制 / 指标 / 二进制快照...", self)
+        a.setToolTip('读取真实复制状态、Prometheus 指标摘要、调用快照 CLI（恢复需确认）')
+        a.triggered.connect(self._open_production_panel)
+        m_tools.addAction(a)
+
         a = QAction("🚚 数据库迁移...", self)
         a.triggered.connect(self._open_migration)
         m_tools.addAction(a)
@@ -2228,6 +2233,13 @@ class MainWindow(QMainWindow):
         dlg = SnapshotDialog(
             conn_getter=self._get_current_conn, parent=self)
         dlg.exec()
+
+    def _open_production_panel(self):
+        """task-83：复制状态 / metrics 摘要 / 二进制快照 CLI 面板。"""
+        from .production_panel import ProductionPanel
+        dlg = ProductionPanel(conn_getter=self._get_current_conn, parent=self)
+        dlg.exec()
+        return dlg
 
     def _tick_snapshot_schedule(self):
         """P2-5：主窗口定时器回调——到点才创建定时快照。
