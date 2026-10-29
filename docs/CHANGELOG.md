@@ -130,6 +130,51 @@
 | 发布 / 安装 | test_release_installer / test_studio_release | 25+ |
 | 自动更新（本次） | test_auto_update_distribution | 9 |
 
+
+## [4.0.0] — 2026-10-29（Wave 3 收尾：生产化 / 引擎深水区 / 分片 / 发布刷新）
+
+### 生产化
+- `/metrics` 内嵌端点（连接/QPS/错误/慢查询/WAL/checkpoint/备份/池指标，Prometheus 文本 + JSON + /health；默认回环关闭）
+- 慢查询日志（阈值 env、环形缓冲 + JSONL 轮转、口令脱敏、`__SLOW_QUERY_LOG__` 可读）
+- 审计按大小/条数轮转（先落盘后切、崩溃安全、SHOW AUDIT LOG 行为不变）
+- 连接池（线程复用/空闲缩容/健康检查、`LIGHTDB_POOL_*`、超限 1040、排队、池指标）
+- **增量复制**（`--follow --interval` 持续追平；失败保留断点不跳过；1236 binlog 缺口显式
+  + `--reset-position`；指数退避；状态原子写 + sha256；`/metrics` 复制延迟指标；
+  1k 事件约 295 ev/s；单主无自动 failover）
+
+### 引擎深水区
+- **视图 JOIN 内联**：简单视图展开为派生表再 Hash Join（1.14x 手写，原物化 3.16x），
+  复杂视图安全回退物化；修复物化路径 NULL 键误匹配
+- **复合主键 3–4 列** + **BTree v3 页格式**（16B 键、叶 24B/内部 20B）；10k 行
+  点查 3.5ms / 前缀 6.0ms / 范围 6.6ms；v1/v2→v3 迁移脚本（真实旧库迁移校验 OK）
+- **LIKE 前缀索引**（10k 行 29x）；`%x%` 保持全扫
+- **二进制 PREPARE**（COM_STMT_*）：参数类型绑定、会话隔离、1243/1210/1064 错误码、
+  RESET、大结果集；SEND_LONG_DATA/游标 FETCH 显式 1235
+- **多进程只读分片原型**：主键区间分片 + 快照每 worker 独立进程；100k 行复用快照
+  4 worker 端到端 **2.85x**、查询段 3.63x（线程对照 0.96x，确认 GIL 瓶颈）；
+  快照准备开销为产品化主要障碍；仅只读/单表/BETWEEN，不支持形态显式 1105
+
+### UI
+- Studio/Web 生产面板：复制状态（SHOW SLAVE STATUS + 状态文件回退）、`/metrics` 摘要、
+  二进制快照备份/恢复（恢复二次确认、不自动执行）
+- Web P3+：ER 拖拽/缩放/关联高亮、图表 tooltip/图例/柱线切换/本地导出、
+  动态 i18n（未翻译清单缩至 2 项）、ER 大库按前缀分组按需渲染（100 表 1ms）、
+  CSV multipart 流式上传（64KiB 分块，超限 413）
+- UI 闭环：Playwright E2E（无浏览器显式 skip）、多窗口生命周期与共享设置、
+  快捷键全覆盖/作用域/恢复默认
+
+### 发布工程 / CI
+- 安装包与 zip 重新构建（Inno 需绝对路径）；`verify_release` PASS=12/0
+- CHANGELOG / RELEASE_NOTES / 路线图定稿；自动更新下发三分支（下载 + SHA256，不自动安装）
+- CI：全量套件加 `pytest-timeout`（300s/thread）防挂起；残留清理收窄为 runner 进程特征；
+  最终 **1755 tests / 0 failed** + benchmark + GUI perf + packaging 全绿
+
+### 已知限制（新增）
+- 复制：单主、无自动 failover、单线程 apply、schema 必须一致
+- 分片：仅只读/单表/整数主键 BETWEEN；快照/进程启动开销大，未接入 server 路由
+- 复合主键 ≤4 列、每分量 signed-32；BTree v3 需旧库迁移
+- 进程内多线程受 GIL + 表锁 + 每事务 flush 限制；组提交/解析缓存/读写锁拆分未落地
+
 ### 已知限制 / 未完成（详见路线图 backlog）
 
 - 自动更新**不含自动安装/替换**（下载+校验后由用户手动安装）。

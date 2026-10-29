@@ -146,3 +146,18 @@ python -m benchmarks.competitive_harness --suite quick   # 自检基准
 - [CONCURRENCY_SCALING.md](CONCURRENCY_SCALING.md) — 并发扩展性与瓶颈证据。
 - [benchmarks/README.md](../benchmarks/README.md) — 基准口径与门禁。
 - [review/04_ROADMAP.md](review/04_ROADMAP.md) — 路线图完成项与剩余 backlog。
+
+---
+
+## 附：2026-10-29 Wave 3 新增能力（4.0.0 刷新）
+
+- **生产运维**：`/metrics`（连接/QPS/错误/慢查询/WAL/池）、慢查询日志、审计轮转、
+  连接池、**增量复制**（持续追平/断点续传/1236 缺口显式/延迟指标）
+- **引擎**：视图 JOIN 内联（1.14x 手写）、复合主键 3–4 列 + BTree v3（旧库迁移脚本）、
+  LIKE 前缀索引（29x）、二进制 PREPARE
+- **多进程只读分片原型**：100k 行 4 worker 2.85x（快照开销为产品化障碍，仅原型）
+- **桌面/Web**：生产面板（复制状态/metrics 摘要/快照备份恢复）、ER 拖拽缩放、
+  图表交互、动态 i18n、CSV multipart 流式上传
+- **发布**：安装包与 zip 已用最新代码重建（`verify_release` PASS=12/0，未签名 WARN）；
+  CI 全绿 1755 tests / 0 failed
+- 详细变更见 `docs/CHANGELOG.md` 2026-10-29 章节与 `docs/RELEASE_2026-10-29_WAVE3.md`
