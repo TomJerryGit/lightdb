@@ -351,3 +351,106 @@ python scripts/replica_apply.py --master-host 127.0.0.1 --master-port 8899 \
 6. 复制状态文件在目标数据目录（非集群元数据），不做多副本/高可用；
 7. 连接池的排队发生在已建立 TCP、未握手阶段（客户端会看到握手响应延迟），
    不是 MySQL 侧的真实"连接代理"；池不替代 `max_connections` 准入。
+
+---
+
+## 9. 增量复制（task-81）：持续追平 / 延迟指标 / 重试 / 断点恢复
+
+### 9.1 模式与 CLI
+
+在 task-71 原型（单次拉取 + `--follow` 简单轮询）之上补齐：
+
+```bash
+# 持续增量跟随（默认无限重试；失败保留断点、指数退避、不跳过）
+python scripts/replica_apply.py --master-host 127.0.0.1 --master-port 8899 \
+    --target-data-dir /tmp/replica-data --follow --interval 0.2 \
+    --retry-backoff 0.5 --max-backoff 30 --max-retries 0
+
+# 一次性追平（无新事件即退出）
+python scripts/replica_apply.py --master-host 127.0.0.1 --master-port 8899 \
+    --target-data-dir /tmp/replica-data
+
+# 排障：查看本地状态（不连主库）；看主库 binlog 清单
+python scripts/replica_apply.py ... --show-state --json
+python scripts/replica_apply.py ... --show-binary-logs
+
+# 位点缺口（1236）人工确认后：显式跳过缺失区间（目标数据需自行校验）
+python scripts/replica_apply.py ... --reset-position
+```
+
+`--follow` 每轮：`SHOW MASTER STATUS` + `SHOW BINARY LOGS` + lsn 范围
+（COUNT/MIN/MAX）→ 缺口检测 → `__BINLOG_FETCH__ WHERE lsn > 已应用 lsn`
+拉取 → 顺序 apply → 原子写状态 → 等待 `--interval`。`--json` 的 stdout 是纯
+JSON（引擎日志压到 ERROR），退出码 0/1/2。
+
+### 9.2 失败语义（显式、保留断点、不跳过）
+
+* **apply 失败**：抛出 `ReplicaApplyError`（带 pos/lsn/type/table 上下文），
+  状态文件 **lsn 停在最后成功事件**、`errors+1` 落盘；follow 下一轮从同一位点
+  重试（幂等重放），**绝不跳到失败事件之后**；
+* **瞬态链路失败**（主库连接/读取错误码 2002/2003/2006/2013/1040/...）：
+  `ReplicaRetryableError`，按 `retry_backoff * 2^n`（上限 `max_backoff`）退避；
+  `max_retries=0` 无限重试（生产默认，不自动 failover），>0 超限后显式抛错；
+  每次重试写 WARN 日志（含当前断点 lsn）；
+* **binlog 位点缺口**（主库轮转后把起始文件删了/重建，`MIN(lsn)` 已大于本地
+  已应用 lsn）：`ReplicaBinlogGap`（**errno 1236** / SQLSTATE HY000 风格），
+  消息含可用文件清单、主库最早 lsn、本地 lsn 与恢复策略；CLI 打印
+  `ERROR 1236 (HY000)` 并退出 1，**不自动跳过**；
+* **恢复策略**：(a) 从主库重新全量备份/快照重建目标库（推荐，保证一致）；
+  (b) 人工确认可接受丢事件后 `--reset-position` 把位点推进到主库当前可用
+  末尾（显式跳过缺失区间，目标数据需自行校验/修复）。
+
+### 9.3 状态文件（原子 + 校验）
+
+* `replica_state.json`：`{version, master_host/port, master_file, lsn, seq,
+  applied, idempotent, errors, last_event_type, last_apply_ts, saved_at,
+  checksum}`；
+* 写入：`tmp + fsync(批末) + os.replace` 原子替换；读入时校验
+  `version`/字段类型/非负 + **sha256 checksum**（排除 checksum/saved_at），
+  损坏/截断/被篡改 → `ReplicaError` 显式拒绝，**不猜位点**；
+* 断点续传：任何中断（含 `kill -9`）后从持久 lsn 继续；最后一批可能被重放，
+  重放按幂等处理（INSERT 主键冲突 / UPDATE|DELETE affected=0 / DDL 已生效）。
+
+### 9.4 指标（`/metrics`，target 节点）
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `lightdb_replica_lag_lsn` | gauge | 主库最大 lsn − 已应用 lsn（真实字节差，追平 0） |
+| `lightdb_replica_lag_seconds` | gauge | 落后时距上次成功 apply 的秒数；追平 0 |
+| `lightdb_replica_events_behind` | gauge | 主库 `lsn > 已应用` 的事件数（真实 COUNT） |
+| `lightdb_replica_applied_lsn` | gauge | 已应用全局 lsn（= 状态文件 lsn） |
+| `lightdb_replica_master_lsn` | gauge | 主库当前最大可读 lsn |
+| `lightdb_replica_applied_events_total` | counter | 已 apply 事件数 |
+| `lightdb_replica_apply_errors_total` | counter | apply 失败次数（断点保留） |
+| `lightdb_replica_last_apply_ts` | gauge | 最后一次成功 apply 的 unix 时间戳 |
+| `lightdb_replica_caught_up` | gauge | 1=追平，0=落后/未运行 |
+| `lightdb_replica_retries_total` | counter | follow 模式累计重试次数 |
+
+数据源：目标库 `Database.replication_status()` → `ReplicaPrototype.show_status()`
+（与状态文件同一快照）。**未配置/无数据时全部输出 0** 并带 `#` 注释；
+数值在锁内成组读取，不会出现 "applied_lsn 已前进、master_lsn 还是上一批"
+的撕裂值。
+
+### 9.5 SHOW SLAVE STATUS（与状态文件一致）
+
+原型在构造时注册到目标库，`SHOW SLAVE STATUS` 的动态列（未改 executor）
+由 `show_status()` 提供：
+
+* `Master_Host/User/Port`、`Master_Log_File`（状态文件记录的主库 binlog 文件）；
+* `Read_Master_Log_Pos` / `Exec_Master_Log_Pos` = **全局 lsn**（跨 binlog 单调，
+  与状态文件 `lsn` 完全一致；不是文件内偏移，本引擎的位点语义见 §7.1）；
+* `Seconds_Behind_Master` = `lag_seconds`（追平 0；落后=距上次成功 apply 秒数）；
+* `Slave_IO_Running`/`Slave_SQL_Running`：follow 运行中 = `Yes`；重试中
+  `Connecting`+错误文本；未跟随/停止 = `No`；
+* `Last_Errno`/`Last_Error` 等 = 最近一次真实错误（无错误 0/空串）；
+  `Master_Info_File` = 状态文件路径；`Relay_Log_Space` = 状态文件真实字节数。
+
+### 9.6 量化与边界（本机 2026-10-29）
+
+* 增量 1k 事件（主库持续写入、follow 追平）：见测试
+  `test_1k_events_incremental_latency` 打印的 `write/apply/rate`（同机实测
+  与 §7.3 同量级：单线程数百 events/s，具体数值随机器负载波动）；
+* 边界：**单主**、**无自动 failover**（主库不可达只重试到上限后报错）、
+  **单线程 apply**（无并行/无冲突解决）、schema 必须一致、不触发目标侧
+  触发器/外键级联；延迟口径不含事件时间戳（导出接口限制），
+  `Seconds_Behind_Master` 为 apply 侧落后时长而非 MySQL 精确事件延迟。

@@ -438,3 +438,57 @@ def test_cli_end_to_end_json(tmp_path, monkeypatch):
         db.shutdown()
     finally:
         master.cleanup()
+
+
+# ==================== 7. 状态快照 / SHOW SLAVE STATUS 一致性（task-81） ====================
+
+def test_show_status_snapshot_matches_state_file(tmp_path, monkeypatch):
+    """原型注册后：SHOW SLAVE STATUS 的位点/延迟与状态文件一致（task-81）"""
+    from lightdb.net.replica_proto import ReplicaPrototype
+
+    master = MasterEnv(tmp_path, monkeypatch)
+    target = _target(tmp_path, monkeypatch)
+    try:
+        conn = master.connect()
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE t (id INT PRIMARY KEY, v INT)')
+        for i in range(1, 6):
+            cur.execute(f'INSERT INTO t VALUES ({i}, {i})')
+        conn.close()
+
+        proto = track(ReplicaPrototype('127.0.0.1', master.cfg.port,
+                                       target))
+        stats = proto.run_until_caught_up(batch=100)
+        assert stats['caught_up'] is True
+        # db.replication_status() 即 show_status() 快照（同一份数据）
+        status = target.replication_status()
+        assert status is not None
+        assert status['Replica_Is_Prototype'] is True
+        assert status['Replica_Applied_LSN'] == proto.state['lsn']
+        assert status['Replica_Lag_LSN'] == 0
+        assert status['Replica_Lag_Seconds'] == 0
+        assert status['Replica_Caught_Up'] == 1
+        # 校验和存在且可重算
+        raw = json.loads(open(proto.state_path, encoding='utf-8').read())
+        assert raw['checksum'] == ReplicaPrototype._state_checksum(raw)
+        # SHOW SLAVE STATUS 的延迟/位点取自同一份状态
+        from lightdb.sql.parser import parser
+        r = proto.executor.execute(parser.parse('SHOW SLAVE STATUS'), {})
+        assert r['type'] == 'resultset'
+        row = dict(zip(r['columns'], r['rows'][0]))
+        assert row['Exec_Master_Log_Pos'] == proto.state['lsn']
+        assert row['Read_Master_Log_Pos'] == proto.state['lsn']
+        assert row['Master_Log_File'] == proto.state['master_file']
+        assert row['Seconds_Behind_Master'] == 0.0
+        assert row['Last_Errno'] == 0
+        # 无数据（新 proto、未运行）时数值列 0，不编造
+        fresh = track(ReplicaPrototype('127.0.0.1', master.cfg.port,
+                                       _target(tmp_path, monkeypatch,
+                                               'fresh_target')))
+        st = fresh.show_status()
+        assert st['Replica_Applied_LSN'] == 0
+        assert st['Replica_Lag_LSN'] == 0
+        assert st['Seconds_Behind_Master'] == 0.0
+        assert st['Last_Errno'] == 0
+    finally:
+        master.cleanup()

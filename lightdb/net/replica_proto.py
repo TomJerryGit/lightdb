@@ -32,19 +32,36 @@
   payload 非法 JSON、未知 event_type、DDL/DML apply 失败 → 全部抛
   `ReplicaApplyError`（带上下文），绝不静默跳过。
 
+增量模式（task-81）
+-------------------
+
+* `follow()`（CLI `--follow --interval N`）持续轮询增量：拉取→应用→等待；
+* **失败保留断点、不跳过**：apply 失败时状态文件停在最后成功事件的 lsn，
+  下一轮从同一位点重试（幂等重放）；连续失败按指数退避（可配上限/重试次数）
+  并写日志；终态错误显式抛给调用方；
+* **binlog 位点缺口**（主库轮转后把起始文件删了/重建，`MIN(lsn)` 已大于本地
+  已应用 lsn）→ 抛 `ReplicaBinlogGap`（errno **1236** 风格），消息含可用
+  文件清单与恢复策略（`--reset-position` 显式放弃缺失区间，不自动跳过）；
+* 状态文件原子写 + `checksum` 校验（损坏/半截/被篡改 → 显式拒绝，不猜位点）；
+* 指标：`db.replication_status()` 暴露 `Replica_*` 快照，`/metrics` 渲染为
+  `lightdb_replica_*`；`SHOW SLAVE STATUS` 的延迟/位点列取同一份状态。
+
 限制（原型边界，如实写进 docs/PRODUCTION_READINESS.md）
 --------------------------------------------------------
 
 * **单主**：一个原型实例只跟一个主库；没有拓扑管理；
-* **无自动 failover**：主库挂了就停（`ReplicaError`），不做选主/切主；
+* **无自动 failover**：主库挂了就停（重试到上限后抛 `ReplicaError`），
+  不做选主/切主；
 * **无多线程 apply**：严格按事件顺序串行应用（单线程）；
 * 目标库 schema 必须与主库一致（DML 行镜像按列顺序/主键 apply；DDL 按
   binlog 里的原始 SQL 重放；不做 schema diff 修复）；
 * 触发器/外键/存储过程副作用不在行镜像里（行级复制不触发目标侧触发器）；
-* 事件时间戳不在导出接口里：原型报告"apply 处理延迟"（拉取→应用耗时）
-  与 `last_apply_ts`，**不**伪造 MySQL 的 `Seconds_Behind_Master`；
+* 事件时间戳不在导出接口里：`lag_seconds` 是**落后时距上次成功 apply 的
+  秒数**（追平恒 0），不是 MySQL 按事件时间戳算的 `Seconds_Behind_Master`；
+  `lag_lsn` 是主库最大 lsn 与已应用 lsn 的**真实字节差**；
 * 不加密、不压缩、不做 binlog 位点校验和（CRC 已由主库读取端校验）。
 """
+import hashlib
 import json
 import os
 import threading
@@ -60,9 +77,45 @@ _IDEMPOTENT_DDL_ACTIONS = frozenset({
     'ADD COLUMN', 'DROP COLUMN', 'RENAME TO',
 })
 
+#: 位点缺口恢复说明（CLI / 异常消息 / 文档共用同一段文字）
+GAP_RECOVERY_HINT = (
+    '恢复策略：原型不会自动跳过缺失区间。请二选一：'
+    '(a) 从主库重新做一次全量备份/快照并重建目标库（推荐，保证一致）；'
+    '(b) 确认可接受丢事件后，用 CLI `--reset-position` 显式把位点推进到'
+    '主库当前可用末尾（会跳过缺失事件，目标数据需自行校验/修复）。'
+)
+
 
 class ReplicaError(Exception):
     """复制链路错误（不可恢复/需人工处理）"""
+
+
+class ReplicaRetryableError(ReplicaError):
+    """可重试错误（主库连接/读取瞬时失败）；断点保留，退避后重试同一个 lsn"""
+
+
+class ReplicaBinlogGap(ReplicaError):
+    """起始位点所在 binlog 已被主库清理/重建（MySQL 1236 风格错误）
+
+    * 显式拒绝继续：本地已应用 lsn 早于主库当前最早可用 lsn，缺失事件
+      无法补齐；自动跳过会造成静默数据丢失，因此**必须人工决策**；
+    * ``available_logs`` / ``earliest_lsn`` / ``local_lsn`` 供排障；
+    * 恢复策略见 ``GAP_RECOVERY_HINT`` / docs。
+    """
+
+    errno = 1236
+    sqlstate = 'HY000'
+
+    def __init__(self, message: str, available_logs=None,
+                 earliest_lsn=None, local_lsn=None):
+        self.available_logs = list(available_logs or [])
+        self.earliest_lsn = earliest_lsn
+        self.local_lsn = local_lsn
+        super().__init__(
+            f'复制位点缺口（errno 1236）：{message}；'
+            f'可用 binlog 文件={self.available_logs or "[]"}，'
+            f'主库最早 lsn={earliest_lsn}，本地已应用 lsn={local_lsn}。'
+            f'{GAP_RECOVERY_HINT}')
 
 
 class ReplicaApplyError(ReplicaError):
@@ -89,7 +142,8 @@ class ReplicaPrototype:
     def __init__(self, master_host: str, master_port: int, target_db,
                  user: str = 'root', password: str = '',
                  state_path: str = None, connect_timeout: float = 5.0,
-                 read_timeout: float = 60.0, target_executor=None):
+                 read_timeout: float = 60.0, target_executor=None,
+                 auto_register: bool = True):
         self.master_host = str(master_host)
         self.master_port = int(master_port)
         self.user = user
@@ -98,13 +152,57 @@ class ReplicaPrototype:
         self.read_timeout = float(read_timeout)
         self.target_db = target_db
         self._executor = target_executor
-        self._lock = threading.Lock()
+        #: RLock：apply_event/延迟快照/show_status 互斥，避免 metrics 读到
+        #: "state 已前进但 master_lsn 还是上一批"的撕裂快照
+        self._lock = threading.RLock()
         self.state_path = (
             state_path if state_path is not None
             else os.path.join(str(target_db.data_dir), 'replica_state.json'))
         self.state = self._load_state()
         self.started_at = time.time()
         self._last_error = None
+        #: 最近一次成功 run 的运行时快照（不进状态文件，SHOW/metrics 用）
+        self._following = False
+        self._caught_up = True
+        self._master_max_lsn = 0
+        self._earliest_master_lsn = 0
+        self._events_behind = 0
+        self._lag_bytes = 0
+        self._lag_seconds = 0.0
+        self._last_batch_events = 0
+        self._last_batch_ts = 0.0
+        self._batches = 0
+        self._retries = 0
+        self._last_error_errno = None
+        self._closed = False
+        # 让目标库的 `SHOW SLAVE STATUS`（经 db.replication_status()）读到
+        # 本原型的真实位点/延迟；这是既有注册接口，不需要改 db/executor。
+        if auto_register:
+            self._register_on_target()
+
+    def _register_on_target(self):
+        attach = getattr(self.target_db, 'attach_replicator', None)
+        if callable(attach):
+            try:
+                attach(self)
+            except Exception as e:                # pragma: no cover - 防御
+                logger.warn(f"注册复制状态到目标库失败（不影响复制）: {e}")
+
+    def close(self):
+        """注销状态注册并落一次盘（幂等；不停止外部 follow 循环）"""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.save_state(sync=True)
+        except ReplicaError as e:                 # pragma: no cover - 防御
+            logger.warn(f"复制器关闭时写状态失败: {e}")
+        detach = getattr(self.target_db, 'detach_replicator', None)
+        if callable(detach):
+            try:
+                detach(self)
+            except Exception:                     # pragma: no cover - 防御
+                pass
 
     # ==================== 状态持久化 ====================
 
@@ -123,6 +221,43 @@ class ReplicaPrototype:
             'last_apply_ts': 0.0,
         }
 
+    #: 状态文件里参与 checksum 的字段（排除 checksum/saved_at 自身）
+    _CHECKSUM_EXCLUDED = ('checksum', 'saved_at')
+
+    @classmethod
+    def _state_checksum(cls, state: dict) -> str:
+        """状态内容 sha256（按 key 排序的规范 JSON；不含 checksum/saved_at）"""
+        payload = {k: v for k, v in state.items()
+                   if k not in cls._CHECKSUM_EXCLUDED}
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                          separators=(',', ':'))
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+    def _validate_state(self, state: dict, path: str):
+        """状态字段校验（类型/范围/版本）；非法 → 显式 ReplicaError"""
+        if state.get('version') != self.STATE_VERSION:
+            raise ReplicaError(
+                f'复制状态文件版本不支持（期望 {self.STATE_VERSION}，'
+                f'实际 {state.get("version")!r}）: {path}')
+        for key in ('lsn', 'seq', 'applied', 'idempotent', 'errors'):
+            value = state.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 0:
+                raise ReplicaError(
+                    f'复制状态文件字段 {key} 非法（需要非负整数）: '
+                    f'{value!r} @ {path}')
+        mf = state.get('master_file')
+        if mf is not None and not isinstance(mf, str):
+            raise ReplicaError(
+                f'复制状态文件字段 master_file 非法: {mf!r} @ {path}')
+        ts = state.get('last_apply_ts')
+        if not isinstance(ts, (int, float)) or ts < 0:
+            raise ReplicaError(
+                f'复制状态文件字段 last_apply_ts 非法: {ts!r} @ {path}')
+        for key in ('master_host', 'master_port'):
+            if state.get(key) is None:
+                state[key] = getattr(self, key, None)
+
     def _load_state(self) -> dict:
         state = self._default_state()
         path = str(self.state_path)
@@ -135,20 +270,34 @@ class ReplicaPrototype:
                 f'复制状态文件损坏，拒绝从不确定位点继续: {path}: {e}')
         if not isinstance(raw, dict):
             raise ReplicaError(f'复制状态文件格式非法: {path}')
+        saved = raw.get('checksum')
+        if saved is not None:
+            actual = self._state_checksum(raw)
+            if saved != actual:
+                raise ReplicaError(
+                    f'复制状态文件校验失败（checksum 不匹配，'
+                    f'可能被截断/篡改）: {path}: '
+                    f'expected={saved} actual={actual}')
+        else:                                    # 兼容 task-71 旧状态文件
+            logger.warn(f'复制状态文件无 checksum（旧格式），按内容校验: {path}')
         state.update({k: raw[k] for k in state if k in raw})
+        self._validate_state(state, path)
         return state
 
     def save_state(self, sync: bool = False):
-        """原子写回状态（tmp + replace）
+        """原子写回状态（tmp + fsync? + replace），并写入内容校验和
 
         * 默认 ``sync=False``：只 flush 到 OS（不 fsync）—— 每条事件都 fsync
           在 Windows 上实测约 0.2s/次，1000 事件会慢到不可用；
         * ``sync=True``：批末/错误路径做一次 fsync，保证断点续传位点尽量
-          不丢（崩溃最多回放最后一批事件，重放按幂等处理）。
+          不丢（崩溃最多回放最后一批事件，重放按幂等处理）；
+        * 状态里带 ``checksum``（sha256，排除 checksum/saved_at），
+          `_load_state` 会校验；损坏/半截文件显式拒绝，不猜位点。
         * 失败抛 ReplicaError（不能假装已持久化）。
         """
         state = dict(self.state)
         state['saved_at'] = time.time()
+        state['checksum'] = self._state_checksum(state)
         path = str(self.state_path)
         parent = os.path.dirname(path)
         if parent:
@@ -166,6 +315,25 @@ class ReplicaPrototype:
 
     # ==================== 主库访问 ====================
 
+    #: 主库连接/读取的瞬时错误码（可退避重试；断点保留）
+    _RETRYABLE_ERRNOS = frozenset({
+        1040, 1053, 1152, 1158, 1159, 1160, 1161,      # 连接/过载类
+        2002, 2003, 2006, 2013, 2014, 2038, 2055,      # socket/网络类
+    })
+
+    @classmethod
+    def _classify_link_error(cls, exc: Exception) -> ReplicaError:
+        """把 pymysql 异常分成"可重试"与"显式不可恢复"两类"""
+        code = None
+        try:
+            code = int(getattr(exc, 'args', [None])[0])
+        except Exception:                        # pragma: no cover - 防御
+            code = None
+        if code in cls._RETRYABLE_ERRNOS:
+            return ReplicaRetryableError(
+                f'主库链路瞬时失败（errno {code}）: {exc}')
+        return ReplicaError(f'主库链路失败: {exc}')
+
     def _connect(self):
         import pymysql
         try:
@@ -174,11 +342,15 @@ class ReplicaPrototype:
                 user=self.user, password=self.password,
                 connect_timeout=self.connect_timeout,
                 read_timeout=self.read_timeout, autocommit=True)
+        except pymysql.MySQLError as e:
+            raise self._classify_link_error(e)
         except Exception as e:
-            raise ReplicaError(
+            # 连接拒绝/DNS/超时等：transient，可退避重试
+            raise ReplicaRetryableError(
                 f'连接主库失败 {self.master_host}:{self.master_port}: {e}')
 
     def _query(self, conn, sql: str):
+        import pymysql
         try:
             cur = conn.cursor()
             cur.execute(sql)
@@ -187,8 +359,52 @@ class ReplicaPrototype:
             return cols, rows
         except ReplicaError:
             raise
+        except pymysql.MySQLError as e:
+            raise self._classify_link_error(e)
         except Exception as e:
             raise ReplicaError(f'主库查询失败: {sql[:120]}: {e}')
+
+    def _aggregate_lsn(self) -> dict:
+        """主库当前可读事件的 lsn 范围（COUNT/MIN/MAX，真实查询）
+
+        返回 ``{'count': n, 'min_lsn': m, 'max_lsn': M}``；无事件时 0。
+        用于：真实 lag（主库最大 lsn - 已应用 lsn）、位点缺口检测。
+        """
+        conn = self._connect()
+        try:
+            cols, rows = self._query(
+                conn,
+                'SELECT COUNT(*), MIN(lsn), MAX(lsn) FROM __BINLOG_FETCH__')
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        row = rows[0] if rows else (0, 0, 0)
+
+        def _int(v):
+            try:
+                return int(v) if v is not None else 0
+            except (TypeError, ValueError):
+                return 0
+        return {'count': _int(row[0]), 'min_lsn': _int(row[1]),
+                'max_lsn': _int(row[2])}
+
+    def _aggregate_max_pos(self) -> int:
+        """主库当前最大事件序号（pos），用于 ``--reset-position``"""
+        conn = self._connect()
+        try:
+            cols, rows = self._query(
+                conn, 'SELECT MAX(pos) FROM __BINLOG_FETCH__')
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            return int(rows[0][0]) if rows and rows[0][0] is not None else 0
+        except (TypeError, ValueError):
+            return 0
 
     def master_status(self) -> dict:
         """`SHOW MASTER STATUS` → {file, position}；binlog 关闭时显式报错"""
@@ -452,37 +668,147 @@ class ReplicaPrototype:
             return bool(col) and str(col) not in have
         return False
 
+    # ==================== 位点/延迟核算 ====================
+
+    def _count_events_after(self, lsn: int) -> int:
+        """主库 `lsn > N` 的事件条数（真实 COUNT，用于 events_behind）"""
+        conn = self._connect()
+        try:
+            cols, rows = self._query(
+                conn,
+                f'SELECT COUNT(*) FROM __BINLOG_FETCH__ WHERE lsn > {int(lsn)}')
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            return int(rows[0][0]) if rows and rows[0][0] is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def check_binlog_gap(self, logs=None, agg=None):
+        """检测"起始位点所在 binlog 已被清理/重建"（1236 风格，显式拒绝）
+
+        判定（任一成立 → `ReplicaBinlogGap`）：
+        1. 状态文件记录的 ``master_file`` 不在主库 `SHOW BINARY LOGS` 清单里
+           （正常轮转会把旧文件保留，因此不会误报）；
+        2. 本地已应用 ``lsn`` 早于主库当前**最早可读 lsn**（`MIN(lsn)`），
+           中间事件已被删除 —— 无法补齐，自动跳过会静默丢数据。
+        """
+        if int(self.state.get('lsn') or 0) == 0:
+            return None                          # 全新复制：从可用起点开始
+        try:
+            if logs is None:
+                logs = self.binary_logs()
+            if agg is None:
+                agg = self._aggregate_lsn()
+        except ReplicaError:
+            raise                                # 链路错误由调用方按可重试处理
+        names = [item.get('name') for item in (logs or [])]
+        prev_file = self.state.get('master_file')
+        earliest = int((agg or {}).get('min_lsn') or 0)
+        local_lsn = int(self.state.get('lsn') or 0)
+        missing_file = bool(prev_file and names and prev_file not in names)
+        lsn_behind_earliest = bool(earliest > 0 and local_lsn < earliest)
+        if missing_file or lsn_behind_earliest:
+            reason = (f'状态文件记录的 binlog {prev_file!r} 已不在主库'
+                      if missing_file else
+                      '本地已应用位点早于主库最早可读事件')
+            raise ReplicaBinlogGap(
+                reason, available_logs=names, earliest_lsn=earliest,
+                local_lsn=local_lsn)
+        return None
+
+    def reset_position(self) -> dict:
+        """显式放弃缺失区间：把位点推进到主库当前可用末尾（CLI 手动动作）
+
+        **会跳过主库已删除区间内的事件**，目标数据可能不一致；只在用户
+        明确接受（CLI ``--reset-position``）或 1236 缺口后人工决策时调用。
+        """
+        status = self.master_status()
+        agg = self._aggregate_lsn()
+        max_pos = self._aggregate_max_pos()
+        old_lsn = int(self.state.get('lsn') or 0)
+        self.state['lsn'] = int(agg.get('max_lsn') or 0)
+        self.state['seq'] = int(max_pos or 0)
+        self.state['master_file'] = status['file']
+        self.state['last_event_type'] = None
+        self._last_error = None
+        self._last_error_errno = None
+        self._caught_up = True
+        self._lag_bytes = 0
+        self._lag_seconds = 0.0
+        self._events_behind = 0
+        self.save_state(sync=True)
+        logger.warn(
+            f'复制位点被显式重置：lsn {old_lsn} -> {self.state["lsn"]}'
+            f'（跳过了主库已不可读区间，目标数据需自行校验）')
+        return {'old_lsn': old_lsn, 'new_lsn': self.state['lsn'],
+                'new_seq': self.state['seq'],
+                'master_file': status['file'],
+                'master_position': status['position'],
+                'master_events': agg.get('count', 0)}
+
+    def _update_lag_runtime(self, max_lsn: int, earliest_lsn: int,
+                            events_behind: int):
+        """更新运行时延迟快照（SHOW/metrics 用；不改持久位点）
+
+        在锁内一次性更新 state 引用之外的运行时字段，`show_status()` 在
+        同一把锁里复制快照 → 指标不会出现 "applied_lsn 已前进、
+        master_lsn 还是上一批" 的撕裂值。
+        """
+        with self._lock:
+            self._master_max_lsn = int(max_lsn or 0)
+            self._earliest_master_lsn = int(earliest_lsn or 0)
+            self._events_behind = max(0, int(events_behind or 0))
+            local_lsn = int(self.state.get('lsn') or 0)
+            self._lag_bytes = max(0, self._master_max_lsn - local_lsn)
+            self._caught_up = (self._events_behind == 0)
+            if self._caught_up:
+                self._lag_seconds = 0.0
+            else:
+                last = float(self.state.get('last_apply_ts') or 0.0)
+                self._lag_seconds = (round(time.time() - last, 3)
+                                     if last > 0 else 0.0)
+
     # ==================== 批量运行 ====================
 
     def run_once(self, limit: int = 500, save_every: int = 50) -> dict:
-        """拉取一批并串行 apply；返回统计（events/applied/idempotent/elapsed_ms）
+        """拉取一批并串行 apply；返回统计（events/applied/idempotent/...）
 
-        ``save_every``：每 N 条事件写一次状态（不 fsync）；批末统一
-        flush+fsync 一次。崩溃最多回放最后一批事件（重放按幂等处理），
-        换来 1000 事件 apply 的可用延迟（每条 fsync 在 Windows 上约 0.2s）。
+        * 先做位点缺口检测（1236 风格，显式拒绝而不是静默跳过）；
+        * ``save_every``：每 N 条事件写一次状态（不 fsync）；批末统一
+          flush+fsync 一次。崩溃最多回放最后一批事件（重放按幂等处理），
+          换来 1000 事件 apply 的可用延迟（每条 fsync 在 Windows 上约 0.2s）；
+        * **apply 失败不推进断点**：抛出前把 errors+1 写入状态文件（sync），
+          下一轮从同一个 lsn 重试（幂等重放），绝不跳到失败事件之后；
+        * 返回 ``caught_up/lag_lsn/lag_seconds/events_behind/master_lsn``
+          等真实核算值（供指标/SHOW SLAVE STATUS/CLI 使用）。
         """
         started = time.time()
         status = self.master_status()
         logs = self.binary_logs()
-        names = {item['name'] for item in logs}
-        prev_file = self.state.get('master_file')
-        if prev_file and names and prev_file not in names:
-            raise ReplicaError(
-                f'起始位点所在 binlog 文件 {prev_file!r} 在 master 已不存在'
-                f'（binlog 被清理/重建）：无法保证断点续传，拒绝继续')
+        agg = self._aggregate_lsn()
+        self.check_binlog_gap(logs=logs, agg=agg)
         events = self.fetch_events(self.state['lsn'], limit)
         stats = {'fetched': len(events), 'applied': 0, 'idempotent': 0,
                  'errors': 0, 'events': len(events), 'last_lsn': None,
                  'last_seq': None, 'master_file': status['file'],
                  'master_position': status['position'],
+                 'master_lsn': int(agg.get('max_lsn') or 0),
+                 'master_min_lsn': int(agg.get('min_lsn') or 0),
                  'elapsed_ms': 0.0, 'events_per_sec': 0.0}
         for idx, ev in enumerate(events):
             try:
                 res = self.apply_event(ev, persist=False)
             except ReplicaApplyError as e:
-                self.state['errors'] = int(self.state.get('errors') or 0) + 1
-                self.save_state(sync=True)
-                self._last_error = str(e)
+                with self._lock:
+                    self.state['errors'] = int(
+                        self.state.get('errors') or 0) + 1
+                    self._last_error = str(e)
+                    self._last_error_errno = getattr(e, 'errno', None)
+                self.save_state(sync=True)       # 断点保留（lsn 未前进）
                 stats['errors'] = 1
                 stats['error'] = str(e)
                 stats['elapsed_ms'] = round(
@@ -498,17 +824,48 @@ class ReplicaPrototype:
                 self.save_state()
         # 记录主库当前文件（用于清理检测；文件级，不含位点）
         self.state['master_file'] = status['file']
-        # 批末 fsync 一次：断点续传位点的持久化点（每事件不 fsync，
-        # 否则 Windows 上 1000 事件 ≈ 200s；崩溃最多回放本批、按幂等处理）
+        # 批末 fsync 一次：断点续传位点的持久化点（每事件不 fsync）
         self.save_state(sync=True)
+
+        # ===== 真实延迟核算（不含事件时间戳，口径见模块 docstring） =====
+        local_lsn = int(self.state.get('lsn') or 0)
+        # apply 期间主库可能继续写入：用**批末重新查询**的 lsn 范围核算，
+        # 避免出现 "master_lsn < applied_lsn" 的陈旧值（如实采集）。
+        try:
+            agg_after = self._aggregate_lsn()
+        except ReplicaError:
+            agg_after = agg
+        max_lsn = int(agg_after.get('max_lsn') or 0)
+        earliest_lsn = int(agg_after.get('min_lsn') or 0)
+        if max_lsn > local_lsn:
+            try:
+                events_behind = self._count_events_after(local_lsn)
+            except ReplicaError:
+                events_behind = len(events)
+        else:
+            events_behind = 0
+        self._update_lag_runtime(max_lsn, earliest_lsn, events_behind)
+        with self._lock:
+            self._batches += 1
+            self._last_batch_events = len(events)
+            self._last_batch_ts = time.time()
+            if events:
+                self._last_error = None           # 成功应用后清空错误
+                self._last_error_errno = None
         elapsed = time.time() - started
         stats['elapsed_ms'] = round(elapsed * 1000.0, 3)
         stats['events_per_sec'] = (
             round(len(events) / elapsed, 1) if elapsed > 0 else 0.0)
-        # 延迟口径：本批"拉取→应用完成"的处理延迟（不是 MySQL 的
-        # Seconds_Behind_Master；导出接口不含事件时间戳，如实说明）
         stats['lag_ms'] = stats['elapsed_ms']
-        stats['caught_up'] = len(events) == 0
+        stats['caught_up'] = self._caught_up
+        stats['lag_lsn'] = self._lag_bytes
+        stats['lag_seconds'] = self._lag_seconds
+        stats['events_behind'] = self._events_behind
+        stats['applied_lsn'] = local_lsn
+        stats['applied_events'] = int(self.state.get('applied') or 0)
+        stats['apply_errors'] = int(self.state.get('errors') or 0)
+        stats['last_apply_ts'] = float(
+            self.state.get('last_apply_ts') or 0.0)
         stats['state'] = dict(self.state)
         return stats
 
@@ -531,31 +888,244 @@ class ReplicaPrototype:
         total['events_per_sec'] = (
             round(total['events'] / (total['elapsed_ms'] / 1000.0), 1)
             if total['elapsed_ms'] > 0 else 0.0)
+        total['lag_seconds'] = self._lag_seconds
+        total['lag_lsn'] = self._lag_bytes
+        total['caught_up'] = self._caught_up
         total['state'] = dict(self.state)
         return total
 
     def follow(self, interval: float = 0.2, batch: int = 500,
-               stop_event: threading.Event = None, max_events: int = None):
-        """持续跟随（单线程）；主库不可达时抛 ReplicaError（无自动 failover）"""
+               stop_event: threading.Event = None, max_events: int = None,
+               retry_backoff: float = 0.5, max_backoff: float = 30.0,
+               max_retries: int = 0) -> dict:
+        """持续增量跟随（单线程轮询；失败保留断点、退避重试、不跳过）
+
+        语义（task-81）：
+
+        * 每一轮从**持久 lsn** 拉取增量并 apply；apply 失败 → 状态文件停在
+          最后成功事件、错误数+1，按指数退避重试同一位点（幂等重放）；
+        * ``max_retries=0`` 表示无限重试（生产默认）；>0 时连续失败超过上限
+          抛 ``ReplicaError``（显式，不自动 failover）；
+        * **binlog 位点缺口**（``ReplicaBinlogGap``，errno 1236）是终态错误：
+          缺失事件无法补齐，立即抛给调用方并附恢复策略（不自动跳过）；
+        * ``stop_event`` 置位后返回；``max_events`` 达到后返回（测试用）；
+        * 每次重试/错误都写日志（含当前断点位点），可观测、可告警。
+        """
         applied_total = 0
-        while True:
-            if stop_event is not None and stop_event.is_set():
-                return {'applied': applied_total, 'stopped': True}
-            try:
-                stats = self.run_once(limit=batch)
-            except ReplicaError:
-                raise
-            applied_total += stats['events']
-            if max_events is not None and applied_total >= max_events:
-                return {'applied': applied_total, 'stopped': True}
-            if stats['events'] == 0:
-                time.sleep(float(interval))
+        events_total = 0
+        retries = 0                 # 连续失败次数（退避用；成功后清零）
+        total_retries = 0           # 累计重试次数（结果/指标用，不清零）
+        failures = 0
+        started = time.time()
+        with self._lock:
+            self._following = True
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return self._follow_result(
+                        applied_total, events_total, total_retries, True,
+                        started)
+                try:
+                    stats = self.run_once(limit=batch)
+                    retries = 0
+                except ReplicaBinlogGap:
+                    # 位点缺口：终态错误，显式上抛（含可用文件/恢复策略）
+                    raise
+                except ReplicaError as e:
+                    failures += 1
+                    retries += 1
+                    total_retries += 1
+                    with self._lock:
+                        self._retries += 1
+                        self._last_error = str(e)
+                        self._last_error_errno = getattr(e, 'errno', None)
+                    delay = min(float(max_backoff),
+                                float(retry_backoff)
+                                * (2 ** min(retries - 1, 16)))
+                    logger.warn(
+                        f'增量复制失败（第 {retries} 次，累计 {failures} 次）'
+                        f'，断点 lsn={self.state.get("lsn")} 保留不跳过；'
+                        f'{delay:.2f}s 后重试: {e}')
+                    if max_retries and retries > int(max_retries):
+                        raise
+                    if stop_event is not None:
+                        # 可中断的退避等待
+                        if stop_event.wait(delay):
+                            return self._follow_result(
+                                applied_total, events_total, total_retries,
+                                True, started)
+                    else:
+                        time.sleep(delay)
+                    continue
+                applied_total += stats['events']
+                events_total += stats['events']
+                if max_events is not None and events_total >= int(max_events):
+                    return self._follow_result(
+                        applied_total, events_total, total_retries, True,
+                        started)
+                if stats['events'] == 0:
+                    if stop_event is not None:
+                        if stop_event.wait(float(interval)):
+                            return self._follow_result(
+                                applied_total, events_total, total_retries,
+                                True, started)
+                    else:
+                        time.sleep(float(interval))
+        finally:
+            with self._lock:
+                self._following = False
+                self._last_batch_ts = time.time()
+
+    def _follow_result(self, applied, events, retries, stopped,
+                       started) -> dict:
+        elapsed = time.time() - started
+        with self._lock:
+            caught_up = bool(self._caught_up)
+            lag_seconds = float(self._lag_seconds)
+            lag_lsn = int(self._lag_bytes)
+            state = dict(self.state)
+        return {
+            'applied': int(applied), 'events': int(events),
+            'retries': int(retries), 'stopped': bool(stopped),
+            'elapsed_ms': round(elapsed * 1000.0, 3),
+            'events_per_sec': (round(events / elapsed, 1)
+                               if elapsed > 0 else 0.0),
+            'caught_up': caught_up,
+            'lag_seconds': lag_seconds,
+            'lag_lsn': lag_lsn,
+            'state': state,
+        }
+
+    # ==================== 状态展示（SHOW SLAVE STATUS / 指标） ====================
+
+    def show_status(self) -> dict:
+        """真实复制状态快照（供 `Database.replication_status()` 使用）
+
+        返回两类键：
+        * MySQL `SHOW SLAVE STATUS` 列名：真实主库连接、位点、延迟、错误
+          （位点 = 状态文件里的**全局 lsn**；`Seconds_Behind_Master` 用
+          `lag_seconds`：追上时 0，落后时=距上次成功 apply 的秒数）；
+        * ``Replica_*`` 自定义键：给 `/metrics` 渲染用（executor 的
+          `_slave_status_values` 只取已知列，未知键不影响 SHOW 输出）。
+        无数据（全新/未运行）时数值列输出 0，不编造非零值。
+        """
+        # 同一把锁内复制状态+运行时字段，避免指标/SHOW 读到撕裂快照
+        with self._lock:
+            state = dict(self.state)
+            following = self._following
+            closed = self._closed
+            last_error = self._last_error
+            last_error_errno = self._last_error_errno
+            master_max_lsn = int(self._master_max_lsn)
+            master_min_lsn = int(self._earliest_master_lsn)
+            lag_bytes = int(self._lag_bytes)
+            lag_seconds = float(self._lag_seconds)
+            events_behind = int(self._events_behind)
+            caught_up = bool(self._caught_up)
+            last_batch_events = int(self._last_batch_events)
+            batches = int(self._batches)
+            retries = int(self._retries)
+        lsn = int(state.get('lsn') or 0)
+        applied = int(state.get('applied') or 0)
+        errors = int(state.get('errors') or 0)
+        last_ts = float(state.get('last_apply_ts') or 0.0)
+        running = following and not closed
+        has_error = bool(last_error)
+        if running and has_error:
+            io_running = 'Connecting'
+            st = f'Retrying: {str(last_error)[:200]}'
+        elif running:
+            io_running = 'Yes'
+            st = 'Replica polling master for binlog events'
+        elif has_error:
+            io_running = 'No'
+            st = f'Error: {str(last_error)[:200]}'
+        elif applied or lsn:
+            io_running = 'No'
+            st = 'Replica idle (last run completed; not following)'
+        else:
+            io_running = 'No'
+            st = 'Replica not started (prototype registered)'
+        errno = last_error_errno or 0
+        state_size = 0
+        try:
+            if os.path.exists(str(self.state_path)):
+                state_size = os.path.getsize(str(self.state_path))
+        except OSError:                          # pragma: no cover - 防御
+            state_size = 0
+        return {
+            'Slave_IO_State': st,
+            'Master_Host': self.master_host,
+            'Master_User': self.user,
+            'Master_Port': self.master_port,
+            'Connect_Retry': 1,
+            'Master_Log_File': state.get('master_file'),
+            'Read_Master_Log_Pos': lsn,
+            'Relay_Log_File': None,
+            'Relay_Log_Pos': None,
+            'Relay_Master_Log_File': state.get('master_file'),
+            'Slave_IO_Running': io_running,
+            'Slave_SQL_Running': 'Yes' if (running and not has_error)
+            else 'No',
+            'Last_Errno': errno,
+            'Last_Error': str(self._last_error or ''),
+            'Skip_Counter': 0,
+            'Exec_Master_Log_Pos': lsn,
+            'Relay_Log_Space': state_size,
+            'Seconds_Behind_Master': (float(self._lag_seconds)
+                                      if (running or applied or lsn)
+                                      else 0.0),
+            'Last_IO_Errno': errno,
+            'Last_IO_Error': str(last_error or ''),
+            'Last_SQL_Errno': errno,
+            'Last_SQL_Error': str(last_error or ''),
+            'Master_Info_File': str(self.state_path),
+            'Slave_SQL_Running_State': st,
+            # ---- 自定义快照（/metrics 用；SHOW 列清单会忽略这些键）----
+            'Replica_Is_Prototype': True,
+            'Replica_Node': 'apply',
+            'Replica_Master_Host': self.master_host,
+            'Replica_Master_Port': self.master_port,
+            'Replica_Following': 1 if running else 0,
+            'Replica_Mode': 'follow' if running else 'once',
+            'Replica_Applied_LSN': lsn,
+            'Replica_Master_LSN': master_max_lsn,
+            'Replica_Master_Min_LSN': master_min_lsn,
+            'Replica_Lag_LSN': lag_bytes,
+            'Replica_Lag_Seconds': lag_seconds,
+            'Replica_Events_Behind': events_behind,
+            'Replica_Applied_Events': applied,
+            'Replica_Idempotent_Events': int(state.get('idempotent') or 0),
+            'Replica_Apply_Errors': errors,
+            'Replica_Last_Apply_Ts': last_ts,
+            'Replica_Last_Batch_Events': last_batch_events,
+            'Replica_Batches': batches,
+            'Replica_Retries': retries,
+            'Replica_Caught_Up': 1 if caught_up else 0,
+            'Replica_Error_Errno': errno,
+            'Replica_State_File': str(self.state_path),
+            'Replica_State_Valid': 1,
+        }
 
     def stats(self) -> dict:
         """当前状态快照（CLI/测试/排障用）"""
-        state = dict(self.state)
-        state['state_path'] = str(self.state_path)
-        state['target_data_dir'] = str(self.target_db.data_dir)
-        state['last_error'] = self._last_error
-        state['process_uptime'] = round(time.time() - self.started_at, 3)
+        with self._lock:
+            state = dict(self.state)
+            state.update({
+                'state_path': str(self.state_path),
+                'target_data_dir': str(self.target_db.data_dir),
+                'last_error': self._last_error,
+                'last_error_errno': self._last_error_errno,
+                'following': self._following,
+                'caught_up': self._caught_up,
+                'lag_lsn': self._lag_bytes,
+                'lag_seconds': self._lag_seconds,
+                'events_behind': self._events_behind,
+                'master_lsn': self._master_max_lsn,
+                'master_min_lsn': self._earliest_master_lsn,
+                'batches': self._batches,
+                'retries': self._retries,
+                'process_uptime': round(time.time() - self.started_at, 3),
+            })
         return state
+

@@ -515,6 +515,72 @@ def _wal_stats(db):
     return out
 
 
+def _replica_status(server):
+    """增量复制原型的真实状态快照（未配置/非原型时返回 None）
+
+    数据源：目标库 `Database.replication_status()` → `ReplicaPrototype.
+    show_status()`（与状态文件/`SHOW SLAVE STATUS` 同一份快照）。
+    """
+    db = getattr(server, 'db', None)
+    getter = getattr(db, 'replication_status', None) if db is not None else None
+    if not callable(getter):
+        return None
+    try:
+        status = getter()
+    except Exception:                            # pragma: no cover - 防御
+        return None
+    if isinstance(status, dict) and status.get('Replica_Is_Prototype'):
+        return status
+    return None
+
+
+#: `/metrics` 的复制度量名 → SHOW 快照键/类型（无数据统一输出 0）
+_REPLICA_METRICS = (
+    ('lightdb_replica_lag_lsn', 'Replica_Lag_LSN', 'gauge',
+     'Master max LSN minus applied LSN (bytes behind, 0 when caught up)'),
+    ('lightdb_replica_lag_seconds', 'Replica_Lag_Seconds', 'gauge',
+     'Seconds since last successful apply while behind (0 when caught up)'),
+    ('lightdb_replica_events_behind', 'Replica_Events_Behind', 'gauge',
+     'Events not yet applied (real COUNT on master)'),
+    ('lightdb_replica_applied_lsn', 'Replica_Applied_LSN', 'gauge',
+     'Last applied global LSN (persisted checkpoint)'),
+    ('lightdb_replica_master_lsn', 'Replica_Master_LSN', 'gauge',
+     'Master max readable global LSN'),
+    ('lightdb_replica_applied_events_total', 'Replica_Applied_Events',
+     'counter', 'Events applied since replication state was created'),
+    ('lightdb_replica_apply_errors_total', 'Replica_Apply_Errors',
+     'counter', 'Apply failures (checkpoint retained, retried)'),
+    ('lightdb_replica_last_apply_ts', 'Replica_Last_Apply_Ts', 'gauge',
+     'Unix timestamp of last successful apply (0 = no data)'),
+    ('lightdb_replica_caught_up', 'Replica_Caught_Up', 'gauge',
+     '1 = fully caught up, 0 = behind/not running'),
+    ('lightdb_replica_retries_total', 'Replica_Retries', 'counter',
+     'Follow-mode retries (backoff) since process start'),
+)
+
+
+def _render_replica_metrics(lines, prefix, status):
+    """渲染增量复制指标（无数据输出 0 + 注释，不编造）"""
+    for name, key, mtype, help_text in _REPLICA_METRICS:
+        _type_line(lines, name, mtype, help_text)
+        try:
+            value = status.get(key, 0) if status else 0
+            value = float(value) if mtype == 'gauge' else int(value or 0)
+        except Exception:                        # pragma: no cover - 防御
+            value = 0
+        lines.append(f'{name} {value}')
+    if status:
+        lines.append(
+            f'# 增量复制: mode={status.get("Replica_Mode")} '
+            f'following={status.get("Replica_Following")} '
+            f'last_error={str(status.get("Last_Error") or "")[:120]!r}')
+    else:
+        lines.append(
+            '# 增量复制未配置/无数据：以上为 0'
+            '（未注册 ReplicaPrototype 或状态不可读）')
+
+
+
 def render_prometheus(server, prefix: str = None) -> str:
     """把一台 MySQLServer 的真实运行数据渲染成 Prometheus text 格式
 
@@ -759,6 +825,9 @@ def render_prometheus(server, prefix: str = None) -> str:
                     labels={'state': state})
         lines.append('# 连接池未启用（LIGHTDB_POOL_ENABLED=0）：以上为 0')
 
+    # ---------- 增量复制（task-81；无数据输出 0 + 注释） ----------
+    _render_replica_metrics(lines, prefix, _replica_status(server))
+
     # ---------- 内存 / 线程 ----------
     try:
         import psutil
@@ -805,4 +874,24 @@ def metrics_snapshot_json(server) -> dict:
         pass
     pool = getattr(server, 'pool', None)
     out['pool'] = pool.snapshot() if pool is not None else None
+    replica = _replica_status(server)
+    out['replica'] = ({
+        'present': True,
+        'lag_lsn': replica.get('Replica_Lag_LSN', 0),
+        'lag_seconds': replica.get('Replica_Lag_Seconds', 0),
+        'events_behind': replica.get('Replica_Events_Behind', 0),
+        'applied_lsn': replica.get('Replica_Applied_LSN', 0),
+        'master_lsn': replica.get('Replica_Master_LSN', 0),
+        'applied_events': replica.get('Replica_Applied_Events', 0),
+        'apply_errors': replica.get('Replica_Apply_Errors', 0),
+        'last_apply_ts': replica.get('Replica_Last_Apply_Ts', 0),
+        'caught_up': bool(replica.get('Replica_Caught_Up', 0)),
+        'following': bool(replica.get('Replica_Following', 0)),
+        'last_error': replica.get('Last_Error', ''),
+    } if replica else {
+        'present': False, 'lag_lsn': 0, 'lag_seconds': 0.0,
+        'events_behind': 0, 'applied_lsn': 0, 'master_lsn': 0,
+        'applied_events': 0, 'apply_errors': 0, 'last_apply_ts': 0,
+        'caught_up': True, 'following': False, 'last_error': '',
+    })
     return out
