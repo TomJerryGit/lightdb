@@ -46,3 +46,25 @@ PASS=12 FAIL=0 WARN=2 SKIP=2 -> PASS
   `docs/INSTALLER_ACCEPTANCE_2026-10-27.md`）
 - 代码签名（无证书，按用户要求忽略）
 - onefile 版在正常桌面会话复验
+
+## 5. 新安装包安装/卸载冒烟结论（2026-10-29 管理员会话实测）
+
+用本次重建的 `LightDB-Studio-Setup-4.0.0.exe`（59,815,236 B，
+sha256 `a55957b3…084b`）执行：
+
+```powershell
+$p = Start-Process '...LightDB-Studio-Setup-4.0.0.exe' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/DIR=D:\LightDBStudio','/LOG=D:\ld_install_wave3.log' -Wait -PassThru
+$s = Start-Process 'D:\LightDBStudio\LightDB-Studio.exe' -ArgumentList '--smoke' -Wait -PassThru
+$u = Start-Process 'D:\LightDBStudio\unins000.exe' -ArgumentList '/VERYSILENT' -Wait -PassThru
+```
+
+| 步骤 | 结果 |
+|---|---|
+| 静默安装 | **install_exit=0** |
+| 安装后 `--smoke` | **smoke_exit=0** |
+| 静默卸载 | **uninstall_exit=0** |
+| 安装目录清理 | **dir_gone=True** |
+
+结论：**包含 beta.101–120 全部改动的新发布产物，安装/启动/卸载全链路 PASS**。
+唯一未做项仍是代码签名（无证书，按需求忽略）。
+
