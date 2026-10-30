@@ -8,6 +8,9 @@
 
 环境变量：
     LIGHTDB_STUDIO_ONEFILE=1   → 单文件模式（脚本会设置）
+
+task-87：打包版内置 paramiko/cryptography/bcrypt/nacl（SSH 隧道可选依赖），
+连接对话框的 SSH 状态在打包产物中应显示“paramiko 可用”，不再提示未安装。
 """
 import os
 from pathlib import Path
@@ -39,7 +42,13 @@ if plugins_dir.is_dir():
 hiddenimports = (
     collect_submodules('lightdb_studio')
     + collect_submodules('lightdb_studio.core')
-    + ['pymysql', 'PIL', 'PIL.Image', 'PIL.ImageQt']
+    # task-87：打包版 SSH 隧道依赖（可选依赖 paramiko 及其密码学后端）
+    + collect_submodules('paramiko')
+    + collect_submodules('cryptography')
+    + collect_submodules('bcrypt')
+    + collect_submodules('nacl')
+    + ['pymysql', 'PIL', 'PIL.Image', 'PIL.ImageQt',
+       'paramiko', 'cryptography']
 )
 
 a = Analysis(
@@ -52,7 +61,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=['tests', 'benchmarks', 'scripts', 'web', 'docs', 'pytest',
-              'cryptography', 'Cython'],
+              'Cython'],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

@@ -35,11 +35,17 @@ from .error_prompts import show_connection_error
 
 
 class ConnectionDialog(QDialog):
-    def __init__(self, parent=None, info: ConnectionInfo = None):
+    # task-87：仅进程内记忆上次填写值（不落盘；口令不记忆）
+    _LAST_FORM = {}
+
+    def __init__(self, parent=None, info: ConnectionInfo = None,
+                 default_port=None, remember=True):
         super().__init__(parent)
         self.setWindowTitle("连接到 LightDB")
         self.setMinimumWidth(460)
         self._is_new = info is None
+        self._default_port = default_port
+        self._remember = bool(remember)
         self.info = info if info is not None else ConnectionInfo()
         # 类型不落盘：**打开已有连接**时按端口反推（`db_types.kind_for_port`：
         # 8899→LightDB，3306→MySQL，其它→其它 MySQL 兼容）。新建连接
@@ -148,6 +154,13 @@ class ConnectionDialog(QDialog):
         self.ssl_key_btn.clicked.connect(
             lambda: self._browse_ssl_file(self.ssl_key_edit, '客户端私钥'))
         self.ssl_check.toggled.connect(self._update_ssl_controls)
+        self.ssl_status = QLabel('')
+        self.ssl_status.setWordWrap(True)
+        self.ssl_status.setStyleSheet('color: #969696;')
+        form.addRow('', self.ssl_status)
+        for _edit in (self.ssl_ca_edit, self.ssl_cert_edit,
+                      self.ssl_key_edit):
+            _edit.textChanged.connect(lambda *_a: self._update_ssl_controls())
 
         # task-42：SSH 隧道（可选依赖 paramiko；未安装时显式禁用，不假成功）
         self._ssh_available = False
@@ -223,6 +236,11 @@ class ConnectionDialog(QDialog):
 
         # 按钮
         btn_row = QHBoxLayout()
+        self.auto_connect_check = QCheckBox('保存后立即连接')
+        self.auto_connect_check.setChecked(True)
+        self.auto_connect_check.setToolTip(
+            '关闭后只保存连接配置，不主动拨号；下次可从对象树/连接菜单连接')
+        btn_row.addWidget(self.auto_connect_check)
         self.test_btn = QPushButton("测试连接")
         self.test_btn.clicked.connect(self._test_connection)
         btn_row.addWidget(self.test_btn)
@@ -249,8 +267,28 @@ class ConnectionDialog(QDialog):
             # previous_kind 传 `self._kind`：此时各框都是空的（只有端口是
             # QSpinBox 的下限 1），按「空着/仍是该类型默认值」判定即全部可填。
             self._apply_defaults(self._kind, self._kind)
-            # 默认端口来自类型表（8899），不是 `ConnectionInfo` 的历史默认
-            # 8888；同步回 info，免得下面按 `self.info.port` 又写回 8888。
+            # task-87：默认端口优先级：调用方（上次连接）> 记忆表单 > 8888?
+            # 主窗口会传上次连接/8898；直接构造时保留类型默认，兼容旧调用。
+            remembered = dict(self._LAST_FORM) if self._remember else {}
+            if remembered:
+                if remembered.get('host'):
+                    self.host_edit.setText(str(remembered['host']))
+                if remembered.get('user'):
+                    self.user_edit.setText(str(remembered['user']))
+                if remembered.get('database'):
+                    self.db_edit.setText(str(remembered['database']))
+                if remembered.get('charset'):
+                    self.charset_combo.setCurrentText(
+                        str(remembered['charset']))
+            if self._default_port:
+                self.port_spin.setValue(int(self._default_port))
+            elif remembered.get('port'):
+                self.port_spin.setValue(int(remembered['port']))
+            # 远程库端口默认与主端口一致（主/远程联动；用户可再改）
+            try:
+                self.ssh_remote_port_spin.setValue(self.port_spin.value())
+            except Exception:
+                pass
             self.info.port = self.port_spin.value()
         self.name_edit.setText(self.info.name)
         self.host_edit.setText(self.info.host)
@@ -290,6 +328,24 @@ class ConnectionDialog(QDialog):
         idx = self.type_combo.findData(self._kind)
         if idx >= 0 and idx != self.type_combo.currentIndex():
             self.type_combo.setCurrentIndex(idx)      # 走 _on_type_changed
+        # task-87：记忆值最后覆盖默认值（不记忆口令）；默认端口由主窗口
+        # 传入的上次连接端口优先。
+        if self._is_new and self._remember and self._LAST_FORM:
+            remembered = self._LAST_FORM
+            if remembered.get('host'):
+                self.host_edit.setText(str(remembered['host']))
+            if remembered.get('user'):
+                self.user_edit.setText(str(remembered['user']))
+            if remembered.get('database'):
+                self.db_edit.setText(str(remembered['database']))
+            if remembered.get('charset'):
+                self.charset_combo.setCurrentText(str(remembered['charset']))
+            if not self._default_port and remembered.get('port'):
+                self.port_spin.setValue(int(remembered['port']))
+            try:
+                self.ssh_remote_port_spin.setValue(self.port_spin.value())
+            except Exception:
+                pass
         self._refresh_type_hint()
 
     # ---------- 类型联动 ----------
@@ -419,10 +475,18 @@ class ConnectionDialog(QDialog):
         if self._ssh_available:
             self.ssh_check.setEnabled(True)
             if enabled:
-                self.ssh_status.setText('SSH 隧道已启用：连接将先建立本地转发。')
-                self.ssh_status.setStyleSheet('color: #89d185;')
+                key_path = self.ssh_key_edit.text().strip()
+                if key_path and not os.path.isfile(key_path):
+                    self.ssh_status.setText(
+                        f'SSH 已启用，但私钥不存在: {key_path}')
+                    self.ssh_status.setStyleSheet('color: #f48771;')
+                else:
+                    self.ssh_status.setText(
+                        'SSH 隧道已启用（paramiko 可用）；连接将先建立本地转发。')
+                    self.ssh_status.setStyleSheet('color: #89d185;')
             else:
-                self.ssh_status.setText('SSH 隧道未启用。')
+                self.ssh_status.setText(
+                    'SSH 隧道未启用（paramiko 可用，勾选后配置转发）。')
                 self.ssh_status.setStyleSheet('color: #969696;')
 
     def build_ssh_options(self):
@@ -474,6 +538,30 @@ class ConnectionDialog(QDialog):
         for edit, btn in getattr(self, '_ssl_rows', []):
             edit.setEnabled(enabled)
             btn.setEnabled(enabled)
+        status = getattr(self, 'ssl_status', None)
+        if status is None:
+            return
+        if not enabled:
+            status.setText('SSL 未启用。')
+            status.setStyleSheet('color: #969696;')
+            return
+        ca = self.ssl_ca_edit.text().strip()
+        cert = self.ssl_cert_edit.text().strip()
+        key = self.ssl_key_edit.text().strip()
+        issues = []
+        for label, path in (('CA', ca), ('客户端证书', cert),
+                            ('客户端私钥', key)):
+            if path and not os.path.isfile(path):
+                issues.append(f'{label} 不存在: {path}')
+        if issues:
+            status.setText('SSL 已启用，但证书状态异常：' + '；'.join(issues))
+            status.setStyleSheet('color: #f48771;')
+        elif ca or cert or key:
+            status.setText('SSL 已启用；证书文件存在可读。')
+            status.setStyleSheet('color: #89d185;')
+        else:
+            status.setText('SSL 已启用（未指定 CA/客户端证书，使用驱动默认校验）。')
+            status.setStyleSheet('color: #d7ba7d;')
 
     def _browse_ssl_file(self, edit, label):
         path, _ = QFileDialog.getOpenFileName(
@@ -529,7 +617,53 @@ class ConnectionDialog(QDialog):
             QLineEdit.Normal if visible else QLineEdit.Password)
         self.pwd_toggle_btn.setText("隐藏" if visible else "显示")
 
+    def _validate_fields(self):
+        """字段校验；返回 (ok, error)。空主机不会再被 _collect 静默替换。"""
+        host = self.host_edit.text().strip()
+        user = self.user_edit.text().strip()
+        if not host:
+            return False, '主机不能为空'
+        if not user:
+            return False, '用户名不能为空'
+        port = int(self.port_spin.value())
+        if port < 1 or port > 65535:
+            return False, f'端口超出范围: {port}'
+        if self.ssh_check.isChecked():
+            if int(self.ssh_port_spin.value()) < 1 or \
+                    int(self.ssh_port_spin.value()) > 65535:
+                return False, 'SSH 端口超出范围'
+            if int(self.ssh_remote_port_spin.value()) < 1 or \
+                    int(self.ssh_remote_port_spin.value()) > 65535:
+                return False, '远程库端口超出范围'
+        return True, ''
+
+    def auto_connect_requested(self):
+        return bool(self.auto_connect_check.isChecked())
+
+    def _remember_form(self):
+        if not self._remember:
+            return
+        ConnectionDialog._LAST_FORM = {
+            'host': self.host_edit.text().strip(),
+            'port': int(self.port_spin.value()),
+            'user': self.user_edit.text().strip(),
+            'database': self.db_edit.text().strip(),
+            'charset': self.charset_combo.currentText(),
+        }
+
     def _test_connection(self):
+        ok, error = self._validate_fields()
+        if not ok:
+            QMessageBox.warning(self, "提示", error)
+            return
+        ok, error = self.validate_ssl_paths()
+        if not ok:
+            QMessageBox.warning(self, 'SSL 配置错误', error)
+            return
+        ok, error = self.validate_ssh_options()
+        if not ok:
+            QMessageBox.warning(self, 'SSH 配置错误', error)
+            return
         info = self._collect()
         if not info.host or not info.user:
             QMessageBox.warning(self, "提示", "主机和用户名不能为空")
@@ -562,6 +696,10 @@ class ConnectionDialog(QDialog):
                 '暂不支持：%s' % db_types.unsupported_reason(
                     self.current_db_type()))
             return
+        ok, error = self._validate_fields()
+        if not ok:
+            QMessageBox.warning(self, '连接配置错误', error)
+            return
         ok, ssl_error = self.validate_ssl_paths()
         if not ok:
             QMessageBox.warning(self, 'SSL 配置错误', ssl_error)
@@ -578,6 +716,7 @@ class ConnectionDialog(QDialog):
             QMessageBox.warning(self, "提示", "主机和用户名不能为空")
             return
         self.info = info
+        self._remember_form()
         self.accept()
 
     def get_connection(self) -> ConnectionInfo:

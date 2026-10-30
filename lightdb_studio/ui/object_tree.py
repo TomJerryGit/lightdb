@@ -99,6 +99,10 @@ class ObjectTree(QWidget):
         refresh_btn.setFixedWidth(32)
         refresh_btn.clicked.connect(self.refresh_all)
         bar_layout.addWidget(refresh_btn)
+        self.refresh_status_label = QLabel('')
+        self.refresh_status_label.setStyleSheet('color: #8a8a8a;')
+        self.refresh_status_label.setObjectName('tree_refresh_status')
+        bar_layout.addWidget(self.refresh_status_label)
 
         layout.addWidget(bar)
 
@@ -183,12 +187,68 @@ class ObjectTree(QWidget):
             del self.connections[name]
 
     def refresh_all(self):
-        """重建整棵树（同时清空表级懒加载缓存）"""
+        """重建整棵树；保留展开的库/当前选择，反馈刷新结果（task-87）。"""
+        # 记录展开的 DB 节点与当前节点，刷新后恢复（多库切换状态保持）
+        expanded = set()
+        current = self.tree.currentItem()
+        current_key = None
+        if current is not None:
+            d = current.data(0, Qt.UserRole)
+            if d:
+                current_key = (d[0], d[1])
+        def scan_expanded(parent):
+            for i in range(parent.childCount()):
+                node = parent.child(i)
+                data = node.data(0, Qt.UserRole)
+                if data and data[0] == NODE_DB and node.isExpanded():
+                    expanded.add((data[1],))
+                scan_expanded(node)
+        scan_expanded(self.tree.invisibleRootItem())
         self._table_cache.clear()
         self.tree.clear()
+        errors = []
         for name, conn in list(self.connections.items()):
             info = conn.config
-            self.add_connection(info, conn)
+            try:
+                self.add_connection(info, conn)
+            except Exception as exc:                  # noqa: BLE001
+                errors.append(f'{name}: {exc}')
+        # 恢复展开的库 & 当前项
+        try:
+            def restore(parent):
+                for i in range(parent.childCount()):
+                    node = parent.child(i)
+                    data = node.data(0, Qt.UserRole)
+                    if data and data[0] == NODE_CONN:
+                        for j in range(node.childCount()):
+                            dbnode = node.child(j)
+                            dd = dbnode.data(0, Qt.UserRole)
+                            if dd and dd[0] == NODE_DB and (dd[1],) in expanded:
+                                dbnode.setExpanded(True)
+                    restore(node)
+            restore(self.tree.invisibleRootItem())
+            if current_key:
+                def find(parent):
+                    for i in range(parent.childCount()):
+                        node = parent.child(i)
+                        d = node.data(0, Qt.UserRole)
+                        if d == current_key:
+                            self.tree.setCurrentItem(node)
+                            return True
+                        if find(node):
+                            return True
+                    return False
+                find(self.tree.invisibleRootItem())
+        except Exception:
+            pass
+        if errors:
+            self.refresh_status_label.setText('刷新失败: ' + '; '.join(errors))
+            self.refresh_status_label.setStyleSheet('color: #f48771;')
+        else:
+            self.refresh_status_label.setText(
+                f'已刷新 {len(self.connections)} 个连接')
+            self.refresh_status_label.setStyleSheet('color: #89d185;')
+        return errors
 
     def get_current_connection(self):
         item = self.tree.currentItem()
@@ -453,10 +513,8 @@ class ObjectTree(QWidget):
         node_type, name = data
 
         if node_type == NODE_TABLE:
-            # 双击表 → 打开数据（Batch 2 实现数据编辑器；这里先弹查询）
-            db = self.get_current_database()
-            sql = f"SELECT * FROM `{name}` LIMIT 1000"
-            self.query_requested.emit(sql)
+            # task-87：双击表 → 打开数据编辑器（信号由主窗口接线）
+            self.table_double_clicked.emit(name)
 
         elif node_type == NODE_PROC:
             db = self.get_current_database()
@@ -511,6 +569,7 @@ class ObjectTree(QWidget):
             add("刷新", lambda: self._reload_table_folder(item))
             add("复制库名", lambda: copy_text(db_name))
         elif node_type == NODE_TABLE:
+            add("打开表", lambda: self.table_double_clicked.emit(name))
             add("复制表名", lambda: copy_text(name))
             add("设计表", lambda: self._ui_design_table(item))
             add("重命名表…", lambda: self._ui_rename_table(item))
@@ -653,7 +712,38 @@ class ObjectTree(QWidget):
 
     def _apply_filter(self, text):
         self._filter_text = text.strip().lower()
+        # 即时过滤：有搜索词时先把尚未展开的库懒加载出来，再匹配表名
+        if self._filter_text:
+            try:
+                for i in range(self.tree.topLevelItemCount()):
+                    conn_item = self.tree.topLevelItem(i)
+                    data = conn_item.data(0, Qt.UserRole)
+                    if not data or data[0] != NODE_CONN:
+                        continue
+                    for j in range(conn_item.childCount()):
+                        db_item = conn_item.child(j)
+                        if db_item.childCount() == 1 and \
+                                db_item.child(0).text(0) == _LOADING_TEXT:
+                            self._load_db_children(db_item)
+            except Exception as exc:                  # noqa: BLE001
+                if hasattr(self, 'refresh_status_label'):
+                    self.refresh_status_label.setText(f'过滤加载失败: {exc}')
+                    self.refresh_status_label.setStyleSheet(
+                        'color: #f48771;')
         self._filter_node(self.tree.invisibleRootItem())
+        # 搜索时自动展开库/表文件夹，否则匹配项藏在折叠节点里看不见
+        if self._filter_text:
+            try:
+                def expand(parent):
+                    for i in range(parent.childCount()):
+                        node = parent.child(i)
+                        data = node.data(0, Qt.UserRole)
+                        if data and data[0] in (NODE_DB, NODE_TABLE_FOLDER):
+                            node.setExpanded(True)
+                        expand(node)
+                expand(self.tree.invisibleRootItem())
+            except Exception:
+                pass
 
     def _filter_node(self, parent):
         for i in range(parent.childCount()):

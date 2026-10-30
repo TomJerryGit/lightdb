@@ -348,6 +348,8 @@ class MainWindow(QMainWindow):
             self._on_tree_import_data)
         self.object_tree.export_data_requested.connect(
             self._on_tree_export_data)
+        # task-87：双击表/右键“打开表”→ 数据编辑器
+        self.object_tree.table_double_clicked.connect(self._open_data_editor)
 
         self.tree_dock = QDockWidget(i18n.t('tab.object_browser'), self)
         self.tree_dock.setWidget(self.object_tree)
@@ -1153,11 +1155,44 @@ class MainWindow(QMainWindow):
         except Exception:
             return [], {}
 
+    def _suggest_connection_port(self):
+        """task-87：新建连接默认端口 = 上次连接端口；否则 8898（LightDB）。"""
+        try:
+            last = getattr(self.config, 'last_connection', '') or ''
+            if last:
+                info = self.config.find(last)
+                if info is not None and 1 <= int(info.port) <= 65535:
+                    return int(info.port)
+            if getattr(self.config, 'connections', None):
+                port = int(self.config.connections[-1].port)
+                if 1 <= port <= 65535:
+                    return port
+        except Exception:
+            pass
+        return 8898
+
     def _new_connection(self):
-        dlg = ConnectionDialog(self)
+        try:
+            dlg = ConnectionDialog(
+                self, default_port=self._suggest_connection_port())
+        except TypeError:
+            dlg = ConnectionDialog(self)
         if dlg.exec() != QDialog.Accepted:
             return
         info = dlg.get_connection()
+        auto_connect = True
+        try:
+            auto_connect = bool(dlg.auto_connect_requested())
+        except Exception:
+            auto_connect = True
+        if not auto_connect:
+            # 只保存配置，不拨号（用户可稍后从对象树/连接菜单连接）
+            self.config.add_connection(info)
+            self.config.last_connection = info.name
+            self.config.save()
+            self.status_label.setText(
+                f"已保存连接: {info.name}（未自动连接）")
+            return
         try:
             conn = DBConnection(info)
             conn.connect()
@@ -1435,7 +1470,12 @@ class MainWindow(QMainWindow):
             self._refresh_schema_cache_async()
 
     def _refresh_tree(self):
-        self.object_tree.refresh_all()
+        errors = self.object_tree.refresh_all()
+        if errors:
+            self.status_label.setText('刷新失败: ' + '; '.join(errors))
+        else:
+            self.status_label.setText(
+                f'已刷新对象树（{len(self.object_tree.connections)} 个连接）')
 
     # ==================== 查询执行 ====================
 
