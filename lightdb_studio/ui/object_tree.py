@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QInputDialog, QToolBar, QLineEdit,
     QPushButton, QHBoxLayout, QLabel, QApplication, QAbstractItemView
 )
-from PySide6.QtCore import Qt, Signal, QMimeData
+from PySide6.QtCore import Qt, Signal, QMimeData, QTimer
 from PySide6.QtGui import QAction, QIcon, QFont, QColor, QDrag
 
 from ..db.connection import DBConnection
@@ -30,6 +30,10 @@ NODE_TRIGGER_FOLDER = 'triggers'
 NODE_TRIGGER = 'trigger'
 NODE_EVENT_FOLDER = 'events'
 NODE_EVENT = 'event'
+
+# task-89：大树防护 —— 单库一次最多插入 500 张表，避免 1000+ 表瞬间建节点
+TABLE_RENDER_LIMIT = 500
+TABLE_FILTER_DEBOUNCE_MS = 220
 
 # 表节点占位子项文本（说明"展开时才加载"）
 _LOADING_TEXT = "加载中..."
@@ -120,6 +124,12 @@ class ObjectTree(QWidget):
 
         # 隐藏的刷新用
         self._filter_text = ""
+        # task-89：过滤防抖（大树才启用；小树保持即时，兼容既有交互）
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(TABLE_FILTER_DEBOUNCE_MS)
+        self._filter_timer.timeout.connect(self._apply_filter_now)
+        self._table_count = 0
 
     # ==================== 对外接口 ====================
 
@@ -205,6 +215,7 @@ class ObjectTree(QWidget):
                 scan_expanded(node)
         scan_expanded(self.tree.invisibleRootItem())
         self._table_cache.clear()
+        self._table_count = 0
         self.tree.clear()
         errors = []
         for name, conn in list(self.connections.items()):
@@ -304,6 +315,9 @@ class ObjectTree(QWidget):
             return
 
         loader = MetadataLoader(conn)
+        # task-89：500+ 表批量插入期间关闭动画/重绘，避免展开卡死 UI
+        self.tree.setUpdatesEnabled(False)
+        self.tree.setAnimated(False)
 
         # 表文件夹
         tables_folder = QTreeWidgetItem(item)
@@ -312,8 +326,18 @@ class ObjectTree(QWidget):
         tables_folder.setData(0, Qt.UserRole + 1, {'conn': conn_name, 'db': db_name})
 
         try:
-            for t in loader.tables():
+            tables = list(loader.tables())
+            shown = 0
+            for t in tables:
+                if shown >= TABLE_RENDER_LIMIT:
+                    note = QTreeWidgetItem(tables_folder)
+                    note.setText(0, f"… 仅显示前 {TABLE_RENDER_LIMIT} 个表"
+                                     f"（共 {len(tables)}，请用过滤框缩小范围）")
+                    note.setForeground(0, QColor('#d7ba7d'))
+                    break
                 self._add_table_node(tables_folder, conn_name, db_name, t)
+                shown += 1
+            self._table_count += shown
         except Exception:
             pass
 
@@ -377,6 +401,9 @@ class ObjectTree(QWidget):
         except Exception:
             pass
 
+        self.tree.setAnimated(True)
+        self.tree.setUpdatesEnabled(True)
+
     # ==================== 表级懒加载（P1-6） ====================
 
     def _add_table_node(self, parent: QTreeWidgetItem, conn_name: str,
@@ -387,7 +414,9 @@ class ObjectTree(QWidget):
         titem.setData(0, Qt.UserRole, (NODE_TABLE, table))
         titem.setData(0, Qt.UserRole + 1,
                       {'conn': conn_name, 'db': db_name})
-        QTreeWidgetItem(titem).setText(0, _LOADING_TEXT)
+        # task-89：不再为每个表建“加载中”子节点（500 表省 500 个 item）；
+        # 用 setChildIndicatorPolicy 保留展开箭头，首次展开再加载。
+        titem.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
         return titem
 
     def _table_key(self, item: QTreeWidgetItem):
@@ -501,9 +530,11 @@ class ObjectTree(QWidget):
                item.child(0).text(0) == _LOADING_TEXT:
                 self._load_db_children(item)
         elif data[0] == NODE_TABLE:
-            # P1-6：展开表才加载列/索引/触发器（缓存命中不重复查）
-            if item.childCount() == 1 and \
-               item.child(0).text(0) == _LOADING_TEXT:
+            # P1-6/task-89：展开表才加载列/索引/触发器（缓存命中不重复查）；
+            # 无占位子节点时 childCount()==0 也要加载。
+            if item.childCount() == 0 or (
+                    item.childCount() == 1 and
+                    item.child(0).text(0) == _LOADING_TEXT):
                 self._load_table_children(item)
 
     def _on_double_click(self, item, col):
@@ -650,11 +681,17 @@ class ObjectTree(QWidget):
             self._load_db_children(db_item)
             db_item.setExpanded(True)
 
+    def clear_table_cache(self):
+        """task-89：切库/关闭时释放表级元数据缓存。"""
+        self._table_cache.clear()
+        self._table_count = 0
+
     def _switch_database(self, db_name):
         conn = self.get_current_connection()
         if conn:
             try:
                 conn.switch_database(db_name)
+                self.clear_table_cache()
             except Exception as e:                    # noqa: BLE001
                 QMessageBox.critical(self, "错误", str(e))
 
@@ -712,6 +749,19 @@ class ObjectTree(QWidget):
 
     def _apply_filter(self, text):
         self._filter_text = text.strip().lower()
+        # task-89：大树输入防抖（>200 表），避免每次按键都遍历/懒加载
+        if self._table_count > 200 and self._filter_text:
+            self._filter_timer.start()
+            return
+        self._filter_timer.stop()
+        self._apply_filter_now()
+
+    def flush_filter(self):
+        """立即执行待处理的过滤（测试/用户按 Enter 时使用）。"""
+        self._filter_timer.stop()
+        self._apply_filter_now()
+
+    def _apply_filter_now(self):
         # 即时过滤：有搜索词时先把尚未展开的库懒加载出来，再匹配表名
         if self._filter_text:
             try:

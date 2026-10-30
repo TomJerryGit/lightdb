@@ -1336,6 +1336,30 @@ class ResultTable(QWidget):
             cb.setText(text)
         return text
 
+    def release(self):
+        """task-89：关闭 tab 时显式释放大结果模型，帮助 RSS 回落。"""
+        try:
+            self.virtual_model.set_data([], [])
+            self.virtual_view.setModel(None)
+        except Exception:
+            pass
+        try:
+            self.table.clear()
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+        except Exception:
+            pass
+        self._orig_rows = []
+        self._columns = []
+        self._all_columns = []
+        self._hidden_columns = set()
+        self._value_filters = {}
+        self.rows_loaded = 0
+        self._result_row_count = 0
+        self.info_label.setText('已释放')
+        self.time_label.setText('')
+        self._hide_filter(True)
+
     def clear(self):
         self._hide_error_view()
         self._hide_filter(True)

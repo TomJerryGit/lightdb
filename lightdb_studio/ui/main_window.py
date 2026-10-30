@@ -222,7 +222,14 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_statusbar()
         self._build_ui()
-        self._build_toolbar()
+        # task-89：Ribbon 工具栏在首帧后 80ms 再构建（省 ~110ms 冷启动）；
+        # 测试/代码访问 win.ribbon / win._main_toolbar 时按需同步构建。
+        self._ribbon = None
+        self._building_toolbar = False
+        self._toolbar_timer = QTimer(self)
+        self._toolbar_timer.setSingleShot(True)
+        self._toolbar_timer.timeout.connect(self._ensure_toolbar)
+        self._toolbar_timer.start(80)
         self._setup_accessibility()
         self._apply_settings()
         self._apply_shortcut_settings()
@@ -938,15 +945,41 @@ class MainWindow(QMainWindow):
         ]
         tb = RibbonBar(specs, self)
         self.addToolBar(tb)
-        self._main_toolbar = tb
         tb.setAccessibleName(i18n.t('a11y.toolbar'))
-        self.ribbon = tb
         if getattr(self, 'env_bar', None) is not None:
             tb.addWidget(self.env_bar)
+        self._ribbon = tb
         self._update_ribbon_state()
+        return tb
+
+    def _ensure_toolbar(self):
+        if getattr(self, '_ribbon', None) is not None:
+            return self._ribbon
+        if getattr(self, '_building_toolbar', False):
+            return None
+        self._building_toolbar = True
+        try:
+            tb = self._build_toolbar()
+            # 工具栏延迟构建后补齐 i18n 引用，语言热切换仍能翻译菜单/工具栏
+            try:
+                self._setup_i18n_refs()
+                self._retranslate_ui()
+            except Exception:
+                pass
+            return tb
+        finally:
+            self._building_toolbar = False
+
+    @property
+    def ribbon(self):
+        return self._ensure_toolbar()
+
+    @property
+    def _main_toolbar(self):
+        return self._ensure_toolbar()
 
     def _update_ribbon_state(self):
-        ribbon = getattr(self, 'ribbon', None)
+        ribbon = getattr(self, '_ribbon', None)
         if ribbon is None:
             return
         try:
@@ -1062,7 +1095,25 @@ class MainWindow(QMainWindow):
     def _close_tab(self, idx):
         if self.tabs.count() <= 1:
             return
-        self.tabs.removeTab(idx)
+        widget = self.tabs.widget(idx)
+        # task-89：先显式释放结果模型（10 万行不再挂在 QTableView 上），
+        # 再 removeTab/deleteLater，避免关闭后 RSS 不回落。
+        try:
+            if isinstance(widget, QSplitter):
+                result = widget.widget(1)
+                if hasattr(result, 'release'):
+                    result.release()
+                editor = widget.widget(0)
+                if hasattr(editor, 'setParent'):
+                    editor.setParent(None)
+                    editor.deleteLater()
+            elif isinstance(widget, DataEditor):
+                pass
+        finally:
+            self.tabs.removeTab(idx)
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
 
     def _on_tab_changed(self, idx):
         conn = self._get_current_conn()
@@ -2051,7 +2102,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             apply_theme(QApplication.instance(), self.settings.theme)
-            ribbon = getattr(self, 'ribbon', None)
+            ribbon = getattr(self, '_ribbon', None)
             if ribbon is not None:
                 ribbon.refresh_icons()
             self._update_ribbon_state()
@@ -2681,7 +2732,7 @@ class MainWindow(QMainWindow):
             from PySide6.QtWidgets import QApplication
             from .theme import apply_theme
             apply_theme(QApplication.instance(), self.settings.theme)
-            ribbon = getattr(self, 'ribbon', None)
+            ribbon = getattr(self, '_ribbon', None)
             if ribbon is not None:
                 ribbon.refresh_icons()
         except Exception:
@@ -2745,7 +2796,7 @@ class MainWindow(QMainWindow):
                         self._i18n_actions.append(key)
         except Exception:
             pass
-        tb = getattr(self, '_main_toolbar', None)
+        tb = getattr(self, '_ribbon', None)
         if tb is not None:
             for act in tb.actions():
                 if act.isSeparator():
@@ -2785,7 +2836,7 @@ class MainWindow(QMainWindow):
                         act.setText(i18n.t(key))
         except Exception:
             pass
-        tb = getattr(self, '_main_toolbar', None)
+        tb = getattr(self, '_ribbon', None)
         if tb is not None:
             tb.setWindowTitle(i18n.t('toolbar.title'))
             tb.setAccessibleName(i18n.t('a11y.toolbar'))

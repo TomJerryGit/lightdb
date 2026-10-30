@@ -19,14 +19,21 @@ import time
 _T0 = time.perf_counter()
 _TIMING = os.environ.get('LIGHTDB_STUDIO_STARTUP_TIMING', '').strip().lower() \
     not in ('', '0', 'false', 'no', 'off')
+STARTUP_MARKS = []
 
 
 def _mark(label: str) -> None:
-    """打印一个启动阶段标记（仅在开关打开时）"""
+    """打印/记录一个启动阶段标记（仅在开关打开时）"""
     if _TIMING:
-        print('[startup] %7.3fs  %s'
-              % (time.perf_counter() - _T0, label),
+        elapsed = time.perf_counter() - _T0
+        STARTUP_MARKS.append({'label': label, 'elapsed_s': elapsed})
+        print('[startup] %7.3fs  %s' % (elapsed, label),
               file=sys.stderr, flush=True)
+
+
+def get_startup_marks():
+    """task-89：返回启动打点（测试/性能证据用，未开启计时时为空）。"""
+    return list(STARTUP_MARKS)
 
 
 _mark('入口开始（不含解释器启动）')
@@ -65,6 +72,11 @@ def run(argv=None) -> int:
     argv = list(sys.argv if argv is None else argv)
     smoke = '--smoke' in argv
     argv = [a for a in argv if a != '--smoke']
+    # task-89：允许命令行开启启动打点（与 env 等价）
+    global _TIMING
+    if '--startup-timing' in argv:
+        _TIMING = True
+        argv = [a for a in argv if a != '--startup-timing']
 
     # 尽早安装崩溃日志 / 异常钩子（QApplication 创建之前；失败不影响启动）
     try:
