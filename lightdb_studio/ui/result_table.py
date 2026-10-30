@@ -13,7 +13,10 @@ P0（2026-10-20 GUI 路线图）：
    错误分类（查询/连接/权限）标签与颜色，并保留"复制错误"按钮。
 """
 import datetime as _dt
+import json
+import os
 import re
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
@@ -137,6 +140,39 @@ def typed_sort_key(value, text=None):
 
 
 VIRTUAL_THRESHOLD = 5000
+
+
+# ==================== task-88：列宽持久化 ====================
+
+def column_widths_path():
+    return Path(os.environ.get('LIGHTDB_STUDIO_LAYOUT_DIR') or
+                (Path.home() / '.lightdb_studio')) / 'result_column_widths.json'
+
+
+def load_column_widths():
+    try:
+        p = column_widths_path()
+        if not p.exists():
+            return {}
+        raw = json.loads(p.read_text(encoding='utf-8'))
+        return {str(k): int(v) for k, v in raw.items()
+                if isinstance(v, (int, float)) and 20 <= int(v) <= 1200}
+    except Exception:
+        return {}
+
+
+def save_column_widths(mapping):
+    try:
+        p = column_widths_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.tmp')
+        tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2),
+                       encoding='utf-8')
+        tmp.replace(p)
+        return True
+    except Exception:
+        return False
+
 
 
 class ResultTableModel(QAbstractTableModel):
@@ -416,7 +452,12 @@ class ResultTable(QWidget):
         self._value_filters = {}
         self._orig_rows = []
         self._virtual_active = False
+        self.row_limit = None
+        self.error_line = None
+        self._restoring_widths = False
+        self._user_resizing = False
         self._build_ui()
+        self._restore_column_widths()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -437,6 +478,16 @@ class ResultTable(QWidget):
         self.time_label = QLabel("")
         self.time_label.setStyleSheet("color: #969696;")
         info_layout.addWidget(self.time_label)
+        # task-88：结果导出快捷按钮（CSV / JSON / SQL），不必先右键
+        self.quick_export_btns = {}
+        for fmt, label in (('csv', 'CSV'), ('json', 'JSON'),
+                           ('sql', 'SQL')):
+            btn = QPushButton(label)
+            btn.setToolTip(f'导出当前全部结果为 {label}')
+            btn.setMaximumWidth(52)
+            btn.clicked.connect(lambda _c=False, f=fmt: self._quick_export(f))
+            info_layout.addWidget(btn)
+            self.quick_export_btns[fmt] = btn
         # P1-2：结果被截断时可见的「加载更多」按钮
         self.load_more_btn = QPushButton("加载更多")
         self.load_more_btn.setToolTip("继续取下一批结果（不重新执行完整查询）")
@@ -511,6 +562,13 @@ class ResultTable(QWidget):
         self.table.customContextMenuRequested.connect(
             self._on_cell_context_menu)
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        # task-88：双击表头自动列宽；列宽拖拽后按列名持久化
+        self.table.horizontalHeader().sectionDoubleClicked.connect(
+            self.fit_column)
+        self.table.horizontalHeader().sectionPressed.connect(
+            self._mark_user_resizing)
+        self.table.horizontalHeader().sectionResized.connect(
+            self._on_section_resized)
 
         layout.addWidget(self.table)
 
@@ -537,6 +595,12 @@ class ResultTable(QWidget):
             self._on_virtual_context_menu)
         self.virtual_view.doubleClicked.connect(self._on_virtual_double_clicked)
         self.virtual_view.setVisible(False)
+        self.virtual_view.horizontalHeader().sectionDoubleClicked.connect(
+            self.fit_column)
+        self.virtual_view.horizontalHeader().sectionPressed.connect(
+            self._mark_user_resizing)
+        self.virtual_view.horizontalHeader().sectionResized.connect(
+            self._on_virtual_section_resized)
         layout.addWidget(self.virtual_view)
 
         # 错误视图
@@ -575,6 +639,100 @@ class ResultTable(QWidget):
 
     # ==================== 结果渲染 ====================
 
+    # ---------- task-88：列宽持久化 / 双击自适应 ----------
+
+    def _active_header(self):
+        return (self.virtual_view.horizontalHeader() if self._virtual_active
+                else self.table.horizontalHeader())
+
+    def _active_view(self):
+        return self.virtual_view if self._virtual_active else self.table
+
+    def _column_size_map(self):
+        header = self._active_header()
+        out = {}
+        for i in range(header.count()):
+            name = self._column_name(i)
+            if name:
+                out[name] = int(header.sectionSize(i))
+        return out
+
+    def _save_current_widths(self):
+        if self._restoring_widths:
+            return
+        save_column_widths(self._column_size_map())
+
+    def _mark_user_resizing(self, *_args):
+        self._user_resizing = True
+
+    def _on_section_resized(self, *_args):
+        if self._user_resizing:
+            self._save_current_widths()
+
+    def _on_virtual_section_resized(self, *_args):
+        if self._user_resizing:
+            self._save_current_widths()
+
+    def _restore_column_widths(self):
+        saved = load_column_widths()
+        if not saved:
+            return
+        header = self._active_header()
+        self._restoring_widths = True
+        try:
+            for i in range(min(header.count(), len(self._columns))):
+                name = self._column_name(i)
+                width = saved.get(name)
+                if width:
+                    header.resizeSection(i, int(width))
+        finally:
+            self._restoring_widths = False
+
+    def fit_column(self, section):
+        """双击表头：按内容自适应列宽并持久化。"""
+        if section is None or section < 0:
+            return None
+        view = self._active_view()
+        try:
+            view.resizeColumnToContents(int(section))
+        except Exception:
+            return None
+        header = self._active_header()
+        width = int(header.sectionSize(int(section)))
+        header.resizeSection(int(section), max(40, min(width, 800)))
+        self._save_current_widths()
+        return header.sectionSize(int(section))
+
+    def column_widths(self):
+        """当前列名→宽度（测试/持久化使用）。"""
+        return self._column_size_map()
+
+    def _quick_export(self, fmt):
+        from .import_export import write_export_chunked
+        filters = {'csv': 'CSV 文件 (*.csv)', 'json': 'JSON 文件 (*.json)',
+                   'sql': 'SQL 文件 (*.sql)'}
+        path, _ = QFileDialog.getSaveFileName(
+            self, f'导出结果 {fmt.upper()}', f'result.{fmt}',
+            filters.get(fmt, '所有文件 (*.*)'))
+        if not path:
+            return ''
+        try:
+            write_export_chunked(
+                path, list(self._columns), [list(r) for r in self._orig_rows],
+                fmt=fmt)
+            self.info_label.setText(f'已导出 {fmt.upper()}: {path}')
+            return path
+        except Exception as exc:                      # noqa: BLE001
+            self.info_label.setText(f'导出失败: {exc}')
+            return ''
+
+    def export_all(self, filepath, fmt='csv'):
+        """导出全部已加载结果（CSV/JSON/SQL），返回底层结果。"""
+        from .import_export import write_export_chunked
+        return write_export_chunked(
+            str(filepath), list(self._columns),
+            [list(r) for r in self._orig_rows], fmt=fmt)
+
     @staticmethod
     def _make_item(val):
         """把原始值转成表格单元格（原始值存 Qt.UserRole 供类型化排序）。"""
@@ -608,20 +766,25 @@ class ResultTable(QWidget):
         return item
 
     def _update_info_label(self, elapsed_ms=None):
-        """结果行数/截断提示（P1-2）。"""
-        suffix = ''
+        """结果行数/限制提示（P1-2 + task-88 大结果集 N/M）。"""
         if self._truncated:
-            suffix = (f"（已截断：显示前 {self.rows_loaded} 行，"
-                      f"可能还有更多，可点『加载更多』）")
-        self.info_label.setText(f"返回 {self.rows_loaded} 行" + suffix)
+            limit = self.row_limit or self.rows_loaded
+            self.info_label.setText(
+                f"已取 {self.rows_loaded} 行 / 限制 {limit} 行"
+                f"（已截断：显示前 {self.rows_loaded} 行，还有更多，"
+                f"可点『加载更多』）")
+        else:
+            self.info_label.setText(f"返回 {self.rows_loaded} 行")
         if elapsed_ms is not None:
             self.time_label.setText(f"{elapsed_ms:.2f} ms")
 
-    def show_result(self, columns, rows, elapsed_ms=0.0, truncated=False):
+    def show_result(self, columns, rows, elapsed_ms=0.0, truncated=False,
+                    limit=None):
         self._hide_error_view()
+        self.row_limit = int(limit) if limit else None
         if len(rows) >= VIRTUAL_THRESHOLD:
             return self._show_virtual_result(columns, rows, elapsed_ms,
-                                             truncated)
+                                             truncated, limit=limit)
         self._virtual_active = False
         self.virtual_view.setVisible(False)
         self.virtual_model.set_data([], [])
@@ -653,15 +816,20 @@ class ResultTable(QWidget):
                 self.table.setItem(ri, ci, self._make_item(val))
 
         self.table.setSortingEnabled(False)   # 保持禁用：类型化排序自己管
-        self.table.resizeColumnsToContents()
-
-        # 限制列宽
-        for ci in range(self.table.columnCount()):
-            w = self.table.columnWidth(ci)
-            if w > 400:
-                self.table.setColumnWidth(ci, 400)
-            if w < 60:
-                self.table.setColumnWidth(ci, 60)
+        self._restoring_widths = True
+        try:
+            self.table.resizeColumnsToContents()
+            # 限制列宽
+            for ci in range(self.table.columnCount()):
+                w = self.table.columnWidth(ci)
+                if w > 400:
+                    self.table.setColumnWidth(ci, 400)
+                if w < 60:
+                    self.table.setColumnWidth(ci, 60)
+        finally:
+            self._restoring_widths = False
+        # task-88：用户保存过的列宽优先于自动列宽
+        self._restore_column_widths()
 
         # 过滤条随结果重建（新的列集合 / 新数据）
         self._reset_filter(columns)
@@ -770,7 +938,7 @@ class ResultTable(QWidget):
     # ==================== G3：完整虚拟化 ====================
 
     def _show_virtual_result(self, columns, rows, elapsed_ms=0.0,
-                             truncated=False):
+                             truncated=False, limit=None):
         self._virtual_active = True
         self.table.setVisible(False)
         self.virtual_view.setVisible(True)
@@ -790,6 +958,8 @@ class ResultTable(QWidget):
         self.rows_loaded = len(rows)
         self._truncated = bool(truncated)
         self._result_row_count = len(rows)
+        self.row_limit = int(limit) if limit else self.row_limit
+        self._restore_column_widths()
         self._reset_filter(columns)
         self._update_info_label(elapsed_ms)
         self.show_load_more(self._truncated)
@@ -1140,8 +1310,12 @@ class ResultTable(QWidget):
         self.info_label.setText(f"错误 [{header}] {summary}")
         self.info_label.setToolTip(full)
         self.info_label.setStyleSheet("color: #f48771;")
+        # task-88：从错误文本提取行号（没有就 None，不伪造）
+        m = re.search(r'(?:at line|line|第)\s*(\d+)', text, re.IGNORECASE)
+        self.error_line = int(m.group(1)) if m else None
+        loc = f" · 第 {self.error_line} 行" if self.error_line else ''
         self.error_label.setText(
-            f"{cat['category']}  （错误码 {code_str}，SQLSTATE {state_str}）")
+            f"{cat['category']}{loc}  （错误码 {code_str}，SQLSTATE {state_str}）")
         self.error_label.setStyleSheet(
             f"color: {cat['color']}; font-weight: bold;")
         self.time_label.setText("")

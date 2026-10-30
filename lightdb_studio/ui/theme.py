@@ -9,11 +9,54 @@ DESIGN_TOKENS = {
     'radius': {'sm': 3, 'md': 5, 'lg': 7},
     'font_size': {'xs': 11, 'sm': 12, 'base': 13, 'lg': 15},
     'icon_size': {'toolbar': 18, 'ribbon': 30, 'menu': 16},
+    # task-88：分割线/高 DPI 也走 token，避免各面板魔法数
+    'divider': {'width': 1, 'handle_width': 5},
+    'dpi': {'base': 96, 'scales': [1.0, 1.25, 1.5, 1.75, 2.0]},
     # task-52：内置 SVG 图标 token（本地优先，按主题色着色）
     'icon': {'asset_dir': 'assets/icons', 'size': 24, 'stroke': 1.8,
              'theme_adaptive': True},
     'ribbon_button': {'min_width': 60, 'min_height': 58},
 }
+
+
+def token(group, key, default=None):
+    """安全读取 design token（控件/测试共用）。"""
+    return (DESIGN_TOKENS.get(group) or {}).get(key, default)
+
+
+def high_dpi_info(app=None):
+    """返回当前高 DPI 缩放信息（125%/150% 验证用，不创建应用）。"""
+    ratio = 1.0
+    dpi = float(DESIGN_TOKENS['dpi']['base'])
+    try:
+        if app is None:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+        if app is not None:
+            screen = app.primaryScreen()
+            if screen is not None:
+                ratio = float(screen.devicePixelRatio() or 1.0)
+                dpi = float(screen.logicalDotsPerInch() or dpi)
+    except Exception:
+        pass
+    return {
+        'ratio': ratio,
+        'percent': int(round(ratio * 100)),
+        'dpi': dpi,
+        'base_dpi': DESIGN_TOKENS['dpi']['base'],
+        'scale_percent': int(round(dpi / DESIGN_TOKENS['dpi']['base'] * 100)),
+        'spacing_md': max(1, int(round(DESIGN_TOKENS['spacing']['md'] * ratio))),
+        'icon_toolbar': max(1, int(round(
+            DESIGN_TOKENS['icon_size']['toolbar'] * ratio))),
+        'rounding_policy': 'PassThrough',
+    }
+
+
+def scale_token(value, ratio=None):
+    """按 DPI 比例缩放 token（125%/150% 下图标/间距不糊不截断）。"""
+    if ratio is None:
+        ratio = high_dpi_info()['ratio']
+    return max(1, int(round(float(value) * float(ratio))))
 
 
 class Theme:
@@ -392,12 +435,13 @@ def available_themes():
 
 
 def theme_tokens(theme_name='dark'):
-    """N1：返回该主题的 design tokens + 颜色（供控件/测试使用）。"""
+    """N1/task-88：返回该主题的 design tokens + 颜色（供控件/测试使用）。"""
     theme = THEMES.get(theme_name, DARK_THEME)
-    tokens = {k: dict(v) if isinstance(v, dict) else v
+    tokens = {k: (dict(v) if isinstance(v, dict) else v)
               for k, v in DESIGN_TOKENS.items()}
     tokens['colors'] = dict(theme.colors)
     tokens['theme'] = theme.name
+    tokens['dpi'] = dict(DESIGN_TOKENS['dpi'])
     return tokens
 
 

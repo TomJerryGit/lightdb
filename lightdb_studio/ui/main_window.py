@@ -992,6 +992,15 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([220, 460])
+        # task-88：分栏比例可拖动并持久化
+        try:
+            from .layout_store import (connect_splitter_persistence,
+                                       restore_splitter_ratios)
+            restore_splitter_ratios('query_editor_result', splitter,
+                                    default_sizes=[220, 460])
+            connect_splitter_persistence('query_editor_result', splitter)
+        except Exception:
+            pass
 
         idx = self.tabs.addTab(splitter, i18n.t('tab.query'))
         # P2 i18n / 可访问性：编辑器空态提示 + accessibleName
@@ -1739,7 +1748,9 @@ class MainWindow(QMainWindow):
         truncated = bool(payload.get('truncated'))
         ctx['rows_loaded'] = len(rows)
         if cols:
-            result.show_result(cols, rows, elapsed, truncated=truncated)
+            result.show_result(
+                cols, rows, elapsed, truncated=truncated,
+                limit=self._effective_max_rows() if truncated else None)
         else:
             result.show_message(payload.get('message') or '执行完成')
         # P1-3：成功执行清除编辑器错误高亮
@@ -1750,13 +1761,13 @@ class MainWindow(QMainWindow):
                 editor.clear_error_highlight()
         except Exception:
             pass
-        status = f"完成 ({elapsed:.1f} ms)"
+        status = f"完成 ({elapsed:.1f} ms) · {len(rows)} 行"
         message = payload.get('message') or ''
         if message and not cols:
             status += f" - {message}"
         if truncated:
-            status += (f"；结果已截断：显示前 {len(rows)} 行"
-                       f"（可点『加载更多』继续）")
+            status += (f"；结果已截断：已取 {len(rows)} 行 / 限制 "
+                       f"{self._effective_max_rows()} 行（可点『加载更多』继续）")
         self._set_status(status)
         try:
             self.history.add(ctx['sql'], ctx['conn_name'], True, elapsed)
