@@ -263,3 +263,30 @@ P3 新增覆盖：
   （无半提交、WAL=0）、快照后写入不丢；跨进程 suspend 后端管道
   （monkeypatch 模拟 suspend/resume）；quiesce 失败显式报错；定位不到服务
   进程显式失败；10k 行阻塞/总时长量化。
+
+---
+
+## 9. 增量备份链（P4，2026-10-29）
+
+在快照基础上新增**基线 + 增量 + 恢复链**原型：
+`scripts/backup_chain.py`（`init/incr/restore/prune/bench`），
+详见 **[INCREMENTAL_BACKUP.md](INCREMENTAL_BACKUP.md)**。
+
+要点（与快照的关系）：
+
+* **基线复用本文件的 `create_snapshot()`**（checkpoint→WAL=0→文件拷贝），
+  因此基线的格式/校验/恢复语义与快照完全一致；
+* **增量不再每次全量拷贝**：静默时刻之间做**行级差分**（新增/删除/修改行，
+  含真实 AUTO_INCREMENT 值），并从 binlog 捕获区间内 **DDL SQL**；恢复时
+  "基线快照 → 顺序应用 DDL+行差分 → 还原自增 → checkpoint(WAL=0)"；
+* 恢复后除本文件的逐表行数/关键值/SHOW CREATE/自增/WAL=0 自检外，还对比
+  基线+增量记录的**全表行摘要/首末行/状态指纹**；断链/缺段/篡改/版本不兼容
+  显式失败且不触碰目标；
+* `--keep N` 通过 rebase（恢复前缀→新基线 snapshot）安全清理旧增量；
+* 量化：10k 行基线 849 KB/8.64s（另一轮 4.97s），1000 行变化增量
+  52 KB/2.92s（另一轮 11.42s，6.1%），恢复链 4.75s（另一轮 8.91s；
+  两轮均 WAL=0/状态校验通过）。
+
+限制：增量链要求**静默离线**（不处理并发写/在线 quiesce）；schema 变更必须
+有 binlog DDL；不支持 TRUNCATE/RENAME；恢复粒度为增量段边界。详见
+[INCREMENTAL_BACKUP.md](INCREMENTAL_BACKUP.md) §6。
