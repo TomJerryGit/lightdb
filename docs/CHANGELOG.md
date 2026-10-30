@@ -175,6 +175,40 @@
 - 复合主键 ≤4 列、每分量 signed-32；BTree v3 需旧库迁移
 - 进程内多线程受 GIL + 表锁 + 每事务 flush 限制；组提交/解析缓存/读写锁拆分未落地
 
+
+## [4.0.0] — 2026-10-30（P4 收尾：增量备份链 / 分片路由 / 复制协议层）
+
+### 备份与恢复
+- **增量备份链**（`scripts/backup_chain.py`）：全量基线快照 + **行级差分增量**
+  （含真实 AUTO_INCREMENT 值）+ binlog DDL；`restore --to N/--latest` 在 staging
+  应用并逐表校验（行数/首末行/全表摘要/SHOW CREATE/自增/WAL=0）通过后才安装目标；
+  `prune --keep N` 用 rebase 保持链连续；断链/缺段/篡改/版本不兼容显式失败且不碰目标。
+  10k 行：基线 849KB/8.64s，1000 行变化增量 52KB（**6.1%**）/2.92s，恢复链 4.75s。
+
+### 服务端
+- **分片接入 MySQL 协议路由**：`LIGHTDB_SHARDING_ENABLED` + `LIGHTDB_SHARDING_MIN_ROWS`
+  自动路由可安全分片 SELECT（单表/整数单列主键/BETWEEN/无 JOIN 聚合排序限流子查询）；
+  结果集编码与普通查询一致；**快照复用 + 常驻 worker 池**（快照创建从每查询 ~13s
+  降为 quiesce 拷贝 ~0.6s，复用后 **4.2x**）；`/metrics` 分片指标；不支持形态/事务/
+  写安全回退，worker 崩溃/超时显式 1105。
+- **复制协议层**：服务端 `COM_BINLOG_DUMP`（非 GTID；响应为自定义 JSON 流，
+  文档明确列出与 MySQL binlog v4 差异，不假装兼容）；binlog 未启用 1381、文件/位点
+  1236、权限 1044/1227；`replica_apply.py --protocol` 原始 socket 握手拉取，复用
+  幂等 apply/断点/状态文件；断线续传、轮转跨文件、301 ev/s（协议开销 3.7%）。
+
+### CI
+- 全量步骤加 `timeout-minutes(50)`；配合 `pytest-timeout` 双层兜底。
+- 最终 CI：**1798 tests / 0 failed** + benchmark + GUI perf + packaging 全绿
+  （提交 `2d7ad7b`），前序 `0e85388` 同代码亦绿。
+- 根因记录：CI 挂起多与本机并行本地全量/其他项目负载争端口有关；CI 运行期间
+  不再并行跑本地全量测试。
+
+### 已知限制（P4 新增）
+- 增量链：仅静默离线；schema 变更必须能在 binlog 区间捕获；不支持 TRUNCATE/RENAME；
+  版本需完全一致；恢复粒度为增量段。
+- 分片：原型级单表 BETWEEN，无分布式事务/JOIN 分片；结果=快照时刻（刷新/TTL 控制）。
+- 复制协议：非 MySQL binlog v4，GTID 未实现；单主、无自动 failover、单线程 apply。
+
 ### 已知限制 / 未完成（详见路线图 backlog）
 
 - 自动更新**不含自动安装/替换**（下载+校验后由用户手动安装）。

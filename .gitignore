@@ -89,3 +89,7 @@ _repro*
 _sweep*
 _bench_*_pairs.json
 _acl_recovery/
+
+_analysis_tmp/
+docs/analysis_2026-10-19/logs/
+docs/analysis_2026-10-19/tmp/
