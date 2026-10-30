@@ -271,3 +271,85 @@ python scripts/shard_query.py --bench --rows 10000,100000 --workers 1,2,4,8 `
 
 边界复述：**只读、单表、整数单列主键、BETWEEN**；一致性为快照时刻；
 不支持形态显式 1105；不是生产查询入口。
+
+---
+
+## 9. 服务端路由（task-85 落地）
+
+> §7 的"快照复用 / worker 池 / 协议接入"三条已在 task-85 落地为
+> `lightdb/net/sharing.py::ShardedQueryEngine` + `MySQLServer` 路由；
+> 本文 §1–§6 是**一次性原型** `execute_sharded()` 的口径与量化，服务端路径
+> 复用同一套解析/切片/合并语义，但快照与 worker 生命周期不同（见下）。
+
+### 9.1 路由规则（默认关闭）
+
+`LIGHTDB_SHARDING_ENABLED=1` 时，`MySQLServer` 在 `_execute_sql_text` 解析
+之后、执行器之前尝试路由。**仅当全部满足**才走分片：
+
+* 单条 `SELECT`，单表，整数单列主键；
+* `WHERE <pk> BETWEEN a AND b`（整数字面量），无 JOIN / 聚合 / GROUP BY /
+  HAVING / DISTINCT / 窗口 / 子查询 / UNION / CTE / ORDER BY / LIMIT / OFFSET；
+* 投影只含列名或 `*`，且包含主键列（否则无法按主键合并）；
+* `(hi - lo + 1) >= LIGHTDB_SHARDING_MIN_ROWS`（默认 20000）；
+* 会话不在显式事务中、当前库为服务端主库、表级 SELECT 权限通过。
+
+其余情况**安全回退普通执行**（结果/错误与未启用分片完全一致），并计入
+`fallbacks_by_reason`；**绝不静默返回错误结果**。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `LIGHTDB_SHARDING_ENABLED` | `0` | 是否启用协议层路由 |
+| `LIGHTDB_SHARDING_WORKERS` | `2` | 常驻 worker 进程数 |
+| `LIGHTDB_SHARDING_MIN_ROWS` | `20000` | BETWEEN 范围最小行数阈值 |
+| `LIGHTDB_SHARDING_TIMEOUT` | `120` | 单次分片查询总超时（秒） |
+| `LIGHTDB_SHARDING_SNAPSHOT_TTL` | `0` | 数据变更后仍复用旧快照的秒数（0=变更即刷新） |
+| `LIGHTDB_SHARDING_POOL_ROOT` | 工作区 `_analysis_tmp/sharding_runs/...` | 快照/worker 临时目录 |
+
+### 9.2 快照复用 + 常驻 worker 池
+
+* **快照**：首次查询时在 quiesce 窗口内 `live_db.checkpoint()`（复用快照模块
+  的 `_TableLocks` 表写锁）→ 校验 WAL=0 → 复制表数据文件到
+  `<pool>/genN/snapshot/data`；**拷贝窗口毫秒级**，不含原型的一次性
+  manifest/COUNT/样本/SHA 采集（那部分只用于备份快照）；
+* **复用**：后续查询若"表数据文件指纹 + 服务端写入纪元"均未变 → 直接复用
+  同一快照（`snapshot_reused_total` 增长，`snapshot_created_total` 不增长）；
+  服务端写入纪元 = 每条非 SELECT 语句成功后 +1（避免纯读下因快照自身
+  checkpoint 改变文件 mtime 而误刷新）；带外写入由文件指纹兜底；
+* **刷新**：数据变更 → 重建快照（重新 quiesce；重试 3 次仍持续写入则显式
+  失败并回退普通执行）；快照 TTL>0 时允许有界陈旧；
+* **worker 池**：每个 worker 进程启动时复制一份快照 data/ 并**打开一次
+  Database/Executor**，之后经任务/结果文件（pickle，原子 replace）复用；
+  不再每查询 spawn/copy/open；worker 数量 = shards 数上限；
+* 每次分片查询串行化（引擎锁），多客户端并发正确但分片查询彼此不并行；
+  非分片查询不受影响。
+
+### 9.3 指标（`/metrics`，服务端进程）
+
+`lightdb_sharding_enabled`、`_workers`、`_min_rows`、`_requests_total`、
+`_sharded_total`、`_fallbacks_total{reason}`、`_worker_errors_total`、
+`_timeouts_total`、`_snapshot_created_total`、`_snapshot_reused_total`、
+`_snapshot_age_seconds`、`_query_latency_ms_last/avg`、`_rows_total`；
+未启用时全部输出 0 + 注释。
+
+### 9.4 错误/一致性语义
+
+* **快照/拷贝失败、持续写入、权限不足、不支持形态、低阈值、事务中** →
+  回退普通执行（正确性优先，指标记录原因）；
+* **worker 崩溃/超时** → 显式 **1105**（消息含 worker 序号/退出码/超时），
+  不返回部分结果、不静默回退；下一查询会重建死掉的 worker；
+* 一致口径：结果 = **查询开始时最近一次快照**的已提交数据（快照时刻一致）；
+  快照刷新期间写入被表写锁阻塞（quiesce 窗口），窗口外写入会在下一次查询
+  触发刷新；与"同一时刻单进程执行逐行一致"在只读/写后静默两类测试下验证。
+
+### 9.5 复跑
+
+```powershell
+# 服务端路由（真实 pymysql：一致/回退/并发/指标/worker 崩溃超时）
+python -m pytest tests/test_server_sharding_routing.py -q
+# 原型 + 引擎（快照复用/worker 池/回退/带外写入刷新）
+python -m pytest tests/test_multiprocess_sharding.py -q
+```
+
+边界：仍是**原型级**只读加速路径（单表/整数单列主键/BETWEEN），无分布式
+事务、无跨表 JOIN 分片、无副本一致性协议；分片结果不保证反映快照之后
+的写入（由刷新/TTL 控制）。

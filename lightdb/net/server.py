@@ -32,6 +32,10 @@ from .observability import ServerRuntimeMetrics
 from .metrics_server import maybe_start_metrics
 # ★ 生产化 B（task-71）：服务端连接池（worker 线程复用/超限策略/健康检查）
 from .pool import ConnectionPool
+# ★ P4（task-85）：只读分片路由（快照复用 + 常驻 worker 池）
+from .sharding import (
+    ShardedQueryEngine, ShardingError, ShardWorkerError,
+    sharding_enabled_by_env)
 
 
 #: 登录失败后的固定延迟（秒）。它让暴力破解/口令扫描变慢，同时不改变
@@ -819,17 +823,46 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 code, sqlstate, message[:200]))
             return
 
-        try:
-            # ★ 复用连接级 session（不再是每条语句新建的临时 dict）：
-            # BEGIN 写的 txn 因此能活到下一条语句；`s['database']` 的切库结果
-            # 也自动保留。这是 P1-B 事务修复的核心。
-            result = self.executor.execute(parsed, self.session)
-        except Exception as e:
-            logger.error(f"SQL执行错误: {e}")
-            code = 1105
-            self._send_packet(mp.make_err_packet(
-                code, classify_sqlstate(code), str(e)[:200]))
-            return
+        # ★ task-85：可安全分片的只读 SELECT 自动路由到分片引擎。
+        #   - 事务中/多库/权限不足/不支持形态/低于阈值 → 回退普通执行；
+        #   - worker 崩溃/超时 → 显式 1105（不静默回退，避免"看起来成功"）；
+        #   - 结果 dict 与执行器 resultset 同形，后续复用同一条编码路径。
+        shard_result = None
+        if parsed.get('command') == 'SELECT':
+            try:
+                shard_result = self._maybe_shard_query(sql, parsed)
+            except ShardWorkerError as e:
+                logger.warn(f"分片查询失败（显式错误）: {e}")
+                self._send_packet(mp.make_err_packet(
+                    int(getattr(e, 'code', 1105)),
+                    getattr(e, 'sqlstate', 'HY000'),
+                    str(e)[:200]))
+                return
+            except ShardingError as e:            # 防御：回退普通执行
+                logger.warn(f"分片查询异常，回退普通执行: {e}")
+                shard_result = None
+
+        if shard_result is not None:
+            result = shard_result
+        else:
+            try:
+                # ★ 复用连接级 session（不再是每条语句新建的临时 dict）：
+                # BEGIN 写的 txn 因此能活到下一条语句；`s['database']` 的切库结果
+                # 也自动保留。这是 P1-B 事务修复的核心。
+                result = self.executor.execute(parsed, self.session)
+            except Exception as e:
+                logger.error(f"SQL执行错误: {e}")
+                code = 1105
+                self._send_packet(mp.make_err_packet(
+                    code, classify_sqlstate(code), str(e)[:200]))
+                return
+            # ★ task-85：写语句成功后写入纪元 +1（分片快照变更检测用；
+            #   读路径不增加，避免纯读负载不断触发快照刷新）。
+            if (parsed.get('command') != 'SELECT'
+                    and not (isinstance(result, dict)
+                             and result.get('type') == 'error')):
+                self.server.data_epoch = int(
+                    getattr(self.server, 'data_epoch', 0)) + 1
 
         # `USE <库>` 由执行器校验（不存在 → 1049）。成功时必须把会话状态
         # 同步回 handler：否则后续的 `SELECT DATABASE()` / `SHOW TABLES`
@@ -846,6 +879,42 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             self._send_execution_result(result, parsed)
         else:
             send_result(result, parsed)
+
+    def _maybe_shard_query(self, sql: str, parsed: dict):
+        """task-85：尝试把只读 SELECT 路由到分片引擎
+
+        返回 resultset dict（分片成功）或 None（回退普通执行）。以下情况
+        一律**安全回退**（由普通执行路径给出正确结果/错误，不静默错答）：
+        未启用分片、会话在显式事务中、非当前库、无表级 SELECT 权限、
+        形态不支持、范围低于阈值、快照生成失败。worker 崩溃/超时由
+        `engine.route()` 抛 `ShardWorkerError` → 调用方显式 1105。
+        """
+        engine = getattr(self.server, 'sharding', None)
+        if engine is None:
+            return None
+        db_obj = getattr(self, 'db', None)
+        db_name = getattr(db_obj, 'name', None)
+        current = (self.session.get('database')
+                   if isinstance(self.session, dict) else None)
+        current = current or getattr(self, 'database', None) or db_name
+        if current and db_name and current != db_name:
+            engine.record_fallback('session_database')
+            return None
+        if isinstance(self.session, dict) and self.session.get('txn'):
+            engine.record_fallback('session_transaction')
+            return None
+        # 权限：分片路径绕过执行器，必须在路由前做**同一份**表级 SELECT
+        # 权限检查；无权限时不走分片，让普通执行路径返回真实的 1044/1142。
+        try:
+            access = self._access_error_packet(
+                'SELECT', database=db_name or current,
+                table=parsed.get('table'))
+        except Exception:                         # pragma: no cover - 防御
+            access = None
+        if access is not None:
+            engine.record_fallback('permission')
+            return None
+        return engine.route(sql, session=self.session)
 
     def _update_session(self, **kwargs):
         with _sessions_lock:
@@ -2457,6 +2526,27 @@ class MySQLServer(socketserver.ThreadingTCPServer):
             logger.warn(f"连接池初始化失败（回退每连接一线程）: {e}")
             self.pool = None
 
+        # ★ task-85：P4 只读分片路由。
+        #   默认关闭（`LIGHTDB_SHARDING_ENABLED=1` 才启用）：对"单表/整数单列
+        #   主键/BETWEEN/无 JOIN/聚合/排序/限流/子查询"的 SELECT 自动路由到
+        #   分片引擎（快照复用 + 常驻 worker 池）；其它形态安全回退普通执行。
+        self.sharding = None
+        self.data_epoch = 0          # 写入纪元（分片快照变更检测；见 sharding.py）
+        try:
+            if sharding_enabled_by_env():
+                self.sharding = ShardedQueryEngine(
+                    self.db,
+                    epoch_provider=lambda: self.data_epoch)
+                logger.info(
+                    "分片路由已启用: workers=%s min_rows=%s timeout=%ss "
+                    "snapshot_ttl=%ss"
+                    % (self.sharding.workers, self.sharding.min_rows,
+                       self.sharding.timeout_s,
+                       self.sharding.snapshot_ttl))
+        except Exception as e:                   # pragma: no cover - 防御
+            logger.warn(f"分片路由初始化失败（回退普通执行）: {e}")
+            self.sharding = None
+
     # ==================== 连接池接入（task-71） ====================
 
     def process_request(self, request, client_address):
@@ -2495,7 +2585,14 @@ class MySQLServer(socketserver.ThreadingTCPServer):
             pass
 
     def shutdown(self):
-        """先停连接池/指标 HTTP 线程，再走 socketserver 的正常关闭"""
+        """先停分片 worker/连接池/指标 HTTP 线程，再走 socketserver 正常关闭"""
+        sharding = getattr(self, 'sharding', None)
+        if sharding is not None:
+            try:
+                sharding.close()
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"停止分片引擎失败: {e}")
+            self.sharding = None
         pool = getattr(self, 'pool', None)
         if pool is not None:
             try:

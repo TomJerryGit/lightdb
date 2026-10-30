@@ -828,6 +828,82 @@ def render_prometheus(server, prefix: str = None) -> str:
     # ---------- 增量复制（task-81；无数据输出 0 + 注释） ----------
     _render_replica_metrics(lines, prefix, _replica_status(server))
 
+    # ---------- 只读分片（task-85；未启用输出 0 + 注释） ----------
+    engine = getattr(server, 'sharding', None)
+    shard_snap = None
+    if engine is not None:
+        try:
+            shard_snap = engine.metrics_snapshot()
+        except Exception as e:                   # pragma: no cover - 防御
+            shard_snap = None
+            lines.append(f'# 分片指标读取失败: {e}')
+    _type_line(lines, f'{prefix}_sharding_enabled', 'gauge',
+               'Read-only sharding routing enabled (1/0)')
+    lines.append(f'{prefix}_sharding_enabled {1 if shard_snap else 0}')
+    if shard_snap:
+        _type_line(lines, f'{prefix}_sharding_workers', 'gauge',
+                   'Resident shard worker processes')
+        lines.append(
+            f'{prefix}_sharding_workers {int(shard_snap.get("workers", 0))}')
+        _type_line(lines, f'{prefix}_sharding_min_rows', 'gauge',
+                   'Minimum BETWEEN range span routed to sharding')
+        lines.append(
+            f'{prefix}_sharding_min_rows {int(shard_snap.get("min_rows", 0))}')
+        for name, key, mtype, help_text in (
+            ('requests_total', 'requests_total', 'counter',
+             'SELECT statements considered for sharding'),
+            ('sharded_total', 'sharded_total', 'counter',
+             'SELECT statements executed by sharding'),
+            ('fallbacks_total', 'fallbacks_total', 'counter',
+             'SELECT statements safely fell back to normal execution'),
+            ('worker_errors_total', 'worker_errors_total', 'counter',
+             'Shard worker failures reported as explicit 1105'),
+            ('timeouts_total', 'timeouts_total', 'counter',
+             'Shard worker timeouts reported as explicit 1105'),
+            ('snapshot_created_total', 'snapshot_created_total', 'counter',
+             'Snapshots created for sharding'),
+            ('snapshot_reused_total', 'snapshot_reused_total', 'counter',
+             'Sharded queries reusing an existing snapshot'),
+            ('snapshot_age_seconds', 'snapshot_age_seconds', 'gauge',
+             'Age of the snapshot currently used by sharding'),
+            ('query_latency_ms_last', 'query_latency_ms_last', 'gauge',
+             'Last sharded query end-to-end latency (ms)'),
+            ('query_latency_ms_avg', 'query_latency_ms_avg', 'gauge',
+             'Average sharded query end-to-end latency (ms)'),
+            ('rows_total', 'rows_sharded_total', 'counter',
+             'Rows returned by sharded queries'),
+        ):
+            metric = f'{prefix}_sharding_{name}'
+            _type_line(lines, metric, mtype, help_text)
+            if mtype == 'counter':
+                value = int(shard_snap.get(key, 0))
+            else:
+                value = float(shard_snap.get(key, 0.0))
+            lines.append(f'{metric} {value}')
+        reasons = shard_snap.get('fallbacks_by_reason') or {}
+        if any(int(v) > 0 for v in reasons.values()):
+            _type_line(lines, f'{prefix}_sharding_fallbacks_by_reason_total',
+                       'counter', 'Sharding fallbacks by reason')
+            for reason, count in sorted(reasons.items()):
+                if int(count) <= 0:
+                    continue
+                _metric(lines,
+                        f'{prefix}_sharding_fallbacks_by_reason_total',
+                        int(count), labels={'reason': reason})
+        lines.append(
+            f'# 分片: generation={shard_snap.get("snapshot_generation")} '
+            f'snapshot_ready={shard_snap.get("snapshot_ready")} '
+            f'last_fallback={shard_snap.get("last_fallback_reason")}')
+    else:
+        for name in ('workers', 'min_rows', 'requests_total',
+                     'sharded_total', 'fallbacks_total',
+                     'worker_errors_total', 'timeouts_total',
+                     'snapshot_created_total', 'snapshot_reused_total',
+                     'snapshot_age_seconds', 'query_latency_ms_last',
+                     'query_latency_ms_avg', 'rows_total'):
+            lines.append(f'{prefix}_sharding_{name} 0')
+        lines.append('# 分片未启用（LIGHTDB_SHARDING_ENABLED=0）：以上为 0')
+
     # ---------- 内存 / 线程 ----------
     try:
         import psutil
@@ -894,4 +970,17 @@ def metrics_snapshot_json(server) -> dict:
         'applied_events': 0, 'apply_errors': 0, 'last_apply_ts': 0,
         'caught_up': True, 'following': False, 'last_error': '',
     })
+    sharding_engine = getattr(server, 'sharding', None)
+    out['sharding'] = ({
+        'enabled': True,
+        **{k: v for k, v in sharding_engine.metrics_snapshot().items()
+           if k in ('workers', 'min_rows', 'requests_total', 'sharded_total',
+                    'fallbacks_total', 'worker_errors_total',
+                    'timeouts_total', 'snapshot_created_total',
+                    'snapshot_reused_total', 'snapshot_age_seconds',
+                    'query_latency_ms_last', 'query_latency_ms_avg',
+                    'rows_sharded_total', 'fallbacks_by_reason',
+                    'last_fallback_reason', 'snapshot_generation',
+                    'snapshot_ready')},
+    } if sharding_engine is not None else {'enabled': False})
     return out

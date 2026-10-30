@@ -223,3 +223,107 @@ def test_worker_execution_error_is_explicit(dataset):
         S.execute_sharded(SQL, dataset, workers=1, timeout_s=60,
                           _worker_inject={'error': 'injected worker failure'})
     assert 'injected worker failure' in str(ei.value)
+
+
+# ==================== task-85：服务端分片引擎（快照复用/worker 池/回退） ====================
+
+def _engine(dataset, tmp_path, workers=2, min_rows=100, timeout_s=120):
+    return S.ShardedQueryEngine(
+        data_dir=str(dataset), workers=workers, min_rows=min_rows,
+        timeout_s=timeout_s, pool_root=str(tmp_path / 'engine_pool'))
+
+
+def test_engine_snapshot_reuse_and_worker_pool(dataset, tmp_path):
+    """快照复用：数据未变时第二个查询不重建快照（原型每查询都建）"""
+    engine = _engine(dataset, tmp_path)
+    try:
+        sql = 'SELECT id, v FROM t WHERE id BETWEEN 100 AND 900'
+        base = S.execute_single(sql, dataset)
+        r1 = engine.route(sql)
+        assert r1 is not None and r1['type'] == 'resultset'
+        assert [tuple(x) for x in r1['rows']] == base['rows']
+        m1 = engine.metrics_snapshot()
+        assert m1['sharded_total'] == 1
+        assert m1['snapshot_created_total'] == 1
+        r2 = engine.route(sql)
+        assert [tuple(x) for x in r2['rows']] == base['rows']
+        m2 = engine.metrics_snapshot()
+        assert m2['snapshot_created_total'] == 1        # 复用，不重建
+        assert m2['snapshot_reused_total'] >= 1
+        assert m2['workers'] == 2
+        assert m2['workers_created_total'] >= 2
+        assert m2['query_latency_ms_last'] > 0
+        assert engine._workers and all(w.alive for w in engine._workers)
+    finally:
+        engine.close()
+
+
+def test_engine_fallbacks_and_threshold(dataset, tmp_path):
+    engine = _engine(dataset, tmp_path, min_rows=100)
+    try:
+        assert engine.route('SELECT COUNT(*) FROM t '
+                            'WHERE id BETWEEN 1 AND 9') is None
+        assert engine.route('SELECT * FROM t WHERE id BETWEEN 1 AND 9') is None
+        assert engine.route('SELECT id FROM t WHERE id BETWEEN 1 AND 9',
+                            session={'txn': 1}) is None
+        m = engine.metrics_snapshot()
+        assert m['fallbacks_by_reason']['unsupported'] >= 1
+        assert m['fallbacks_by_reason']['below_threshold'] >= 1
+        assert m['fallbacks_by_reason']['session_transaction'] >= 1
+        assert m['sharded_total'] == 0
+    finally:
+        engine.close()
+
+
+def test_engine_crash_and_timeout_explicit(dataset, tmp_path, monkeypatch):
+    monkeypatch.setenv('LIGHTDB_SHARDING_TEST_WORKER_CRASH', '1')
+    engine = _engine(dataset, tmp_path / 'crash', workers=1,
+                     min_rows=10)
+    try:
+        with pytest.raises(S.ShardWorkerError) as ei:
+            engine.route('SELECT id, v FROM t WHERE id BETWEEN 1 AND 100')
+        assert ei.value.code == 1105
+        assert 'worker' in str(ei.value).lower()
+    finally:
+        engine.close()
+
+    monkeypatch.delenv('LIGHTDB_SHARDING_TEST_WORKER_CRASH', raising=False)
+    monkeypatch.setenv('LIGHTDB_SHARDING_TEST_WORKER_SLEEP', '5')
+    engine2 = _engine(dataset, tmp_path / 'timeout', workers=1,
+                      min_rows=10, timeout_s=0.8)
+    try:
+        with pytest.raises(S.ShardWorkerError) as ei:
+            engine2.route('SELECT id, v FROM t WHERE id BETWEEN 1 AND 100')
+        assert ei.value.code == 1105
+        assert '超时' in str(ei.value)
+        assert engine2.metrics_snapshot()['worker_errors_total'] >= 1
+    finally:
+        engine2.close()
+
+
+def test_engine_refresh_after_out_of_band_write(tmp_path, monkeypatch):
+    """带外写入（不经过服务端）：文件指纹变化 → 下次查询刷新快照"""
+    monkeypatch.delenv('LIGHTDB_SHARDING_TEST_WORKER_SLEEP', raising=False)
+    from lightdb.db.database import Database
+    _quiet()
+    dd = tmp_path / 'oob'
+    db = Database(str(dd))
+    tbl = db.create_table('t', COLS)
+    for i in range(1, 401):
+        tbl.insert([i, i])
+    db.checkpoint(force=True)
+    db.shutdown()
+    engine = _engine(dd, tmp_path, workers=1, min_rows=50)
+    try:
+        r1 = engine.route('SELECT id, v FROM t WHERE id BETWEEN 1 AND 400')
+        assert len(r1['rows']) == 400
+        created = engine.metrics_snapshot()['snapshot_created_total']
+        db2 = Database(str(dd))
+        db2.get_table('t').insert([999, 1])
+        db2.checkpoint(force=True)
+        db2.shutdown()
+        r2 = engine.route('SELECT id, v FROM t WHERE id BETWEEN 1 AND 999')
+        assert (999, 1) in [tuple(x) for x in r2['rows']]
+        assert engine.metrics_snapshot()['snapshot_created_total'] > created
+    finally:
+        engine.close()
