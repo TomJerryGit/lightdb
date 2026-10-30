@@ -64,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help='一次性模式最多批数（默认 10000）')
     ap.add_argument('--follow', action='store_true',
                     help='持续增量跟随主库（Ctrl+C 停止；失败保留断点并退避重试）')
+    ap.add_argument('--protocol', action='store_true',
+                    help='经 MySQL 协议 COM_BINLOG_DUMP 拉取事件（默认内部导出；'
+                         '本引擎协议流为自定义 JSON，见 docs）')
     ap.add_argument('--interval', type=float, default=0.2,
                     help='follow 模式空闲轮询间隔秒（默认 0.2）')
     ap.add_argument('--retry-backoff', type=float, default=0.5,
@@ -120,7 +123,8 @@ def main(argv=None) -> int:
             args.master_host, args.master_port, target_db,
             user=args.master_user, password=password,
             state_path=(os.path.abspath(args.state_file)
-                        if args.state_file else None))
+                        if args.state_file else None),
+            source=('protocol' if args.protocol else 'export'))
     except Exception as e:
         print(f'[error] 初始化复制原型失败: {e}', file=sys.stderr)
         if target_db is not None:
@@ -187,7 +191,8 @@ def main(argv=None) -> int:
                     stop_event=stop,
                     retry_backoff=args.retry_backoff,
                     max_backoff=args.max_backoff,
-                    max_retries=args.max_retries)
+                    max_retries=args.max_retries,
+                    source=('protocol' if args.protocol else 'export'))
             except KeyboardInterrupt:
                 stats = {'stopped': True, 'reason': 'KeyboardInterrupt'}
             except ReplicaBinlogGap as e:
@@ -207,12 +212,14 @@ def main(argv=None) -> int:
             return 0
 
         stats = proto.run_until_caught_up(
-            batch=args.limit, max_batches=args.max_batches)
+            batch=args.limit, max_batches=args.max_batches,
+            source=('protocol' if args.protocol else 'export'))
         out = {'summary': stats, 'state': proto.stats()}
         if args.json:
             _print_json(out)
         else:
-            print(f"批数={stats['batches']} 事件={stats['events']} "
+            print(f"source={proto.source} 批数={stats['batches']} "
+                  f"事件={stats['events']} "
                   f"applied={stats['applied']} "
                   f"idempotent={stats['idempotent']} "
                   f"耗时={stats['elapsed_ms']:.1f}ms "
@@ -220,6 +227,8 @@ def main(argv=None) -> int:
             print(f"目标位点: lsn={stats['state']['lsn']} "
                   f"seq={stats['state']['seq']} "
                   f"last_file={stats['state']['master_file']} "
+                  f"protocol={stats['state'].get('protocol_file')}"
+                  f"@{stats['state'].get('protocol_pos')} "
                   f"lag_lsn={stats.get('lag_lsn')} "
                   f"lag_seconds={stats.get('lag_seconds')} "
                   f"caught_up={stats.get('caught_up')}")

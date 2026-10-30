@@ -454,3 +454,78 @@ JSON（引擎日志压到 ERROR），退出码 0/1/2。
   **单线程 apply**（无并行/无冲突解决）、schema 必须一致、不触发目标侧
   触发器/外键级联；延迟口径不含事件时间戳（导出接口限制），
   `Seconds_Behind_Master` 为 apply 侧落后时长而非 MySQL 精确事件延迟。
+
+---
+
+## 10. 复制协议层：COM_BINLOG_DUMP + `--protocol` 客户端（task-86）
+
+### 10.1 协议形态（诚实声明：**不是** MySQL binlog v4 兼容）
+
+服务端实现 `COM_BINLOG_DUMP`（0x12，最小非 GTID）；`COM_BINLOG_DUMP_GTID`
+（0x1e）**显式 1105 未实现**（本引擎没有 GTID 概念），不假装兼容。
+
+* **请求体（与 MySQL 同布局）**：`4B binlog-pos + 2B flags + 4B server-id
+  + filename(剩余字节)`；flags 仅支持 `BINLOG_DUMP_NON_BLOCK(0x01)`；
+  `BINLOG_SEND_ANNOTATE_ROWS(0x02)` 与未知位显式 1105。
+* **响应体（自定义）**：成功时若干包，每包=1 字节标记 + 载荷：
+  * `0x00 + UTF-8 JSON`：`stream_start`（schema=`lightdb-binlog-dump/1`、
+    file/pos/global_lsn/server_id/flags）、`event`（pos=全局 seq、lsn=跨文件
+    全局字节偏移、txn_id、event_type、table_name、data、file、next_pos）、
+    `eof`（count/last_lsn/last_file/last_pos/caught_up/start_*）；
+  * `0xfe`：**标准 MySQL EOF 包**（5 字节：warnings+status）标记流结束；
+  * `0xff`：**标准 MySQL ERR 包**（errno+SQLSTATE+message）。
+* **与 MySQL 的差异（明确列出）**：不发送 MySQL binlog v4 event 字节
+  （无 FormatDescription/TableMap/WriteRows/UpdateRows/DeleteRows/XID/
+  Rotate/Heartbeat/GTID/checksum 等事件）；只发送**数据事件**
+  （INSERT/UPDATE/DELETE/DDL；BEGIN/COMMIT 等控制事件不单发，事务号在
+  `txn_id` 中）；本引擎总是"取完当前可用事件即 EOF"（固定 NON_BLOCK 语义），
+  不提供 MySQL 那种长连接阻塞流；位点字段同时给文件内 `next_pos` 与跨文件
+  `lsn`。事件 JSON 与内部导出 `__BINLOG_FETCH__` 行同口径。
+* **参数/权限校验**：binlog 未启用 → 1381；filename 不存在/pos 越界/非事件
+  边界 → **1236 风格错误**（含可用文件与边界提示）；flags/server_id/短包
+  → 1105；权限：管理员或 `REPLICATION` 权限（否则 1044/1227）。
+* 流结束后连接仍可用（回到命令循环），客户端可继续查询/重发 dump。
+
+### 10.2 `--protocol` 客户端（replica_apply.py）
+
+```bash
+# 协议模式：从主库 COM_BINLOG_DUMP 拉取 → 解析 JSON 事件 → 复用幂等 apply
+python scripts/replica_apply.py --protocol --follow --interval 0.2 \
+    --master-host 127.0.0.1 --master-port 8899 \
+    --target-data-dir /tmp/replica-proto
+
+# 一次性追平（与 export 模式同一套 apply/状态/指标）
+python scripts/replica_apply.py --protocol \
+    --master-host 127.0.0.1 --master-port 8899 \
+    --target-data-dir /tmp/replica-proto --json
+```
+
+* 实现：`lightdb/net/replica_proto.py::BinlogDumpClient`（原始 socket 4.1
+  明文握手 + mysql_native_password + COM_BINLOG_DUMP）；**不依赖 pymysql
+  私有 API**。
+* 事件解析后转成与内部导出**相同的 6 列**（pos/lsn/txn_id/event_type/
+  table_name/data），`ReplicaPrototype.run_once(source='protocol')` 复用既有
+  幂等 apply / DDL 幂等预判 / 状态文件（原子+checksum）/ 断点保留 / 失败
+  退避 / 延迟指标。
+* **断线续传**：状态文件新增 `protocol_file`/`protocol_pos`（最后成功应用
+  事件的 `file` + `next_pos`）；每次拉取用短连接，断线/只取 N 条后下次
+  从该位点重连（服务端校验边界）；进程重启同样续传。
+* 与内部导出模式**同数据一致**：同一主库分别用两种模式复制到两个目标库，
+  逐行数据、`lsn`、`applied` 一致（测试
+  `tests/test_replication_protocol_stream.py::test_protocol_matches_export_and_master`）。
+* 轮转：单次 dump 会跨 binlog 文件继续流式发送（file 字段随事件变化），
+  客户端按最后事件位点续传；起始文件被清理 → 1236 显式错误，恢复策略同
+  §9.2（`--reset-position` 同步重置协议位点）。
+* 指标：复用 §9.4 的 `lightdb_replica_*`（lag_lsn/lag_seconds/applied_events/
+  apply_errors/last_apply_ts/caught_up 等）；`SHOW SLAVE STATUS`/`proto.stats()`
+  额外暴露 `Replica_Source`/`Replica_Protocol_File`/`Replica_Protocol_Pos`。
+
+### 10.3 量化与边界（本机 2026-10-30）
+
+* 121 条数据事件（含 1 DDL + 120 INSERT，跨 2 个 binlog 文件）单次
+  COM_BINLOG_DUMP 完整流式传输；协议模式与导出模式逐行/位点一致；
+* 1k 事件协议拉取+apply 与 export 模式同量级（同一台机器、单线程 apply，
+  数百 events/s，具体随负载波动；见测试打印）；
+* 边界：本层是**复制原型**（单主、无自动 failover、单线程 apply、schema
+  必须一致、数据事件级幂等），协议流仅支持非 GTID dump、事件类型为数据
+  事件；不是 MySQL 从库可直接消费的 binlog v4 流（差异见 §10.1）。

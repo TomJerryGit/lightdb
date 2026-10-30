@@ -64,10 +64,13 @@
 import hashlib
 import json
 import os
+import socket
+import struct
 import threading
 import time
 
 from ..logger import logger
+from . import mysql_protocol as mp
 
 #: 原型支持的事件类型（其它一律显式错误）
 KNOWN_EVENT_TYPES = frozenset({'INSERT', 'UPDATE', 'DELETE', 'DDL'})
@@ -134,6 +137,209 @@ class ReplicaApplyError(ReplicaError):
         super().__init__(f'复制 apply 失败{ctx}: {message}')
 
 
+#: binlog dump 流协议版本（响应为 marker+JSON，不是 MySQL binlog v4 字节）
+BINLOG_DUMP_SCHEMA = mp.BINLOG_DUMP_SCHEMA
+
+
+class BinlogDumpClient:
+    """最小 MySQL 协议客户端：握手 + COM_BINLOG_DUMP 流式拉取
+
+    只实现复制需要的两条链路：4.1 明文握手（mysql_native_password）与
+    COM_BINLOG_DUMP（非 GTID）。响应体是**本引擎自定义的 JSON 流**：
+
+    * ``0x00 + JSON``：``stream_start`` / ``event`` / ``eof`` 三类包；
+    * ``0xff``：MySQL ERR 包（errno 1236/1381/1105/1044...）；
+    * ``0xfe``：标准 EOF（流结束；本引擎"取完当前可用事件即 EOF"）。
+
+    ``event`` JSON 与 ``__BINLOG_FETCH__`` 行同口径：
+    pos(全局 seq)/lsn(全局字节偏移)/txn_id/event_type/table_name/data，
+    另带 file/next_pos 用于断点续传。**不是 MySQL binlog v4 兼容格式**，
+    差异见 docs/PRODUCTION_READINESS.md §10。
+    """
+
+    def __init__(self, host: str, port: int, user: str = 'root',
+                 password: str = '', connect_timeout: float = 5.0,
+                 read_timeout: float = 60.0):
+        self.host = str(host)
+        self.port = int(port)
+        self.user = user
+        self.password = password
+        self.connect_timeout = float(connect_timeout)
+        self.read_timeout = float(read_timeout)
+        self.sock = None
+        self.server_id = 0
+        self.server_version = ''
+
+    # ---------- 包收发 ----------
+    def _recv_exact(self, n: int) -> bytes:
+        chunks = []
+        got = 0
+        while got < n:
+            part = self.sock.recv(n - got)
+            if not part:
+                raise ConnectionError('主库连接在读取响应时被关闭')
+            chunks.append(part)
+            got += len(part)
+        return b''.join(chunks)
+
+    def _read_packet(self) -> bytes:
+        header = self._recv_exact(4)
+        length = header[0] | (header[1] << 8) | (header[2] << 16)
+        if length <= 0:
+            return b''
+        return self._recv_exact(length)
+
+    def _send_packet(self, payload: bytes, seq: int = 0):
+        length = len(payload)
+        header = bytes([length & 0xff, (length >> 8) & 0xff,
+                        (length >> 16) & 0xff, seq & 0xff])
+        self.sock.sendall(header + payload)
+
+    # ---------- 连接/认证 ----------
+    def connect(self):
+        if self.sock is not None:
+            return self
+        try:
+            self.sock = socket.create_connection(
+                (self.host, self.port), timeout=self.connect_timeout)
+            self.sock.settimeout(self.read_timeout)
+        except OSError as exc:
+            self.close()
+            raise ReplicaRetryableError(
+                f'连接主库失败 {self.host}:{self.port}: {exc}') from exc
+        try:
+            handshake = self._read_packet()
+            info = mp.parse_handshake_v10(handshake)
+            self.server_id = int(info.get('connection_id') or 0)
+            self.server_version = str(info.get('server_version') or '')
+            response = mp.make_handshake_response(
+                self.user, self.password, info['auth_seed'])
+            self._send_packet(response, 1)
+            auth = self._read_packet()
+        except ReplicaError:
+            self.close()
+            raise
+        except (OSError, ValueError, IndexError) as exc:
+            self.close()
+            raise ReplicaRetryableError(
+                f'主库握手失败: {exc}') from exc
+        if auth[:1] == b'\xff':
+            err = mp.parse_err_packet(auth) or (1105, 'HY000', '认证失败')
+            self.close()
+            if int(err[0]) in (2003, 2006, 2013):
+                raise ReplicaRetryableError(
+                    f'主库认证时连接失败: {err[0]} {err[2]}')
+            raise ReplicaError(
+                f'主库认证失败（errno {err[0]}）: {err[2]}')
+        if auth[:1] != b'\x00':
+            self.close()
+            raise ReplicaError('主库认证响应非法（不是 OK/ERR 包）')
+        return self
+
+    def close(self):
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:                   # pragma: no cover - 防御
+                pass
+
+    # ---------- binlog dump ----------
+    @staticmethod
+    def _map_stream_error(errno, sqlstate, message):
+        if int(errno) == 1236:
+            return ReplicaBinlogGap(message)
+        return ReplicaError(
+            f'主库 binlog dump 错误（errno {errno}, {sqlstate}）: {message}')
+
+    def dump(self, filename: str, binlog_pos: int, max_events: int = None,
+             flags: int = mp.BINLOG_DUMP_NON_BLOCK,
+             server_id: int = 1) -> dict:
+        """执行一次 COM_BINLOG_DUMP；返回 events/eof/truncated
+
+        ``max_events`` 只取前 N 条就主动断开（模拟"拉一半断线"：服务端
+        后续发送会得到 BrokenPipe；客户端状态由最后一条事件的
+        file/next_pos 决定，下一次从该位点续传）。
+        """
+        self.connect()
+        request = (bytes([mp.COM_BINLOG_DUMP])
+                   + mp.make_binlog_dump_request(
+                       binlog_pos=binlog_pos, flags=flags,
+                       server_id=server_id, filename=filename))
+        try:
+            self._send_packet(request, 0)
+            first = self._read_packet()
+        except OSError as exc:
+            self.close()
+            raise ReplicaRetryableError(
+                f'COM_BINLOG_DUMP 发送/读取失败: {exc}') from exc
+        if first[:1] == b'\xff':
+            err = mp.parse_err_packet(first) or (1105, 'HY000', 'dump 失败')
+            self.close()
+            raise self._map_stream_error(*err)
+        if first[:1] != bytes([mp.BINLOG_STREAM_MARKER]):
+            self.close()
+            raise ReplicaError(
+                f'COM_BINLOG_DUMP 响应头非法（首字节 {first[:1]!r}）')
+        try:
+            header = json.loads(first[1:].decode('utf-8'))
+        except Exception as exc:                 # noqa: BLE001
+            self.close()
+            raise ReplicaError(f'流头 JSON 解析失败: {exc}') from exc
+        if header.get('schema') != BINLOG_DUMP_SCHEMA:
+            self.close()
+            raise ReplicaError(
+                f"binlog dump 协议不匹配: {header.get('schema')!r} "
+                f"（期望 {BINLOG_DUMP_SCHEMA!r}）")
+        events = []
+        eof = None
+        truncated = False
+        while True:
+            try:
+                packet = self._read_packet()
+            except (OSError, ConnectionError) as exc:
+                self.close()
+                if events:
+                    # 已拿到部分事件：交给上层 apply（由状态位点续传）
+                    return {'header': header, 'events': events,
+                            'eof': None, 'truncated': True,
+                            'disconnect': str(exc)}
+                raise ReplicaRetryableError(
+                    f'binlog 流读取失败: {exc}') from exc
+            marker = packet[:1]
+            if marker == b'\xff':
+                err = mp.parse_err_packet(packet) or (1105, 'HY000', '流错误')
+                self.close()
+                raise self._map_stream_error(*err)
+            if marker == bytes([mp.BINLOG_STREAM_EOF]):
+                self.close()
+                return {'header': header, 'events': events,
+                        'eof': eof, 'truncated': truncated}
+            if marker != bytes([mp.BINLOG_STREAM_MARKER]):
+                self.close()
+                raise ReplicaError(f'binlog 流包标记非法: {marker!r}')
+            try:
+                obj = json.loads(packet[1:].decode('utf-8'))
+            except Exception as exc:             # noqa: BLE001
+                self.close()
+                raise ReplicaError(
+                    f'binlog 流 JSON 解析失败: {exc}') from exc
+            kind = obj.get('type')
+            if kind == 'event':
+                events.append(obj)
+                if max_events is not None and len(events) >= int(max_events):
+                    # 主动断开（服务端后续写 BrokenPipe）→ 状态位点续传
+                    self.close()
+                    truncated = True
+                    return {'header': header, 'events': events,
+                            'eof': None, 'truncated': True}
+            elif kind == 'eof':
+                eof = obj
+            else:
+                self.close()
+                raise ReplicaError(f'未知 binlog 流包类型: {kind!r}')
+
+
 class ReplicaPrototype:
     """单主、单线程的 binlog → 目标库 apply 原型"""
 
@@ -143,7 +349,7 @@ class ReplicaPrototype:
                  user: str = 'root', password: str = '',
                  state_path: str = None, connect_timeout: float = 5.0,
                  read_timeout: float = 60.0, target_executor=None,
-                 auto_register: bool = True):
+                 auto_register: bool = True, source: str = 'export'):
         self.master_host = str(master_host)
         self.master_port = int(master_port)
         self.user = user
@@ -152,6 +358,12 @@ class ReplicaPrototype:
         self.read_timeout = float(read_timeout)
         self.target_db = target_db
         self._executor = target_executor
+        #: 拉取方式：``export``=内部导出（__BINLOG_FETCH__），
+        #: ``protocol``=MySQL 协议 COM_BINLOG_DUMP（自定义 JSON 流，task-86）
+        self.source = str(source or 'export').lower()
+        if self.source not in ('export', 'protocol'):
+            raise ReplicaError(
+                f'未知复制拉取方式: {source!r}（仅 export/protocol）')
         #: RLock：apply_event/延迟快照/show_status 互斥，避免 metrics 读到
         #: "state 已前进但 master_lsn 还是上一批"的撕裂快照
         self._lock = threading.RLock()
@@ -219,6 +431,9 @@ class ReplicaPrototype:
             'errors': 0,
             'last_event_type': None,
             'last_apply_ts': 0.0,
+            # ★ task-86：协议模式的精确续传位点（file + 文件内 pos）
+            'protocol_file': None,
+            'protocol_pos': None,
         }
 
     #: 状态文件里参与 checksum 的字段（排除 checksum/saved_at 自身）
@@ -254,6 +469,15 @@ class ReplicaPrototype:
         if not isinstance(ts, (int, float)) or ts < 0:
             raise ReplicaError(
                 f'复制状态文件字段 last_apply_ts 非法: {ts!r} @ {path}')
+        pf = state.get('protocol_file')
+        if pf is not None and not isinstance(pf, str):
+            raise ReplicaError(
+                f'复制状态文件字段 protocol_file 非法: {pf!r} @ {path}')
+        pp = state.get('protocol_pos')
+        if pp is not None and (not isinstance(pp, int)
+                               or isinstance(pp, bool) or pp < 0):
+            raise ReplicaError(
+                f'复制状态文件字段 protocol_pos 非法: {pp!r} @ {path}')
         for key in ('master_host', 'master_port'):
             if state.get(key) is None:
                 state[key] = getattr(self, key, None)
@@ -459,6 +683,81 @@ class ReplicaPrototype:
             raise ReplicaError(
                 f'主库 __BINLOG_FETCH__ 列契约变化：期望 {expect}，实际 {cols}')
         return [tuple(r) for r in rows]
+
+    # ==================== 协议拉取（COM_BINLOG_DUMP，task-86） ====================
+
+    def _protocol_start_position(self) -> tuple:
+        """解析协议模式的起始 (file, pos)
+
+        * 状态里有 `protocol_file/pos` → 直接续传（断线/进程重启后）；
+        * 全新状态（从未应用）→ 从主库**最早可用 binlog 文件头**开始，
+          这样协议模式与内部导出模式一样从历史事件全量追平；
+        * 已有 lsn 但没有协议位点（状态来自 export 模式）→ 显式报错，
+          要求换新状态文件/显式重置，避免从错误位点静默复制。
+        """
+        from ..replication.append_only_binlog import FILE_HEADER_SIZE
+        with self._lock:
+            file = self.state.get('protocol_file')
+            pos = self.state.get('protocol_pos')
+            lsn = int(self.state.get('lsn') or 0)
+            applied = int(self.state.get('applied') or 0)
+        if file is not None and pos is not None:
+            return str(file), int(pos)
+        if lsn > 0 or applied > 0:
+            raise ReplicaError(
+                '状态文件来自内部导出租模式（有 lsn 但没有协议续传位点）：'
+                '协议模式需要独立状态文件；请使用新的 --state-file，或人工'
+                '确认后用 --reset-position 把协议位点重置到主库当前末尾')
+        logs = self.binary_logs()
+        if not logs:
+            raise ReplicaError(
+                '主库没有可用 binlog 文件（binlog 未启用或尚无写入）')
+        first = sorted(logs, key=lambda x: str(x.get('name')))[0]
+        return str(first['name']), int(FILE_HEADER_SIZE)
+
+    def _fetch_protocol_events(self, limit: int) -> dict:
+        """经 COM_BINLOG_DUMP 拉取一批事件（返回六列元组 + 续传位点）
+
+        连接是**每次拉取一条短连接**：服务端在"取完当前可用事件"后发 EOF
+        并结束流；断线/只取 N 条时状态里的 file/pos 保留在最后成功应用的
+        事件之后，下次从该位点重连续传（服务端会校验 file/pos 边界）。
+        """
+        start_file, start_pos = self._protocol_start_position()
+        client = BinlogDumpClient(
+            self.master_host, self.master_port, user=self.user,
+            password=self.password, connect_timeout=self.connect_timeout,
+            read_timeout=self.read_timeout)
+        try:
+            batch = client.dump(start_file, start_pos,
+                                max_events=max(1, int(limit)))
+        finally:
+            client.close()
+        events = []
+        for obj in batch.get('events') or []:
+            try:
+                data = obj.get('data')
+                if isinstance(data, (dict, list)):
+                    data_text = json.dumps(data, ensure_ascii=False,
+                                           default=str)
+                else:
+                    data_text = data if isinstance(data, str) else '{}'
+                events.append({
+                    'event': (int(obj.get('pos') or 0),
+                              int(obj.get('lsn') or 0),
+                              obj.get('txn_id'),
+                              str(obj.get('event_type') or ''),
+                              obj.get('table_name'),
+                              data_text),
+                    'file': obj.get('file'),
+                    'next_pos': obj.get('next_pos'),
+                })
+            except Exception as exc:             # noqa: BLE001
+                raise ReplicaError(
+                    f'协议事件字段非法（拒绝静默跳过）: {obj!r}: {exc}')
+        return {'events': events, 'header': batch.get('header'),
+                'eof': batch.get('eof'),
+                'truncated': bool(batch.get('truncated')),
+                'disconnect': batch.get('disconnect')}
 
     # ==================== apply ====================
 
@@ -733,6 +1032,9 @@ class ReplicaPrototype:
         self.state['lsn'] = int(agg.get('max_lsn') or 0)
         self.state['seq'] = int(max_pos or 0)
         self.state['master_file'] = status['file']
+        # ★ task-86：协议模式的续传位点也重置到主库当前文件/位点
+        self.state['protocol_file'] = status['file']
+        self.state['protocol_pos'] = int(status['position'])
         self.state['last_event_type'] = None
         self._last_error = None
         self._last_error_errno = None
@@ -774,8 +1076,15 @@ class ReplicaPrototype:
 
     # ==================== 批量运行 ====================
 
-    def run_once(self, limit: int = 500, save_every: int = 50) -> dict:
+    def run_once(self, limit: int = 500, save_every: int = 50,
+                 source: str = None) -> dict:
         """拉取一批并串行 apply；返回统计（events/applied/idempotent/...）
+
+        ``source``：``export``=内部导出（默认，``__BINLOG_FETCH__``）；
+        ``protocol``=任务 86 的 COM_BINLOG_DUMP 协议流。两种来源的事件
+        六列语义一致（pos/lsn/txn_id/event_type/table_name/data），apply/
+        断点/状态文件/指标逻辑完全复用；协议模式额外用
+        ``protocol_file/protocol_pos`` 做精确的断线续传位点。
 
         * 先做位点缺口检测（1236 风格，显式拒绝而不是静默跳过）；
         * ``save_every``：每 N 条事件写一次状态（不 fsync）；批末统一
@@ -787,19 +1096,34 @@ class ReplicaPrototype:
           等真实核算值（供指标/SHOW SLAVE STATUS/CLI 使用）。
         """
         started = time.time()
+        source = str(source or self.source).lower()
+        if source not in ('export', 'protocol'):
+            raise ReplicaError(
+                f'未知复制拉取方式: {source!r}（仅 export/protocol）')
         status = self.master_status()
-        logs = self.binary_logs()
         agg = self._aggregate_lsn()
-        self.check_binlog_gap(logs=logs, agg=agg)
-        events = self.fetch_events(self.state['lsn'], limit)
+        protocol_meta = None
+        if source == 'protocol':
+            fetched = self._fetch_protocol_events(limit)
+            entries = fetched['events']
+            protocol_meta = {k: fetched.get(k) for k in
+                             ('header', 'eof', 'truncated', 'disconnect')}
+        else:
+            logs = self.binary_logs()
+            self.check_binlog_gap(logs=logs, agg=agg)
+            entries = [{'event': ev} for ev in
+                       self.fetch_events(self.state['lsn'], limit)]
+        events = [entry['event'] for entry in entries]
         stats = {'fetched': len(events), 'applied': 0, 'idempotent': 0,
                  'errors': 0, 'events': len(events), 'last_lsn': None,
                  'last_seq': None, 'master_file': status['file'],
                  'master_position': status['position'],
                  'master_lsn': int(agg.get('max_lsn') or 0),
                  'master_min_lsn': int(agg.get('min_lsn') or 0),
+                 'source': source,
                  'elapsed_ms': 0.0, 'events_per_sec': 0.0}
-        for idx, ev in enumerate(events):
+        for idx, entry in enumerate(entries):
+            ev = entry['event']
             try:
                 res = self.apply_event(ev, persist=False)
             except ReplicaApplyError as e:
@@ -820,8 +1144,23 @@ class ReplicaPrototype:
                 stats['idempotent'] += 1
             stats['last_lsn'] = res['lsn']
             stats['last_seq'] = int(self.state.get('seq') or 0)
+            if source == 'protocol':
+                # 断点续传位点：最后成功应用事件所在文件 + 事件结束偏移
+                with self._lock:
+                    if entry.get('file') is not None:
+                        self.state['protocol_file'] = str(entry['file'])
+                    if entry.get('next_pos') is not None:
+                        self.state['protocol_pos'] = int(entry['next_pos'])
             if save_every and (idx + 1) % max(1, int(save_every)) == 0:
                 self.save_state()
+        # 协议流 EOF：把精确续传位点推进到 EOF 报告的位置（空批次也能前进）
+        if protocol_meta and protocol_meta.get('eof'):
+            eof = protocol_meta['eof'] or {}
+            with self._lock:
+                if eof.get('last_file'):
+                    self.state['protocol_file'] = str(eof['last_file'])
+                if eof.get('last_pos') is not None:
+                    self.state['protocol_pos'] = int(eof['last_pos'])
         # 记录主库当前文件（用于清理检测；文件级，不含位点）
         self.state['master_file'] = status['file']
         # 批末 fsync 一次：断点续传位点的持久化点（每事件不 fsync）
@@ -866,17 +1205,25 @@ class ReplicaPrototype:
         stats['apply_errors'] = int(self.state.get('errors') or 0)
         stats['last_apply_ts'] = float(
             self.state.get('last_apply_ts') or 0.0)
+        stats['protocol_file'] = self.state.get('protocol_file')
+        stats['protocol_pos'] = self.state.get('protocol_pos')
+        if protocol_meta is not None:
+            stats['protocol_truncated'] = bool(
+                protocol_meta.get('truncated'))
+            stats['protocol_disconnect'] = protocol_meta.get('disconnect')
+            stats['protocol_eof'] = bool(protocol_meta.get('eof'))
         stats['state'] = dict(self.state)
         return stats
 
     def run_until_caught_up(self, batch: int = 500,
-                            max_batches: int = 1000) -> dict:
+                            max_batches: int = 1000,
+                            source: str = None) -> dict:
         """连续应用直到没有新事件（用于测试/一次性同步）"""
         started = time.time()
         total = {'batches': 0, 'events': 0, 'applied': 0,
                  'idempotent': 0, 'elapsed_ms': 0.0, 'caught_up': False}
         for _ in range(max(1, int(max_batches))):
-            stats = self.run_once(limit=batch)
+            stats = self.run_once(limit=batch, source=source)
             total['batches'] += 1
             total['events'] += stats['events']
             total['applied'] += stats['applied']
@@ -897,7 +1244,7 @@ class ReplicaPrototype:
     def follow(self, interval: float = 0.2, batch: int = 500,
                stop_event: threading.Event = None, max_events: int = None,
                retry_backoff: float = 0.5, max_backoff: float = 30.0,
-               max_retries: int = 0) -> dict:
+               max_retries: int = 0, source: str = None) -> dict:
         """持续增量跟随（单线程轮询；失败保留断点、退避重试、不跳过）
 
         语义（task-81）：
@@ -926,7 +1273,7 @@ class ReplicaPrototype:
                         applied_total, events_total, total_retries, True,
                         started)
                 try:
-                    stats = self.run_once(limit=batch)
+                    stats = self.run_once(limit=batch, source=source)
                     retries = 0
                 except ReplicaBinlogGap:
                     # 位点缺口：终态错误，显式上抛（含可用文件/恢复策略）
@@ -1084,6 +1431,9 @@ class ReplicaPrototype:
             # ---- 自定义快照（/metrics 用；SHOW 列清单会忽略这些键）----
             'Replica_Is_Prototype': True,
             'Replica_Node': 'apply',
+            'Replica_Source': self.source,
+            'Replica_Protocol_File': state.get('protocol_file'),
+            'Replica_Protocol_Pos': state.get('protocol_pos'),
             'Replica_Master_Host': self.master_host,
             'Replica_Master_Port': self.master_port,
             'Replica_Following': 1 if running else 0,
@@ -1114,6 +1464,9 @@ class ReplicaPrototype:
             state.update({
                 'state_path': str(self.state_path),
                 'target_data_dir': str(self.target_db.data_dir),
+                'source': self.source,
+                'protocol_file': self.state.get('protocol_file'),
+                'protocol_pos': self.state.get('protocol_pos'),
                 'last_error': self._last_error,
                 'last_error_errno': self._last_error_errno,
                 'following': self._following,

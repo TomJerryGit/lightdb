@@ -9,6 +9,7 @@ LightDB MySQL 兼容服务器（修复版）
 - 查询语句识别更严谨
 """
 import math
+import json
 import os
 import re
 import socket
@@ -604,6 +605,16 @@ class MySQLHandler(socketserver.BaseRequestHandler):
                 'COM_STMT_FETCH（游标）暂不支持：本引擎的预处理语句'
                 '在 EXECUTE 时直接返回全量结果集（未实现 CURSOR 形态）'))
 
+        # ★ task-86：复制协议（最小非 GTID binlog dump；响应为自定义 JSON 流）
+        elif cmd == mp.COM_BINLOG_DUMP:
+            self._handle_binlog_dump(body)
+
+        elif cmd == mp.COM_BINLOG_DUMP_GTID:
+            self._send_packet(mp.make_err_packet(
+                1105, 'HY000',
+                'COM_BINLOG_DUMP_GTID 未实现：本引擎没有 GTID 概念，'
+                '请使用 COM_BINLOG_DUMP（非 GTID，file+pos）'))
+
         else:
             self._send_packet(mp.make_err_packet(
                 1047, "08S01",
@@ -915,6 +926,232 @@ class MySQLHandler(socketserver.BaseRequestHandler):
             engine.record_fallback('permission')
             return None
         return engine.route(sql, session=self.session)
+
+    # ==================== 复制协议：COM_BINLOG_DUMP（task-86） ====================
+
+    #: binlog 文件名格式（`SHOW BINARY LOGS` / 文件夹里的真实文件）
+    _BINLOG_FILE_RE = re.compile(r'^binlog\.\d{6}$')
+
+    def _binlog_dump_err(self, code, sqlstate, message):
+        self._send_packet(mp.make_err_packet(
+            int(code), sqlstate or classify_sqlstate(code),
+            str(message)[:255]))
+
+    def _binlog_dump_json(self, obj) -> bool:
+        """发送一个 `0x00 + JSON` 流包；连接已断返回 False"""
+        payload = (bytes([mp.BINLOG_STREAM_MARKER])
+                   + json.dumps(obj, ensure_ascii=False,
+                                default=str).encode('utf-8'))
+        self._send_packet(payload)
+        return not self.closed
+
+    def _handle_binlog_dump(self, body: bytes):
+        """COM_BINLOG_DUMP：最小非 GTID 的 binlog 事件流
+
+        **协议形态（自定义，不是 MySQL binlog v4 event 字节）**：
+        请求体 = 4B binlog-pos + 2B flags + 4B server-id + filename；
+        成功响应 = 若干 `0x00 + JSON` 包（header/event/eof）+ 标准 EOF 包；
+        失败响应 = 标准 MySQL ERR 包。JSON 事件字段与 `__BINLOG_FETCH__`
+        同口径（pos/lsn/txn_id/event_type/table_name/data），只发送数据事件
+        （BEGIN/COMMIT 等控制事件不单独发送，事务号在 txn_id 里）。
+        本引擎总是 "取完当前可用事件即 EOF"（BINLOG_DUMP_NON_BLOCK 语义），
+        不提供 MySQL 那种长连接阻塞流；差异已写入
+        docs/PRODUCTION_READINESS.md §10。
+        """
+        from ..replication.append_only_binlog import (
+            DATA_TYPES, FILE_HEADER_SIZE, BinlogError, binlog_enabled)
+        # ---------- 参数校验 ----------
+        if len(body) < 10:
+            self._binlog_dump_err(
+                1105, 'HY000',
+                'COM_BINLOG_DUMP 参数不足（需要 pos:4 + flags:2 + '
+                'server_id:4 + filename）')
+            return
+        binlog_pos, flags, server_id = struct.unpack_from('<IHI', body, 0)
+        filename = body[10:].decode('utf-8', 'replace').strip('\x00').strip()
+        allowed = mp.BINLOG_DUMP_NON_BLOCK | mp.BINLOG_SEND_ANNOTATE_ROWS
+        if flags & ~allowed:
+            self._binlog_dump_err(
+                1105, 'HY000',
+                f'COM_BINLOG_DUMP flags 非法: {flags:#06x}'
+                f'（仅支持 NON_BLOCK/ANNOTATE_ROWS 位）')
+            return
+        if flags & mp.BINLOG_SEND_ANNOTATE_ROWS:
+            self._binlog_dump_err(
+                1105, 'HY000',
+                'BINLOG_SEND_ANNOTATE_ROWS 未实现（本引擎不生成 annotated rows）')
+            return
+        if server_id <= 0:
+            self._binlog_dump_err(
+                1105, 'HY000', 'COM_BINLOG_DUMP server_id 必须 > 0')
+            return
+        # ---------- 权限：需要 REPLICATION（管理员直接放行） ----------
+        if not self._session_is_admin():
+            check = getattr(self.executor, 'check_access', None)
+            if callable(check):
+                try:
+                    err = check(
+                        self.session, 'REPLICATION',
+                        database=getattr(self.db, 'name', None))
+                except Exception:             # pragma: no cover - 防御
+                    err = None
+                if err:
+                    self._send_packet(mp.make_err_packet(
+                        int(err.get('code') or 1044),
+                        err.get('sqlstate') or '42000',
+                        str(err.get('message') or 'Access denied')[:200]))
+                    return
+        # ---------- binlog 已启用 ----------
+        if not binlog_enabled():
+            self._binlog_dump_err(
+                1381, 'HY000', 'You are not using binary logging')
+            return
+        data_dir = getattr(self.db, 'data_dir', None)
+        if data_dir is None:                  # pragma: no cover - 多进程 worker
+            self._binlog_dump_err(
+                1105, 'HY000',
+                'COM_BINLOG_DUMP 仅支持单进程 Master（多进程 Worker 无 binlog）')
+            return
+        try:
+            writer = self.db.binlog_log     # 复用服务端唯一的写器/读器实例
+        except Exception as e:             # pragma: no cover - 防御
+            self._binlog_dump_err(
+                1105, 'HY000', f'打开 binlog 失败: {e}')
+            return
+        if writer is None:
+            self._binlog_dump_err(
+                1381, 'HY000', 'You are not using binary logging')
+            return
+        # ---------- 文件清单/起始位点校验 ----------
+        binlog_dir = os.path.join(str(data_dir), 'binlog')
+        try:
+            raw_names = sorted(
+                n for n in os.listdir(binlog_dir)
+                if self._BINLOG_FILE_RE.match(n))
+        except OSError:
+            raw_names = []
+        if not raw_names:
+            # 尚无任何 binlog 事件：显式 EOF（不创建空文件）
+            if not self._binlog_dump_json({
+                    'type': 'stream_start',
+                    'schema': mp.BINLOG_DUMP_SCHEMA,
+                    'file': None, 'pos': int(binlog_pos),
+                    'events': 0, 'caught_up': True,
+                    'note': 'binlog 目录为空（尚无可复制事件）'}):
+                return
+            self._binlog_dump_json({
+                'type': 'eof', 'schema': mp.BINLOG_DUMP_SCHEMA,
+                'count': 0, 'last_lsn': None,
+                'last_file': None, 'last_pos': None,
+                'caught_up': True})
+            self._send_packet(mp.make_eof_packet())
+            return
+        if not filename:
+            filename = raw_names[-1]
+        if filename not in raw_names:
+            self._binlog_dump_err(
+                1236, 'HY000',
+                f"Could not find first log file name in binary log "
+                f"index file: {filename!r}; available={raw_names}")
+            return
+        if binlog_pos < FILE_HEADER_SIZE:
+            self._binlog_dump_err(
+                1236, 'HY000',
+                f'起始位点 {binlog_pos} 小于 binlog 文件头 '
+                f'({FILE_HEADER_SIZE})')
+            return
+        try:
+            binlog_dir_path = os.path.join(str(data_dir), 'binlog')
+            file_sizes = {n: os.path.getsize(
+                os.path.join(binlog_dir_path, n)) for n in raw_names}
+            bases = {}
+            cum = 0
+            for n in raw_names:
+                bases[n] = cum
+                cum += file_sizes[n]
+            file_size = int(file_sizes.get(filename, 0))
+            records = writer.read_file(filename, FILE_HEADER_SIZE)
+        except BinlogError as e:
+            self._binlog_dump_err(
+                1105, 'HY000', f'读取 binlog 失败（损坏/截断）: {e}')
+            return
+        except Exception as e:                # pragma: no cover - 防御
+            self._binlog_dump_err(1105, 'HY000', f'读取 binlog 失败: {e}')
+            return
+        if binlog_pos > file_size:
+            self._binlog_dump_err(
+                1236, 'HY000',
+                f'起始位点 {binlog_pos} 超过文件 {filename} 大小 {file_size}')
+            return
+        starts = {rec.pos for rec in records} | {file_size}
+        if binlog_pos not in starts:
+            self._binlog_dump_err(
+                1236, 'HY000',
+                f'起始位点 {binlog_pos} 不是 {filename} 的事件边界'
+                f'（文件大小 {file_size}；请从 SHOW MASTER STATUS / '
+                f'上一次事件流的 next_pos 续传）')
+            return
+        # 全局 base 用**磁盘文件真实大小**累计（writer 的内存 size 元数据在
+        # 当前文件追加后不会实时更新）；旧文件不可变，累计值稳定。
+        start_global = int(bases.get(filename, 0)) + int(binlog_pos)
+        # ---------- 流头 ----------
+        if not self._binlog_dump_json({
+                'type': 'stream_start',
+                'schema': mp.BINLOG_DUMP_SCHEMA,
+                'file': filename, 'pos': int(binlog_pos),
+                'global_lsn': start_global,
+                'server_id': server_id, 'flags': flags,
+                'events': 0, 'caught_up': False,
+                'note': ('自定义 JSON 事件流（非 MySQL binlog v4）；'
+                         '仅数据事件；取完当前可用事件即 EOF')}):
+            return
+        # ---------- 事件流 ----------
+        sent = 0
+        last = None
+        start_index = raw_names.index(filename)
+        for name in raw_names[start_index:]:
+            from_pos = (int(binlog_pos) if name == filename
+                        else 0)  # 0 由 read_file 归一到 FILE_HEADER_SIZE
+            try:
+                recs = writer.read_file(name, max(FILE_HEADER_SIZE, from_pos))
+            except BinlogError as e:
+                self._binlog_dump_err(
+                    1105, 'HY000', f'读取 binlog 事件流失败: {e}')
+                return
+            base = int(bases.get(name, 0))
+            for rec in recs:
+                if self.closed:
+                    return
+                if rec.type not in DATA_TYPES:
+                    continue
+                seq = (rec.payload.get('seq')
+                       if isinstance(rec.payload, dict) else None)
+                if not isinstance(seq, int) or seq <= 0:
+                    seq = sent + 1            # 旧记录缺 seq：按本次流计数兜底
+                sent += 1
+                global_pos = int(base) + int(rec.pos)
+                last = {'lsn': global_pos, 'pos': seq,
+                        'file': name, 'next_pos': int(rec.end_pos)}
+                ok = self._binlog_dump_json({
+                    'type': 'event', 'schema': mp.BINLOG_DUMP_SCHEMA,
+                    'pos': seq, 'lsn': global_pos,
+                    'txn_id': rec.txn_id,
+                    'event_type': rec.type_name,
+                    'table_name': rec.table,
+                    'data': rec.data,
+                    'file': name,
+                    'next_pos': int(rec.end_pos)})
+                if not ok:
+                    return
+        self._binlog_dump_json({
+            'type': 'eof', 'schema': mp.BINLOG_DUMP_SCHEMA,
+            'count': sent,
+            'last_lsn': (last or {}).get('lsn'),
+            'last_file': (last or {}).get('file'),
+            'last_pos': (last or {}).get('next_pos'),
+            'caught_up': True,
+            'start_file': filename, 'start_pos': int(binlog_pos)})
+        self._send_packet(mp.make_eof_packet())
 
     def _update_session(self, **kwargs):
         with _sessions_lock:

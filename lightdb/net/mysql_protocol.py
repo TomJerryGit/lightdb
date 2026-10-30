@@ -59,12 +59,24 @@ COM_INIT_DB = 0x02
 COM_QUERY = 0x03
 COM_FIELD_LIST = 0x04
 COM_PING = 0x0e
+# ★ task-86：复制协议（最小非 GTID binlog dump；GTID 命令显式不支持）
+COM_BINLOG_DUMP = 0x12
+COM_BINLOG_DUMP_GTID = 0x1e
 COM_STMT_PREPARE = 0x16
 COM_STMT_EXECUTE = 0x17
 COM_STMT_SEND_LONG_DATA = 0x18
 COM_STMT_CLOSE = 0x19
 COM_STMT_RESET = 0x1a
 COM_STMT_FETCH = 0x1c
+
+#: COM_BINLOG_DUMP flags
+BINLOG_DUMP_NON_BLOCK = 0x01        # 请求"取完现有事件就结束"（本引擎总是该语义）
+BINLOG_SEND_ANNOTATE_ROWS = 0x02    # 仅 MySQL 8 annotated rows；本引擎不支持，请求时显式报错
+
+#: COM_BINLOG_DUMP 响应包的**自定义**流标记（不是 MySQL binlog v4 event 字节）
+BINLOG_STREAM_MARKER = 0x00         # 后接 UTF-8 JSON（header/event）
+BINLOG_STREAM_EOF = 0xfe            # 标准 EOF 包（warnings/status 4 字节）
+BINLOG_DUMP_SCHEMA = 'lightdb-binlog-dump/1'
 
 # ========== 列类型 ==========
 MYSQL_TYPE_DECIMAL     = 0x00
@@ -802,3 +814,120 @@ def make_binary_row(values, columns, encoding: str = 'utf-8') -> bytes:
             continue
         parts.append(_encode_binary_value(value, ctype, encoding))
     return b'\x00' + bytes(bitmap) + b''.join(parts)
+
+
+# ==================== 客户端握手 / 复制协议（task-86） ====================
+# 说明：以下 helper 供**本引擎自己的复制客户端**（replica_apply --protocol）
+# 与协议字节级测试使用。COM_BINLOG_DUMP 的响应体是本引擎自定义的
+# JSON 流（marker + JSON），**不是** MySQL binlog v4 event 字节；见
+# docs/PRODUCTION_READINESS.md 的"复制协议层"章节。握手/ERR/EOF 包保持
+# MySQL 4.1 标准形态。
+
+def parse_handshake_v10(data: bytes) -> dict:
+    """解析服务端 HandshakeV10 包（客户端侧）"""
+    pos = 0
+
+    def need(n):
+        if pos + n > len(data):
+            raise ValueError('HandshakeV10 包被截断')
+
+    need(1)
+    protocol = data[pos]
+    pos += 1
+    end = data.index(b'\x00', pos)
+    server_version = data[pos:end].decode('utf-8', 'replace')
+    pos = end + 1
+    need(4)
+    connection_id = struct.unpack_from('<I', data, pos)[0]
+    pos += 4
+    need(8)
+    seed1 = data[pos:pos + 8]
+    pos += 8
+    pos += 1                                  # filler
+    need(2)
+    caps_low = struct.unpack_from('<H', data, pos)[0]
+    pos += 2
+    charset = 0
+    status = 0
+    caps_high = 0
+    if pos < len(data):
+        charset = data[pos]
+        pos += 1
+    if pos + 2 <= len(data):
+        status = struct.unpack_from('<H', data, pos)[0]
+        pos += 2
+    if pos + 2 <= len(data):
+        caps_high = struct.unpack_from('<H', data, pos)[0]
+        pos += 2
+    seed2 = b''
+    if pos < len(data):
+        pos += 1                              # auth_plugin_data_len
+        pos += 10                             # reserved
+        seed2 = data[pos:pos + 12]
+        pos += 12
+    seed = (seed1 + seed2)[:20]
+    return {'protocol': protocol,
+            'server_version': server_version,
+            'connection_id': connection_id,
+            'auth_seed': seed,
+            'capabilities': (caps_high << 16) | caps_low,
+            'charset': charset, 'status': status}
+
+
+def _native_password_scramble(password: str, auth_seed: bytes) -> bytes:
+    """mysql_native_password 客户端应答（与服务端校验算法互逆）"""
+    if not password:
+        return b''
+    import hashlib
+    h1 = hashlib.sha1(password.encode('utf-8')).digest()
+    h2 = hashlib.sha1(h1).digest()
+    temp = hashlib.sha1(auth_seed + h2).digest()
+    return bytes(a ^ b for a, b in zip(h1, temp))
+
+
+def make_handshake_response(username: str, password: str, auth_seed: bytes,
+                            database: str = '',
+                            charset: int = CHARSET_UTF8MB4) -> bytes:
+    """构造客户端 HandshakeResponse41（明文握手；不主动协商 TLS）"""
+    caps = (CLIENT_LONG_PASSWORD | CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
+            | CLIENT_TRANSACTIONS | CLIENT_MULTI_RESULTS)
+    if database:
+        caps |= CLIENT_CONNECT_WITH_DB
+    auth = _native_password_scramble(password, auth_seed)
+    payload = struct.pack('<I', caps)
+    payload += struct.pack('<I', 16 * 1024 * 1024)   # max packet size
+    payload += bytes([charset])
+    payload += b'\x00' * 23                           # reserved
+    payload += username.encode('utf-8') + b'\x00'
+    payload += bytes([len(auth)]) + auth
+    if database:
+        payload += database.encode('utf-8') + b'\x00'
+    payload += b'mysql_native_password\x00'
+    return payload
+
+
+def make_binlog_dump_request(binlog_pos: int = 4, flags: int = 0,
+                             server_id: int = 1,
+                             filename: str = '') -> bytes:
+    """COM_BINLOG_DUMP 请求体（不含 1 字节 command，调用方加）"""
+    return (struct.pack('<I', int(binlog_pos))
+            + struct.pack('<H', int(flags))
+            + struct.pack('<I', int(server_id))
+            + str(filename or '').encode('utf-8'))
+
+
+def parse_err_packet(data: bytes):
+    """解析 MySQL ERR 包 → (errno, sqlstate, message)；非 ERR 返回 None"""
+    if not data or data[0] != 0xff or len(data) < 3:
+        return None
+    errno = struct.unpack_from('<H', data, 1)[0]
+    sqlstate = 'HY000'
+    msg = ''
+    pos = 3
+    if len(data) >= 9 and data[3:4] == b'#':
+        sqlstate = data[4:9].decode('ascii', 'replace')
+        pos = 9
+    if pos < len(data):
+        msg = data[pos:].decode('utf-8', 'replace')
+    return errno, sqlstate, msg
