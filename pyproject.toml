@@ -39,7 +39,10 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = [
-    "PySide6>=6.5.0",
+    # PySide6 与 shiboken6 必须同版本：只写 PySide6>=6.5.0 时 pip 可能单独升级
+    # shiboken6（曾升到 6.12 导致 QtCore DLL 加载失败），因此两者都精确 pin。
+    "PySide6==6.6.0",
+    "shiboken6==6.6.0",
     "openpyxl>=3.1.0",
 ]
 web = [
@@ -53,7 +56,8 @@ ssh = [
     "paramiko>=3.0",
 ]
 all = [
-    "PySide6>=6.5.0",
+    "PySide6==6.6.0",
+    "shiboken6==6.6.0",
     "openpyxl>=3.1.0",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
