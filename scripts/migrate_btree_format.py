@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""旧 B+Tree 页格式迁移（v1/v2 → v3）
+"""旧 B+Tree 页格式迁移（v1/v2/v3 → v4）
 
-task-72 把键扩到 uint64（v2）；task-80 支持 3–4 列复合主键后，页条目改为
-「16 字节大端 128 位键 + pid/sid 或 child」（叶 24B / 内部 20B，v3）。
-旧 `.dat` 不能按 v3 直接读取。本脚本支持 **v1/v2 → v3**：
+task-72 键扩到 uint64（v2）；task-80 支持 3–4 列复合主键（v3，16B 键）；
+task-92 支持 5–8 列复合主键后，页条目改为「32 字节大端 256 位键 +
+pid/sid 或 child」（叶 40B / 内部 36B，v4）。旧 `.dat` 不能按 v4 直接读取。
+本脚本支持 **v1/v2/v3 → v4**：
 
-1. 只接受**旧格式**数据目录（按 .btroot 根页结构判定 v1/v2）；
+1. 只接受**旧格式**数据目录（按 .btroot 根页结构判定 v1/v2/v3）；
 2. 逐表扫描旧堆页，读取 xmax=0 的可见行版本（要求旧库已正常关闭/checkpoint；
    未完成事务/崩溃中的旧库请先从备份恢复）；
-3. 在新目录用 v3 格式重建同样的表（cols/UNIQUE/二级索引/CHECK/分区/
-   AUTO_INCREMENT 计数/表选项，含 2–4 列复合主键），逐行插入；
+3. 在新目录用 v4 格式重建同样的表（cols/UNIQUE/二级索引/CHECK/分区/
+   AUTO_INCREMENT 计数/表选项，含 2–8 列复合主键），逐行插入；
 4. 重新打开新目录，校验每张表行数、行内容、索引与旧库一致；
 5. 复制用户/视图/存储过程等非表元数据。
 
@@ -79,7 +80,7 @@ def _is_legacy_file(data_file: Path) -> bool:
         with open(data_file, 'rb') as f:
             root_raw = _read_page_bytes(f, root_id)
         fmt = classify_btree_root_page(root_raw, read_page, file_pages)
-        return fmt in (1, 2) and fmt != BTREE_FORMAT_VERSION
+        return fmt in (1, 2, 3) and fmt != BTREE_FORMAT_VERSION
     except Exception:
         return False
 
@@ -165,8 +166,8 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
               if _is_legacy_file(old_dir / f"{name}.dat")]
     if not legacy:
         raise MigrationError(
-            "未检测到旧格式 B+Tree 页（v1/v2）：该目录可能已是 v3 格式，"
-            "无需迁移；直接启动即可")
+            "未检测到旧格式 B+Tree 页（v1/v2/v3）：该目录可能已是 v4 "
+            "格式，无需迁移；直接启动即可")
     _prepare_target(old_dir, new_dir, force)
 
     from lightdb.db.database import Database
@@ -179,10 +180,10 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
             if not cols:
                 raise MigrationError(f"表 {name} 没有列定义")
             pk_cols = [c for c in cols if c.get('primary')]
-            if len(pk_cols) > 4:
+            if len(pk_cols) > 8:
                 raise MigrationError(
-                    f"表 {name} 的主键列数 {len(pk_cols)} > 4（v3 只支持"
-                    f"最多 4 列）；请先确认元数据未被手工修改")
+                    f"表 {name} 的主键列数 {len(pk_cols)} > 8（v4 只支持"
+                    f"最多 8 列）；请先确认元数据未被手工修改")
             data_file = old_dir / f"{name}.dat"
             rows = []
             if data_file.exists():
@@ -248,7 +249,7 @@ def migrate(old_dir: Path, new_dir: Path, force: bool = False) -> dict:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description='LightDB 旧 B+Tree 页格式（v1 uint32 / v2 uint64）迁移到 v3')
+        description='LightDB 旧 B+Tree 页格式（v1/v2/v3）迁移到 v4')
     ap.add_argument('old_dir', help='旧数据目录（只读）')
     ap.add_argument('new_dir', help='新数据目录（会被创建/覆盖需 --force）')
     ap.add_argument('--force', action='store_true',

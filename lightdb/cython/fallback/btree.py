@@ -2,10 +2,10 @@
 ``btree_pyx`` 的纯 Python 回退
 =============================
 
-复用：页布局常量与 ``lightdb/storage/btree.py`` **v3** 完全一致
-（LEAF_HEADER=6, INTERNAL_HEADER=6, LEAF_ENTRY_SIZE=24,
-INTERNAL_ENTRY_SIZE=20, PAGE_HEADER_SIZE=24；键为 16 字节大端 128 位，
-页头 reserved[21] 格式标记=3），因此回退读同一份页字节就能得到与 .pyx
+复用：页布局常量与 ``lightdb/storage/btree.py`` **v4** 完全一致
+（LEAF_HEADER=6, INTERNAL_HEADER=6, LEAF_ENTRY_SIZE=40,
+INTERNAL_ENTRY_SIZE=36, PAGE_HEADER_SIZE=24；键为 32 字节大端 256 位，
+页头 reserved[21] 格式标记=4），因此回退读同一份页字节就能得到与 .pyx
 相同的结果。
 ``RawBTreeIndex`` 用 ``bisect`` 维护有序键数组，替代 .pyx 的 C 数组游标插入。
 
@@ -20,9 +20,9 @@ INTERNAL_ENTRY_SIZE=20, PAGE_HEADER_SIZE=24；键为 16 字节大端 128 位，
        ``capacity`` 个槽位，满了抛 ``RuntimeError``）。回退同样在超过
        ``capacity`` 时抛 ``RuntimeError("索引已满")``，语义一致；但回退
        底层是 Python list，容量只是显式校验。
-    2. .pyx 存的是 ``int32``/``uint128`` 定宽整数，超范围会静默回绕；
+    2. .pyx 存的是 ``int32``/``uint256`` 定宽整数，超范围会静默回绕；
        回退把 page_id / slot_id 折叠到 int32（与 C 强转一致），key 保持
-       Python 大整数（不静默回绕；v3 键是 128 位内大端编码）。
+       Python 大整数（不静默回绕；v4 键是 256 位内大端编码）。
     3. ``compare_keys_bulk`` 在 .pyx 里是 ``cpdef`` 且带
        ``const unsigned char*`` 参数 —— Python 层无法转换指针，本身就是
        编译错误（本轮已改为 ``const unsigned char[:]`` memoryview 签名）。
@@ -70,10 +70,10 @@ def _uint16_at(buf, offset):
     return buf[offset] | (buf[offset + 1] << 8)
 
 
-def _uint128_at(buf, offset):
-    """v3 主键键：16 字节大端 128 位（与 storage/btree.py 页格式一致）"""
+def _uint256_at(buf, offset):
+    """v4 主键键：32 字节大端 256 位（与 storage/btree.py 页格式一致）"""
     v = 0
-    for i in range(16):
+    for i in range(32):
         v = (v << 8) | buf[offset + i]
     return v
 
@@ -99,18 +99,18 @@ def _leaf_n_keys(data):
 
 
 def _leaf_key_at(data, i):
-    return _uint128_at(data,
+    return _uint256_at(data,
                        PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE)
 
 
 def _leaf_pid_at(data, i):
     return _int32_at(data,
-                     PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 16)
+                     PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 32)
 
 
 def _leaf_sid_at(data, i):
     return _int32_at(data,
-                     PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 20)
+                     PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 36)
 
 
 def leaf_search(data, key):
@@ -165,14 +165,14 @@ def _internal_n_keys(data):
 
 
 def _internal_key_at(data, i):
-    return _uint128_at(
+    return _uint256_at(
         data, PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE)
 
 
 def _internal_child_at(data, i):
     return _int32_at(
         data,
-        PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE + 16)
+        PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE + 32)
 
 
 def _internal_first_child(data):
@@ -194,12 +194,12 @@ def internal_find_child(data, key):
 # ==================== 批量键比较 ====================
 
 def compare_keys_bulk(a, b, n):
-    """批量比较两个 **128 位**键数组（v3：每个键 16 字节大端），返回 -1/0/1"""
+    """批量比较两个 **256 位**键数组（v4：每个键 32 字节大端），返回 -1/0/1"""
     a = _to_bytes_view(a)
     b = _to_bytes_view(b)
     for i in range(n):
-        ka = _uint128_at(a, i * 16)
-        kb = _uint128_at(b, i * 16)
+        ka = _uint256_at(a, i * 32)
+        kb = _uint256_at(b, i * 32)
         if ka < kb:
             return -1
         if ka > kb:

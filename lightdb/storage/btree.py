@@ -19,44 +19,47 @@ from .page import (
 
 LEAF_HEADER = 6
 INTERNAL_HEADER = 6
-#: task-80：复合主键扩展到 3–4 列（每分量 signed-32 位，键最大 128 位），
-#: B+Tree 页条目改为「16 字节大端键 + pid/sid 或 child」：
+#: task-92：复合主键扩展到 5–8 列（每分量 signed-32 位，键最大 256 位），
+#: B+Tree 页条目改为「32 字节大端键 + pid/sid 或 child」：
 #: * v1（task-72 之前）：12/8 字节条目，uint32 键；
 #: * v2（task-72）：16/12 字节条目，uint64 键；
-#: * v3（task-80）：24/20 字节条目，128 位键（Python int，页上 16B 大端）。
+#: * v3（task-80）：24/20 字节条目，128 位键（16B 大端）；
+#: * v4（task-92）：40/36 字节条目，256 位键（32B 大端）。
 #: 页头 reserved[21] 写格式版本号；启动时显式拒绝旧格式并指向迁移脚本。
-BTREE_FORMAT_VERSION = 3
+BTREE_FORMAT_VERSION = 4
+BTREE_FORMAT_V3 = 3
 BTREE_FORMAT_V2 = 2
 BTREE_FORMAT_LEGACY = 1
 BTREE_FORMAT_MARKER_OFFSET = 21
-LEAF_ENTRY_SIZE = 24            # key(16) + pid(4) + sid(4)
-INTERNAL_ENTRY_SIZE = 20        # key(16) + child(4)
-_KEY_WIDTH = 16
+LEAF_ENTRY_SIZE = 40            # key(32) + pid(4) + sid(4)
+INTERNAL_ENTRY_SIZE = 36        # key(32) + child(4)
+_KEY_WIDTH = 32
 
 
-def _key_from_page(raw, offset):
-    """页上 16 字节大端键 → Python int（order-preserving）"""
-    return int.from_bytes(raw[offset:offset + _KEY_WIDTH], 'big')
+def _key_from_page(raw, offset, width=_KEY_WIDTH):
+    """页上 width 字节大端键 → Python int（order-preserving）"""
+    return int.from_bytes(raw[offset:offset + width], 'big')
 
 
 def _key_to_page(key):
-    """Python int 键 → 16 字节大端（页格式 v3）"""
+    """Python int 键 → 32 字节大端（页格式 v4）"""
     k = int(key)
-    if k < 0 or k >= (1 << 128):
-        raise ValueError(f"B+Tree 键超出 128 位范围: {key!r}")
+    if k < 0 or k >= (1 << 256):
+        raise ValueError(f"B+Tree 键超出 256 位范围: {key!r}")
     return k.to_bytes(_KEY_WIDTH, 'big')
 
 
 def classify_btree_root_page(root_raw, read_page, file_pages):
-    """判定 `.btroot` 根页的物理格式：1=v1 / 2=v2 / 3=v3 / 0=非 BTree / -1=损坏
+    """判定 `.btroot` 根页物理格式：1=v1 / 2=v2 / 3=v3 / 4=v4 / 0=非BTree / -1=损坏
 
-    仅靠页头标记不够：v1/v2 升级到"写入 marker"之间创建的数据库也可能是
-    新布局但 marker=0。这里按条目结构做**多重校验**：
+    仅靠页头标记不够：旧版本升级到"写入 marker"之间创建的数据库也可能
+    是新布局但 marker=0。这里按条目结构做多重校验：
       * v1：叶 12B（`<III`）/ 内部 8B（`<II`），uint32 键；
       * v2：叶 16B（`<QII`）/ 内部 12B（`<QI`），uint64 键；
       * v3：叶 24B / 内部 20B，16 字节大端 128 位键；
-    对叶页要求 (pid, sid) 指向真实堆页有效槽位、key 严格递增；对内部页
-    要求 child 指向真实 BTree 页。取通过校验的最高版本。
+      * v4：叶 40B / 内部 36B，32 字节大端 256 位键；
+    叶页要求 (pid, sid) 指向真实堆页有效槽位、key 严格递增；内部页要求
+    child 指向真实 BTree 页。取通过校验的最高版本。
     """
     if not root_raw or len(root_raw) < 24 or root_raw[:4] != b'LDBP':
         return 0
@@ -135,16 +138,17 @@ def classify_btree_root_page(root_raw, read_page, file_pages):
     old_ok = (_leaf_ok(12, '<III') if leaf else _internal_ok(8, '<II'))
     v2_ok = (_leaf_ok(16, '<QII') if leaf else _internal_ok(12, '<QI'))
 
-    def _v3_leaf_ok():
-        end = PAGE_HEADER_SIZE + LEAF_HEADER + n * LEAF_ENTRY_SIZE
+    def _big_leaf_ok(entry_size, key_width):
+        end = PAGE_HEADER_SIZE + LEAF_HEADER + n * entry_size
         if end > 4096:
             return False
         prev = None
         for i in range(n):
-            off = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
+            off = PAGE_HEADER_SIZE + LEAF_HEADER + i * entry_size
             try:
-                key = _key_from_page(root_raw, off)
-                pid, sid = struct.unpack_from('<II', root_raw, off + 16)
+                key = _key_from_page(root_raw, off, key_width)
+                pid, sid = struct.unpack_from('<II', root_raw,
+                                              off + key_width)
             except struct.error:                 # pragma: no cover - 防御
                 return False
             if not _valid_heap_slot(pid, sid):
@@ -154,16 +158,17 @@ def classify_btree_root_page(root_raw, read_page, file_pages):
             prev = key
         return True
 
-    def _v3_internal_ok():
-        end = PAGE_HEADER_SIZE + INTERNAL_HEADER + n * INTERNAL_ENTRY_SIZE
+    def _big_internal_ok(entry_size, key_width):
+        end = PAGE_HEADER_SIZE + INTERNAL_HEADER + n * entry_size
         if end > 4096:
             return False
         prev = None
         for i in range(n):
-            off = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE
+            off = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * entry_size
             try:
-                key = _key_from_page(root_raw, off)
-                child = struct.unpack_from('<I', root_raw, off + 16)[0]
+                key = _key_from_page(root_raw, off, key_width)
+                child = struct.unpack_from('<I', root_raw,
+                                           off + key_width)[0]
             except struct.error:                 # pragma: no cover - 防御
                 return False
             if not _valid_btree_child(child):
@@ -173,9 +178,13 @@ def classify_btree_root_page(root_raw, read_page, file_pages):
             prev = key
         return True
 
-    v3_ok = _v3_leaf_ok() if leaf else _v3_internal_ok()
-    if v3_ok:
+    v3_ok = (_big_leaf_ok(24, 16) if leaf else _big_internal_ok(20, 16))
+    v4_ok = (_big_leaf_ok(LEAF_ENTRY_SIZE, _KEY_WIDTH) if leaf
+             else _big_internal_ok(INTERNAL_ENTRY_SIZE, _KEY_WIDTH))
+    if v4_ok:
         return BTREE_FORMAT_VERSION
+    if v3_ok:
+        return BTREE_FORMAT_V3
     if v2_ok:
         return BTREE_FORMAT_V2
     if old_ok:
@@ -259,7 +268,7 @@ class BTree:
     def _leaf_entry(self, page, i):
         off = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
         key = _key_from_page(page.data, off)
-        pid, sid = struct.unpack_from('<II', page.data, off + 16)
+        pid, sid = struct.unpack_from('<II', page.data, off + _KEY_WIDTH)
         return key, pid, sid
 
     def _leaf_lower_bound(self, page, key) -> int:
@@ -335,7 +344,7 @@ class BTree:
     def _leaf_set_entry(self, page, i, k, pid, sid):
         off = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE
         page.data[off:off + _KEY_WIDTH] = _key_to_page(k)
-        struct.pack_into('<II', page.data, off + 16, pid, sid)
+        struct.pack_into('<II', page.data, off + _KEY_WIDTH, pid, sid)
 
     # ==================== 内部节点操作 ====================
 
@@ -362,13 +371,13 @@ class BTree:
     def _internal_entry(self, page, i):
         off = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE
         key = _key_from_page(page.data, off)
-        child = struct.unpack_from('<I', page.data, off + 16)[0]
+        child = struct.unpack_from('<I', page.data, off + _KEY_WIDTH)[0]
         return key, child
 
     def _internal_set_entry(self, page, i, k, c):
         off = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE
         page.data[off:off + _KEY_WIDTH] = _key_to_page(k)
-        struct.pack_into('<I', page.data, off + 16, c)
+        struct.pack_into('<I', page.data, off + _KEY_WIDTH, c)
 
     # ==================== 查找 ====================
 

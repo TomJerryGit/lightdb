@@ -196,8 +196,8 @@ def make_v2_legacy_dir(base):
     return old
 
 
-def test_v2_composite_migrates_to_v3(tmp_path):
-    """v2 的 2 列复合主键库 → v3：检测/迁移/复合唯一性/点查校验"""
+def test_v2_composite_migrates_to_v4(tmp_path):
+    """v2 的 2 列复合主键库 → v4：检测/迁移/复合唯一性/点查校验"""
     from lightdb.db.database import Database
     from lightdb.db.errors import LegacyBTreeFormatError
     from lightdb.sql.executor import Executor
@@ -223,7 +223,94 @@ def test_v2_composite_migrates_to_v3(tmp_path):
         assert r.get('code') == 1062, r
     finally:
         db.shutdown()
-    print('\n    v2（2 列复合主键）→ v3 迁移：行数/复合唯一性/前缀查询一致')
+    print('\n    v2（2 列复合主键）→ v4 迁移：行数/复合唯一性/前缀查询一致')
+
+
+def make_v3_legacy_dir(base):
+    """v3（16B 大端键、24/20 字节条目）3 列复合主键旧库"""
+    from lightdb.storage.buffer_pool import BufferPool
+    from lightdb.storage.page import PAGE_TYPE_HEAP, PAGE_TYPE_BTREE_LEAF
+    from lightdb.storage.btree import PAGE_HEADER_SIZE, LEAF_HEADER
+
+    old = base / 'old_v3'
+    old.mkdir(parents=True)
+    names = ('a', 'b', 'c')
+    cols = [{'name': n, 'type': 'INT', 'primary': True,
+             'unique': False, 'notnull': True, 'has_default': False,
+             'default': None, 'check': None, 'implicit_pk': False}
+            for n in names]
+    cols.append({'name': 'v', 'type': 'VARCHAR(10)', 'primary': False,
+                 'unique': False, 'notnull': False, 'has_default': False,
+                 'default': None, 'check': None})
+    meta = {'tables': {'old3': {
+        'cols': cols, 'partition': None, 'unique_indexes': [],
+        'indexes': [], 'checks': None, 'requested_engine': 'LightDB',
+        'table_options': {'engine': 'LightDB', 'charset': 'utf8mb4',
+                          'collate': 'utf8mb4_bin', 'comment': None},
+        'comment': '', 'auto_increment_next': {}}},
+        'users': {}, 'views': {}, 'pending_ddl': None}
+    with open(old / '_meta.json', 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    rows = [(1, 1, 1, 'x'), (1, 1, 2, 'y'), (1, 2, 1, 'z')]
+    dat = old / 'old3.dat'
+    bp = BufferPool(str(dat))
+    heap = bp.new_page(PAGE_TYPE_HEAP)
+    entries = []
+    bias = 1 << 31
+    for a, b, c, v in rows:
+        payload = json.dumps([a, b, c, v],
+                             ensure_ascii=False).encode('utf-8')
+        rb = struct.pack('<IIBIII', 1, 0, 0, len(payload),
+                         0xFFFFFFFF, 0) + payload
+        sid = heap.insert_row(rb)
+        key = ((((a + bias) << 32) | (b + bias)) << 32) | (c + bias)
+        entries.append((key, heap.page_id, sid))
+    leaf = bp.new_page(PAGE_TYPE_BTREE_LEAF)
+    leaf.data[21] = 3                    # v3 marker
+    struct.pack_into('<H', leaf.data, PAGE_HEADER_SIZE, len(entries))
+    struct.pack_into('<I', leaf.data, PAGE_HEADER_SIZE + 2, 0)
+    for i, (key, pid, sid) in enumerate(entries):
+        off = PAGE_HEADER_SIZE + LEAF_HEADER + i * 24
+        leaf.data[off:off + 16] = key.to_bytes(16, 'big')
+        struct.pack_into('<II', leaf.data, off + 16, pid, sid)
+    leaf.dirty = True
+    bp.flush()
+    bp.close()
+    (old / 'old3.btroot').write_text(str(leaf.page_id))
+    return old
+
+
+def test_v3_composite_migrates_to_v4(tmp_path):
+    """v3 的 3 列复合主键库 → v4：检测/迁移/点查/前缀/唯一性"""
+    from lightdb.db.database import Database
+    from lightdb.db.errors import LegacyBTreeFormatError
+    from lightdb.sql.executor import Executor
+    old = make_v3_legacy_dir(tmp_path)
+    with pytest.raises(LegacyBTreeFormatError):
+        Database(str(old))
+    new = tmp_path / 'new_v3'
+    script = os.path.join(ROOT, 'scripts', 'migrate_btree_format.py')
+    env = dict(os.environ, PYTHONIOENCODING='utf-8')
+    p = subprocess.run([sys.executable, script, str(old), str(new)],
+                       capture_output=True, text=True, timeout=180, env=env,
+                       encoding='utf-8', errors='replace')
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    assert '校验=OK' in p.stdout, p.stdout
+    db = Database(str(new))
+    ex = Executor(db)
+    try:
+        assert ex.execute_sql(
+            'SELECT * FROM old3 WHERE a=1 AND b=1 AND c=2',
+            {})['rows'] == [(1, 1, 2, 'y')]
+        assert ex.execute_sql('SELECT * FROM old3 WHERE a=1 ORDER BY b,c',
+                              {})['rows'] == [(1, 1, 1, 'x'),
+                                              (1, 1, 2, 'y'),
+                                              (1, 2, 1, 'z')]
+        r = ex.execute_sql("INSERT INTO old3 VALUES (1,1,1,'dup')", {})
+        assert r.get('code') == 1062, r
+    finally:
+        db.shutdown()
+    print('\n    v3（3 列复合主键）→ v4 迁移：点查/前缀/唯一性一致')
 
 
 def test_window_new_format_without_marker_is_not_false_positive(tmp_path):

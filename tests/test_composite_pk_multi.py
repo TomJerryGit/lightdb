@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""task-80 验收：3–4 列复合主键（B+Tree v3，128 位 order-preserving 键）
+"""task-80 验收：3–4 列复合主键（B+Tree v3→v4 兼容，256 位键编码）
 
-编码：每个分量 signed-32 位 + 2^31 偏置后按 32 位大端拼接：
-2 列 64 位、3 列 96 位、4 列 128 位；v3 页用 16 字节大端保存。因此
+编码：每个分量 signed-32 位 + 2^31 偏置后按 32 位大端拼接；v4 页用
+32 字节大端保存（3/4 列分别 96/128 位，高位补 0）。因此
 ```
 WHERE a=? AND b=? AND c=?       → 精确点查
 WHERE a=?                       → 键范围（前缀）
@@ -128,16 +128,17 @@ def test_composite_type_and_column_count_errors(env):
     r = err(ex, 'CREATE TABLE bad2 (a INT, b BIGINT, '
                 'PRIMARY KEY (a, b))')
     assert r['code'] == 1064 and 'signed-32' in r['message'], r
-    # 5 列超过 v3 键容量 → 显式 1064，不截断
-    r = err(ex, 'CREATE TABLE bad3 (a INT, b INT, c INT, d INT, e INT, '
-                'PRIMARY KEY (a,b,c,d,e))')
-    assert r['code'] == 1064 and '4 列' in r['message'], r
+    # 9 列超过 v4 键容量 → 显式 1064，不截断
+    ok(ex, 'CREATE TABLE bad3 (a INT, b INT, c INT, d INT, e INT, '
+           'f INT, g INT, h INT, i INT)')
+    r = err(ex, 'ALTER TABLE bad3 ADD PRIMARY KEY (a,b,c,d,e,f,g,h,i)')
+    assert r['code'] == 1235, r
     # 不存在列 / 重复列
     r = err(ex, 'CREATE TABLE bad4 (a INT, b INT, PRIMARY KEY (a, nope))')
     assert r['code'] == 1072 or r['code'] == 1064, r
     r = err(ex, 'CREATE TABLE bad5 (a INT, b INT, PRIMARY KEY (a, a))')
     assert r['code'] == 1064, r
-    print("\n    3–4 列限制：非 signed-32 分量 1064、5 列 1064、重复/缺列显式")
+    print("\n    3–4 列限制：非 signed-32 分量 1064、9 列 1235、重复/缺列显式")
 
 
 # ==================== ALTER ====================

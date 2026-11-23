@@ -34,12 +34,12 @@ class DdlError(Exception):
 
 
 class LegacyBTreeFormatError(Exception):
-    """启动时发现旧 B+Tree 页格式（v1 uint32 / v2 uint64）
+    """启动时发现旧 B+Tree 页格式（v1/v2/v3）
 
-    v3 页条目为「16 字节大端 128 位键 + pid/sid 或 child」（24/20 字节），
-    支持 3–4 列复合主键；v1（12/8B）与 v2（16/12B）条目大小不同，直接按
-    v3 读取会把键/页号读错。这里在 `Database` 启动阶段显式拒绝，绝不"猜着
-    读"旧页（那会静默返回错行/损坏索引）。迁移步骤见
+    v4 页条目为「32 字节大端 256 位键 + pid/sid 或 child」（40/36 字节），
+    支持 5–8 列复合主键；v1/v2/v3 条目大小不同，直接按 v4 读取会把键/
+    页号读错。这里在 `Database` 启动阶段显式拒绝，绝不"猜着读"旧页
+    （那会静默返回错行/损坏索引）。迁移步骤见
     `docs/MIGRATION_BTREE_V2.md`，迁移脚本：
     `python scripts/migrate_btree_format.py <旧数据目录> <新数据目录>`。
     """
@@ -49,9 +49,9 @@ class LegacyBTreeFormatError(Exception):
         self.root_page_id = root_page_id
         self.data_file = data_file
         super().__init__(
-            f"检测到旧版 B+Tree 页格式（v1/v2）：表 '{table}' 的根页 "
-            f"{root_page_id}（{data_file}）不是 v3 格式（16 字节大端 128 位"
+            f"检测到旧版 B+Tree 页格式（v1/v2/v3）：表 '{table}' 的根页 "
+            f"{root_page_id}（{data_file}）不是 v4 格式（32 字节大端 256 位"
             f"键）。请先备份数据目录，然后运行："
             f"`python scripts/migrate_btree_format.py <旧数据目录> "
-            f"<新数据目录>`；迁移会逐表重建为 v3 并校验行数/主键/索引。"
+            f"<新数据目录>`；迁移会逐表重建为 v4 并校验行数/主键/索引。"
             f"详见 docs/MIGRATION_BTREE_V2.md。")

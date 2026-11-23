@@ -358,12 +358,13 @@ def test_dump_parsing_rejects_unsupported_statement():
     assert '索引' in str(ei.value) or '不支持' in str(ei.value)
     print(f'  → 不支持语句被拒绝: {ei.value}')
 
-    # task-80：2–4 列复合主键已支持；5 列及以上仍显式拒绝（格式已知限制）
+    # task-92：2–8 列复合主键已支持；9 列及以上仍显式拒绝（格式已知限制）
     with pytest.raises(BackupError):
         parse_dump("CREATE TABLE t (\n  a INT NOT NULL,\n  b INT NOT NULL,\n"
                    "  c INT NOT NULL,\n  d INT NOT NULL,\n  e INT NOT NULL,\n"
-                   "  PRIMARY KEY (a, b, c, d, e)\n);\n")
-    print('  → 5 列主键仍被显式拒绝（v3 键最多 4 个 32 位分量）')
+                   "  f INT NOT NULL,\n  g INT NOT NULL,\n  h INT NOT NULL,\n"
+                   "  i INT NOT NULL,\n  PRIMARY KEY (a,b,c,d,e,f,g,h,i)\n);\n")
+    print('  → 9 列主键仍被显式拒绝（v4 键最多 8 个 32 位分量）')
 
 
 def test_restore_reports_per_field_values_via_select():

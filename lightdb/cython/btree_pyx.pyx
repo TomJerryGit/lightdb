@@ -32,8 +32,8 @@ from libc.string cimport memcpy, memset
 # ==================== 常量 ====================
 cdef int LEAF_HEADER = 6       # n_keys(2) + next_leaf(4)
 cdef int INTERNAL_HEADER = 6
-cdef int LEAF_ENTRY_SIZE = 24   # v3: key(16) + pid(4) + sid(4)
-cdef int INTERNAL_ENTRY_SIZE = 20  # v3: key(16) + child(4)
+cdef int LEAF_ENTRY_SIZE = 40   # v4: key(32) + pid(4) + sid(4)
+cdef int INTERNAL_ENTRY_SIZE = 36  # v4: key(32) + child(4)
 cdef int PAGE_HEADER_SIZE = 24
 
 
@@ -56,10 +56,10 @@ cdef inline uint16_t _read_uint16(const unsigned char* buf, int offset) nogil:
 
 
 cdef inline object _read_key(const unsigned char* buf, int offset):
-    """v3 页键：16 字节大端 → Python int（128 位；未编译验证，回退为准）"""
+    """v4 页键：32 字节大端 → Python int（256 位；未编译验证，回退为准）"""
     cdef int i
     cdef object v = 0
-    for i in range(16):
+    for i in range(32):
         v = (v << 8) | buf[offset + i]
     return v
 
@@ -84,12 +84,12 @@ cdef inline object _leaf_key_at(const unsigned char* data, int i):
 
 
 cdef inline int _leaf_pid_at(const unsigned char* data, int i) nogil:
-    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 16
+    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 32
     return _read_int32(data, offset)
 
 
 cdef inline int _leaf_sid_at(const unsigned char* data, int i) nogil:
-    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 20
+    cdef int offset = PAGE_HEADER_SIZE + LEAF_HEADER + i * LEAF_ENTRY_SIZE + 36
     return _read_int32(data, offset)
 
 
@@ -167,7 +167,7 @@ cdef inline object _internal_key_at(const unsigned char* data, int i):
     return _read_key(data, offset)
 
 cdef inline int _internal_child_at(const unsigned char* data, int i) nogil:
-    cdef int offset = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE + 16
+    cdef int offset = PAGE_HEADER_SIZE + INTERNAL_HEADER + i * INTERNAL_ENTRY_SIZE + 32
     return _read_int32(data, offset)
 
 cdef inline int _internal_first_child(const unsigned char* data) nogil:
@@ -200,12 +200,12 @@ cpdef int internal_find_child(const unsigned char[:] data, object key):
 
 cdef int _compare_keys_bulk_c(const unsigned char* a,
                               const unsigned char* b, int n):
-    """批量比较两个 128 位键数组（v3：每键 16 字节大端），返回 -1/0/1"""
+    """批量比较两个 256 位键数组（v4：每键 32 字节大端），返回 -1/0/1"""
     cdef int i
     cdef object ka, kb
     for i in range(n):
-        ka = _read_key(a, i * 16)
-        kb = _read_key(b, i * 16)
+        ka = _read_key(a, i * 32)
+        kb = _read_key(b, i * 32)
         if ka < kb:
             return -1
         elif ka > kb:

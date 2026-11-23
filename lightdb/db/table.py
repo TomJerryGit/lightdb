@@ -1170,23 +1170,22 @@ class Table:
                     break
         return out
 
-    # ==================== task-72/task-80：复合主键编码 ====================
+    # ==================== task-72/80/92：复合主键编码 ====================
 
     _PK_PART_BIAS = 1 << 31
     _PK_PART_MAX = (1 << 32) - 1
 
     @classmethod
     def _encode_pk_parts(cls, parts) -> int:
-        """把 2–4 个有符号 32 位整数编码成 order-preserving 128 位键
+        """把 2–8 个有符号 32 位整数编码成 order-preserving 256 位内键
 
-        每分量偏置 2^31 后取 32 位、按顺序大端拼接：2 列→64 位、3 列→96 位、
-        4 列→128 位。B+Tree v3 页用 16 字节大端保存，因此键顺序与元组
-        字典序一致。
+        每分量偏置 2^31 后取 32 位、按顺序大端拼接：2 列→64 位……8 列→256
+        位。B+Tree v4 页用 32 字节大端保存，键顺序与元组字典序一致。
         """
         n = len(parts)
-        if n < 2 or n > 4:
+        if n < 2 or n > 8:
             raise ValueError(
-                f"复合主键只支持 2–4 列（收到 {n} 列）")
+                f"复合主键只支持 2–8 列（收到 {n} 列）")
         key = 0
         for v in parts:
             if isinstance(v, bool) or not isinstance(v, int):
@@ -1199,7 +1198,7 @@ class Table:
         return key
 
     def _row_key(self, values) -> int:
-        """一行对应的物理主键键值（单列 = 列值；复合 = 编码后的 128 位内 int）"""
+        """一行对应的物理主键键值（单列 = 列值；复合 = 编码后的 256 位内 int）"""
         if not getattr(self, 'composite_pk', False):
             return values[self.pk_idx]
         parts = []
