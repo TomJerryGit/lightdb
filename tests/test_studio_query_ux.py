@@ -55,8 +55,19 @@ def test_local_sort_copy_and_multiline(home):
         assert vals_desc[0] == '270.5' and vals_desc[-1] == 'NULL'
         assert 'SELECT' not in rt.info_label.text()
         # 多行/单元格复制 + CSV
+        # 注意：完整套件顺序下（其它 Qt 测试之后）QTableWidget 未显示时
+        # selectRow 可能不产生 selectedRanges，用 selectionModel 显式选择整行，
+        # 保证测试只验证复制逻辑本身，与焦点/窗口系统状态无关。
+        from PySide6.QtCore import QItemSelectionModel
+        rt.table.setFocus()
+        qapp().processEvents()
         rt.table.setCurrentCell(0, 0)
         rt.table.selectRow(0)
+        if not rt.table.selectedRanges():
+            sm = rt.table.selectionModel()
+            sm.select(rt.table.model().index(0, 0),
+                      QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        qapp().processEvents()
         text = rt.copy_without_headers()
         assert text and '\t' in text
         csv_text = rt.copy_as_csv()

@@ -1799,6 +1799,13 @@ class ResultTable(QWidget):
             return rows, cols, matrix
         ranges = self.table.selectedRanges()
         if not ranges:
+            # 兜底：某些无焦点/非可见状态下 selectRow 不一定产生 selectedRanges，
+            # 但 clipboard 操作仍应可用 → 回退到当前单元格（真实 GUI 点击行时
+            # 一定会有 ranges，这里只影响脚本/测试环境）。
+            cur = self.table.currentIndex()
+            if cur is not None and cur.isValid():
+                return [cur.row()], [cur.column()], [
+                    [self._raw_value(cur.row(), cur.column())]]
             return [], [], []
         rng = ranges[0]
         rows = list(range(rng.topRow(), rng.bottomRow() + 1))
