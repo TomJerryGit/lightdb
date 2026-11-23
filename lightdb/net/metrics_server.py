@@ -27,7 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from ..logger import logger
-from .observability import metrics_snapshot_json, render_prometheus
+from .observability import (
+    metrics_snapshot_json, render_prometheus, replication_status_payload)
 
 
 class _MetricsHandler(BaseHTTPRequestHandler):
@@ -82,6 +83,31 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 return
             self._write(200, body,
                         'text/plain; version=0.0.4; charset=utf-8')
+            return
+        # ★ task-91：只读复制延迟面板数据（多副本位点/延迟/错误/采样历史）
+        if path in ('/replication/status', '/replication/status/'):
+            if server is None:
+                self._write(503, b'{"error":"metrics server not attached"}',
+                            'application/json; charset=utf-8')
+                return
+            query = parse_qs(parsed.query or '')
+            try:
+                limit = int((query.get('history_limit') or ['60'])[0])
+            except (TypeError, ValueError):
+                limit = 60
+            try:
+                payload = replication_status_payload(
+                    server, history_limit=max(0, min(1000, limit)))
+                body = json.dumps(payload, ensure_ascii=False,
+                                  default=str).encode('utf-8')
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"生成 /replication/status 失败: {e}")
+                body = json.dumps(
+                    {'schema': 'lightdb-replication-status/1',
+                     'empty': True, 'count': 0,
+                     'error': f'状态生成失败: {e}'},
+                    ensure_ascii=False).encode('utf-8')
+            self._write(200, body, 'application/json; charset=utf-8')
             return
         self._write(404, b'# not found\n', 'text/plain; charset=utf-8')
 

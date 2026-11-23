@@ -68,6 +68,7 @@ import socket
 import struct
 import threading
 import time
+from collections import deque
 
 from ..logger import logger
 from . import mysql_protocol as mp
@@ -349,7 +350,9 @@ class ReplicaPrototype:
                  user: str = 'root', password: str = '',
                  state_path: str = None, connect_timeout: float = 5.0,
                  read_timeout: float = 60.0, target_executor=None,
-                 auto_register: bool = True, source: str = 'export'):
+                 auto_register: bool = True, source: str = 'export',
+                 replica_id: str = 'default', status_dir: str = None,
+                 history_size: int = None, write_status: bool = True):
         self.master_host = str(master_host)
         self.master_port = int(master_port)
         self.user = user
@@ -364,12 +367,27 @@ class ReplicaPrototype:
         if self.source not in ('export', 'protocol'):
             raise ReplicaError(
                 f'未知复制拉取方式: {source!r}（仅 export/protocol）')
+        # ★ task-91：多副本标识/状态心跳
+        self.replica_id = str(replica_id or 'default').strip() or 'default'
+        self.status_dir = str(status_dir or target_db.data_dir)
+        if history_size is None:
+            try:
+                history_size = int(
+                    os.environ.get('LIGHTDB_REPLICA_HISTORY') or 60)
+            except (TypeError, ValueError):
+                history_size = 60
+        self.history_size = max(1, min(1000, int(history_size)))
+        self.write_status = bool(write_status)
         #: RLock：apply_event/延迟快照/show_status 互斥，避免 metrics 读到
         #: "state 已前进但 master_lsn 还是上一批"的撕裂快照
         self._lock = threading.RLock()
-        self.state_path = (
-            state_path if state_path is not None
-            else os.path.join(str(target_db.data_dir), 'replica_state.json'))
+        if state_path is None:
+            name = ('replica_state.json' if self.replica_id == 'default'
+                    else f'replica_state.{self.replica_id}.json')
+            state_path = os.path.join(str(target_db.data_dir), name)
+        self.state_path = state_path
+        self.status_path = os.path.join(
+            self.status_dir, f'replica_status.{self.replica_id}.json')
         self.state = self._load_state()
         self.started_at = time.time()
         self._last_error = None
@@ -387,6 +405,16 @@ class ReplicaPrototype:
         self._retries = 0
         self._last_error_errno = None
         self._closed = False
+        # ★ task-91：自动重连/心跳统计
+        self._reconnects = 0             # 失败后恢复成功的次数
+        self._reconnect_attempts = 0     # 累计重连尝试次数
+        self._disconnect_count = 0       # 失败区间数（连续失败算一次断连）
+        self._recovery_ms_last = 0.0     # 最近一次断连→恢复成功耗时
+        self._recovery_ms_total = 0.0
+        self._last_error_ts = 0.0
+        self._last_success_ts = 0.0
+        self._failure_started_at = None
+        self._samples = deque(maxlen=self.history_size)
         # 让目标库的 `SHOW SLAVE STATUS`（经 db.replication_status()）读到
         # 本原型的真实位点/延迟；这是既有注册接口，不需要改 db/executor。
         if auto_register:
@@ -409,12 +437,101 @@ class ReplicaPrototype:
             self.save_state(sync=True)
         except ReplicaError as e:                 # pragma: no cover - 防御
             logger.warn(f"复制器关闭时写状态失败: {e}")
+        try:
+            self._write_status_snapshot()
+        except Exception:                         # pragma: no cover - 防御
+            pass
         detach = getattr(self.target_db, 'detach_replicator', None)
         if callable(detach):
             try:
                 detach(self)
             except Exception:                     # pragma: no cover - 防御
                 pass
+
+    # ==================== 多副本状态心跳（task-91） ====================
+
+    def _status_snapshot(self) -> dict:
+        """本副本的状态心跳（原子写 `<status_dir>/replica_status.<id>.json`）
+
+        供 `/replication/status`（目标节点内嵌 HTTP）与 `--list-replicas` 读取；
+        与 `/metrics` per-replica 标签同源。**不**替代权威状态文件：权威位点
+        仍在 `<state_path>`（原子+checksum）。
+        """
+        with self._lock:
+            state = dict(self.state)
+            now = time.time()
+            data = {
+                'schema': 'lightdb-replica-status/1',
+                'replica_id': self.replica_id,
+                'master_host': self.master_host,
+                'master_port': self.master_port,
+                'source': self.source,
+                'state_path': str(self.state_path),
+                'pid': os.getpid(),
+                'updated_at': round(now, 3),
+                'following': bool(self._following),
+                'closed': bool(self._closed),
+                'caught_up': bool(self._caught_up),
+                'applied_lsn': int(state.get('lsn') or 0),
+                'master_lsn': int(self._master_max_lsn),
+                'master_min_lsn': int(self._earliest_master_lsn),
+                'lag_lsn': int(self._lag_bytes),
+                'lag_seconds': float(self._lag_seconds),
+                'events_behind': int(self._events_behind),
+                'applied_events': int(state.get('applied') or 0),
+                'idempotent_events': int(state.get('idempotent') or 0),
+                'apply_errors': int(state.get('errors') or 0),
+                'last_apply_ts': float(state.get('last_apply_ts') or 0.0),
+                'last_success_ts': float(self._last_success_ts or 0.0),
+                'last_error': str(self._last_error or ''),
+                'last_error_errno': self._last_error_errno,
+                'last_error_ts': float(self._last_error_ts or 0.0),
+                'batches': int(self._batches),
+                'retries_total': int(self._retries),
+                'reconnect_attempts_total': int(self._reconnect_attempts),
+                'reconnects_total': int(self._reconnects),
+                'disconnects_total': int(self._disconnect_count),
+                'recovery_ms_last': round(float(self._recovery_ms_last), 3),
+                'recovery_ms_total': round(float(self._recovery_ms_total), 3),
+                'protocol_file': state.get('protocol_file'),
+                'protocol_pos': state.get('protocol_pos'),
+                'samples': list(self._samples),
+            }
+        return data
+
+    def _write_status_snapshot(self):
+        """原子写状态心跳（失败只告警，不影响复制主流程）"""
+        if not self.write_status:
+            return
+        try:
+            snap = self._status_snapshot()
+            os.makedirs(self.status_dir, exist_ok=True)
+            tmp = self.status_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(snap, f, ensure_ascii=False, indent=2,
+                          default=str)
+                f.flush()
+            os.replace(tmp, self.status_path)
+        except Exception as e:                    # pragma: no cover - 防御
+            logger.warn(f"副本状态心跳写入失败（不影响复制）: {e}")
+
+    def _append_sample(self):
+        """记录一次采样（内存环形，随心跳持久化；限制条数）"""
+        try:
+            snap = self._status_snapshot()
+            with self._lock:
+                self._samples.append({
+                    'ts': snap['updated_at'],
+                    'applied_lsn': snap['applied_lsn'],
+                    'lag_lsn': snap['lag_lsn'],
+                    'lag_seconds': snap['lag_seconds'],
+                    'events_behind': snap['events_behind'],
+                    'applied_events': snap['applied_events'],
+                    'caught_up': snap['caught_up'],
+                })
+        except Exception:                         # pragma: no cover - 防御
+            pass
+        self._write_status_snapshot()
 
     # ==================== 状态持久化 ====================
 
@@ -1127,12 +1244,17 @@ class ReplicaPrototype:
             try:
                 res = self.apply_event(ev, persist=False)
             except ReplicaApplyError as e:
+                now = time.time()
                 with self._lock:
                     self.state['errors'] = int(
                         self.state.get('errors') or 0) + 1
                     self._last_error = str(e)
                     self._last_error_errno = getattr(e, 'errno', None)
+                    self._last_error_ts = now
+                    if self._failure_started_at is None:
+                        self._failure_started_at = now
                 self.save_state(sync=True)       # 断点保留（lsn 未前进）
+                self._write_status_snapshot()
                 stats['errors'] = 1
                 stats['error'] = str(e)
                 stats['elapsed_ms'] = round(
@@ -1212,6 +1334,16 @@ class ReplicaPrototype:
                 protocol_meta.get('truncated'))
             stats['protocol_disconnect'] = protocol_meta.get('disconnect')
             stats['protocol_eof'] = bool(protocol_meta.get('eof'))
+        # ★ task-91：成功批次 → 最近成功时间 + 采样（/replication/status 用）
+        with self._lock:
+            self._last_success_ts = time.time()
+            stats['replica_id'] = self.replica_id
+            stats['reconnects'] = int(self._reconnects)
+            stats['reconnect_attempts'] = int(self._reconnect_attempts)
+            stats['disconnects'] = int(self._disconnect_count)
+            stats['recovery_ms_last'] = round(
+                float(self._recovery_ms_last), 3)
+        self._append_sample()
         stats['state'] = dict(self.state)
         return stats
 
@@ -1266,6 +1398,11 @@ class ReplicaPrototype:
         started = time.time()
         with self._lock:
             self._following = True
+        self._write_status_snapshot()
+        logger.info(
+            f"副本 {self.replica_id} 开始跟随主库 "
+            f"{self.master_host}:{self.master_port}"
+            f"（source={source or self.source}，自动重连开启）")
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -1275,6 +1412,19 @@ class ReplicaPrototype:
                 try:
                     stats = self.run_once(limit=batch, source=source)
                     retries = 0
+                    # ★ task-91：失败后首次成功 = 自动重连成功（记录恢复耗时）
+                    with self._lock:
+                        if self._failure_started_at is not None:
+                            recovery_ms = (
+                                time.time() - self._failure_started_at) * 1000.0
+                            self._reconnects += 1
+                            self._recovery_ms_last = recovery_ms
+                            self._recovery_ms_total += recovery_ms
+                            self._failure_started_at = None
+                            logger.info(
+                                f"副本 {self.replica_id} 自动重连成功："
+                                f"恢复耗时 {recovery_ms:.1f}ms，"
+                                f"从位点 lsn={self.state.get('lsn')} 续传")
                 except ReplicaBinlogGap:
                     # 位点缺口：终态错误，显式上抛（含可用文件/恢复策略）
                     raise
@@ -1282,16 +1432,30 @@ class ReplicaPrototype:
                     failures += 1
                     retries += 1
                     total_retries += 1
+                    now = time.time()
                     with self._lock:
                         self._retries += 1
+                        self._reconnect_attempts += 1
                         self._last_error = str(e)
                         self._last_error_errno = getattr(e, 'errno', None)
+                        self._last_error_ts = now
+                        if self._failure_started_at is None:
+                            self._disconnect_count += 1
+                            self._failure_started_at = now
+                            logger.warn(
+                                f"副本 {self.replica_id} 与主库的连接断开"
+                                f"（第 {self._disconnect_count} 次），"
+                                f"将从持久位点自动重连"
+                                f"（当前断点 lsn={self.state.get('lsn')}）")
+                    self._write_status_snapshot()
                     delay = min(float(max_backoff),
                                 float(retry_backoff)
                                 * (2 ** min(retries - 1, 16)))
                     logger.warn(
-                        f'增量复制失败（第 {retries} 次，累计 {failures} 次）'
-                        f'，断点 lsn={self.state.get("lsn")} 保留不跳过；'
+                        f'副本 {self.replica_id} 复制失败（连续第 {retries} 次，'
+                        f'累计 {failures} 次，重连尝试 '
+                        f'#{self._reconnect_attempts}），断点 '
+                        f'lsn={self.state.get("lsn")} 保留不跳过；'
                         f'{delay:.2f}s 后重试: {e}')
                     if max_retries and retries > int(max_retries):
                         raise
@@ -1322,6 +1486,7 @@ class ReplicaPrototype:
             with self._lock:
                 self._following = False
                 self._last_batch_ts = time.time()
+            self._write_status_snapshot()
 
     def _follow_result(self, applied, events, retries, stopped,
                        started) -> dict:
@@ -1330,8 +1495,13 @@ class ReplicaPrototype:
             caught_up = bool(self._caught_up)
             lag_seconds = float(self._lag_seconds)
             lag_lsn = int(self._lag_bytes)
+            reconnects = int(self._reconnects)
+            reconnect_attempts = int(self._reconnect_attempts)
+            disconnects = int(self._disconnect_count)
+            recovery_ms_last = round(float(self._recovery_ms_last), 3)
             state = dict(self.state)
         return {
+            'replica_id': self.replica_id,
             'applied': int(applied), 'events': int(events),
             'retries': int(retries), 'stopped': bool(stopped),
             'elapsed_ms': round(elapsed * 1000.0, 3),
@@ -1340,6 +1510,10 @@ class ReplicaPrototype:
             'caught_up': caught_up,
             'lag_seconds': lag_seconds,
             'lag_lsn': lag_lsn,
+            'reconnects': reconnects,
+            'reconnect_attempts': reconnect_attempts,
+            'disconnects': disconnects,
+            'recovery_ms_last': recovery_ms_last,
             'state': state,
         }
 
@@ -1431,6 +1605,13 @@ class ReplicaPrototype:
             # ---- 自定义快照（/metrics 用；SHOW 列清单会忽略这些键）----
             'Replica_Is_Prototype': True,
             'Replica_Node': 'apply',
+            'Replica_Id': self.replica_id,
+            'Replica_Status_File': str(self.status_path),
+            'Replica_Reconnects': int(self._reconnects),
+            'Replica_Reconnect_Attempts': int(self._reconnect_attempts),
+            'Replica_Disconnects': int(self._disconnect_count),
+            'Replica_Recovery_Ms_Last': round(
+                float(self._recovery_ms_last), 3),
             'Replica_Source': self.source,
             'Replica_Protocol_File': state.get('protocol_file'),
             'Replica_Protocol_Pos': state.get('protocol_pos'),
@@ -1465,6 +1646,15 @@ class ReplicaPrototype:
                 'state_path': str(self.state_path),
                 'target_data_dir': str(self.target_db.data_dir),
                 'source': self.source,
+                'replica_id': self.replica_id,
+                'status_path': str(self.status_path),
+                'reconnects': int(self._reconnects),
+                'reconnect_attempts': int(self._reconnect_attempts),
+                'disconnects': int(self._disconnect_count),
+                'recovery_ms_last': round(float(self._recovery_ms_last), 3),
+                'recovery_ms_total': round(float(self._recovery_ms_total), 3),
+                'last_error_ts': float(self._last_error_ts or 0.0),
+                'last_success_ts': float(self._last_success_ts or 0.0),
                 'protocol_file': self.state.get('protocol_file'),
                 'protocol_pos': self.state.get('protocol_pos'),
                 'last_error': self._last_error,
@@ -1481,4 +1671,118 @@ class ReplicaPrototype:
                 'process_uptime': round(time.time() - self.started_at, 3),
             })
         return state
+
+
+# ==================== 多副本注册表（task-91：观测/CLI/演练共用） ====================
+
+#: 副本状态心跳文件名模式
+REPLICA_STATUS_GLOB = 'replica_status.*.json'
+
+
+def default_replica_status_dir(data_dir) -> str:
+    return str(data_dir)
+
+
+def default_replica_state_path(data_dir, replica_id: str = 'default') -> str:
+    if str(replica_id or 'default') == 'default':
+        return os.path.join(str(data_dir), 'replica_state.json')
+    return os.path.join(str(data_dir), f'replica_state.{replica_id}.json')
+
+
+def read_replica_statuses(data_dir, history_limit: int = 60,
+                          stale_after: float = None) -> list:
+    """读取某数据目录下的多副本状态心跳（`/replication/status` 数据源）
+
+    * 优先读 `<data_dir>/replica_status.<id>.json`（apply 进程原子写的心跳，
+      含最近采样历史）；
+    * 只有 `replica_state.<id>.json` 而没有心跳的（例如 apply 进程刚启动/已
+      退出）→ 返回 `has_status=False` 的条目（位点来自权威状态文件，延迟
+      字段显式 None，不编造）；
+    * 解析失败的心跳 → 返回带 `error` 的条目（显式，不静默丢弃）；
+    * `stale_after` 缺省取 `LIGHTDB_REPLICA_STALE_S`（默认 30s），超时条目标
+      `stale=True`。
+    """
+    import glob as _glob
+    data_dir = str(data_dir)
+    if stale_after is None:
+        try:
+            stale_after = float(
+                os.environ.get('LIGHTDB_REPLICA_STALE_S') or 30)
+        except (TypeError, ValueError):
+            stale_after = 30.0
+    history_limit = max(0, int(history_limit))
+    out = []
+    now = time.time()
+    seen = set()
+    for path in sorted(_glob.glob(os.path.join(
+            data_dir, REPLICA_STATUS_GLOB))):
+        name = os.path.basename(path)
+        fallback_id = name[len('replica_status.'):-len('.json')] or 'unknown'
+        try:
+            raw = json.loads(open(path, encoding='utf-8').read())
+        except Exception as exc:                  # noqa: BLE001
+            out.append({'replica_id': fallback_id, 'status_path': path,
+                        'state_path': None, 'has_status': False,
+                        'stale': True, 'updated_age_seconds': None,
+                        'error': f'心跳文件损坏: {exc}',
+                        'samples': []})
+            seen.add(fallback_id)
+            continue
+        rid = str(raw.get('replica_id') or fallback_id)
+        seen.add(rid)
+        updated = raw.get('updated_at')
+        try:
+            updated_f = float(updated)
+        except (TypeError, ValueError):
+            updated_f = 0.0
+        age = (now - updated_f) if updated_f > 0 else None
+        item = dict(raw)
+        item['replica_id'] = rid
+        item['status_path'] = path
+        item['has_status'] = True
+        item['updated_age_seconds'] = (round(age, 3)
+                                       if age is not None else None)
+        item['stale'] = bool(age is None or age > stale_after)
+        samples = raw.get('samples')
+        item['samples'] = (list(samples or [])[-history_limit:]
+                           if history_limit else [])
+        out.append(item)
+    # 只有权威状态文件、没有心跳的副本（显式 has_status=False）
+    for path in sorted(_glob.glob(os.path.join(
+            data_dir, 'replica_state*.json'))):
+        name = os.path.basename(path)
+        if name == 'replica_state.json':
+            rid = 'default'
+        elif name.startswith('replica_state.') and name.endswith('.json'):
+            rid = name[len('replica_state.'):-len('.json')]
+        else:
+            continue
+        if rid in seen:
+            continue
+        try:
+            raw = json.loads(open(path, encoding='utf-8').read())
+        except Exception as exc:                  # noqa: BLE001
+            out.append({'replica_id': rid, 'status_path': None,
+                        'state_path': path, 'has_status': False,
+                        'stale': True, 'updated_age_seconds': None,
+                        'error': f'状态文件损坏: {exc}', 'samples': []})
+            continue
+        out.append({
+            'schema': 'lightdb-replica-status/1',
+            'replica_id': rid, 'has_status': False, 'stale': True,
+            'status_path': None, 'state_path': path,
+            'applied_lsn': int(raw.get('lsn') or 0),
+            'applied_events': int(raw.get('applied') or 0),
+            'apply_errors': int(raw.get('errors') or 0),
+            'master_host': raw.get('master_host'),
+            'master_port': raw.get('master_port'),
+            'last_apply_ts': float(raw.get('last_apply_ts') or 0.0),
+            'protocol_file': raw.get('protocol_file'),
+            'protocol_pos': raw.get('protocol_pos'),
+            'lag_lsn': None, 'lag_seconds': None,
+            'events_behind': None, 'caught_up': None,
+            'updated_age_seconds': None, 'samples': [],
+        })
+    out.sort(key=lambda x: str(x.get('replica_id')))
+    return out
 

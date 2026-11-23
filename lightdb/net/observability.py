@@ -580,6 +580,168 @@ def _render_replica_metrics(lines, prefix, status):
             '（未注册 ReplicaPrototype 或状态不可读）')
 
 
+def _replica_registry(data_dir, history_limit: int = 60) -> list:
+    """读取数据目录下的多副本状态心跳（task-91；无数据返回空列表）"""
+    if not data_dir:
+        return []
+    try:
+        from .replica_proto import read_replica_statuses
+        return read_replica_statuses(str(data_dir),
+                                     history_limit=history_limit)
+    except Exception:                            # pragma: no cover - 防御
+        return []
+
+
+def _render_replica_registry_metrics(lines, prefix, entries):
+    """多副本 per-replica 指标（`{replica="..."}` 标签，task-91）
+
+    无副本数据时显式输出 0 + 注释（不静默省略）；只有权威状态文件而没有
+    心跳的副本（has_status=False）只输出位点/累计计数，不编造延迟类指标。
+    """
+    _type_line(lines, f'{prefix}_replica_registry_replicas', 'gauge',
+               'Replicas registered in this data directory')
+    lines.append(f'{prefix}_replica_registry_replicas {len(entries or [])}')
+    _type_line(lines, f'{prefix}_replica_registry_with_status', 'gauge',
+               'Replicas with a live/heartbeat status snapshot')
+    with_status = [e for e in (entries or []) if e.get('has_status')]
+    lines.append(
+        f'{prefix}_replica_registry_with_status {len(with_status)}')
+    if not entries:
+        lines.append(
+            '# 多副本: 本数据目录没有副本状态（replica_status.*.json / '
+            'replica_state*.json），per-replica 指标为空')
+        return
+    specs = (
+        (f'{prefix}_replica_lag_lsn', 'lag_lsn', 'gauge',
+         'Per-replica lag bytes (master max LSN - applied LSN)'),
+        (f'{prefix}_replica_lag_seconds', 'lag_seconds', 'gauge',
+         'Per-replica lag seconds while behind (0 when caught up)'),
+        (f'{prefix}_replica_events_behind', 'events_behind', 'gauge',
+         'Per-replica events not yet applied'),
+        (f'{prefix}_replica_applied_lsn', 'applied_lsn', 'gauge',
+         'Per-replica applied global LSN (persisted checkpoint)'),
+        (f'{prefix}_replica_master_lsn', 'master_lsn', 'gauge',
+         'Master max LSN as last observed by the replica'),
+        (f'{prefix}_replica_applied_events_total', 'applied_events',
+         'counter', 'Per-replica applied events total'),
+        (f'{prefix}_replica_idempotent_events_total', 'idempotent_events',
+         'counter', 'Per-replica idempotent replay events total'),
+        (f'{prefix}_replica_apply_errors_total', 'apply_errors',
+         'counter', 'Per-replica apply failures (checkpoint retained)'),
+        (f'{prefix}_replica_last_apply_ts', 'last_apply_ts', 'gauge',
+         'Per-replica last successful apply unix timestamp'),
+        (f'{prefix}_replica_caught_up', 'caught_up', 'gauge',
+         'Per-replica caught-up flag (1/0; absent for state-only entries)'),
+        (f'{prefix}_replica_disconnects_total', 'disconnects_total',
+         'counter', 'Per-replica observed master disconnects'),
+        (f'{prefix}_replica_reconnects_total', 'reconnects_total',
+         'counter', 'Per-replica successful automatic reconnects'),
+        (f'{prefix}_replica_reconnect_attempts_total',
+         'reconnect_attempts_total', 'counter',
+         'Per-replica automatic reconnect attempts'),
+        (f'{prefix}_replica_recovery_ms_last', 'recovery_ms_last', 'gauge',
+         'Per-replica last disconnect-to-recovery latency (ms)'),
+        (f'{prefix}_replica_stale', 'stale', 'gauge',
+         'Per-replica heartbeat stale flag (1=no recent heartbeat)'),
+        (f'{prefix}_replica_status_age_seconds', 'updated_age_seconds',
+         'gauge', 'Per-replica seconds since last heartbeat'),
+    )
+    for metric, key, mtype, help_text in specs:
+        _type_line(lines, metric, mtype, help_text)
+        for entry in entries:
+            rid = entry.get('replica_id')
+            value = entry.get(key)
+            if value is None or rid is None:
+                continue
+            if key == 'caught_up':
+                value = 1 if value else 0
+            if key == 'stale':
+                value = 1 if value else 0
+            _metric(lines, metric, value, labels={'replica': rid})
+    lines.append(
+        '# 多副本: ' + ', '.join(
+            f'{e.get("replica_id")}'
+            f'(status={"yes" if e.get("has_status") else "state-only"},'
+            f'stale={"yes" if e.get("stale") else "no"},'
+            f'lag={e.get("lag_seconds")})'
+            for e in entries))
+
+
+def replication_status_payload(server, history_limit: int = 60,
+                               stale_after: float = None) -> dict:
+    """`GET /replication/status` 只读载荷（task-91）
+
+    * 多副本：数据目录下所有 `replica_status.*.json`（含最近采样历史）与
+      仅有权威状态文件的副本；
+    * 本进程内注册的 ReplicaPrototype 若还没写心跳，也作为一条返回；
+    * **无复制数据时显式空**：`{empty: true, count: 0, reason: ...}`，
+      不返回伪造的 0 lag 副本。
+    """
+    db = getattr(server, 'db', None)
+    data_dir = str(getattr(db, 'data_dir', '') or '') if db is not None else ''
+    entries = _replica_registry(data_dir, history_limit=history_limit)
+    try:
+        local = _replica_status(server)
+    except Exception:                            # pragma: no cover - 防御
+        local = None
+    if local:
+        rep = getattr(db, 'replicator', None)
+        entry = None
+        if hasattr(rep, '_status_snapshot'):
+            try:
+                entry = rep._status_snapshot()
+            except Exception:                    # pragma: no cover - 防御
+                entry = None
+        if entry is None:
+            entry = {
+                'schema': 'lightdb-replica-status/1',
+                'replica_id': getattr(rep, 'replica_id', 'default'),
+                'has_status': True, 'stale': False,
+                'source': 'export', 'state_path': None,
+                'applied_lsn': local.get('Replica_Applied_LSN', 0),
+                'master_lsn': local.get('Replica_Master_LSN', 0),
+                'lag_lsn': local.get('Replica_Lag_LSN', 0),
+                'lag_seconds': local.get('Replica_Lag_Seconds', 0.0),
+                'events_behind': local.get('Replica_Events_Behind', 0),
+                'applied_events': local.get('Replica_Applied_Events', 0),
+                'idempotent_events': local.get(
+                    'Replica_Idempotent_Events', 0),
+                'apply_errors': local.get('Replica_Apply_Errors', 0),
+                'last_apply_ts': local.get('Replica_Last_Apply_Ts', 0),
+                'caught_up': bool(local.get('Replica_Caught_Up', 0)),
+                'last_error': local.get('Last_Error', ''),
+                'updated_at': time.time(),
+                'updated_age_seconds': 0.0,
+                'samples': [],
+            }
+            entry['replica_id'] = str(
+                getattr(rep, 'replica_id', entry['replica_id']))
+        entry.setdefault('has_status', True)
+        entry['samples'] = list(entry.get('samples') or [])[-history_limit:]
+        known = {str(e.get('replica_id')) for e in entries}
+        if str(entry.get('replica_id')) not in known:
+            entries.append(entry)
+            entries.sort(key=lambda x: str(x.get('replica_id')))
+    payload = {
+        'schema': 'lightdb-replication-status/1',
+        'generated_at': round(time.time(), 3),
+        'data_dir': data_dir,
+        'history_limit': int(history_limit),
+        'replicas': entries,
+        'count': len(entries),
+        'empty': not entries,
+    }
+    if not entries:
+        payload['reason'] = (
+            '本数据目录没有已注册副本（无 replica_status.*.json / '
+            'replica_state*.json），复制面板为空是真实状态')
+    else:
+        payload['stale_count'] = sum(
+            1 for e in entries if e.get('stale'))
+        payload['caught_up_count'] = sum(
+            1 for e in entries if e.get('caught_up'))
+    return payload
+
 
 def render_prometheus(server, prefix: str = None) -> str:
     """把一台 MySQLServer 的真实运行数据渲染成 Prometheus text 格式
@@ -827,6 +989,11 @@ def render_prometheus(server, prefix: str = None) -> str:
 
     # ---------- 增量复制（task-81；无数据输出 0 + 注释） ----------
     _render_replica_metrics(lines, prefix, _replica_status(server))
+    # ---------- 多副本注册表（task-91；per-replica 标签） ----------
+    _render_replica_registry_metrics(
+        lines, prefix,
+        _replica_registry(getattr(getattr(server, 'db', None),
+                                  'data_dir', '')))
 
     # ---------- 只读分片（task-85；未启用输出 0 + 注释） ----------
     engine = getattr(server, 'sharding', None)
@@ -983,4 +1150,14 @@ def metrics_snapshot_json(server) -> dict:
                     'last_fallback_reason', 'snapshot_generation',
                     'snapshot_ready')},
     } if sharding_engine is not None else {'enabled': False})
+    # ---------- 多副本（task-91；无数据显式 empty） ----------
+    try:
+        payload = replication_status_payload(server)
+        out['replication'] = {
+            'count': payload['count'],
+            'empty': payload['empty'],
+            'replicas': payload['replicas'],
+        }
+    except Exception:                            # pragma: no cover - 防御
+        out['replication'] = {'count': 0, 'empty': True, 'replicas': []}
     return out
