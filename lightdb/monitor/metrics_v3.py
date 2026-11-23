@@ -187,8 +187,20 @@ class MetricsCollector:
                       proc.memory_info().rss)
             self._set('lightdb_server_cpu_usage',
                       proc.cpu_percent() / 100.0)
-            self._set('lightdb_server_open_files',
-                      len(proc.open_files()))
+            # Windows 上 open_files() 需要枚举进程全部句柄，句柄多/系统繁忙时
+            # 可能阻塞数十秒到数分钟（CI 曾因此在 test_metrics_collector 挂起）。
+            # 默认用廉价的 num_handles()；需要精确文件列表时显式设置
+            # LIGHTDB_METRICS_OPEN_FILES=1 再启用 open_files()。
+            if os.environ.get('LIGHTDB_METRICS_OPEN_FILES', '') in (
+                    '1', 'true', 'TRUE'):
+                self._set('lightdb_server_open_files',
+                          len(proc.open_files()))
+            else:
+                try:
+                    self._set('lightdb_server_open_files',
+                              proc.num_handles())
+                except Exception:
+                    self._set('lightdb_server_open_files', 0)
         except Exception:
             pass
 
