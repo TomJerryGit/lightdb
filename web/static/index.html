@@ -134,6 +134,7 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           <button id="tool-er-btn" class="tab-btn" data-tool="er" data-i18n="er.tab">ER 图</button>
           <button id="tool-plugins-btn" class="tab-btn" data-tool="plugins" data-i18n="plugins.tab">插件</button>
           <button id="tool-production-btn" class="tab-btn" data-tool="production">生产</button>
+          <button id="tool-backup-btn" class="tab-btn" data-tool="backup">备份</button>
         </div>
 
         <div id="history-section" class="tool-section">
@@ -222,6 +223,39 @@ SELECT * FROM users LIMIT 100;" spellcheck="false"></textarea>
           </div>
           <div id="prod-snapshot-status" class="status"></div>
           <pre id="prod-snapshot-log" class="sql-preview"></pre>
+        </div>
+
+        <div id="backup-section" class="tool-section hidden">
+          <h3>增量备份链（真实 CLI）</h3>
+          <div class="form-row">
+            <input id="backup-root-input" type="text" placeholder="备份链根目录">
+            <button id="backup-refresh-btn" class="btn-small">刷新链</button>
+          </div>
+          <div class="form-row">
+            <input id="backup-data-input" type="text" placeholder="data-dir（init 用）">
+            <input id="backup-chain-input" type="text" placeholder="链目录（新链/已有链）">
+            <button id="backup-init-btn" class="btn-small">初始化基线</button>
+          </div>
+          <div class="form-row">
+            <input id="backup-keep-input" type="number" value="7" min="1"
+                   class="btn-small" style="width:70px">
+            <button id="backup-incr-btn" class="btn-small">创建增量</button>
+            <button id="backup-prune-btn" class="btn-small">剪枝 prune</button>
+          </div>
+          <div id="backup-status" class="status"></div>
+          <div id="backup-list" class="result-table"></div>
+          <pre id="backup-log" class="sql-preview"></pre>
+          <h4>恢复向导（恢复需二次确认）</h4>
+          <div class="form-row">
+            <select id="backup-restore-chain"></select>
+            <select id="backup-restore-to"></select>
+            <input id="backup-restore-target" type="text" placeholder="目标目录（空目录或 --force）">
+            <button id="backup-preview-btn" class="btn-small">预览影响</button>
+            <button id="backup-restore-btn" class="btn-small">执行恢复</button>
+          </div>
+          <div id="backup-restore-status" class="status"></div>
+          <div id="backup-preview" class="result-table"></div>
+          <div id="backup-verify" class="result-table"></div>
         </div>
       </aside>
     </div>

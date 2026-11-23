@@ -709,6 +709,11 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._open_production_panel)
         m_tools.addAction(a)
 
+        a = QAction("💾 备份中心（增量链）...", self)
+        a.setToolTip('增量备份链：基线/增量列表、创建、prune、恢复向导')
+        a.triggered.connect(self._open_backup_center)
+        m_tools.addAction(a)
+
         a = QAction("🚚 数据库迁移...", self)
         a.triggered.connect(self._open_migration)
         m_tools.addAction(a)
@@ -2346,6 +2351,13 @@ class MainWindow(QMainWindow):
         """task-83：复制状态 / metrics 摘要 / 二进制快照 CLI 面板。"""
         from .production_panel import ProductionPanel
         dlg = ProductionPanel(conn_getter=self._get_current_conn, parent=self)
+        dlg.exec()
+        return dlg
+
+    def _open_backup_center(self):
+        """task-90：增量备份链备份中心。"""
+        from .backup_center import BackupCenterDialog
+        dlg = BackupCenterDialog(parent=self)
         dlg.exec()
         return dlg
 

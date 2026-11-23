@@ -709,7 +709,7 @@ async function loadHistory() {
 // ==================== 报表模板 ====================
 
 function switchTool(tool) {
-  ['history', 'reports', 'quality', 'er', 'plugins', 'production']
+  ['history', 'reports', 'quality', 'er', 'plugins', 'production', 'backup']
     .forEach(name => {
     const btn = $id('tool-' + name + '-btn');
     if (btn) btn.classList.toggle('active', name === tool);
@@ -720,6 +720,7 @@ function switchTool(tool) {
   if (tool === 'er') loadER();
   if (tool === 'plugins') loadPlugins();
   if (tool === 'production') loadReplicationStatus();
+  if (tool === 'backup') loadBackupChains();
 }
 
 function selectedTemplate() {
@@ -1430,6 +1431,198 @@ async function runSnapshotRestore() {
 }
 
 
+// ==================== task-90：增量备份链 ====================
+
+function renderBackupTable(target, headers, rows) {
+  clearNode(target);
+  if (!rows || !rows.length) {
+    target.appendChild(el('div', 'empty-hint', '无数据'));
+    return;
+  }
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const hr = document.createElement('tr');
+  headers.forEach(h => hr.appendChild(el('th', '', h)));
+  thead.appendChild(hr); table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  rows.forEach(row => {
+    const tr = document.createElement('tr');
+    row.forEach(v => tr.appendChild(el('td', '', v === null || v === undefined ? '—' : v)));
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody); target.appendChild(table);
+}
+
+async function loadBackupChains() {
+  const status = $id('backup-status');
+  const root = $id('backup-root-input').value.trim();
+  if (!root) {
+    status.textContent = '请输入备份链根目录（或设置 LIGHTDB_BACKUP_CHAIN_DIR）';
+    status.classList.add('status-error');
+    return;
+  }
+  try {
+    const data = await api('/backup-chain/list?root=' + encodeURIComponent(root));
+    renderBackupTable($id('backup-list'),
+      ['链', '段', '类型', '时间', '大小', '校验', '行/表'],
+      (data.chains || []).flatMap(ch => (ch.rows || []).map(r => [
+        ch.name, '#' + r.id, r.kind, r.created_at, r.size_text,
+        r.verified ? '✓' : '✗', r.rows + ' / ' + r.tables])));
+    const restoreSel = $id('backup-restore-chain');
+    clearNode(restoreSel);
+    (data.chains || []).forEach(ch => {
+      const opt = document.createElement('option');
+      opt.value = ch.path; opt.textContent = ch.name;
+      restoreSel.appendChild(opt);
+    });
+    await loadBackupSegments();
+    status.textContent = '共 ' + (data.chains || []).length + ' 条备份链';
+    status.classList.remove('status-error');
+  } catch (e) {
+    status.textContent = '读取备份链失败: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
+async function loadBackupSegments() {
+  const chain = $id('backup-restore-chain').value;
+  const sel = $id('backup-restore-to');
+  clearNode(sel);
+  if (!chain) return;
+  try {
+    const data = await api('/backup-chain/preview?chain_dir=' + encodeURIComponent(chain));
+    // preview 不返回段列表；从 list 重新取
+    const root = $id('backup-root-input').value.trim();
+    const list = await api('/backup-chain/list?root=' + encodeURIComponent(root));
+    const ch = (list.chains || []).find(c => c.path === chain);
+    (ch && ch.rows ? ch.rows : []).forEach(r => {
+      const opt = document.createElement('option');
+      opt.value = r.id;
+      opt.textContent = '#' + r.id + ' ' + (r.kind === 'full' ? '基线' : '增量');
+      sel.appendChild(opt);
+    });
+  } catch (e) {
+    $id('backup-restore-status').textContent = '读取段失败: ' + e.message;
+  }
+}
+
+async function pollBackupJob(jobId, statusEl, logEl, doneCb) {
+  for (let i = 0; i < 600; i++) {
+    try {
+      const job = await api('/backup-chain/status?job_id=' + encodeURIComponent(jobId));
+      if (logEl) logEl.textContent = (job.log || []).join('\n');
+      if (job.state === 'done' || job.state === 'failed') {
+        statusEl.textContent = job.ok
+          ? '成功（返回码 ' + job.returncode + '）'
+          : '失败（返回码 ' + job.returncode + '）: ' + (job.error || '');
+        statusEl.classList.toggle('status-error', !job.ok);
+        if (doneCb) await doneCb(job);
+        return job;
+      }
+      statusEl.textContent = '任务运行中… (' + (job.log || []).length + ' 行日志)';
+    } catch (e) {
+      statusEl.textContent = '轮询失败: ' + e.message;
+      statusEl.classList.add('status-error');
+      return null;
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  statusEl.textContent = '轮询超时';
+  statusEl.classList.add('status-error');
+  return null;
+}
+
+async function runBackupOp(action) {
+  const status = $id('backup-status');
+  const log = $id('backup-log');
+  try {
+    let body;
+    if (action === 'init') {
+      const chainDir = $id('backup-chain-input').value.trim();
+      const dataDir = $id('backup-data-input').value.trim();
+      if (!chainDir || !dataDir) {
+        status.textContent = '初始化需要 data-dir 和新链目录'; return;
+      }
+      body = {chain_dir: chainDir, data_dir: dataDir};
+    } else {
+      const chainDir = $id('backup-restore-chain').value ||
+        $id('backup-chain-input').value.trim();
+      if (!chainDir) { status.textContent = '请选择/填写已有链目录'; return; }
+      if (action === 'incr') {
+        body = {chain_dir: chainDir,
+                keep: parseInt($id('backup-keep-input').value || '7', 10)};
+      } else {
+        body = {chain_dir: chainDir,
+                keep: parseInt($id('backup-keep-input').value || '7', 10)};
+      }
+    }
+    const res = await api('/backup-chain/' + action, {method: 'POST', body: JSON.stringify(body)});
+    status.textContent = '任务已启动: ' + res.job_id;
+    await pollBackupJob(res.job_id, status, log);
+    await loadBackupChains();
+  } catch (e) {
+    status.textContent = '操作失败: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
+async function previewBackupRestore() {
+  const chain = $id('backup-restore-chain').value;
+  const to = parseInt($id('backup-restore-to').value || '0', 10);
+  const status = $id('backup-restore-status');
+  if (!chain) { status.textContent = '请选择备份链'; return; }
+  try {
+    const data = await api('/backup-chain/preview?chain_dir=' +
+      encodeURIComponent(chain) + '&to=' + to);
+    if (!data.ok) {
+      status.textContent = '预览失败: ' + data.error;
+      status.classList.add('status-error');
+      return;
+    }
+    renderKeyValueTable($id('backup-preview'),
+      Object.keys(data.preview || {}).map(k => [k, data.preview[k]]));
+    status.textContent = '预览完成（未触碰目标）';
+    status.classList.remove('status-error');
+  } catch (e) {
+    status.textContent = '预览失败: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
+async function restoreBackupChain() {
+  const chain = $id('backup-restore-chain').value;
+  const to = parseInt($id('backup-restore-to').value || '0', 10);
+  const target = $id('backup-restore-target').value.trim();
+  const status = $id('backup-restore-status');
+  if (!chain || !target) {
+    status.textContent = '恢复需要备份链和目标目录';
+    status.classList.add('status-error'); return;
+  }
+  if (!window.confirm('恢复会覆盖目标目录，不可逆。是否继续？')) {
+    status.textContent = '用户取消恢复（未执行）';
+    return;
+  }
+  try {
+    const res = await api('/backup-chain/restore', {
+      method: 'POST',
+      body: JSON.stringify({chain_dir: chain, target: target, to: to,
+                            force: true, confirm: true}),
+    });
+    status.textContent = '恢复任务已启动: ' + res.job_id;
+    const job = await pollBackupJob(res.job_id, status, $id('backup-log'));
+    if (job && job.ok) {
+      const preview = await api('/backup-chain/preview?chain_dir=' +
+        encodeURIComponent(chain) + '&to=' + to);
+      renderBackupTable($id('backup-verify'), ['表', '行数', '校验'],
+        ((preview.table_rows || [])).map(r => [r.table, r.rows,
+          r.verified ? '✓' : '✗']));
+    }
+  } catch (e) {
+    status.textContent = '恢复失败: ' + e.message;
+    status.classList.add('status-error');
+  }
+}
+
 window.addEventListener('DOMContentLoaded', async () => {
   $id('login-btn').onclick = doLogin;
   $id('login-pass').onkeydown = (e) => {
@@ -1484,6 +1677,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   $id('tool-er-btn').onclick = () => switchTool('er');
   $id('tool-plugins-btn').onclick = () => switchTool('plugins');
   $id('tool-production-btn').onclick = () => switchTool('production');
+  $id('tool-backup-btn').onclick = () => switchTool('backup');
+  $id('backup-refresh-btn').onclick = loadBackupChains;
+  $id('backup-init-btn').onclick = () => runBackupOp('init');
+  $id('backup-incr-btn').onclick = () => runBackupOp('incr');
+  $id('backup-prune-btn').onclick = () => runBackupOp('prune');
+  $id('backup-restore-chain').onchange = loadBackupSegments;
+  $id('backup-preview-btn').onclick = previewBackupRestore;
+  $id('backup-restore-btn').onclick = restoreBackupChain;
   $id('prod-rep-refresh').onclick = loadReplicationStatus;
   $id('prod-metrics-refresh').onclick = loadMetricsSummary;
   $id('prod-snapshot-backup').onclick = runSnapshotBackup;
