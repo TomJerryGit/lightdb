@@ -299,7 +299,13 @@ class MainWindow(QMainWindow):
             慢网/不可达时每个连接都要等到超时）。`auto_connect=False` 时
             仍按老逻辑不连。
         """
-        QTimer.singleShot(0, self.do_startup_restore)
+        # 经一层间接调用：测试/子类可以在构造后覆盖 do_startup_restore，
+        # 定时器仍会调用到覆盖后的实现（曾经 singleShot 直接捕获绑定方法，
+        # 覆盖不生效，导致 GUI smoke 里 auto_connect=False 仍执行并改状态栏文案）。
+        QTimer.singleShot(0, self._run_startup_restore)
+
+    def _run_startup_restore(self):
+        self.do_startup_restore()
 
     def do_startup_restore(self):
         """首屏之后要做的启动期恢复（可被测试直接调用，不必等事件循环）。"""
