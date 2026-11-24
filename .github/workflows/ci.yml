@@ -69,26 +69,37 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
-          python -m pip install --upgrade pip
-          # 运行时显式装 setuptools/wheel：check_packaging.py 在**运行环境**里
-          # 调 setuptools.build_meta.build_wheel，CI 的 ensurepip 环境可能
-          # 只有 pip（或旧 setuptools），缺 wheel 时 packaging 步骤会 exit 1。
-          python -m pip install "setuptools>=61" wheel
-          # 自助 runner 的依赖在首次配置时已装好；CI 每次只安装项目本身（--no-deps），
-          # 避免网络抖动时 pip 重新解析/下载依赖卡住（曾卡 12+ 分钟导致 job 失败）。
+          python -m pip install --upgrade pip --retries 3 --timeout 20
+          # 运行时显式装 setuptools/wheel：check_packaging.py 在运行环境里调
+          # setuptools.build_meta.build_wheel，缺 wheel 时 packaging 步骤会 exit 1。
+          python -m pip install "setuptools>=61" wheel --retries 3 --timeout 20
+
+          # 1) 清理被中断安装留下的 ~*.dist-info 残留（它们会让 import 报
+          #    "incompletely removed distribution"，并可能留下半装的 Qt 包）。
+          python -c "import glob, os, shutil, site; sp = site.getsitepackages()[0]; [shutil.rmtree(p, ignore_errors=True) for p in glob.glob(os.path.join(sp, '~*'))]"
+
+          # 2) 只安装项目本体：依赖已在 runner 首次配置时装好（见 scripts/bootstrap_ci_env.ps1）；
+          #    --no-deps 避免网络抖动时 pip 重新解析/下载依赖（曾卡 12+ 分钟）。
           python -m pip install -e ".[all,dev]" --no-deps --retries 2 --timeout 20
-          # 自检：关键依赖缺失（例如 runner 刚重置）才回退完整安装。
-          python -c "import pytest, fastapi, PySide6.QtCore, numpy, paramiko"
+
+          # 3) 强制校正 Qt ABI：共享系统 Python 上 shiboken6/Essentials/Addons 可能被
+          #    单独升级（6.12 与 PySide6 6.6.0 不兼容 → QtCore DLL 加载失败，整套 Qt
+          #    测试在 pytest_configure 崩溃）。四个包必须同版本。
+          python -m pip install --disable-pip-version-check --force-reinstall --no-deps --retries 3 --timeout 30 `
+            "PySide6==6.6.0" "PySide6-Essentials==6.6.0" "PySide6-Addons==6.6.0" "shiboken6==6.6.0"
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "key deps missing -> full install"
-            python -m pip install -e ".[all,dev]" --retries 3 --timeout 30
+            Write-Host "::error::Qt pinned reinstall failed (network?)"
+            exit 1
           }
-          # 共享系统 Python 上，历史残留/依赖解析可能把 shiboken6 单独升级
-          # （6.12 与 PySide6 6.6.0 不兼容 → QtCore DLL 加载失败、整套 Qt
-          # 测试在 pytest_configure 崩溃）。这里强制校正 ABI 并 fail-fast。
-          python -m pip install --disable-pip-version-check --force-reinstall --no-deps "PySide6==6.6.0" "shiboken6==6.6.0"
+
+          # 4) fail-fast 自检：Qt 与关键运行依赖都必须在场。
           python -c "import PySide6.QtCore, shiboken6; print('Qt ABI ok:', PySide6.QtCore.qVersion(), shiboken6.__version__)"
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::Qt ABI check failed"; exit 1 }
+          python -c "import pytest, fastapi, numpy, paramiko, psutil"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::runner env incomplete: run scripts/bootstrap_ci_env.ps1 once on this machine"
+            exit 1
+          }
 
       - name: Compileall
         run: python -m compileall -q lightdb lightdb_studio web
