@@ -82,14 +82,17 @@ jobs:
           #    --no-deps 避免网络抖动时 pip 重新解析/下载依赖（曾卡 12+ 分钟）。
           python -m pip install -e ".[all,dev]" --no-deps --retries 2 --timeout 20
 
-          # 3) 强制校正 Qt ABI：共享系统 Python 上 shiboken6/Essentials/Addons 可能被
-          #    单独升级（6.12 与 PySide6 6.6.0 不兼容 → QtCore DLL 加载失败，整套 Qt
-          #    测试在 pytest_configure 崩溃）。四个包必须同版本。
-          python -m pip install --disable-pip-version-check --force-reinstall --no-deps --retries 3 --timeout 30 `
-            "PySide6==6.6.0" "PySide6-Essentials==6.6.0" "PySide6-Addons==6.6.0" "shiboken6==6.6.0"
+          # 3) Qt ABI：共享系统 Python 上 shiboken6/Essentials/Addons 可能被
+          #    其它项目单独升级（6.12 与 PySide6 6.6.0 不兼容 → QtCore DLL 加载
+          #    失败）。**仅在版本不对时修复**，并限制重试/超时，避免网络抖动时
+          #    pip 卡住 30+ 分钟（曾导致整条流水线挂起）。
+          python -c "import PySide6.QtCore, shiboken6; assert PySide6.QtCore.qVersion() == '6.6.0' and shiboken6.__version__ == '6.6.0'"
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Qt pinned reinstall failed (network?)"
-            exit 1
+            Write-Host "Qt ABI mismatch -> bounded reinstall (6.6.0)"
+            python -m pip install --disable-pip-version-check --force-reinstall --no-deps               --retries 1 --timeout 10               "PySide6==6.6.0" "PySide6-Essentials==6.6.0" "PySide6-Addons==6.6.0" "shiboken6==6.6.0"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::Qt bounded reinstall failed (network?); continuing, Qt tests may fail"
+            }
           }
 
           # 4) fail-fast 自检：Qt 与关键运行依赖都必须在场。
