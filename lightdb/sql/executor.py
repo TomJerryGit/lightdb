@@ -1765,6 +1765,9 @@ class Executor:
                              # E2：内联非唯一 KEY/INDEX（与独立 CREATE INDEX
                              # 共用同一份持久化声明）
                              secondary_indexes=p.get('secondary_indexes'),
+                             # D2：外键声明（Database.create_table 校验父表/
+                             # 父列索引，随元数据持久化并由写入路径强制）
+                             foreign_keys=p.get('foreign_keys'),
                              # E2：ENGINE= 兼容别名（持久化请求名）
                              requested_engine=table_options['engine'],
                              # P6：`CREATE TABLE ... AUTO_INCREMENT=n`

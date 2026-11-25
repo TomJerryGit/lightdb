@@ -33,7 +33,7 @@ from ..logger import logger
 from ..storage.txn import TxnManager
 from ..storage.lock_manager import LockManager
 from ..storage.mvcc import MVCCManager
-from .errors import DdlError, LegacyBTreeFormatError
+from .errors import DdlError, ForeignKeyViolation, LegacyBTreeFormatError
 from .table import Table, coerce
 
 
@@ -578,7 +578,10 @@ class Database:
                     # P6：AUTO_INCREMENT 下一号随元数据持久化；重启后
                     # 接着分配（不因删行/回滚而重用旧号）。
                     auto_increment_next=tinfo.get('auto_increment_next'),
+                    # D2：外键约束随元数据持久化，重启后仍强制。
+                    foreign_keys=tinfo.get('foreign_keys'),
                 )
+                self.tables[tname]._db = self
                 if tinfo.get('partition'):
                     # 分区描述随表元数据一起持久化（SHOW PARTITIONS /
                     # 分区裁剪都读 Table._partition）
@@ -641,6 +644,9 @@ class Database:
                     # 表级约束在这里）。没有它，重启后表级 CHECK 就消失，
                     # 违规数据会被静默写进来。
                     'checks': getattr(t, '_checks', None),
+                    # D2：外键约束（子表声明 + 父表引用检查）随元数据持久化。
+                    'foreign_keys': t.foreign_keys()
+                    if hasattr(t, 'foreign_keys') else [],
                     # E2：非唯一索引声明 + 请求的引擎名（兼容别名）。
                     # 都是真实生效/回显的元数据，必须随元数据持久化。
                     'indexes': t.secondary_indexes()
@@ -720,6 +726,255 @@ class Database:
             return sorted(self.tables.keys())
         return []
 
+    # ==================== D2：外键定义/写入校验 ====================
+
+    def _table_by_name(self, name):
+        """按名字找表（大小写不敏感回退；SQL 标识符常见大小写混用）"""
+        if name in self.tables:
+            return self.tables[name]
+        low = str(name).lower()
+        for tname, tbl in self.tables.items():
+            if str(tname).lower() == low:
+                return tbl
+        return None
+
+    @staticmethod
+    def _table_has_key_on(tbl, column: str) -> bool:
+        """父列是否有可用键：主键 / 单列 UNIQUE / 以该列为最左列的索引"""
+        for c in tbl.cols:
+            if c.get('name') == column and c.get('primary'):
+                return True
+        try:
+            uqs = tbl.unique_indexes()
+        except Exception:
+            uqs = []
+        for spec in uqs:
+            if list(spec.get('columns') or []) == [column]:
+                return True
+        try:
+            idxs = tbl.secondary_indexes()
+        except Exception:
+            idxs = []
+        for spec in idxs:
+            cols = list(spec.get('columns') or [])
+            if cols and cols[0] == column:
+                return True
+        return False
+
+    def _resolve_foreign_keys(self, name: str, cols: List[dict],
+                              specs) -> List[dict]:
+        """定义期校验/规范化外键；父表/父列/父列键缺失 → 1822 风格错误"""
+        if not specs:
+            return []
+        child_cols = {c['name'] for c in cols}
+        used_names = set()
+        out = []
+        auto_no = 1
+        for raw in specs:
+            if not isinstance(raw, dict):
+                raise DdlError("外键声明结构非法", errno=1822,
+                               sqlstate='HY000')
+            col = str(raw.get('column') or '').strip()
+            ref_table = str(raw.get('ref_table') or '').strip()
+            ref_column = str(raw.get('ref_column') or '').strip()
+            if not col or not ref_table or not ref_column:
+                raise DdlError(
+                    "Foreign key 声明缺少列/父表/父列", errno=1822,
+                    sqlstate='HY000')
+            if col not in child_cols:
+                raise DdlError(
+                    f"Failed to add the foreign key constraint. Missing "
+                    f"column '{col}' in the referencing table '{name}'",
+                    errno=1822, sqlstate='HY000')
+            # 父表：允许自引用（本表正在创建，还不在 self.tables 里）
+            if ref_table.lower() == name.lower():
+                parent_cols = child_cols
+                parent_tbl = None
+            else:
+                parent_tbl = self._table_by_name(ref_table)
+                if parent_tbl is None:
+                    raise DdlError(
+                        f"Failed to add the foreign key constraint. Missing "
+                        f"table '{ref_table}' in the referenced table",
+                        errno=1822, sqlstate='HY000')
+                parent_cols = {c['name'] for c in parent_tbl.cols}
+            if ref_column not in parent_cols:
+                raise DdlError(
+                    f"Failed to add the foreign key constraint. Missing "
+                    f"column '{ref_column}' in the referenced table "
+                    f"'{ref_table}'", errno=1822, sqlstate='HY000')
+            if parent_tbl is not None and not self._table_has_key_on(
+                    parent_tbl, ref_column):
+                raise DdlError(
+                    f"Failed to add the foreign key constraint. Missing "
+                    f"index for constraint on the referenced table "
+                    f"'{ref_table}' (父列 '{ref_column}' 必须是主键/UNIQUE/"
+                    f"最左索引列)", errno=1822, sqlstate='HY000')
+            if parent_tbl is None:
+                # 自引用：本表的主键/UNIQUE/索引声明同样要覆盖父列
+                self_ok = any(
+                    c.get('name') == ref_column and c.get('primary')
+                    for c in cols)
+                if not self_ok:
+                    self_ok = any(
+                        list(s.get('columns') or []) == [ref_column]
+                        for s in unique_specs)
+                if not self_ok:
+                    self_ok = any(
+                        (list(s.get('columns') or []) or [None])[0]
+                        == ref_column for s in secondary_specs)
+                if not self_ok:
+                    raise DdlError(
+                        f"Failed to add the foreign key constraint. Missing "
+                        f"index for self-referencing constraint on column "
+                        f"'{ref_column}'", errno=1822, sqlstate='HY000')
+            on_delete = str(raw.get('on_delete') or 'RESTRICT').upper()
+            on_update = str(raw.get('on_update') or 'RESTRICT').upper()
+            for act in (on_delete, on_update):
+                if act not in ('RESTRICT', 'NO ACTION'):
+                    raise DdlError(
+                        f"不支持 ON DELETE/UPDATE {act}：本引擎外键只实现 "
+                        f"RESTRICT/NO ACTION", errno=1235, sqlstate='42000')
+            fk_name = raw.get('name')
+            if not fk_name:
+                while f"{name}_ibfk_{auto_no}" in used_names:
+                    auto_no += 1
+                fk_name = f"{name}_ibfk_{auto_no}"
+                auto_no += 1
+            fk_name = str(fk_name)
+            if fk_name in used_names:
+                raise DdlError(
+                    f"Duplicate foreign key constraint name '{fk_name}'",
+                    errno=1826, sqlstate='HY000')
+            used_names.add(fk_name)
+            out.append({
+                'name': fk_name,
+                'column': col,
+                'ref_table': ref_table,
+                'ref_column': ref_column,
+                'on_delete': on_delete,
+                'on_update': on_update,
+            })
+        return out
+
+    def has_referencing_children(self, parent_tbl) -> bool:
+        """是否存在其它表的外键指向该表（父表删改前快速判定）"""
+        target = str(parent_tbl.name).lower()
+        for child in self.tables.values():
+            for fk in child.foreign_keys():
+                if str(fk.get('ref_table') or '').lower() == target:
+                    return True
+        return False
+
+    def _fk_parent_info(self, fk):
+        parent = self._table_by_name(fk['ref_table'])
+        if parent is None:
+            return None, None
+        try:
+            pidx = parent._col_idx(fk['ref_column'])
+        except KeyError:
+            return parent, None
+        return parent, pidx
+
+    def validate_foreign_key_row(self, child_tbl, row):
+        """子表 INSERT/UPDATE：非 NULL 外键值必须在父表存在 → 1452"""
+        for fk in child_tbl.foreign_keys():
+            try:
+                cidx = child_tbl._col_idx(fk['column'])
+            except KeyError:
+                continue
+            value = row[cidx] if cidx < len(row) else None
+            if value is None:
+                continue
+            parent, pidx = self._fk_parent_info(fk)
+            if parent is None or pidx is None:
+                raise ForeignKeyViolation(
+                    f"Cannot add or update a child row: a foreign key "
+                    f"constraint fails (parent table '{fk['ref_table']}' "
+                    f"missing)", errno=1452)
+            found = any(
+                (vals[pidx] if pidx < len(vals) else None) == value
+                for _pk, vals in parent._live_rows())
+            if not found:
+                raise ForeignKeyViolation(
+                    f"Cannot add or update a child row: a foreign key "
+                    f"constraint fails (`{child_tbl.name}`, CONSTRAINT "
+                    f"`{fk['name']}` FOREIGN KEY (`{fk['column']}`) "
+                    f"REFERENCES `{fk['ref_table']}` (`{fk['ref_column']}`))",
+                    errno=1452)
+
+    def _child_fk_rows(self, parent_tbl, ref_column, value):
+        """返回引用 (parent_tbl.name, ref_column, value) 的子行列表"""
+        out = []
+        for child in self.tables.values():
+            for fk in child.foreign_keys():
+                if (str(fk['ref_table']).lower()
+                        != str(parent_tbl.name).lower()):
+                    continue
+                if fk['ref_column'] != ref_column:
+                    continue
+                try:
+                    cidx = child._col_idx(fk['column'])
+                except KeyError:
+                    continue
+                for pk, vals in child._live_rows():
+                    if (vals[cidx] if cidx < len(vals) else None) == value:
+                        out.append((child, fk, pk, vals))
+        return out
+
+    def validate_parent_delete(self, parent_tbl, rows):
+        """父表 DELETE：仍有子行引用 → 1451（RESTRICT）"""
+        # 遍历全库找出所有指向 parent_tbl 的外键声明
+        for child in self.tables.values():
+            for fk in child.foreign_keys():
+                if str(fk['ref_table']).lower() != str(
+                        parent_tbl.name).lower():
+                    continue
+                try:
+                    pidx = parent_tbl._col_idx(fk['ref_column'])
+                except KeyError:
+                    continue
+                parents = {row[pidx] for row in rows
+                           if pidx < len(row) and row[pidx] is not None}
+                for value in parents:
+                    hits = self._child_fk_rows(parent_tbl,
+                                               fk['ref_column'], value)
+                    if hits:
+                        ch, _fk, _pk, _vals = hits[0]
+                        raise ForeignKeyViolation(
+                            f"Cannot delete or update a parent row: a "
+                            f"foreign key constraint fails (`{ch.name}`, "
+                            f"CONSTRAINT `{_fk['name']}` FOREIGN KEY "
+                            f"(`{_fk['column']}`) REFERENCES "
+                            f"`{parent_tbl.name}` (`{_fk['ref_column']}`))",
+                            errno=1451)
+
+    def validate_parent_update(self, parent_tbl, old_row, new_row):
+        """父表 UPDATE 被引用键列：旧值仍被子行引用 → 1451（RESTRICT）"""
+        for child in self.tables.values():
+            for fk in child.foreign_keys():
+                if str(fk['ref_table']).lower() != str(
+                        parent_tbl.name).lower():
+                    continue
+                try:
+                    pidx = parent_tbl._col_idx(fk['ref_column'])
+                except KeyError:
+                    continue
+                oldv = old_row[pidx] if pidx < len(old_row) else None
+                newv = new_row[pidx] if pidx < len(new_row) else None
+                if oldv is None or oldv == newv:
+                    continue
+                hits = self._child_fk_rows(parent_tbl,
+                                           fk['ref_column'], oldv)
+                if hits:
+                    ch, _fk, _pk, _vals = hits[0]
+                    raise ForeignKeyViolation(
+                        f"Cannot delete or update a parent row: a foreign "
+                        f"key constraint fails (`{ch.name}`, CONSTRAINT "
+                        f"`{_fk['name']}` FOREIGN KEY (`{_fk['column']}`) "
+                        f"REFERENCES `{parent_tbl.name}` "
+                        f"(`{_fk['ref_column']}`))", errno=1451)
+
     def create_table(self, name: str,
                      cols: List[dict],
                      partition: dict = None,
@@ -727,7 +982,8 @@ class Database:
                      unique_indexes: List[dict] = None,
                      secondary_indexes: List[dict] = None,
                      requested_engine: str = None,
-                     auto_increment_start: int = None) -> Table:
+                     auto_increment_start: int = None,
+                     foreign_keys: List[dict] = None) -> Table:
         """建表
 
         `checks` 是 `CREATE TABLE` 里表级 CHECK 约束（`sql/parser.py` 的
@@ -809,13 +1065,16 @@ class Database:
         reserved = [s['name'] for s in unique_specs]
         secondary_specs = resolve_secondary_indexes(
             name, cols, secondary_indexes, reserved_names=reserved)
+        fk_specs = self._resolve_foreign_keys(name, cols, foreign_keys)
         tbl = Table(
             name, cols, str(self.data_dir),
             self.lock_manager, self.mvcc,
             unique_indexes=unique_specs,
             secondary_indexes=secondary_specs,
             requested_engine=requested_engine or 'LightDB',
-            auto_increment_start=auto_increment_start)
+            auto_increment_start=auto_increment_start,
+            foreign_keys=fk_specs)
+        tbl._db = self
         if partition:
             tbl.set_partition(partition)
         tbl.set_checks(checks)
@@ -1959,7 +2218,10 @@ class Database:
                  'auto_increment_next': (
                      tbl.auto_increment_next_values()
                      if hasattr(tbl, 'auto_increment_next_values') else {}),
-                 'checks': [dict(c) for c in getattr(tbl, '_checks', [])]}
+                 'checks': [dict(c) for c in getattr(tbl, '_checks', [])],
+                 # D2：外键跟着改名走（子表声明；父表改名时其它表的
+                 # ref_table 在 `_finish_rename` 末尾统一改到新名字）。
+                 'foreign_keys': tbl.foreign_keys()}
         self._ddl_begin(entry)
         self._finish_rename(entry)
         return {'from': old, 'to': new}
@@ -2007,12 +2269,26 @@ class Database:
                            'auto_increment_next',
                            (tbl.auto_increment_next_values()
                             if hasattr(tbl, 'auto_increment_next_values')
-                            else None)))
+                            else None)),
+                       foreign_keys=entry.get('foreign_keys',
+                                              tbl.foreign_keys()))
+        newtbl._db = self
         if entry.get('partition'):
             newtbl.set_partition(entry['partition'])
         if entry.get('checks'):
             newtbl.set_checks(entry['checks'])
         self.tables[new] = newtbl
+        # D2：父表改名后，其它表里指向旧名的外键同步到新名（否则重启后
+        # 引用检查会找不到父表而永久 1452/校验失败）。
+        for child in self.tables.values():
+            specs = child.foreign_keys()
+            changed = False
+            for fk in specs:
+                if str(fk.get('ref_table') or '').lower() == old.lower():
+                    fk['ref_table'] = new
+                    changed = True
+            if changed:
+                child.set_foreign_keys(specs)
         self._pending_ddl = None
         self.save_meta()
 
@@ -2602,7 +2878,8 @@ class Database:
                     unique_indexes=unique,
                     secondary_indexes=secondary,
                     requested_engine=engine,
-                    auto_increment_next=auto_state)
+                    auto_increment_next=auto_state,
+                    foreign_keys=tbl.foreign_keys())
                 if partition:
                     new.set_partition(partition)
                 new.set_checks(checks)
@@ -2677,7 +2954,9 @@ class Database:
             self.lock_manager, self.mvcc,
             unique_indexes=unique, secondary_indexes=secondary,
             requested_engine=engine,
-            auto_increment_next=auto_state)
+            auto_increment_next=auto_state,
+            foreign_keys=tbl.foreign_keys())
+        new_tbl._db = self
         if partition:
             new_tbl.set_partition(partition)
         new_tbl.set_checks(checks)

@@ -244,6 +244,9 @@ class TableSchema:
     #: 本引擎没有独立唯一索引结构，唯一性由写入路径检查强制；这里把它
     #: 原样写回 DDL，恢复后仍然强制（`SHOW INDEX` 报 UNIQUE-CHECK）。
     unique_indexes: list = field(default_factory=list)  # [{'name','columns'}]
+    #: D2：外键（单列 RESTRICT/NO ACTION）→ 原样写回 DDL / 恢复后仍强制。
+    foreign_keys: list = field(default_factory=list)
+    #  [{'name','column','ref_table','ref_column','on_delete','on_update'}]
     #: 内部行键（物理 B+Tree 键）列名。`DROP PRIMARY KEY` 后列上没有用户
     #: 声明的 PRIMARY KEY，但引擎仍需要一个行键扫描/备份；它**不**会写进
     #: SHOW CREATE / dump 的 DDL（否则等于凭空恢复出一条主键约束），只用于
@@ -302,7 +305,8 @@ class TableSchema:
         ]
 
     @classmethod
-    def from_engine_cols(cls, name, cols, checks=None, unique_indexes=None):
+    def from_engine_cols(cls, name, cols, checks=None, unique_indexes=None,
+                         foreign_keys=None):
         columns = []
         for c in cols:
             ck = c.get('check') or {}
@@ -349,8 +353,20 @@ class TableSchema:
             uq.append({'name': str(spec.get('name') or uq_cols[0]),
                        'columns': uq_cols})
         row_key = next((c['name'] for c in cols if c.get('primary')), None)
+        fks = []
+        for fk in (foreign_keys or []):
+            if not isinstance(fk, dict):
+                continue
+            fks.append({
+                'name': str(fk.get('name') or ''),
+                'column': str(fk.get('column') or ''),
+                'ref_table': str(fk.get('ref_table') or ''),
+                'ref_column': str(fk.get('ref_column') or ''),
+                'on_delete': str(fk.get('on_delete') or 'RESTRICT').upper(),
+                'on_update': str(fk.get('on_update') or 'RESTRICT').upper(),
+            })
         schema = cls(name=name, columns=columns, table_checks=table_checks,
-                     unique_indexes=uq, row_key=row_key)
+                     unique_indexes=uq, foreign_keys=fks, row_key=row_key)
         # 用与 `Database.create_table` 完全相同的一份命名规则补全自动名：
         # 否则"dump 里的匿名约束"与"恢复后引擎自动命名的约束"名字对不上，
         # 恢复校验会把一次正确恢复误判成失败。
@@ -425,6 +441,12 @@ class TableSchema:
                 continue
             cols_sql = ', '.join(str(c) for c in (uq.get('columns') or []))
             parts.append(f"  UNIQUE KEY {uq['name']} ({cols_sql})")
+        # D2：外键（单列 RESTRICT/NO ACTION）。必须写回 DDL，否则恢复后
+        # 引用完整性静默消失；父表先建/后建由 `table_schemas` 拓扑排序保证。
+        for fk in self.foreign_keys:
+            parts.append(
+                f"  CONSTRAINT {fk['name']} FOREIGN KEY ({fk['column']}) "
+                f"REFERENCES {fk['ref_table']} ({fk['ref_column']})")
         # 表级约束的自动名序号要**接在列级之后**（MySQL 的 `表名_chk_n`
         # 按约束在语句里的出现顺序编号），否则 dump 里写出的名字与恢复后
         # 引擎重新编号的名字会错位。
@@ -493,6 +515,34 @@ class TableSchema:
                     raise BackupError(
                         f"表 {self.name} 的 UNIQUE 索引 {spec.get('name')!r} "
                         f"引用了不存在的列 {cn!r}，无法导出")
+        # D2：外键必须能原样写出/解析（单列、RESTRICT/NO ACTION）
+        seen_fk = set()
+        for fk in self.foreign_keys:
+            fname = str(fk.get('name') or '')
+            if not _check_ident_ok(fname):
+                raise BackupError(
+                    f"表 {self.name} 的外键名 {fname!r} 含不支持的字符"
+                    f"（无法原样导出/恢复）")
+            if fname.lower() in seen_fk:
+                raise BackupError(
+                    f"表 {self.name} 的外键名 {fname!r} 重复")
+            seen_fk.add(fname.lower())
+            if fk.get('column') not in col_names:
+                raise BackupError(
+                    f"表 {self.name} 的外键 {fname!r} 引用了不存在的列 "
+                    f"{fk.get('column')!r}")
+            if not _check_ident_ok(fk.get('ref_table')) or not \
+                    _check_ident_ok(fk.get('ref_column')):
+                raise BackupError(
+                    f"表 {self.name} 的外键 {fname!r} 父表/父列名含不支持的"
+                    f"字符（无法原样导出/恢复）")
+            if (str(fk.get('on_delete') or 'RESTRICT').upper()
+                    not in ('RESTRICT', 'NO ACTION')
+                    or str(fk.get('on_update') or 'RESTRICT').upper()
+                    not in ('RESTRICT', 'NO ACTION')):
+                raise BackupError(
+                    f"表 {self.name} 的外键 {fname!r} 使用了未实现的级联"
+                    f"动作（只支持 RESTRICT/NO ACTION）")
         if not any(c.get('primary') for c in self.columns) and not self.row_key:
             raise BackupError(f"表 {self.name} 没有主键，无法按主键扫描备份")
 
@@ -592,6 +642,46 @@ def _parse_ddl_key_row(part: str, table: str):
     return kind, constraint_name, index_name, columns
 
 
+def _parse_ddl_foreign_key(part: str, table: str) -> dict:
+    """解析 dump 里的外键行：`[CONSTRAINT n] FOREIGN KEY (c) REFERENCES p(c)`"""
+    s = part.strip()
+    name = None
+    cm = re.match(r'CONSTRAINT\s+`?([A-Za-z_]\w*)`?\s+(.*)$',
+                  s, re.IGNORECASE | re.DOTALL)
+    if cm:
+        name, s = cm.group(1), cm.group(2).strip()
+    m = re.match(
+        r'FOREIGN\s+KEY\s*(?:`?[A-Za-z_]\w*`?\s*)?'
+        r'\(\s*`?([A-Za-z_]\w*)`?\s*\)\s*REFERENCES\s+'
+        r'(?:`?[A-Za-z_]\w*`?\s*\.\s*)?`?([A-Za-z_]\w*)`?\s*'
+        r'\(\s*`?([A-Za-z_]\w*)`?\s*\)(.*)$',
+        s, re.IGNORECASE | re.DOTALL)
+    if not m:
+        raise BackupError(
+            f"表 {table} 的外键行 {part[:100]!r} 无法解析"
+            f"（只支持 FOREIGN KEY (col) REFERENCES parent(col)）")
+    col, ref_table, ref_col, rest = (m.group(1), m.group(2),
+                                     m.group(3), m.group(4).strip())
+    actions = {'on_delete': 'RESTRICT', 'on_update': 'RESTRICT'}
+    while rest:
+        am = re.match(
+            r'ON\s+(DELETE|UPDATE)\s+'
+            r'(RESTRICT|NO\s+ACTION|CASCADE|SET\s+NULL|SET\s+DEFAULT)\b'
+            r'(.*)$', rest, re.IGNORECASE | re.DOTALL)
+        if not am:
+            raise BackupError(
+                f"表 {table} 的外键尾巴无法识别 {rest[:80]!r}")
+        act = re.sub(r'\s+', ' ', am.group(2).strip().upper())
+        if act not in ('RESTRICT', 'NO ACTION'):
+            raise BackupError(
+                f"表 {table} 的外键用了未实现的 ON {am.group(1).upper()} "
+                f"{act}（只支持 RESTRICT/NO ACTION，拒绝静默降级）")
+        actions['on_' + am.group(1).lower()] = 'RESTRICT'
+        rest = am.group(3).strip()
+    return {'name': name, 'column': col, 'ref_table': ref_table,
+            'ref_column': ref_col, **actions}
+
+
 def parse_create_table(stmt: str) -> TableSchema:
     """解析 `CREATE TABLE [IF NOT EXISTS] t ( ... );` → TableSchema
 
@@ -645,11 +735,20 @@ def parse_create_table(stmt: str) -> TableSchema:
     table_checks = []
     table_pk_cols = None
     table_unique = []
+    table_foreign_keys = []
     for part in _split_top_level(body):
         part = part.strip()
         if not part:
             continue
         up = part.upper()
+
+        # ---- D2：外键行（必须在 CONSTRAINT/键声明分支之前识别）----
+        if (up.startswith('FOREIGN KEY')
+                or (up.startswith('CONSTRAINT')
+                    and re.search(r'\bFOREIGN\s+KEY\b', up))):
+            table_foreign_keys.append(
+                _parse_ddl_foreign_key(part, name))
+            continue
 
         # ---- 表级键声明（PRIMARY KEY / UNIQUE，含 CONSTRAINT 形态）----
         #
@@ -816,9 +915,23 @@ def parse_create_table(stmt: str) -> TableSchema:
         row_key = columns[0]['name']
     else:
         row_key = next((c['name'] for c in columns if c.get('primary')), None)
+    # 外键匿名名按 MySQL 风格 table_ibfk_N 补全；重名显式报错
+    used_fk_names = set()
+    for i, fk in enumerate(table_foreign_keys):
+        if not fk.get('name'):
+            n = i + 1
+            while f"{name}_ibfk_{n}" in used_fk_names:
+                n += 1
+            fk['name'] = f"{name}_ibfk_{n}"
+        low = str(fk['name']).lower()
+        if low in used_fk_names:
+            raise BackupError(
+                f"表 {name} 的外键名 {fk['name']!r} 重复")
+        used_fk_names.add(low)
     schema = TableSchema(name=name, columns=columns,
                          table_checks=table_checks,
-                         unique_indexes=table_unique, row_key=row_key)
+                         unique_indexes=table_unique,
+                         foreign_keys=table_foreign_keys, row_key=row_key)
     # 匿名约束按与 `Database.create_table` 相同的规则补名，再自检支持面
     _assign_check_names(schema)
     schema.assert_supported()
@@ -1100,8 +1213,40 @@ def count_rows(tbl) -> int:
     return n
 
 
+def _sort_schemas_parents_first(schemas):
+    """按外键依赖做拓扑排序：父表先于子表（恢复时 CREATE 才能通过校验）
+
+    无外键时退化为按名字排序的稳定顺序。自引用不参与；环路显式报错
+    （本引擎没有延迟约束，环无法恢复）。
+    """
+    by_name = {s.name.lower(): s for s in schemas}
+    ordered = []
+    state = {}
+
+    def visit(schema):
+        key = schema.name.lower()
+        st = state.get(key)
+        if st == 'done':
+            return
+        if st == 'visiting':
+            raise BackupError(
+                f"表 {schema.name} 的外键依赖成环（无法按拓扑序恢复）")
+        state[key] = 'visiting'
+        for fk in schema.foreign_keys:
+            parent = by_name.get(
+                str(fk.get('ref_table') or '').lower())
+            if parent is not None and parent is not schema:
+                visit(parent)
+        state[key] = 'done'
+        ordered.append(schema)
+
+    for schema in schemas:
+        visit(schema)
+    return ordered
+
+
 def table_schemas(db) -> list:
-    """目标库全部表的 TableSchema（按表名排序，dump 结果稳定可比对）
+    """目标库全部表的 TableSchema（按表名排序 + 外键依赖父表在前）
 
     CHECK 约束在这里被**真正读出来**：列级在 `cols[i]['check']`，表级在
     `Table._checks`。老版本只读 name/type/primary/unique/notnull，于是
@@ -1112,8 +1257,10 @@ def table_schemas(db) -> list:
         tbl = db.tables[name]
         out.append(TableSchema.from_engine_cols(
             name, tbl.cols, getattr(tbl, '_checks', None),
-            unique_indexes=tbl.table_unique_indexes()))
-    return out
+            unique_indexes=tbl.table_unique_indexes(),
+            foreign_keys=(tbl.foreign_keys()
+                          if hasattr(tbl, 'foreign_keys') else [])))
+    return _sort_schemas_parents_first(out)
 
 
 def check_ddl(db, name: str, if_not_exists: bool = False) -> str:
@@ -1121,14 +1268,16 @@ def check_ddl(db, name: str, if_not_exists: bool = False) -> str:
 
     引擎侧（`Executor._show_create_table`）与备份侧（`render_dump` →
     `TableSchema.canonical_ddl`）都从这里出发，避免出两条会各自漂移的
-    DDL 生成路径。CHECK 的落位见 `TableSchema.canonical_ddl`。
+    DDL 生成路径。CHECK/外键的落位见 `TableSchema.canonical_ddl`。
     """
     if name not in db.tables:
         raise BackupError(f"表 {name} 不存在")
     tbl = db.tables[name]
     schema = TableSchema.from_engine_cols(
         name, tbl.cols, getattr(tbl, '_checks', None),
-        unique_indexes=tbl.table_unique_indexes())
+        unique_indexes=tbl.table_unique_indexes(),
+        foreign_keys=(tbl.foreign_keys()
+                      if hasattr(tbl, 'foreign_keys') else []))
     schema.assert_supported()
     return schema.canonical_ddl(if_not_exists=if_not_exists)
 

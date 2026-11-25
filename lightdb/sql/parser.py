@@ -2331,6 +2331,10 @@ class Parser:
         #: 索引结构，但声明会随表持久化并在 SHOW INDEX/SHOW CREATE 如实
         #: 展示（Index_type 标明「扫描辅助/不声称 BTREE」），绝不静默丢弃。
         secondary_indexes = []
+        #: D2：表级 `FOREIGN KEY [name] (col) REFERENCES parent(col)`。
+        #: 单列 RESTRICT/NO ACTION；结构交给 Database.create_table 校验
+        #: 父表存在/父列有索引，并由写入路径真实强制。
+        foreign_keys = []
         for part in self._split_top_level(body):
             part_stripped = part.strip()
             up = part_stripped.upper()
@@ -2371,7 +2375,8 @@ class Parser:
                         f"（本引擎只支持 CONSTRAINT <名字> CHECK / UNIQUE / "
                         f"PRIMARY KEY）")
                 table_pk, unique_indexes = self._apply_table_key(
-                    kd, table_pk, unique_indexes, secondary_indexes)
+                    kd, table_pk, unique_indexes, secondary_indexes,
+                    foreign_keys)
                 continue
 
             # ---- 表级索引/键声明 ----
@@ -2383,12 +2388,13 @@ class Parser:
             # `UNIQUE (c)` / `SPATIAL KEY ...` 压根不在它的跳过列表里，
             # 会被当成一列（列名 `UNIQUE`、类型 `INDEX`）建出来，元数据
             # 直接长出一根假列。现在：能真做的（表级单列主键、UNIQUE）
-            # 真做，做不到的（二级索引 / FULLTEXT / SPATIAL / 外键）
+            # 真做，做不到的（FULLTEXT / SPATIAL / 多列外键等）
             # 一律显式 SyntaxError。
             kd = self._parse_table_key(part_stripped)
             if kd is not None:
                 table_pk, unique_indexes = self._apply_table_key(
-                    kd, table_pk, unique_indexes, secondary_indexes)
+                    kd, table_pk, unique_indexes, secondary_indexes,
+                    foreign_keys)
                 continue
 
             col = self._column_def(part_stripped)
@@ -2503,6 +2509,8 @@ class Parser:
             # E2：表级非唯一 KEY/INDEX（持久化并在 SHOW INDEX/SHOW CREATE
             # 如实展示；查询仍走扫描，不谎称 BTREE）。
             'secondary_indexes': secondary_indexes,
+            # D2：外键声明（Database.create_table 校验父表/父列索引并持久化）
+            'foreign_keys': foreign_keys,
             # `CREATE TABLE IF NOT EXISTS` 原实现被正则吃掉后丢掉：执行器
             # 于是"表已存在就报错"，同一份 dump 无法重复恢复。此处如实
             # 回传，由执行器决定幂等语义。
@@ -2582,6 +2590,8 @@ class Parser:
                 raise SyntaxError(
                     f"FOREIGN KEY 声明缺少列清单: {s[:120]}")
             inner, end = self._extract_paren(rest, 0)
+            if name is None and constraint_name:
+                name = constraint_name
             return {'kind': kind, 'name': name,
                     'columns': self._parse_key_columns(inner, kw),
                     'tail': rest[end + 1:].strip(),
@@ -2632,15 +2642,14 @@ class Parser:
         return cols
 
     def _apply_table_key(self, kd, table_pk, unique_indexes,
-                         secondary_indexes=None):
+                         secondary_indexes=None, foreign_keys=None):
         """把一条表级键声明落到建表结果上；**做不到的一律显式报错**
 
-        支持：`PRIMARY KEY (...)`（单列）、`UNIQUE [KEY|INDEX] ...`
-        （单列/多列，都真强制）、**E2** 非唯一 `[KEY|INDEX] [名字] (列...)`
-        （落成持久化元数据并在 SHOW INDEX/SHOW CREATE 如实展示；查询仍走
-        扫描，Index_type 不声称 BTREE）。其余（FULLTEXT、SPATIAL、
-        FOREIGN KEY）本引擎没有对应实现，声明会被静默丢弃 —— 这里改为
-        SyntaxError。
+        支持：`PRIMARY KEY (...)`（单列/复合）、`UNIQUE [KEY|INDEX] ...`
+        （单列/多列，都真强制）、**E2** 非唯一 `[KEY|INDEX] [名字] (列...)`、
+        **D2** 单列 `FOREIGN KEY (col) REFERENCES parent(col)`
+        （RESTRICT/NO ACTION；元数据交给 Database.create_table 校验）。
+        其余（FULLTEXT、SPATIAL、CASCADE/SET NULL、多列外键）显式报错。
         """
         kind = kd['kind']
         original = kd.get('original') or ''
@@ -2720,10 +2729,53 @@ class Parser:
                 f"实现（没有空间索引），该声明不会生效")
 
         if kind == 'FOREIGN':
-            raise SyntaxError(
-                f"本引擎不支持外键（没有外键强制/级联实现）："
-                f"`{original[:80]}` 不会生效，因此显式拒绝而不是静默丢弃。"
-                f"请在应用层保证引用完整性")
+            # D2：单列外键，REFERENCES parent(col)，仅 RESTRICT/NO ACTION。
+            # CASCADE / SET NULL / SET DEFAULT 显式拒绝（不静默降级）。
+            fks = (foreign_keys if foreign_keys is not None else [])
+            cols_list = list(kd.get('columns') or [])
+            if len(cols_list) != 1:
+                raise SyntaxError(
+                    f"FOREIGN KEY 只支持单列（收到 {cols_list}）："
+                    f"多列外键本引擎未实现，显式拒绝而非静默截断")
+            tail = (kd.get('tail') or '').strip()
+            rm = re.match(
+                r'REFERENCES\s+(?:`?[A-Za-z_]\w*`?\s*\.\s*)?'
+                r'`?([A-Za-z_]\w*)`?\s*\(\s*`?([A-Za-z_]\w*)`?\s*\)'
+                r'(.*)$', tail, re.IGNORECASE | re.DOTALL)
+            if not rm:
+                raise SyntaxError(
+                    f"FOREIGN KEY 缺少合法的 REFERENCES parent(col) 子句: "
+                    f"{(original or tail)[:140]}")
+            ref_table, ref_column, rest = (rm.group(1), rm.group(2),
+                                           rm.group(3).strip())
+            actions = {'delete': 'RESTRICT', 'update': 'RESTRICT'}
+            while rest:
+                am = re.match(
+                    r'ON\s+(DELETE|UPDATE)\s+'
+                    r'(RESTRICT|NO\s+ACTION|CASCADE|SET\s+NULL|SET\s+DEFAULT)'
+                    r'\b(.*)$', rest, re.IGNORECASE | re.DOTALL)
+                if not am:
+                    raise SyntaxError(
+                        f"FOREIGN KEY 的尾巴无法识别 {rest[:100]!r}"
+                        f"（支持 ON DELETE/UPDATE RESTRICT|NO ACTION，"
+                        f"CASCADE/SET NULL 显式拒绝）")
+                act = re.sub(r'\s+', ' ', am.group(2).strip().upper())
+                if act in ('CASCADE', 'SET NULL', 'SET DEFAULT'):
+                    raise SyntaxError(
+                        f"不支持 FOREIGN KEY ... ON {am.group(1).upper()} "
+                        f"{act}：本引擎外键只实现 RESTRICT/NO ACTION，"
+                        f"级联/置空会静默改变数据语义，因此显式拒绝")
+                actions[am.group(1).lower()] = 'RESTRICT'
+                rest = am.group(3).strip()
+            fks.append({
+                'name': kd.get('name'),
+                'column': cols_list[0],
+                'ref_table': ref_table,
+                'ref_column': ref_column,
+                'on_delete': actions['delete'],
+                'on_update': actions['update'],
+            })
+            return table_pk, unique_indexes
 
         raise SyntaxError(f"不支持的表级键声明: {original[:120]}")
 

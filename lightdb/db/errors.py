@@ -33,6 +33,23 @@ class DdlError(Exception):
         return str(self)
 
 
+class ForeignKeyViolation(ValueError):
+    """外键约束违规（写入/父表删除/父键更新）
+
+    MySQL 错误码：
+      * 1452 ER_NO_REFERENCED_ROW_2 —— 子表写入/更新时父行不存在；
+      * 1451 ER_ROW_IS_REFERENCED_2 —— 父表删除/更新被引用且 RESTRICT。
+    继承 ValueError，执行器统一按 `errno`/`sqlstate` 渲染，不会被
+    压成 1062/1105。
+    """
+
+    def __init__(self, message: str, errno: int = 1452,
+                 sqlstate: str = '23000'):
+        super().__init__(str(message))
+        self.errno = int(errno)
+        self.sqlstate = str(sqlstate)
+
+
 class LegacyBTreeFormatError(Exception):
     """启动时发现旧 B+Tree 页格式（v1/v2/v3）
 

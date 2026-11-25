@@ -347,7 +347,8 @@ class Table:
                  secondary_indexes: List[Dict] = None,
                  requested_engine: str = 'LightDB',
                  auto_increment_next: Dict[str, int] = None,
-                 auto_increment_start: int = None):
+                 auto_increment_start: int = None,
+                 foreign_keys: List[Dict] = None):
         self.name = name
         self.cols = cols
         self.data_dir = Path(data_dir)
@@ -356,6 +357,13 @@ class Table:
         #: 实际存储始终是 LightDB 原生行存；这里只持久化并如实回显，
         #: **不实现** InnoDB/MyISAM/MEMORY/CSV 的任何语义差异。
         self.requested_engine = requested_engine or 'LightDB'
+        #: D2：本表作为**子表**声明的外键（单列，RESTRICT/NO ACTION）。
+        #: 由 `Database.create_table` 定义期校验并持久化；写入路径在 Table
+        #: 内强制（子表插入/更新父行必须存在，父表删除/更新被引用→1451）。
+        self._foreign_keys = [dict(fk) for fk in (foreign_keys or [])]
+        #: 反向引用（由 Database 在加载/建表时注入），用于跨表引用检查。
+        #: 直接裸 `Table` 构造时为空，跨表校验不启用（Database 路径总是设置）。
+        self._db = None
 
         # 最后一个堆页的缓存（见 _heap_insert；纯性能优化，不改变语义）
         self._last_heap_pid = None
@@ -753,6 +761,65 @@ class Table:
             if self._key_tuple(values, idxs) == tup:
                 return pk
         return None
+
+    # ==================== D2：外键（子表写 / 父表删改）====================
+
+    def foreign_keys(self) -> List[Dict]:
+        return [dict(fk) for fk in getattr(self, '_foreign_keys', [])]
+
+    def set_foreign_keys(self, specs):
+        self._foreign_keys = [dict(fk) for fk in (specs or [])]
+
+    def _fk_db(self):
+        return getattr(self, '_db', None)
+
+    def _row_at_pk(self, pk, read_view):
+        """读一个主键当前可见行（用于外键检查；不可见返回 None）"""
+        anchor = self._read_version(pk, read_view)
+        if anchor is None:
+            return None
+        _pk, _xmin, _xmax, apid, asid = anchor
+        page = self.bp.get_page(apid)
+        if page is None:
+            return None
+        r = self._decode_row_ver(page.get_row(asid))
+        return r[0] if r else None
+
+    def _validate_fk_child_row(self, row):
+        """子表写入（INSERT/UPDATE 后的新行）→ 父行必须存在（1452）"""
+        db = self._fk_db()
+        if db is not None and self._foreign_keys:
+            db.validate_foreign_key_row(self, row)
+
+    def _validate_fk_update(self, pks, set_pairs, read_view):
+        """UPDATE 前的跨表校验：子列新值 + 父键旧值被引用（1451）"""
+        db = self._fk_db()
+        if db is None:
+            return
+        referenced = db.has_referencing_children(self)
+        for pk in pks:
+            old = self._row_at_pk(pk, read_view)
+            if old is None:
+                continue
+            new = self._apply_set_pairs(old, set_pairs,
+                                        allow_pk_change=True)
+            if self._foreign_keys:
+                db.validate_foreign_key_row(self, new)
+            if referenced:
+                db.validate_parent_update(self, old, new)
+
+    def _validate_fk_parent_delete(self, pks, read_view):
+        """父表 DELETE 前：仍有子行引用 → 1451"""
+        db = self._fk_db()
+        if db is None or not db.has_referencing_children(self):
+            return
+        rows = []
+        for pk in pks:
+            row = self._row_at_pk(pk, read_view)
+            if row is not None:
+                rows.append(row)
+        if rows:
+            db.validate_parent_delete(self, rows)
 
     def _validate_unique_insert(self, row):
         """INSERT 前的唯一性检查（在任何 WAL / 页写入之前）
@@ -2220,6 +2287,10 @@ class Table:
         # 任何半条记录（也不会白占一个 WAL 序号）。
         self._validate_unique_insert(row)
 
+        # D2：外键（子表）——非 NULL 外键值必须在父表存在（1452）。
+        # 与 CHECK/UNIQUE 同一位置：拿锁 / WAL 之前，失败不留半条记录。
+        self._validate_fk_child_row(row)
+
         # 加锁
         self._acquire_row_lock(tid, pk)
 
@@ -2471,6 +2542,10 @@ class Table:
         if getattr(self, '_has_checks', False):
             self._validate_update_checks(pks, set_pairs, read_view)
 
+        # D2：跨表外键——子表新外键值必须存在父行（1452）；若本表作为父表
+        # 被引用且键值被改，旧值仍有子行引用则 1451。先全查再写。
+        self._validate_fk_update(pks, set_pairs, read_view)
+
         n = 0
         for pk in pks:
             self._acquire_row_lock(tid, pk)
@@ -2589,6 +2664,8 @@ class Table:
 
     def _delete_locked(self, where, tid, read_view, owned) -> int:
         pks = self._find_pks(where, read_view)
+        # D2：父表删除前检查子行引用（RESTRICT → 1451），先全查再写。
+        self._validate_fk_parent_delete(pks, read_view)
         n = 0
         for pk in pks:
             self._acquire_row_lock(tid, pk)

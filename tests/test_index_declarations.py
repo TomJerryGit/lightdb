@@ -251,8 +251,17 @@ UNSUPPORTED_DECLS = [
     ('FULLTEXT KEY ft (body)', 'FULLTEXT'),
     ('FULLTEXT (body)', 'FULLTEXT'),
     ('SPATIAL KEY sp (body)', 'SPATIAL'),
-    ('FOREIGN KEY (a) REFERENCES other(id)', '外键'),
 ]
+
+
+def test_foreign_key_missing_parent_is_definition_error(tmp_path):
+    """D2：外键已是真实支持；父表缺失属于定义期错误（1822），不是"不支持" """
+    db = open_db(tmp_path / 'data')
+    r = err(db, 'CREATE TABLE t (id INT PRIMARY KEY, a INT, '
+                'FOREIGN KEY (a) REFERENCES other(id))')
+    assert r['code'] == 1822, r
+    assert 'other' in r['message'], r
+    assert err(db, 'SHOW INDEX FROM t')['code'] == 1146
 
 
 @pytest.mark.parametrize('decl,needle', UNSUPPORTED_DECLS)
