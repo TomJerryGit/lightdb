@@ -2955,15 +2955,21 @@ class Table:
         return []
 
     def _secondary_like_plan(self, where):
-        """`LIKE 'abc%'` 前缀匹配是否可用某个二级索引的首列
+        """`LIKE 'abc%'` 前缀匹配是否可用二级索引（支持等值前缀 + LIKE）
 
-        只有**纯字面量前缀 + 尾部 `%`** 才走索引范围：
-        `abc%` 可用；`%abc` / `%abc%` / `a%c` / `a_c%` / `abc` 都返回
-        None（安全回退全表扫描，结果仍由 LIKE 求值器逐行判定）。
+        规则：LIKE 列之前的所有索引列都必须有 `=` 条件（等值前缀），
+        LIKE 自身必须是**纯字面量前缀 + 尾部 `%`**；例如
+        `WHERE a=? AND b LIKE 'x%'`（idx(a,b)）走 `maps[2]` 的键前缀过滤。
+        `%abc` / `%abc%` / `a%c` / `a_c%` / `abc` 返回 None（安全回退全表
+        扫描，结果仍由 LIKE 求值器逐行判定）。
+
+        返回 `(spec, eq_values, like_index, prefix)` 或 None。
         """
         if not isinstance(where, dict) or 'or' in where:
             return None
-        for cond in self._secondary_conjuncts(where):
+        conj = self._secondary_conjuncts(where)
+        like_conds = []
+        for cond in conj:
             if cond.get('op') != 'LIKE':
                 continue
             pat = cond.get('value')
@@ -2972,26 +2978,61 @@ class Table:
             prefix = pat[:-1]
             if not prefix or '%' in prefix or '_' in prefix:
                 continue
-            col = cond.get('column')
+            like_conds.append((cond.get('column'), prefix))
+        if not like_conds:
+            return None
+        by_col = {}
+        for cond in conj:
+            if cond.get('op') == '=':
+                by_col.setdefault(cond.get('column'), []).append(cond)
+        best = None
+        for col, prefix in like_conds:
             for spec in (self._secondary_indexes or []):
                 cols = [str(c) for c in (spec.get('columns') or [])]
-                if cols and cols[0] == col:
-                    return spec, prefix
-        return None
+                if col not in cols:
+                    continue
+                k = cols.index(col)
+                eq_vals = []
+                ok = True
+                for j in range(k):
+                    conds = by_col.get(cols[j]) or []
+                    vals = {c.get('value') for c in conds}
+                    if not conds or len(vals) > 1:
+                        ok = False
+                        break
+                    try:
+                        cidx = self._col_idx(cols[j])
+                        eq_vals.append(
+                            coerce(conds[-1].get('value'),
+                                   self.cols[cidx].get('type')))
+                    except Exception:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                score = (k, len(cols))
+                if best is None or score > best[0]:
+                    best = (score, spec, tuple(eq_vals), k, prefix)
+        if best is None:
+            return None
+        return best[1], best[2], best[3], best[4]
 
-    def _secondary_like_candidate_pks(self, spec, prefix):
+    def _secondary_like_candidate_pks(self, spec, eq_values, like_index, prefix):
         entry = self._secondary_entry(spec)
         if entry is None:
             return None
-        keys = self._secondary_sorted_keys(entry, 1)
-        vals = [k[0] for k in keys if isinstance(k[0], str)]
-        lo = bisect.bisect_left(vals, prefix)
+        want = like_index + 1
+        keys = self._secondary_sorted_keys(entry, want)
+        maps = entry['maps'][want]
         out = set()
-        full_map = entry['maps'][1]
-        for v in vals[lo:]:
-            if not v.startswith(prefix):
-                break
-            out.update(full_map.get((v,), ()))
+        fixed_len = len(eq_values)
+        for key in keys:
+            if fixed_len and key[:fixed_len] != eq_values:
+                continue
+            value = key[fixed_len]
+            if not isinstance(value, str) or not value.startswith(prefix):
+                continue
+            out.update(maps.get(key, ()))
         return out
 
     def _index_ordered_pks(self, order_by, where, limit, read_view):

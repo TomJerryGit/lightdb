@@ -53,3 +53,19 @@ CREATE TABLE child (
   尚未接入（本 MVP 只保证 `SHOW CREATE TABLE` 与写入路径真实生效）。
 * 外键检查走父表行扫描（MVP 未建 FK 专用索引）；父表极大时性能受限，
   但不影响正确性。
+
+## 多列索引 + LIKE 前缀组合优化（D4，beta.148）
+
+- 支持 **等值前缀 + 后续列 LIKE 前缀** 走二级索引：
+  `WHERE a=? AND b LIKE 'x%'`（idx(a,b)）、
+  `WHERE a=? AND b=? AND c LIKE 'x%'`（idx(a,b,c)）。
+- 实现：`Table._secondary_like_plan()` 找到 LIKE 列下标 k，要求 0..k-1 列都有
+  `=` 条件（值冲突/缺失则安全回退）；`_secondary_like_candidate_pks()` 在
+  `maps[k+1]` 上按等值元组 + 字符串前缀过滤，结果仍逐行 `_match` 复核。
+- 不支持：`%x%`、`x%y`、`_` 通配、OR、LIKE 列之前有范围条件（
+  `a=? AND b BETWEEN ... AND c LIKE ...` 无法在范围后使用后续列索引）→ 安全
+  全表扫描，结果不变。
+- 观测：命中时 `Table._index_stats['like_prefix']` 自增；`EXPLAIN` 仍显示
+  ALL（与既有前缀索引一致，未新增计划输出）。
+- 测试：`tests/test_composite_index_like.py`（等值前缀、二级等值前缀、
+  回退形态、NULL/空结果、重启一致性、2000 行量化）。
