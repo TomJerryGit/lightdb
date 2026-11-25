@@ -31,48 +31,14 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
-          # 上一轮 job 的 pytest/Studio 子进程可能残留（端口/文件锁），
-          # 会让下一轮 wire_union/batch10/first_run 等用例间歇失败。
-          # 只匹配 runner 自己的进程特征（--junitxml=pytest-results.xml / 工作区路径 / lightdb 服务），
-          # 不匹配裸 `-m pytest`，避免误杀同一台机器上开发者手动跑的全量测试。
-          $killed = 0
-          Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-            Where-Object {
-              $_.CommandLine -and (
-                $_.CommandLine -like '*_work\lightdb\lightdb*' -or
-                $_.CommandLine -like '*lightdb_studio*' -or
-                $_.CommandLine -like '*lightdb.main*' -or
-                $_.CommandLine -like '*pytest-results.xml*'
-              )
-            } |
-            ForEach-Object {
-              # 先尝试 WMI Terminate（普通 Stop-Process 对部分孤儿进程无效）
-              Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null
-              Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-              $killed++
-            }
-          Write-Host "killed stale test processes: $killed"
-          Start-Sleep -Seconds 2
-
-      - name: Sync local mirror (self-hosted; keeps checkout offline-capable)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          git --git-dir D:\lightdb_mirror.git fetch D:\lightdb_project "+refs/heads/main:refs/heads/main" "+refs/tags/*:refs/tags/*"
-
-      - uses: actions/checkout@v7
-
-      - name: Verify system Python (self-hosted)
-        run: python --version
-
-      - name: Install (editable, all extras + dev)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          python -m pip install --upgrade pip --retries 3 --timeout 20
-          # 运行时显式装 setuptools/wheel：check_packaging.py 在运行环境里调
-          # setuptools.build_meta.build_wheel，缺 wheel 时 packaging 步骤会 exit 1。
-          python -m pip install "setuptools>=61" wheel --retries 3 --timeout 20
+          # 完全离线优先：自助 runner 的 pip/setuptools/wheel 与全部依赖已预装
+          # （见 scripts/bootstrap_ci_env.ps1）。CI 每次只做"项目可编辑安装"，
+          # 不升级 pip、不联网解析依赖；网络抖动时不会再卡 30+ 分钟。
+          python -c "import pip, setuptools, wheel" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::runner env incomplete: run scripts/bootstrap_ci_env.ps1 once on this machine"
+            exit 1
+          }
 
           # 1) 清理被中断安装留下的 ~*.dist-info 残留（它们会让 import 报
           #    "incompletely removed distribution"，并可能留下半装的 Qt 包）。
@@ -80,7 +46,7 @@ jobs:
 
           # 2) 只安装项目本体：依赖已在 runner 首次配置时装好（见 scripts/bootstrap_ci_env.ps1）；
           #    --no-deps 避免网络抖动时 pip 重新解析/下载依赖（曾卡 12+ 分钟）。
-          python -m pip install -e ".[all,dev]" --no-deps --retries 2 --timeout 20
+          python -m pip install -e ".[all,dev]" --no-deps --no-build-isolation
 
           # 3) Qt ABI：共享系统 Python 上 shiboken6/Essentials/Addons 可能被
           #    其它项目单独升级（6.12 与 PySide6 6.6.0 不兼容 → QtCore DLL 加载
