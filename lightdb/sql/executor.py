@@ -582,10 +582,12 @@ class Executor:
             logger.warn(f"登记存储函数查询钩子失败: {e}")
         try:
             from .trigger import TriggerManager
-            self._trigger_mgr = TriggerManager(str(db.data_dir))
+            self._trigger_mgr = TriggerManager(str(db.data_dir), db=db)
         except Exception as e:                   # pragma: no cover
             logger.warn(f"初始化触发器管理器失败: {e}")
             self._trigger_mgr = None
+        # D3：触发器内 DML 不再递归触发触发器（只执行一层）
+        self._trigger_depth = 0
 
         # PL 循环的迭代上限（默认 100 万；测试/运维可调小）
         # 也可以在会话里写 `SET SESSION pl_max_iterations = N`（优先）。
@@ -2804,7 +2806,55 @@ class Executor:
 
     # ==================== DML ====================
 
+    def _any_triggers_for_event(self, table, event):
+        mgr = getattr(self, '_trigger_mgr', None)
+        if mgr is None:
+            return False
+        return any(str(t.event).upper() == str(event).upper()
+                   for t in (getattr(mgr, 'triggers', {}).get(table) or []))
+
+    def _coerce_trigger_row(self, tbl, row):
+        """按列类型转换触发器 NEW/OLD 上下文值
+
+        解析器把 `SET x=3` / `INSERT VALUES (3)` 的字面量存成字符串；触发器
+        表达式（如 `NEW.qty * NEW.price`）必须先拿到 INT/DOUBLE 等真实类型，
+        否则会把 '3' * '10' 当字符串运算报错。转换失败保留原值，交给正式
+        写入路径报类型错误。
+        """
+        out = list(row)
+        from ..db.table import coerce
+        for i, c in enumerate(tbl.cols):
+            if i >= len(out):
+                break
+            try:
+                out[i] = coerce(out[i], c['type'])
+            except Exception:
+                pass
+        return out
+
     def _cmd_insert(self, p, s):
+        """触发器语句的外层事务壳：主语句与触发器 DML 同事务、失败回滚"""
+        txn = s.get('txn') if isinstance(s, dict) else None
+        implicit = None
+        if txn is None and self._any_triggers_for_event(p['table'], 'INSERT'):
+            implicit = self.db.begin()
+            s['txn'] = implicit
+        try:
+            r = self._cmd_insert_inner(p, s)
+            if implicit is not None:
+                self._restore_session_txn(s, implicit)
+                self.db.commit_statement(implicit)
+            return r
+        except BaseException:
+            if implicit is not None:
+                self._restore_session_txn(s, implicit)
+                try:
+                    self.db.abort(implicit)
+                except Exception:              # pragma: no cover - 防御
+                    pass
+            raise
+
+    def _cmd_insert_inner(self, p, s):
         tbl = self.db.get_table(p['table'])
         values_list = p['values']
 
@@ -2912,7 +2962,7 @@ class Executor:
 
         try:
             for row in values_list:
-                row = list(row)
+                row = self._coerce_trigger_row(tbl, list(row))
                 # BEFORE INSERT 触发器可以改 NEW 列（`SET NEW.x = ...`），
                 # 因此必须在真正写入之前触发；AFTER INSERT 在写入之后触发。
                 self._fire_triggers('BEFORE', 'INSERT', p['table'],
@@ -7840,6 +7890,28 @@ class Executor:
                        for k in pks]}
 
     def _cmd_update(self, p, s):
+        """触发器语句的外层事务壳：主语句与触发器 DML 同事务、失败回滚"""
+        txn = s.get('txn') if isinstance(s, dict) else None
+        implicit = None
+        if txn is None and self._any_triggers_for_event(p['table'], 'UPDATE'):
+            implicit = self.db.begin()
+            s['txn'] = implicit
+        try:
+            r = self._cmd_update_inner(p, s)
+            if implicit is not None:
+                self._restore_session_txn(s, implicit)
+                self.db.commit_statement(implicit)
+            return r
+        except BaseException:
+            if implicit is not None:
+                self._restore_session_txn(s, implicit)
+                try:
+                    self.db.abort(implicit)
+                except Exception:              # pragma: no cover - 防御
+                    pass
+            raise
+
+    def _cmd_update_inner(self, p, s):
         tbl = self.db.get_table(p['table'])
         txn = s.get('txn')
         tid = txn['txn_id'] if txn else 0
@@ -7873,6 +7945,7 @@ class Executor:
                 for r in old_rows:
                     row = [self._set_value(p['set'], old_cols, r, c)
                            for c in old_cols]
+                    row = self._coerce_trigger_row(tbl, row)
                     self._fire_triggers('BEFORE', 'UPDATE', p['table'],
                                         old_row=list(r), new_row=row,
                                         session=s)
@@ -7913,6 +7986,7 @@ class Executor:
             for r in old_rows:
                 new_row = [self._set_value(p['set'], old_cols, r, c)
                            for c in old_cols]
+                new_row = self._coerce_trigger_row(tbl, new_row)
                 self._fire_triggers('AFTER', 'UPDATE', p['table'],
                                     old_row=list(r), new_row=new_row,
                                     session=s)
@@ -7961,6 +8035,28 @@ class Executor:
                 if t.timing == timing and t.event == event]
 
     def _cmd_delete(self, p, s):
+        """触发器语句的外层事务壳：主语句与触发器 DML 同事务、失败回滚"""
+        txn = s.get('txn') if isinstance(s, dict) else None
+        implicit = None
+        if txn is None and self._any_triggers_for_event(p['table'], 'DELETE'):
+            implicit = self.db.begin()
+            s['txn'] = implicit
+        try:
+            r = self._cmd_delete_inner(p, s)
+            if implicit is not None:
+                self._restore_session_txn(s, implicit)
+                self.db.commit_statement(implicit)
+            return r
+        except BaseException:
+            if implicit is not None:
+                self._restore_session_txn(s, implicit)
+                try:
+                    self.db.abort(implicit)
+                except Exception:              # pragma: no cover - 防御
+                    pass
+            raise
+
+    def _cmd_delete_inner(self, p, s):
         tbl = self.db.get_table(p['table'])
         txn = s.get('txn')
         tid = txn['txn_id'] if txn else 0
@@ -10926,14 +11022,27 @@ class Executor:
         * 体内 `NEW.列` / `OLD.列` 会被替换成真实行的字面量（引号内不替换）；
         * BEFORE 触发器里的 `SET NEW.列 = 表达式` 会真改写入的行值（本方法
           直接改 `new_row` 列表，调用方随后写入的就是改后的值）；
-        * 触发器体执行失败会向上抛出 → 语句以显式错误结束（不静默）。
+        * 触发器体执行失败会向上抛出 → 语句以显式错误结束（不静默）；
+        * **只执行一层**：触发器体内的 DML 进入本方法时 `_trigger_depth>0`，
+          直接返回，不会递归触发其它触发器（与 MySQL 默认行为一致）。
         """
         mgr = self._trigger_mgr
         if mgr is None:
             return
+        if getattr(self, '_trigger_depth', 0) > 0:
+            return
         tlist = list(getattr(mgr, 'triggers', {}).get(table) or [])
         if not tlist:
             return
+        self._trigger_depth += 1
+        try:
+            self._fire_triggers_impl(timing, event, table, tlist,
+                                     old_row, new_row, session)
+        finally:
+            self._trigger_depth -= 1
+
+    def _fire_triggers_impl(self, timing, event, table, tlist,
+                            old_row, new_row, session):
         tbl = self.db.get_table(table)
         cols = [c['name'] for c in tbl.cols]
         env = {

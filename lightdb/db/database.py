@@ -338,6 +338,11 @@ class Database:
         #: `save_meta()`。见 `_recover_pending_ddl`。
         self._pending_ddl = None
 
+        #: D3：触发器定义（list[dict]：name/table/timing/event/body/order/
+        #: created_at）。由 `sql/trigger.py::TriggerManager` 读写，随
+        #: `_meta.json` 持久化（重启/备份恢复后仍生效）。
+        self._trigger_defs = []
+
         # P5：COMPACT 在 `_load()` 之前先把"崩溃中断的多文件替换"补完，
         # 否则随后 `_load`/`_recover` 会看到新旧文件混在一起的状态。
         self._pre_recover_compact()
@@ -602,6 +607,30 @@ class Database:
                     or '')
             if 'users' in meta:
                 self.users = meta['users']
+            # D3：触发器定义（旧数据目录的 `_triggers.json` 自动迁移到
+            # `_meta.json` 的 triggers 键；TriggerManager 之后从这里加载）
+            defs = meta.get('triggers')
+            if isinstance(defs, list):
+                self._trigger_defs = [dict(d) for d in defs
+                                      if isinstance(d, dict)]
+            elif not defs:
+                legacy = self.data_dir / '_triggers.json'
+                if legacy.exists():
+                    try:
+                        with open(legacy, encoding='utf-8') as f:
+                            old = json.load(f)
+                        migrated = []
+                        if isinstance(old, dict):
+                            for tname, items in old.items():
+                                for d in (items or []):
+                                    if not isinstance(d, dict):
+                                        continue
+                                    item = dict(d)
+                                    item.setdefault('table', tname)
+                                    migrated.append(item)
+                        self._trigger_defs = migrated
+                    except Exception as e:           # pragma: no cover
+                        logger.warn(f"旧 _triggers.json 迁移失败（忽略）: {e}")
             # E3：视图定义随元数据恢复（重启后 SHOW FULL TABLES/CREATE/
             # SELECT 仍可用；损坏条目丢弃并告警，绝不让半个视图进入目录）。
             loaded_views = meta.get('views') or {}
@@ -668,6 +697,8 @@ class Database:
             # E3：视图定义（名字 → {'sql','columns'}）。不导出数据，
             # 只持久化定义，SELECT 时展开到底层查询。
             'views': self.views,
+            # D3：触发器定义随元数据持久化（重启/备份恢复后仍生效）
+            'triggers': getattr(self, '_trigger_defs', []),
             # ★ 进行中的结构变更（崩溃恢复的唯一依据）。它有值 = "结构变更
             #   还没提交"：重启后按它把剩余的行补完（见 `_recover_pending_ddl`）。
             #   写在**同一份** `_meta.json` 里，是为了让"新列定义"与

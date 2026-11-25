@@ -105,6 +105,10 @@ FORMAT_HEADER = '-- lightdb-logical-dump v1'
 ROWS_MARKER = '-- lightdb:rows '
 TABLE_MARKER = '-- table: '
 CHECK_MARKER = '-- lightdb:check '
+#: D3：触发器定义哨兵（每行一个 JSON；触发器体含分号，不能直接作为普通
+#: SQL 语句混在 dump 里被按分号切分）。恢复端在处理完全部表/数据后再
+#: CREATE TRIGGER，避免恢复 INSERT 时提前触发触发器。
+TRIGGER_MARKER = '-- lightdb:trigger '
 CHECKS_COUNT_MARKER = '-- lightdb:checks '
 
 # 表名/列名：本引擎的上限（不支持空格、点号、反引号本身）
@@ -289,6 +293,7 @@ class TableSchema:
              'primary': bool(c.get('primary')),
              'unique': bool(c.get('unique')),
              'notnull': bool(c.get('notnull')),
+             'auto_increment': bool(c.get('auto_increment')),
              # ★ `DEFAULT` 必须跟着走：`has_default` 区分"声明了 DEFAULT
              #   NULL"与"根本没写 DEFAULT"（`SHOW COLUMNS` 的 Default 列
              #   两者都是 NULL，但 `_meta.json` 里的 `has_default` 不同，
@@ -327,6 +332,7 @@ class TableSchema:
                             and not c.get('implicit_pk')),
                 'unique': bool(c.get('unique')),
                 'notnull': bool(c.get('notnull')),
+                'auto_increment': bool(c.get('auto_increment')),
                 'has_default': bool(c.get('has_default')),
                 'default': c.get('default'),
                 'check': ({'name': ck.get('name') or '',
@@ -419,6 +425,8 @@ class TableSchema:
             #   静默丢掉默认值和唯一性声明（同会话一直在清的那类失效）。
             line = (f"  {c['name']} {c['type']}"
                     + (' NOT NULL' if c.get('notnull') else ' NULL'))
+            if c.get('auto_increment'):
+                line += ' AUTO_INCREMENT'
             if c.get('has_default'):
                 line += ' DEFAULT ' + _default_literal(c)
             if c.get('primary') and not composite_pk:
@@ -861,7 +869,8 @@ def parse_create_table(stmt: str) -> TableSchema:
             tail, table=name, column=cname)
         tup = tail.upper()
         unknown = [t for t in re.findall(r'[A-Z_]+', tup)
-                   if t not in ('NOT', 'NULL', 'PRIMARY', 'KEY', 'UNIQUE')]
+                   if t not in ('NOT', 'NULL', 'PRIMARY', 'KEY', 'UNIQUE',
+                                'AUTO_INCREMENT')]
         if unknown:
             # 明确点出 MySQL 允许、但本引擎解析器不接受的形态：
             # `列 类型 CONSTRAINT 名字 CHECK (expr)`（列内联命名约束）。
@@ -880,6 +889,7 @@ def parse_create_table(stmt: str) -> TableSchema:
             'primary': 'PRIMARY KEY' in tup,
             'unique': 'UNIQUE' in tup,
             'notnull': bool(re.search(r'\bNOT\s+NULL\b', tup)),
+            'auto_increment': bool(re.search(r'\bAUTO_INCREMENT\b', tup)),
             'has_default': col_has_default,
             'default': col_default,
             'check': col_check,
@@ -1325,7 +1335,7 @@ def decode_check_attestation(line: str):
 
 def render_dump(schemas, row_provider, no_data: bool = False,
                 no_create: bool = False, source: str = 'LightDB',
-                include_header: bool = True) -> str:
+                include_header: bool = True, triggers=None) -> str:
     """把"结构 + 行提供者"渲染成 lightdb-logical-dump v1 文本
 
     `row_provider(schema) -> 可迭代行`。服务器端（`BackupManager` 直连
@@ -1367,6 +1377,23 @@ def render_dump(schemas, row_provider, no_data: bool = False,
             lines.append(f"INSERT INTO {schema.name} VALUES ({vals});")
         lines.append("")
 
+    # D3：触发器哨兵放最后（恢复端先建表/灌数据，最后才 CREATE TRIGGER，
+    # 避免恢复 INSERT 时触发业务触发器导致数据被二次改写）。
+    for trig in (triggers or []):
+        rec = {
+            'name': str(trig.get('name') or ''),
+            'table': str(trig.get('table') or ''),
+            'timing': str(trig.get('timing') or '').upper(),
+            'event': str(trig.get('event') or '').upper(),
+            'body': str(trig.get('body') or ''),
+            'order': int(trig.get('order') or 0),
+            'created_at': float(trig.get('created_at') or 0),
+        }
+        lines.append(TRIGGER_MARKER
+                     + json.dumps(rec, ensure_ascii=False))
+    if triggers:
+        lines.append("")
+
     return '\n'.join(lines) + '\n'
 
 
@@ -1385,7 +1412,9 @@ def build_dump(db, tables=None, no_data: bool = False,
     return render_dump(
         schemas, lambda s: iter_rows(db.tables[s.name]),
         no_data=no_data, no_create=no_create,
-        source=source, include_header=include_header)
+        source=source, include_header=include_header,
+        triggers=[dict(t) for t in getattr(db, '_trigger_defs', []) or []
+                  if not tables or str(t.get('table')) in set(tables)])
 
 
 # ==================== 解析 dump ====================
@@ -1419,6 +1448,8 @@ class DumpPlan:
     expected_checks: dict = field(default_factory=dict)
     has_check_attestation: bool = False
     dropped: set = field(default_factory=set)
+    #: D3：触发器定义（`-- lightdb:trigger <json>` 哨兵；恢复末尾 CREATE）
+    triggers: list = field(default_factory=list)
     version: str = None
     ignorable: int = 0
 
@@ -1520,6 +1551,30 @@ def parse_dump(content: str) -> DumpPlan:
                 raise BackupError(f"CHECK 条数哨兵表名非法: {s!r}")
             checks_count[parts[0]] = int(parts[1])
             plan.has_check_attestation = True
+        elif s.startswith(TRIGGER_MARKER):
+            # D3：触发器哨兵（JSON；体里可含分号，故不按普通 SQL 语句解析）
+            raw = s[len(TRIGGER_MARKER):].strip()
+            try:
+                rec = json.loads(raw)
+            except Exception as e:
+                raise BackupError(
+                    f"触发器哨兵 JSON 无法解析: {s[:120]!r}: {e}")
+            if not isinstance(rec, dict):
+                raise BackupError(f"触发器哨兵结构非法: {s[:120]!r}")
+            for key in ('name', 'table', 'timing', 'event', 'body'):
+                if not str(rec.get(key) or '').strip():
+                    raise BackupError(
+                        f"触发器哨兵缺少字段 {key}: {s[:120]!r}")
+            if not _IDENT_RE.match(str(rec['name'])) or not \
+                    _IDENT_RE.match(str(rec['table'])):
+                raise BackupError(
+                    f"触发器哨兵名/表名含不支持的字符: {s[:120]!r}")
+            if str(rec['timing']).upper() not in ('BEFORE', 'AFTER') or \
+                    str(rec['event']).upper() not in (
+                        'INSERT', 'UPDATE', 'DELETE'):
+                raise BackupError(
+                    f"触发器哨兵 timing/event 非法: {s[:120]!r}")
+            plan.triggers.append(rec)
 
     if plan.has_check_attestation:
         for table, specs in checks_declared.items():
@@ -1650,6 +1705,31 @@ def restore_dump(db, dump_file: str = None, content: str = None,
             errors.append(
                 f"表 {name}: 成功写入 {got} 行 != dump 声明 {want} 行"
                 f"（{'缺少 INSERT 或部分语句失败' if got < want else '行数多出'}）")
+
+    # D3：恢复触发器（放在全部表/数据之后，避免恢复 INSERT 时触发业务
+    # 触发器改写数据；先 DROP IF EXISTS 保证重复恢复幂等）
+    for trig in plan.triggers:
+        name = str(trig['name'])
+        try:
+            drop = _parse_sql(f"DROP TRIGGER IF EXISTS {name}")
+            ex.execute(drop, {'_no_binlog': True})
+            ddl = (f"CREATE TRIGGER {name} "
+                   f"{str(trig['timing']).upper()} "
+                   f"{str(trig['event']).upper()} ON {trig['table']} "
+                   f"FOR EACH ROW {trig['body']}")
+            parsed = _parse_sql(ddl)
+            r = ex.execute(parsed, {'_no_binlog': True})
+        except Exception as e:                      # noqa: BLE001
+            fail += 1
+            errors.append(f"触发器 {name} 恢复异常: {e}")
+            continue
+        if isinstance(r, dict) and r.get('type') == 'error':
+            fail += 1
+            errors.append(
+                f"触发器 {name} 恢复失败[{r.get('code')}]: "
+                f"{r.get('message')}")
+        else:
+            ok += 1
 
     report = None
     if fail == 0 and verify:

@@ -54,7 +54,7 @@ class TriggerColumnError(ValueError):
 #: 触发器体里允许作为"普通 SQL 语句"起始的关键字（其余形态交给执行器的
 #: 触发器小解释器；它只认 SET/IF 与普通 SQL，见 `Executor._run_trigger_stmt`）
 _TRIGGER_SQL_KEYWORDS = frozenset((
-    'INSERT', 'UPDATE', 'DELETE', 'SELECT', 'CALL', 'REPLACE',
+    'INSERT', 'UPDATE', 'DELETE',
 ))
 
 #: 各类事件在触发器上下文里可用的行：INSERT 只有 NEW，UPDATE 两者都有，
@@ -197,11 +197,23 @@ def _validate_single_stmt(stmt, timing, event, table):
             f"触发器体里的 SET 只支持 SET NEW.列 = 表达式 / "
             f"SET OLD.列 = 表达式（不支持 SET @变量 或普通变量赋值）: "
             f"{s[:120]}")
+    if keyword in ('SELECT', 'CALL', 'REPLACE', 'CREATE', 'DROP', 'ALTER',
+                   'TRUNCATE', 'RENAME', 'GRANT', 'REVOKE'):
+        raise TriggerBodyError(
+            f"触发器体内不支持 {keyword}：只允许 INSERT/UPDATE/DELETE/"
+            f"SET NEW|OLD.列 与 IF 控制流（DDL/SELECT/CALL 显式拒绝，"
+            f"不静默执行）: {s[:120]}")
     if keyword not in _TRIGGER_SQL_KEYWORDS:
         raise TriggerBodyError(
             f"触发器体里的语句不是本引擎支持的形态（只支持 "
-            f"SET NEW|OLD.列=表达式、IF ... THEN ... END IF 与普通 SQL）: "
-            f"{s[:120]}")
+            f"INSERT/UPDATE/DELETE、SET NEW|OLD.列=表达式、"
+            f"IF ... THEN ... END IF）: {s[:120]}")
+    # 不支持子查询（INSERT ... SELECT / WHERE ... (SELECT ...) 等）
+    masked_dml = _mask_strings(s).upper()
+    if re.search(r'\b(SELECT|WITH)\b', masked_dml):
+        raise TriggerBodyError(
+            f"触发器体内不支持子查询/SELECT：只允许单表 DML "
+            f"（显式拒绝，不静默执行）: {s[:120]}")
     # 普通 SQL 语句再用**运行期同一份 SQL 解析器**验一次：像
     # `INSERT INTO logs VALUES (NEW.id` 这种括号没闭合的体必须在这里就失败，
     # 不能等到第一次写入时才把整张表变成不可写。
@@ -331,23 +343,64 @@ class Trigger:
 
 
 class TriggerManager:
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, db=None):
         self.path = Path(data_dir) / '_triggers.json'
+        self.db = db
         self.triggers = {}   # table -> [Trigger, ...]
         self._load()
 
     def _load(self):
+        # D3：优先从 Database._meta.json（db._trigger_defs）加载；旧数据
+        # 目录只有 `_triggers.json` 时迁移读取。
+        defs = None
+        if self.db is not None:
+            defs = list(getattr(self.db, '_trigger_defs', None) or [])
+        if defs:
+            for d in defs:
+                if not isinstance(d, dict):
+                    continue
+                table = str(d.get('table') or '')
+                if not table:
+                    continue
+                try:
+                    self.triggers.setdefault(table, []).append(
+                        Trigger.from_dict(d))
+                except Exception:
+                    continue
+            for tlist in self.triggers.values():
+                tlist.sort(key=lambda x: x.order)
+            return
         if not self.path.exists():
             return
         try:
             with open(self.path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             for table, tlist in data.items():
-                self.triggers[table] = [Trigger.from_dict(d) for d in tlist]
+                fixed = []
+                for d in tlist:
+                    if not isinstance(d, dict):
+                        continue
+                    item = dict(d)
+                    item.setdefault('table', table)
+                    fixed.append(item)
+                self.triggers[table] = [Trigger.from_dict(d) for d in fixed]
         except Exception:
             pass
 
+    def _defs(self):
+        out = []
+        for tlist in self.triggers.values():
+            for t in tlist:
+                d = t.to_dict()
+                d['table'] = t.table
+                out.append(d)
+        return out
+
     def save(self):
+        if self.db is not None:
+            self.db._trigger_defs = self._defs()
+            self.db.save_meta()
+            return
         data = {
             table: [t.to_dict() for t in tlist]
             for table, tlist in self.triggers.items()

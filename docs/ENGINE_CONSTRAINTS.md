@@ -69,3 +69,37 @@ CREATE TABLE child (
   ALL（与既有前缀索引一致，未新增计划输出）。
 - 测试：`tests/test_composite_index_like.py`（等值前缀、二级等值前缀、
   回退形态、NULL/空结果、重启一致性、2000 行量化）。
+
+## 触发器（D3，beta.149）
+
+```sql
+CREATE TRIGGER trg_name BEFORE INSERT ON t FOR EACH ROW
+BEGIN
+  IF NEW.age IS NULL THEN SET NEW.age = 18; END IF;
+  INSERT INTO log_t (id, msg) VALUES (NEW.id, 'inserted');
+END;
+```
+
+支持范围：
+
+* `CREATE TRIGGER <name> {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON <table>
+  FOR EACH ROW <body>`；body 可为单条语句或 `BEGIN ... END` 顺序多条。
+* body 允许：`INSERT` / `UPDATE` / `DELETE`（单表）、`SET NEW.col = 表达式`
+  （BEFORE 可改 NEW；UPDATE 的 NEW 值按列类型转换后参与算术/比较）、
+  `IF ... THEN ... [ELSE ...] END IF`（嵌套 IF 支持）、NEW.col/OLD.col 引用。
+* BEFORE 在行落库前执行，可修改 NEW（INSERT/UPDATE）；AFTER 在行落库后执行。
+* 触发器内 DML 与主语句**同事务**：主语句成功则一起提交，触发器失败则
+  整条语句回滚（含 AFTER 触发器写入后的失败）；显式事务由用户 ROLLBACK。
+* **只执行一层**：触发器体内的 DML 不会再次触发其它触发器（与 MySQL 默认
+  行为一致；非递归）。
+* 显式拒绝：子查询/SELECT、DDL、CALL/REPLACE、`SET @变量`、ELSEIF；触发器
+  体错误在 **CREATE 定义期** 1064 拒绝并指出触发器名，不会留下"坏触发器
+  锁表"。
+* 元数据：持久化到 `Database._meta.json` 的 `triggers` 键（旧
+  `_triggers.json` 自动迁移），重启后生效；`SHOW TRIGGERS` /
+  `SHOW CREATE TRIGGER` 回显真实定义；`DROP TRIGGER [IF EXISTS]`。
+* 备份恢复：dump 末尾写 `-- lightdb:trigger <json>` 哨兵，恢复在全部表/数据
+  之后 CREATE TRIGGER（避免恢复 INSERT 提前触发业务触发器）；重复恢复先
+  `DROP TRIGGER IF EXISTS`，触发器在后恢复库中仍真实生效。
+* 测试：`tests/test_triggers_basic.py`（BEFORE/AFTER × I/U/D、NEW/OLD、
+  多语句、失败回滚、递归抑制、DDL/子查询拒绝、SHOW/DROP、重启、备份恢复）。
