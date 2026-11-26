@@ -3597,6 +3597,11 @@ class Table:
 
         # 恢复期的"版本位置重映射"表（见 _resolve_old_loc）
         self._recovery_remap = {}
+        # checkpoint 可能只 flush 了数据页、尚未保存 BTree 根指针就被硬杀：
+        # 此时磁盘索引看不到这些已落盘的行，redo 若直接追加新版本会造成
+        # "同一主键两份可见版本"（全表扫描重复）。先建堆内 pk -> 版本索引，
+        # redo 遇到索引缺失时优先复用已落盘版本。
+        self._recovery_heap_index = self._build_recovery_heap_index()
 
         replayed = 0
         failed = 0
@@ -3618,8 +3623,17 @@ class Table:
                 failed += 1
                 logger.warn(f"撤销 lsn={lsn} {rtype} 失败: {e}")
         self._recovery_remap = {}
+        self._recovery_heap_index = {}
 
         if replayed or undone:
+            # 有真实 redo/undo 才重建索引：checkpoint 中断窗口里磁盘 BTree
+            # 可能缺页/混用旧叶子链，直接信任会出现重复索引项。重建按堆页
+            # 版本去重（每 pk 只保留一个链头）。干净重启（WAL 为空、无重放）
+            # 保持原有 free-page/索引布局，不做任何重建。
+            try:
+                self._rebuild_index_after_recovery()
+            except Exception as e:               # pragma: no cover - 防御
+                logger.warn(f"{self.name}: 恢复后重建索引失败: {e}")
             logger.info(
                 f"崩溃恢复 {self.name}: redo {replayed} 条, "
                 f"undo {undone} 条")
@@ -3643,6 +3657,95 @@ class Table:
                 f"{self.name}: 恢复结果刷盘失败，保留 WAL 不截断: {e}")
             return replayed
         return replayed
+
+    def _rebuild_index_after_recovery(self):
+        """崩溃恢复末尾：用堆页真实版本重建 BTree 索引（幂等、按 pk 去重）。
+
+        只用于 recovery 路径：正常运行时索引由写路径维护，不应调用。
+        去重规则：同一 pk 可能出现两个互不相连的"链头"（checkpoint 中断
+        窗口里已 flush 的旧版本 + redo 追加的新版本）；保留堆位置最大的
+        一个作为索引目标，其余版本不建索引（内容相同，不会被读到）。
+        """
+        versions = {}
+        try:
+            n = int(self.bp.total_pages())
+        except Exception:                        # pragma: no cover - 防御
+            return
+        for pid in range(1, n + 1):
+            page = self.bp.get_page(pid)
+            if page is None or page.page_type != PAGE_TYPE_HEAP:
+                continue
+            for sid, rb in page.iter_rows():
+                r = self._decode_row_ver(rb)
+                if not r:
+                    continue
+                row, xmin, xmax, pp, ps = r
+                try:
+                    if getattr(self, 'composite_pk', False):
+                        pk = self._row_key(row)
+                    else:
+                        pk = row[self.pk_idx]
+                except Exception:
+                    continue
+                if not isinstance(pk, int):
+                    continue
+                versions.setdefault(pk, []).append(
+                    (pid, sid, xmin, xmax, pp, ps))
+        if not versions:
+            return
+        new_bt = BTree(self.bp, root_page_id=None)
+        for pk, vers in versions.items():
+            referenced = {(v[4], v[5]) for v in vers if v[4] != NO_PREV}
+            heads = [v for v in vers
+                     if (v[0], v[1]) not in referenced] or list(vers)
+            head = max(heads, key=lambda h: (h[0], h[1]))
+            new_bt.insert(pk, head[0], head[1])
+        self.bt = new_bt
+        self._save_btree_root(new_bt.root_page_id, sync=True)
+        self.bp.flush()
+
+    def _build_recovery_heap_index(self):
+        """扫描全部堆页，建立 pk -> [(page_id, slot, row_bytes, values)]（仅 xmax=0）。
+
+        只用于崩溃恢复期间 redo 的幂等性补偿：checkpoint 的"数据页已落盘、
+        BTree 根指针未落盘"窗口内被硬杀时，磁盘索引会丢失这些行；redo 直接
+        追加会产生同主键的重复可见版本。
+        """
+        index = {}
+        try:
+            n = int(self.bp.total_pages())
+        except Exception:                        # pragma: no cover - 防御
+            return index
+        for pid in range(1, n + 1):
+            try:
+                page = self.bp.get_page(pid)
+            except Exception:
+                continue
+            if page is None or page.page_type != PAGE_TYPE_HEAP:
+                continue
+            try:
+                rows = list(page.iter_rows())
+            except Exception:                    # pragma: no cover - 防御
+                continue
+            for sid, rb in rows:
+                if not rb:
+                    continue
+                r = self._decode_row_ver(bytes(rb))
+                if r is None:
+                    continue
+                values, _xmin, xmax = r[0], r[1], r[2]
+                if xmax != 0:
+                    continue
+                try:
+                    if getattr(self, 'composite_pk', False):
+                        pk = self._row_key(values)
+                    else:
+                        pk = values[self.pk_idx]
+                except Exception:
+                    continue
+                index.setdefault(pk, []).append(
+                    (pid, sid, bytes(rb), values))
+        return index
 
     # ---------- 恢复期的"版本位置重映射" ----------
     #
@@ -3871,6 +3974,15 @@ class Table:
         还会让后续 loser undo 找不到真正的旧版本位置。
         """
         loc = self.bt.search(pk)
+        if loc is None:
+            # checkpoint 中断窗口内数据页已落盘但根指针未落盘：堆里可能
+            # 已有同一 payload 的可见版本；直接让索引指回去，禁止再插一份。
+            for hpid, hsid, hrb, _hvals in \
+                    (getattr(self, '_recovery_heap_index', None) or {}).get(
+                        pk, ()):
+                if hrb == rb or self._same_row_payload(hrb, rb):
+                    self.bt.insert(pk, hpid, hsid)
+                    return True
         if loc is not None:
             page = self.bp.get_page(loc[0])
             cur = page.get_row(loc[1]) if page is not None else None
