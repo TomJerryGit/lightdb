@@ -1,70 +1,70 @@
-name: ci
-
-on:
-  push:
-    branches: [main]
-    tags-ignore: ['**']
-  pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # 曾因 cancel-in-progress 取消正在跑的 job，但 Windows 上 pytest 子进程
-  # 未随之退出，残留进程与新 job 抢同一 workspace 导致 pytest 异常缓慢/超时；
-  # 改为排队执行（同一时间只跑一个，不再产生孤儿 pytest）。
-  cancel-in-progress: false
-
-jobs:
-  test:
-    # 项目主要在 Windows 上开发（文件锁、socket.share、msvcrt 等路径），
-    # 因此 CI 用 windows-latest；Linux 兼容性另有 roadmap 项。
-    runs-on: [self-hosted, windows, lightdb-local]
-    timeout-minutes: 60
-    env:
-      # GitHub Windows runner 控制台不是 UTF-8（cp1252），测试/注解输出里含中文
-      # 会 UnicodeEncodeError（2026-10-21 首跑实测）。强制 Python 以 UTF-8 输出。
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
-      PYTHONUNBUFFERED: "1"
-    steps:
-      - name: Kill stale test processes from previous runs (self-hosted)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          # 上一轮 job 的 pytest/Studio 子进程可能残留（端口/文件锁），
-          # 会让下一轮 wire_union/batch10/first_run 等用例间歇失败。
-          # 只匹配 runner 自己的进程特征（--junitxml=pytest-results.xml / 工作区路径 / lightdb 服务），
-          # 不匹配裸 `-m pytest`，避免误杀同一台机器上开发者手动跑的全量测试。
-          $killed = 0
-          Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-            Where-Object {
-              $_.CommandLine -and (
-                $_.CommandLine -like '*_work\lightdb\lightdb*' -or
-                $_.CommandLine -like '*lightdb_studio*' -or
-                $_.CommandLine -like '*lightdb.main*' -or
-                $_.CommandLine -like '*pytest-results.xml*'
-              )
-            } |
-            ForEach-Object {
-              # 先尝试 WMI Terminate（普通 Stop-Process 对部分孤儿进程无效）
-              Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null
-              Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-              $killed++
-            }
-          Write-Host "killed stale test processes: $killed"
-          Start-Sleep -Seconds 2
-
-      - name: Sync local mirror (self-hosted; keeps checkout offline-capable)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          git --git-dir D:\lightdb_mirror.git fetch D:\lightdb_project "+refs/heads/main:refs/heads/main" "+refs/tags/*:refs/tags/*"
-
-      - uses: actions/checkout@v7
-
-      - name: Verify system Python (self-hosted)
-        run: python --version
-
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # 曾因 cancel-in-progress 取消正在跑的 job，但 Windows 上 pytest 子进程
+  # 未随之退出，残留进程与新 job 抢同一 workspace 导致 pytest 异常缓慢/超时；
+  # 改为排队执行（同一时间只跑一个，不再产生孤儿 pytest）。
+  cancel-in-progress: false
+
+jobs:
+  test:
+    # 项目主要在 Windows 上开发（文件锁、socket.share、msvcrt 等路径），
+    # 因此 CI 用 windows-latest；Linux 兼容性另有 roadmap 项。
+    runs-on: [self-hosted, windows, lightdb-local]
+    timeout-minutes: 60
+    env:
+      # GitHub Windows runner 控制台不是 UTF-8（cp1252），测试/注解输出里含中文
+      # 会 UnicodeEncodeError（2026-10-21 首跑实测）。强制 Python 以 UTF-8 输出。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Kill stale test processes from previous runs (self-hosted)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # 上一轮 job 的 pytest/Studio 子进程可能残留（端口/文件锁），
+          # 会让下一轮 wire_union/batch10/first_run 等用例间歇失败。
+          # 只匹配 runner 自己的进程特征（--junitxml=pytest-results.xml / 工作区路径 / lightdb 服务），
+          # 不匹配裸 `-m pytest`，避免误杀同一台机器上开发者手动跑的全量测试。
+          $killed = 0
+          Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
+            Where-Object {
+              $_.CommandLine -and (
+                $_.CommandLine -like '*_work\lightdb\lightdb*' -or
+                $_.CommandLine -like '*lightdb_studio*' -or
+                $_.CommandLine -like '*lightdb.main*' -or
+                $_.CommandLine -like '*pytest-results.xml*'
+              )
+            } |
+            ForEach-Object {
+              # 先尝试 WMI Terminate（普通 Stop-Process 对部分孤儿进程无效）
+              Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null
+              Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+              $killed++
+            }
+          Write-Host "killed stale test processes: $killed"
+          Start-Sleep -Seconds 2
+
+      - name: Sync local mirror (self-hosted; keeps checkout offline-capable)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          git --git-dir D:\lightdb_mirror.git fetch D:\lightdb_project "+refs/heads/main:refs/heads/main" "+refs/tags/*:refs/tags/*"
+
+      - uses: actions/checkout@v7
+
+      - name: Verify system Python (self-hosted)
+        run: python --version
+
       - name: Install (editable, all extras + dev)
         shell: powershell
         timeout-minutes: 15
@@ -73,7 +73,10 @@ jobs:
           # 离线优先：runner 的 pip/setuptools 与全部依赖已预装
           # （见 scripts/bootstrap_ci_env.ps1）；CI 每次只做项目可编辑安装，
           # 不升级 pip、不联网解析依赖，网络抖动时不再卡 30+ 分钟。
-          python -c "import pip, setuptools" 2>$null
+          # 注意 import 顺序：`import pip` 会先导入 stdlib distutils，随后 setuptools
+          # 的 _distutils_hack 会断言失败；只检查 setuptools 即可（pip install 自身
+          # 会验证 pip 可用性）。
+          python -c "import setuptools" 2>$null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::runner env incomplete: run scripts/bootstrap_ci_env.ps1 once on this machine"
             exit 1
@@ -108,92 +111,92 @@ jobs:
             exit 1
           }
 
-      - name: Compileall
-        run: python -m compileall -q lightdb lightdb_studio web
-
-      - name: GUI smoke (offscreen, fail fast)
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: python -m pytest tests/test_gui_smoke_ci.py -q -p no:cacheprovider
-
-      - name: Full test suite (JUnit gate; raw pytest exit logged)
-        shell: powershell
-        timeout-minutes: 50
-        env:
-          # 测试全绿后 Qt/原生库在解释器退出阶段可能 fail-fast（0xC0000409）；
-          # conftest 在 pytest 收尾后按 exitstatus os._exit，绕过问题析构路径。
-          LIGHTDB_PYTEST_HARD_EXIT: "1"
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $raw = 0
-          try {
-            python -m pytest tests -q -p no:cacheprovider --timeout=300 --timeout-method=thread --junitxml=pytest-results.xml *> pytest-console.log
-            $raw = $LASTEXITCODE
-          } catch {
-            Write-Host "pytest launch failed: $_"
-          }
-          Write-Host "pytest raw exit code: $raw"
-          try { Get-Content pytest-console.log -Tail 120 -ErrorAction SilentlyContinue } catch {}
-          try {
-            python scripts/check_junit.py pytest-results.xml
-            $gate = $LASTEXITCODE
-          } catch {
-            $gate = 1
-          }
-          if ($gate -ne 0) { exit $gate }
-          if ($raw -ne 0) {
-            Write-Host "::warning::pytest exited $raw but JUnit shows 0 failures/errors; gate uses JUnit as the source of truth"
-          }
-          exit 0
-
-      - name: Annotate failed tests (public check-run annotations)
-        if: always()
-        run: python scripts/ci_annotate_pytest.py pytest-results.xml
-
-      - name: Upload pytest result
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pytest-results
-          path: |
-            pytest-results.xml
-            pytest-console.log
-          if-no-files-found: warn
-
-      - name: Benchmark gate (quick)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          cmd /c "python -m benchmarks.run --suite quick --gate > bench.log 2>&1"
-          $code = $LASTEXITCODE
-          Get-Content bench.log -Tail 100
-          if ($code -ne 0) {
-            Get-Content bench.log -Tail 40 | ForEach-Object { "::error::benchmark: $_" }
-            exit $code
-          }
-
-      - name: GUI perf budget (hard ceiling; target = WARN only)
-        env:
-          QT_QPA_PLATFORM: offscreen
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          cmd /c "python scripts/gui_perf_budget.py > gui_perf.log 2>&1"
-          $code = $LASTEXITCODE
-          Get-Content gui_perf.log -Tail 80
-          if ($code -ne 0) {
-            Get-Content gui_perf.log -Tail 40 | ForEach-Object { "::error::gui-perf: $_" }
-            exit $code
-          }
-
-      - name: Packaging check (wheel must contain engine + entry points)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          cmd /c "python scripts/check_packaging.py > packaging.log 2>&1"
-          $code = $LASTEXITCODE
-          Get-Content packaging.log -Tail 100
-          if ($code -ne 0) {
-            Get-Content packaging.log -Tail 40 | ForEach-Object { "::error::packaging: $_" }
-            exit $code
-          }
+      - name: Compileall
+        run: python -m compileall -q lightdb lightdb_studio web
+
+      - name: GUI smoke (offscreen, fail fast)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/test_gui_smoke_ci.py -q -p no:cacheprovider
+
+      - name: Full test suite (JUnit gate; raw pytest exit logged)
+        shell: powershell
+        timeout-minutes: 50
+        env:
+          # 测试全绿后 Qt/原生库在解释器退出阶段可能 fail-fast（0xC0000409）；
+          # conftest 在 pytest 收尾后按 exitstatus os._exit，绕过问题析构路径。
+          LIGHTDB_PYTEST_HARD_EXIT: "1"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $raw = 0
+          try {
+            python -m pytest tests -q -p no:cacheprovider --timeout=300 --timeout-method=thread --junitxml=pytest-results.xml *> pytest-console.log
+            $raw = $LASTEXITCODE
+          } catch {
+            Write-Host "pytest launch failed: $_"
+          }
+          Write-Host "pytest raw exit code: $raw"
+          try { Get-Content pytest-console.log -Tail 120 -ErrorAction SilentlyContinue } catch {}
+          try {
+            python scripts/check_junit.py pytest-results.xml
+            $gate = $LASTEXITCODE
+          } catch {
+            $gate = 1
+          }
+          if ($gate -ne 0) { exit $gate }
+          if ($raw -ne 0) {
+            Write-Host "::warning::pytest exited $raw but JUnit shows 0 failures/errors; gate uses JUnit as the source of truth"
+          }
+          exit 0
+
+      - name: Annotate failed tests (public check-run annotations)
+        if: always()
+        run: python scripts/ci_annotate_pytest.py pytest-results.xml
+
+      - name: Upload pytest result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-results
+          path: |
+            pytest-results.xml
+            pytest-console.log
+          if-no-files-found: warn
+
+      - name: Benchmark gate (quick)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmd /c "python -m benchmarks.run --suite quick --gate > bench.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content bench.log -Tail 100
+          if ($code -ne 0) {
+            Get-Content bench.log -Tail 40 | ForEach-Object { "::error::benchmark: $_" }
+            exit $code
+          }
+
+      - name: GUI perf budget (hard ceiling; target = WARN only)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmd /c "python scripts/gui_perf_budget.py > gui_perf.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content gui_perf.log -Tail 80
+          if ($code -ne 0) {
+            Get-Content gui_perf.log -Tail 40 | ForEach-Object { "::error::gui-perf: $_" }
+            exit $code
+          }
+
+      - name: Packaging check (wheel must contain engine + entry points)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmd /c "python scripts/check_packaging.py > packaging.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content packaging.log -Tail 100
+          if ($code -ne 0) {
+            Get-Content packaging.log -Tail 40 | ForEach-Object { "::error::packaging: $_" }
+            exit $code
+          }
