@@ -34,10 +34,14 @@ function Record([string]$name, [bool]$ok, [string]$detail) {
 
 function Run([string]$name, [scriptblock]$block) {
     try {
-        $out = & $block 2>&1
-        $code = $LASTEXITCODE
+        $out = @(& $block 2>&1)
+        $code = 0
+        if ($out.Count -gt 0) {
+            $last = $out[-1]
+            if ($last -is [int]) { $code = [int]$last }
+            elseif ("$last" -match '^-?\d+$') { $code = [int]"$last" }
+        }
         $out | Out-File -FilePath (Join-Path $logs "$name.log") -Encoding utf8
-        if ($null -eq $code) { $code = 0 }
         Record $name ($code -eq 0) "exit=$code"
         return $code
     } catch {
@@ -65,11 +69,19 @@ $sha = (Get-FileHash $Installer -Algorithm SHA256).Hash
 Record 'precondition' $true "sha256=$sha"
 
 # 1) 静默安装
+$innoLog = Join-Path $WorkDir 'install_inno.log'
+$installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+                 '/NOICONS', "/DIR=$AppDir", "/LOG=$innoLog")
 Run 'install' {
-    $args = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS',
-              "/DIR=$AppDir", "/LOG=$(Join-Path $logs 'install.log')")
-    $p = Start-Process -FilePath $Installer -ArgumentList $args -Wait -PassThru
-    $p.ExitCode
+    $p = Start-Process -FilePath $Installer -ArgumentList $installArgs -Wait -PassThru
+    Write-Host "installer exit=$($p.ExitCode)"
+    if (Test-Path $innoLog) {
+        Write-Host '--- installer log (tail) ---'
+        Get-Content $innoLog -Tail 40 | ForEach-Object { Write-Host $_ }
+    } else {
+        Write-Host "installer log not found: $innoLog"
+    }
+    return [int]$p.ExitCode
 }
 $exe = Join-Path $AppDir 'LightDB-Studio.exe'
 $unins = Join-Path $AppDir 'unins000.exe'
@@ -84,7 +96,7 @@ if (-not (Test-Path $exe)) {
     }
 }
 if (-not (Test-Path $exe)) {
-    Record 'install_artifact' $false "missing $exe（请在本机普通 PowerShell 或 Windows Sandbox 中运行本脚本：受限沙箱会话无法写注册表/开始菜单）"
+    Record 'install_artifact' $false "missing $exe；请查看 $innoLog 的日志尾部（若在非管理员/非交互会话请改用管理员 PowerShell 运行）"
     $steps | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $WorkDir 'summary.json') -Encoding utf8
     exit 1
 }
