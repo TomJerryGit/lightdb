@@ -5,7 +5,7 @@
   S2 显式事务：已提交保留、未提交消失
   S3 多行 INSERT 语句原子性（全成或全无）
   S4 checkpoint / VACUUM 期间硬杀
-  S5 干净关闭后 WAL 尾部截断（模拟掉电 torn write）→ 可恢复或显式报错
+  S5 硬杀后 WAL 尾部截断（模拟掉电 torn write）→ 可恢复或显式报错
   S6 崩溃后重启 → 全量快照 → 恢复到新目录 → 数据一致
 
 输出：<out>/report.json + 每个场景日志；任一场景失败退出码 1。

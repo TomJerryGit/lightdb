@@ -67,3 +67,12 @@
 - 通过公网直接暴露 MySQL 端口（无生产级防护/审计保证）
 - 高并发写入服务、批量导入 >100 万行/次
 - 在线 DDL 期间承载业务读写
+
+## 8. 持久性档位（与 DURABILITY_MATRIX 一致）
+
+- 单行 autocommit：**进程硬杀不丢**（WAL flush 到 OS）；**掉电可能丢最后若干条**（未 fsync）
+- 多行 `INSERT ... VALUES (...),(...)`：同 autocommit 档位（语句级 flush，不 fsync）
+- 显式 `BEGIN ... COMMIT`：COMMIT 会 fsync，**掉电不丢已提交**
+- 需要"掉电不丢"的关键写入请使用显式事务；每次发布前跑
+  `python scripts/crash_matrix.py --iterations 3`
+- 场景、实测结果与已修复缺陷见 `docs/DURABILITY_MATRIX.md`
