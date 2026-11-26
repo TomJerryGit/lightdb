@@ -115,6 +115,35 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def _method_not_allowed(self):
+        # Windows 上若未读取请求体就关闭连接，内核会回 RST，客户端看到的是
+        # ConnectionAbortedError 而不是 405 响应（CI 高负载下必现）。先把
+        # 请求体读掉（限长），再写 405。
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except (TypeError, ValueError):
+            length = 0
+        try:
+            if length > 0:
+                self.rfile.read(min(length, 1024 * 1024))
+            elif str(self.headers.get('Transfer-Encoding', '')).lower() == 'chunked':
+                # 简单 drain：读到空行/终止块为止（限 1MB、最多 1024 块）
+                total = 0
+                while total < 1024 * 1024:
+                    line = self.rfile.readline(8192)
+                    if not line:
+                        break
+                    try:
+                        size = int(line.strip().split(b';')[0], 16)
+                    except ValueError:
+                        break
+                    if size == 0:
+                        self.rfile.readline(8192)      # 末尾空行
+                        break
+                    self.rfile.read(size)
+                    self.rfile.readline(8192)          # 块后 CRLF
+                    total += size
+        except Exception:                          # pragma: no cover - 防御
+            pass
         self._write(405, b'# method not allowed\n',
                     'text/plain; charset=utf-8')
 
