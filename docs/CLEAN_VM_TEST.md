@@ -85,3 +85,9 @@ powershell -ExecutionPolicy Bypass -File scripts\clean_install_acceptance.ps1 `
 - **管理员会话**下同一安装包此前已验证：install/smoke/uninstall = 0/0/0（见
   `docs/RELEASE_2026-11-29_WAVE3.md` 或最新发布记录）。
 - 结论：本脚本请**在普通 PowerShell（非 DSH 受限会话）或 Windows Sandbox/VM 内运行**。
+
+## 验收结果（2026-11-26，宿主隔离目录）
+
+**PASS（15/15）**：安装→冒烟→服务/探针→备份→恢复→重装→回滚→卸载全流程通过，
+安装包 SHA256 973E0B5B...F98D0。详见 docs/CLEAN_INSTALL_ACCEPTANCE_2026-11-26.md。
+真机干净环境（Windows Sandbox/VM）待启用虚拟化后复跑。
