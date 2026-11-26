@@ -77,3 +77,28 @@ python scripts/crash_matrix.py --iterations 3 --out _analysis_tmp\crash_matrix
   建议后续加：小 VHD 填满磁盘、随机 kill 于 1 万行 CHECKPOINT、连续 100 次
   kill 的疲劳测试。
 - 每次发布前建议至少跑一次 `--iterations 3`；重大存储改动跑 100 次疲劳测试。
+
+
+## 6. 首次完整运行结果（2026-11-26）
+
+- `python scripts/crash_matrix.py --iterations 3`：**18/18 PASS**（153s）
+- 修复后复跑 `--iterations 2`：**12/12 PASS**（99s）
+- 确定性回归测试：`tests/test_recovery_interrupted_checkpoint.py` **1 passed**
+- 持久性相关回归：`wal/checkpoint/vacuum/备份/复合主键/崩溃/原子性` **78 passed / 1 skipped**
+- CI：提交 `84e6cd9`（beta.162）全绿 **1860 tests / 0 failed / 45 skipped**
+  + benchmark / GUI perf / packaging
+
+### 6.1 顺带修复：metrics 405 在 Windows 高负载下的 RST
+
+`tests/test_production_metrics.py::test_metrics_health_404_405` 在 CI（高负载）
+连续两次失败：POST `/metrics` 期望 405，客户端收到 `ConnectionAbortedError
+[WinError 10053]`。根因是 HTTP 处理程序未读取请求体就关闭连接，Windows 内核
+回 RST。修复：`metrics_server._method_not_allowed()` 先按 `Content-Length`
+（或 chunked）读掉请求体，再写 405；本地 17/17、CI 全绿验证。
+
+### 6.2 发布前检查清单（持久性）
+
+- [ ] `python scripts/crash_matrix.py --iterations 3` 全绿
+- [ ] `python -m pytest tests/test_recovery_interrupted_checkpoint.py -q` 通过
+- [ ] 备份/恢复演练（`docs/BACKUP_RESTORE_GUIDE.md`）通过
+- [ ] 真机断电验证（VM，见 `docs/CLEAN_VM_TEST.md`）——建议每季度一次
