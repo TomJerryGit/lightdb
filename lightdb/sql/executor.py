@@ -2823,9 +2823,19 @@ class Executor:
         """
         out = list(row)
         from ..db.table import coerce
+        try:
+            from ..db.table import _OMITTED as _OMITTED_ROW
+        except Exception:                          # pragma: no cover - 防御
+            _OMITTED_ROW = object()
         for i, c in enumerate(tbl.cols):
             if i >= len(out):
                 break
+            # `_OMITTED` 是"INSERT 列清单里没给、且无 DEFAULT"的内部哨兵，
+            # 必须原样留给 `Table._insert_locked` 解析成 NULL；如果先经过
+            # coerce，其 `__str__` 会变成普通字符串 'NULL'（曾导致缺失列被
+            # 写成字符串、UNIQUE 列出现 1062 Duplicate entry 'NULL'）。
+            if out[i] is _OMITTED_ROW:
+                continue
             try:
                 out[i] = coerce(out[i], c['type'])
             except Exception:
@@ -8929,8 +8939,11 @@ class Executor:
             if gen:
                 body += (f" GENERATED ALWAYS AS ({gen.get('expr')}) "
                          f"{'STORED' if gen.get('stored') else 'VIRTUAL'}")
-            if cname in auto_cols:
+            if cname in auto_cols and ' AUTO_INCREMENT' not in body:
                 # MySQL 的列属性顺序：... AUTO_INCREMENT [PRIMARY KEY]
+                # 注意：logical_dump.canonical_ddl 现在也会输出 AUTO_INCREMENT
+                # （备份 dump 需要保留自增），因此这里必须先判重，否则
+                # SHOW CREATE 会出现两个 AUTO_INCREMENT。
                 if ' PRIMARY KEY' in body:
                     body = body.replace(' PRIMARY KEY',
                                         ' AUTO_INCREMENT PRIMARY KEY', 1)

@@ -425,14 +425,20 @@ class TableSchema:
             #   静默丢掉默认值和唯一性声明（同会话一直在清的那类失效）。
             line = (f"  {c['name']} {c['type']}"
                     + (' NOT NULL' if c.get('notnull') else ' NULL'))
-            if c.get('auto_increment'):
-                line += ' AUTO_INCREMENT'
             if c.get('has_default'):
                 line += ' DEFAULT ' + _default_literal(c)
-            if c.get('primary') and not composite_pk:
+            primary_single = bool(c.get('primary')) and not composite_pk
+            if primary_single:
+                # MySQL 习惯：单列主键列上 AUTO_INCREMENT 紧跟 NULL/NOT NULL，
+                # 内联写 `col INT NOT NULL AUTO_INCREMENT PRIMARY KEY`。
+                if c.get('auto_increment'):
+                    line += ' AUTO_INCREMENT'
                 line += ' PRIMARY KEY'
             if c.get('unique'):
                 line += ' UNIQUE'
+            if c.get('auto_increment') and not primary_single:
+                # 非主键自增列：按 MySQL 习惯跟在键/唯一性声明之后。
+                line += ' AUTO_INCREMENT'
             ck = c.get('check') or {}
             if ck.get('expr'):
                 line += f" CHECK ({ck['expr']})"
