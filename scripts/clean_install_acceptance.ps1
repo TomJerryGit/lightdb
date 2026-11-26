@@ -1,9 +1,9 @@
-﻿# 干净安装 -> 冒烟 -> 备份/恢复 -> 重装(升级) -> 回滚 -> 卸载 全流程验收
-# 用法（管理员或普通 PowerShell 均可；Windows Sandbox 内也可）：
+﻿# LightDB clean acceptance: install -> smoke -> server/probe -> backup -> restore
+# -> reinstall(upgrade) -> rollback -> uninstall
+# Run in an elevated PowerShell (recommended) or Windows Sandbox/VM:
 #   powershell -ExecutionPolicy Bypass -File scripts\clean_install_acceptance.ps1 `
 #     -Installer D:\lightdb_project\dist\installer\LightDB-Studio-Setup-4.0.0.exe `
 #     -WorkDir D:\lightdb_acceptance
-# 输出：summary.json + 每步日志；任一步失败返回非 0 并保留现场。
 
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
@@ -24,7 +24,13 @@ $homeDir = Join-Path $WorkDir 'home'
 $logs = Join-Path $WorkDir 'logs'
 $repo = Split-Path -Parent $PSScriptRoot
 $env:PYTHONPATH = $repo
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 New-Item -ItemType Directory -Force -Path $WorkDir, $logs, $homeDir | Out-Null
+# 清理上一轮残留（否则快照/恢复会因目标目录非空失败）
+foreach ($d in @($dataDir, $backupDir, $restoreDir)) {
+    if (Test-Path $d) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }
+}
 
 function Record([string]$name, [bool]$ok, [string]$detail) {
     $script:steps += [pscustomobject]@{ step = $name; ok = $ok; detail = $detail; at = (Get-Date).ToString('s') }
@@ -57,6 +63,14 @@ function Stop-LightDB {
     Start-Sleep -Seconds 1
 }
 
+function Wait-Port([int]$p, [int]$timeoutSec = 40) {
+    for ($i = 0; $i -lt $timeoutSec; $i++) {
+        if (Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
 Write-Host "== LightDB clean acceptance =="
 Write-Host "installer: $Installer"
 Write-Host "workdir:   $WorkDir"
@@ -67,8 +81,9 @@ if (-not (Test-Path $Installer)) {
 }
 $sha = (Get-FileHash $Installer -Algorithm SHA256).Hash
 Record 'precondition' $true "sha256=$sha"
+Record 'session' $true "user=$env:USERNAME elevated=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
 
-# 1) 静默安装
+# 1) silent install
 $innoLog = Join-Path $WorkDir 'install_inno.log'
 $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
                  '/NOICONS', "/DIR=$AppDir", "/LOG=$innoLog")
@@ -77,40 +92,28 @@ Run 'install' {
     Write-Host "installer exit=$($p.ExitCode)"
     if (Test-Path $innoLog) {
         Write-Host '--- installer log (tail) ---'
-        Get-Content $innoLog -Tail 40 | ForEach-Object { Write-Host $_ }
-    } else {
-        Write-Host "installer log not found: $innoLog"
+        Get-Content $innoLog -Tail 20 | ForEach-Object { Write-Host $_ }
     }
     return [int]$p.ExitCode
 }
 $exe = Join-Path $AppDir 'LightDB-Studio.exe'
 $unins = Join-Path $AppDir 'unins000.exe'
 if (-not (Test-Path $exe)) {
-    # 兜底：Inno 在 lowest 权限下可能装到 {autopf}（=%LOCALAPPDATA%\Programs）；
-    # 某些受限/沙箱会话写注册表会被拒绝 → 安装 exit 0 但目录不存在。
-    $candidate = Join-Path $env:LOCALAPPDATA 'Programs\LightDB Studio\LightDB-Studio.exe'
-    if (Test-Path $candidate) {
-        $AppDir = Split-Path -Parent $candidate
-        $exe = $candidate
-        $unins = Join-Path $AppDir 'unins000.exe'
-    }
-}
-if (-not (Test-Path $exe)) {
-    Record 'install_artifact' $false "missing $exe；请查看 $innoLog 的日志尾部（若在非管理员/非交互会话请改用管理员 PowerShell 运行）"
+    Record 'install_artifact' $false "missing $exe; see $innoLog"
     $steps | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $WorkDir 'summary.json') -Encoding utf8
     exit 1
 }
 Record 'install_artifact' $true $exe
 
-# 2) 安装后冒烟
+# 2) smoke
 Run 'smoke' {
     $env:QT_QPA_PLATFORM = 'offscreen'; $env:LIGHTDB_STUDIO_SUPPRESS_FIRST_RUN = '1'
     $env:USERPROFILE = $homeDir; $env:HOME = $homeDir
     $p = Start-Process -FilePath $exe -ArgumentList '--smoke' -Wait -PassThru
-    $p.ExitCode
+    return [int]$p.ExitCode
 }
 
-# 3) 服务 + 连接 + 建表/插入/查询
+# 3) server + probe
 Run 'server_start' {
     Stop-LightDB
     $env:USERPROFILE = $homeDir; $env:HOME = $homeDir
@@ -118,73 +121,85 @@ Run 'server_start' {
         '-m', 'lightdb.main', '--mode', 'single', '--host', '127.0.0.1',
         '--port', "$Port", '--data-dir', $dataDir, '--root-password', 'demo123'
     ) -WorkingDirectory $repo -WindowStyle Hidden | Out-Null
-    Start-Sleep -Seconds 8
-    if (-not (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) { 1 } else { 0 }
+    if (Wait-Port $Port 40) { Start-Sleep -Seconds 2; return 0 } else { return 1 }
 }
-Run 'probe' {
-    $code = @'
+$probeFile = Join-Path $WorkDir 'probe.py'
+$probeSrc = @'
 import pymysql, sys
-c = pymysql.connect(host='127.0.0.1', port=PORT, user='root', password='demo123', autocommit=True)
-cur = c.cursor()
-cur.execute('CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(20))')
-cur.execute("INSERT INTO t VALUES (1,'a'),(2,'b')")
-cur.execute('SELECT COUNT(*) FROM t')
-n = cur.fetchone()[0]
-c.close()
-print('rows=', n)
-sys.exit(0 if n == 2 else 1)
+try:
+    c = pymysql.connect(host='127.0.0.1', port=__PORT__, user='root', password='demo123', autocommit=True)
+    cur = c.cursor()
+    cur.execute('CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(20))')
+    cur.execute("INSERT INTO t VALUES (1,'a'),(2,'b')")
+    cur.execute('SELECT COUNT(*) FROM t')
+    n = cur.fetchone()[0]
+    c.close()
+    print('rows=', n)
+    sys.exit(0 if n == 2 else 1)
+except Exception as exc:
+    print('PROBE ERROR:', type(exc).__name__, exc)
+    sys.exit(1)
 '@
-    $code = $code.Replace('PORT', "$Port")
-    $tmp = Join-Path $WorkDir 'probe.py'
-    Set-Content -Path $tmp -Value $code -Encoding ascii
-    & $PythonExe $tmp
-    $LASTEXITCODE
+$probeSrc = $probeSrc.Replace('__PORT__', "$Port")
+Set-Content -Path $probeFile -Value $probeSrc -Encoding ascii
+Run 'probe' {
+    & $PythonExe $probeFile *> (Join-Path $logs 'probe_stdout.log')
+    $code = $LASTEXITCODE
+    Get-Content (Join-Path $logs 'probe_stdout.log') -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host $_ }
+    return [int]$code
 }
 
-# 4) 备份 + 恢复 + 行数校验
+# 4) backup + restore
 Run 'snapshot_backup' {
-    & $PythonExe (Join-Path $repo 'scripts\snapshot_backup.py') --data-dir $dataDir --out $backupDir
-    $LASTEXITCODE
+    & $PythonExe (Join-Path $repo 'scripts\snapshot_backup.py') --data-dir $dataDir --out $backupDir *> (Join-Path $logs 'backup_stdout.log')
+    $code = $LASTEXITCODE
+    Get-Content (Join-Path $logs 'backup_stdout.log') -ErrorAction SilentlyContinue |
+        Select-Object -Last 5 | ForEach-Object { Write-Host $_ }
+    return [int]$code
 }
 Run 'snapshot_restore' {
-    & $PythonExe (Join-Path $repo 'scripts\snapshot_restore.py') --snapshot $backupDir --data-dir $restoreDir
-    $LASTEXITCODE
+    & $PythonExe (Join-Path $repo 'scripts\snapshot_restore.py') --snapshot $backupDir --data-dir $restoreDir *> (Join-Path $logs 'restore_stdout.log')
+    $code = $LASTEXITCODE
+    Get-Content (Join-Path $logs 'restore_stdout.log') -ErrorAction SilentlyContinue |
+        Select-Object -Last 5 | ForEach-Object { Write-Host $_ }
+    return [int]$code
 }
-Run 'verify_restored_shows_ai' {
-    # 恢复后按快照目录核对：恢复脚本内部已做行数/校验；这里再确认目标目录非空
-    if (Test-Path $restoreDir) { 0 } else { 1 }
+Run 'verify_restored_meta' {
+    if ((Test-Path (Join-Path $restoreDir '_meta.json')) -and
+        (Get-ChildItem $restoreDir -Filter '*.dat' -ErrorAction SilentlyContinue)) { return 0 } else { return 1 }
 }
 
-# 5) 重装（模拟升级）：覆盖安装后原数据仍在
+# 5) reinstall (upgrade simulation), data must survive
 Stop-LightDB
 Run 'reinstall_upgrade' {
     $p = Start-Process -FilePath $Installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', "/DIR=$AppDir") -Wait -PassThru
-    $p.ExitCode
+    return [int]$p.ExitCode
 }
 Run 'data_survives_upgrade' {
-    if ((Test-Path $dataDir) -and (Get-ChildItem $dataDir -Recurse -File -ErrorAction SilentlyContinue)) { 0 } else { 1 }
+    if ((Test-Path $dataDir) -and (Get-ChildItem $dataDir -Recurse -File -ErrorAction SilentlyContinue)) { return 0 } else { return 1 }
 }
 
-# 6) 回滚：卸载 + 重装（保留数据目录）
+# 6) rollback: uninstall + reinstall (data dir untouched)
 Run 'rollback_uninstall' {
     $p = Start-Process -FilePath $unins -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
     Start-Sleep -Seconds 3
-    $p.ExitCode
+    return [int]$p.ExitCode
 }
 Run 'rollback_reinstall' {
     $p = Start-Process -FilePath $Installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', "/DIR=$AppDir") -Wait -PassThru
-    $p.ExitCode
+    return [int]$p.ExitCode
 }
 Run 'rollback_data_check' {
-    if ((Test-Path $dataDir) -and (Get-ChildItem $dataDir -Recurse -File -ErrorAction SilentlyContinue)) { 0 } else { 1 }
+    if ((Test-Path $dataDir) -and (Get-ChildItem $dataDir -Recurse -File -ErrorAction SilentlyContinue)) { return 0 } else { return 1 }
 }
 
-# 7) 最终卸载 + 目录清理
+# 7) final uninstall + cleanup
 Stop-LightDB
 Run 'final_uninstall' {
     $p = Start-Process -FilePath $unins -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
     Start-Sleep -Seconds 5
-    $p.ExitCode
+    return [int]$p.ExitCode
 }
 Record 'appdir_removed' (-not (Test-Path $AppDir)) "appdir_exists=$(Test-Path $AppDir)"
 
@@ -201,4 +216,3 @@ $summary | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $WorkDir 'summary.js
 Write-Host "summary: $(Join-Path $WorkDir 'summary.json')"
 Write-Host "result: $(if ($failed) { 'FAIL' } else { 'PASS' })"
 if ($failed) { exit 1 } else { exit 0 }
-
