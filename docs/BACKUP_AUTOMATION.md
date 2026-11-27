@@ -69,3 +69,10 @@ powershell -ExecutionPolicy Bypass -File scripts\install_backup_task.ps1 -Uninst
 - 手工备份/恢复细节：`docs/BACKUP_RESTORE_GUIDE.md`
 - 持久性档位：`docs/DURABILITY_MATRIX.md`
 - 发布前检查：`docs/DURABILITY_MATRIX.md` §6.2
+
+> 实测补充：计划任务实际执行的包装命令（
+un_backup.cmd / 
+un_drill.cmd）已用
+> D:\lightdb\data（2 表 / 250 行）实测：备份 1.2s、恢复校验 0.9s、演练 PASS。
+> **创建计划任务需要在普通（非 DSH 沙箱）PowerShell 中运行**：沙箱会话对 Task
+> Scheduler 无权限（schtasks 报 Access is denied），脚本会给出提示并以 exit 3 结束。

@@ -20,6 +20,15 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+# 计划任务以 GBK 控制台（cmd.exe）运行时，子进程输出可能带替换字符；
+# 直接 print 会抛 UnicodeEncodeError 把备份进程本身搞挂。这里统一改为
+# "不可编码字符用 ? 替代"。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors='replace')
+    except Exception:
+        pass
+
 REPO = Path(__file__).resolve().parent.parent
 PYTHON = sys.executable
 SNAPSHOT_BACKUP = REPO / 'scripts' / 'snapshot_backup.py'

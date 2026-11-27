@@ -52,23 +52,52 @@ $drillCmd = Join-Path $BackupDir 'run_drill.cmd'
 @"
 @echo off
 chcp 65001 >nul
-set LOG=%BackupDir%\logs\task-%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%.log
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+set "LOG=$backupAbs\logs\task-cmd.log"
 "$PythonExe" "$script" run --data-dir "$dataAbs" --out "$backupAbs" --keep $Keep --drill >> "%LOG%" 2>&1
 exit /b %ERRORLEVEL%
 "@ | Set-Content -Path $dailyCmd -Encoding ASCII
 @"
 @echo off
 chcp 65001 >nul
-set LOG=%BackupDir%\logs\task-%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%.log
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+set "LOG=$backupAbs\logs\task-cmd.log"
 "$PythonExe" "$script" drill --out "$backupAbs" >> "%LOG%" 2>&1
 exit /b %ERRORLEVEL%
 "@ | Set-Content -Path $drillCmd -Encoding ASCII
 
 # 先创建任务绑定当前用户交互令牌（/IT），无需保存密码、无需管理员
-& schtasks /Create /F /SC DAILY /ST $DailyAt /TN $dailyTask /TR "`"$dailyCmd`"" /IT | Out-Host
-if ($LASTEXITCODE -ne 0) { throw "创建每日任务失败 rc=$LASTEXITCODE" }
-& schtasks /Create /F /SC WEEKLY /D $DrillDay /ST $DrillAt /TN $drillTask /TR "`"$drillCmd`"" /IT | Out-Host
-if ($LASTEXITCODE -ne 0) { throw "创建每周演练任务失败 rc=$LASTEXITCODE" }
+function New-LightDBTask([string]$name, [string[]]$params) {
+    # PS 5.1 在 $ErrorActionPreference='Stop' 时会把原生 stderr 当终止错误；
+    # 这里局部放宽，先拿到退出码与输出，再决定是"给出权限指引"还是抛错。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & schtasks @params 2>&1
+        $rc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $out | Out-Host
+    if ($rc -ne 0) {
+        $text = ($out | Out-String)
+        if ($text -match 'Access is denied|拒绝访问') {
+            Write-Host ""
+            Write-Host "!! 当前会话无权创建计划任务（被沙箱/低权限限制）。"
+            Write-Host "!! 请在普通 PowerShell（开始菜单 → Windows PowerShell）中重新运行本脚本。"
+            exit 3
+        }
+        throw "创建任务 $name 失败 rc=${rc}: $text"
+    }
+}
+
+New-LightDBTask $dailyTask @('/Create', '/F', '/SC', 'DAILY', '/ST', $DailyAt,
+                             '/TN', $dailyTask, '/TR', "`"$dailyCmd`"", '/IT')
+New-LightDBTask $drillTask @('/Create', '/F', '/SC', 'WEEKLY', '/D', $DrillDay,
+                             '/ST', $DrillAt, '/TN', $drillTask,
+                             '/TR', "`"$drillCmd`"", '/IT')
 
 Write-Host ''
 Write-Host '已安装计划任务：'
