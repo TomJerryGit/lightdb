@@ -80,6 +80,9 @@ dev = [
     "wheel",
     # tests/test_wire_ssl.py 用 cryptography 生成自签证书（不依赖 openssl CLI）。
     "cryptography>=41.0",
+    # 客户端兼容矩阵：SQLAlchemy（mysql+pymysql）基础用法验证；
+    # 缺失时 tests/test_client_compatibility.py 自动 skip。
+    "sqlalchemy>=2.0",
 ]
 
 [project.scripts]

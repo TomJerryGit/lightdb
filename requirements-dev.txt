@@ -14,3 +14,5 @@ cryptography>=41.0
 
 # Cython 加速模块的本地编译（可选，见 scripts/build_cython.sh）
 # cython>=3.0.0
+
+sqlalchemy>=2.0

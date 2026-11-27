@@ -68,3 +68,10 @@ python scripts/restore_drill.py --backup D:\backup\full-latest --target D:\resto
 - 没有自动备份调度服务：需要你自己用 Windows 计划任务调用上述命令
 - RPO/RTO 由你的备份频率决定（建议每日全量 + 每小时增量，RPO ≤ 1 小时）
 - **本软件不承担数据丢失责任**（见 `docs/POSITIONING.md` 免责声明）
+
+
+## 8. 自动化（计划任务 + 每周演练）
+
+手工流程可以完全自动化：每日备份+校验+保留、每周恢复演练。见
+docs/BACKUP_AUTOMATION.md（scripts/backup_automation.py +
+scripts/install_backup_task.ps1）。装任务前先按本文档做一次手工备份/恢复验证。
