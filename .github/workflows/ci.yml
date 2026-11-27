@@ -119,6 +119,26 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests/test_gui_smoke_ci.py -q -p no:cacheprovider
 
+      - name: Re-check Qt ABI right before tests (bounded repair)
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # 共享系统 Python 可能被同机其它项目的 pip 安装改坏（shiboken 单飞
+          # → QtCore DLL 加载失败）。安装步骤通过不代表 1 分钟后还可用：
+          # 在整套件之前再验一次，坏了就有界修复，避免 pytest 在 GUI 测试处
+          # 中途崩溃（junit 只写一半、CI 表现为 20% 卡停）。
+          python -c "import PySide6.QtCore, shiboken6; assert PySide6.QtCore.qVersion() == '6.6.0' and shiboken6.__version__ == '6.6.0'" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Qt ABI mismatch before tests -> bounded reinstall (6.6.0)"
+            python -m pip install --disable-pip-version-check --force-reinstall --no-deps --retries 1 --timeout 10 "PySide6==6.6.0" "PySide6-Essentials==6.6.0" "PySide6-Addons==6.6.0" "shiboken6==6.6.0"
+            python -c "import PySide6.QtCore, shiboken6; print('Qt ABI ok:', PySide6.QtCore.qVersion(), shiboken6.__version__)" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Qt ABI still broken; run scripts/bootstrap_ci_env.ps1 on this runner"
+              exit 1
+            }
+          }
+
       - name: Full test suite (JUnit gate; raw pytest exit logged)
         shell: powershell
         timeout-minutes: 50

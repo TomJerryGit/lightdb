@@ -10,6 +10,7 @@
 """
 import gc
 import os
+from pathlib import Path
 import shutil
 import sys
 import time
@@ -25,6 +26,48 @@ import pytest
 # CLI `--allow-empty-password`（显式、可审计，不是把安全默认改回不安全）。
 # 新默认行为本身由 tests/test_auth_defaults.py 单独验证（那里会 delenv）。
 os.environ.setdefault('LIGHTDB_ALLOW_EMPTY_PASSWORD', '1')
+
+
+# ==================== Qt 可用性探测（防止 DLL 损坏时全套件崩溃）====================
+# 共享系统 Python 的 PySide6/shiboken 可能被其它项目 pip 安装打坏（版本错配
+# 导致 QtCore DLL 加载失败）。此时 GUI 测试模块一旦被收集就会在 import 阶段
+# 让 pytest 进程异常退出（junit 只写到一半，CI 表现为 20% 卡停）。
+# 这里在收集期探测一次：Qt 不可用 → 跳过所有引用 PySide6 的测试文件，
+# 其余引擎/协议/备份测试照常运行，并在报告中明确提示。
+_QT_IMPORT_ERROR = None
+if os.environ.get('LIGHTDB_TEST_FORCE_NO_QT') == '1':
+    _QT_IMPORT_ERROR = RuntimeError('forced by LIGHTDB_TEST_FORCE_NO_QT=1')
+else:
+    try:
+        import PySide6.QtCore  # noqa: F401
+    except Exception as _exc:                    # pragma: no cover - 环境相关
+        _QT_IMPORT_ERROR = _exc
+
+_QT_SKIPPED_FILES = []
+
+
+def pytest_ignore_collect(collection_path, config):
+    if _QT_IMPORT_ERROR is None:
+        return False
+    path = str(collection_path)
+    if not path.endswith('.py'):
+        return False
+    try:
+        head = Path(path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return False
+    if 'PySide6' in head or 'PySide2' in head:
+        _QT_SKIPPED_FILES.append(path)
+        return True
+    return False
+
+
+def pytest_collection_finish(session):
+    if _QT_IMPORT_ERROR is not None and _QT_SKIPPED_FILES:
+        sys.stderr.write(
+            f"\n[conftest] Qt 不可用（{_QT_IMPORT_ERROR}），已跳过 "
+            f"{len(_QT_SKIPPED_FILES)} 个 GUI 测试文件；"
+            f"请运行 scripts/bootstrap_ci_env.ps1 修复 PySide6/shiboken 版本。\n")
 
 
 for _stream in (sys.stdout, sys.stderr):
